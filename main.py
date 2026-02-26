@@ -120,8 +120,25 @@ class ChatWindow(QMainWindow):
         self.send_btn = QPushButton("发送")
         self.send_btn.setFixedWidth(80)
         self.send_btn.clicked.connect(self.send_message)
+
+        # 新增：中止和重新生成按钮，垂直排列
+        self.stop_btn = QPushButton("中止")
+        self.stop_btn.setFixedWidth(60)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_generation)
+
+        self.regenerate_btn = QPushButton("重新生成")
+        self.regenerate_btn.setFixedWidth(60)
+        self.regenerate_btn.setEnabled(False)
+        self.regenerate_btn.clicked.connect(self.regenerate_message)
+
+        button_layout = QVBoxLayout()
+        button_layout.addWidget(self.stop_btn)
+        button_layout.addWidget(self.regenerate_btn)
+
         input_layout.addWidget(self.input_edit)
         input_layout.addWidget(self.send_btn)
+        input_layout.addLayout(button_layout)  # 将垂直按钮组放到发送按钮右侧
         bottom_layout.addLayout(input_layout)
         right_layout.addLayout(bottom_layout)
 
@@ -142,6 +159,84 @@ class ChatWindow(QMainWindow):
             self.switch_conversation(self.conv_list.item(0))
         else:
             self.create_new_conversation()
+
+        self.update_regenerate_button_state()
+
+    def stop_generation(self):
+        """中止当前的生成"""
+        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+            self.worker.stop()
+            # 中止后，worker 会触发 finished 信号，后续状态在 on_worker_finished 中恢复
+            # 可以添加一条系统消息提示用户
+            self.add_chat_message("system", "生成已中止")
+
+    def regenerate_message(self):
+        """重新生成最后一条用户消息的回复"""
+        if self.processing:
+            return
+        if not self.current_conversation:
+            return
+
+        # 找到最后一条用户消息
+        user_msg_index = -1
+        for i in range(len(self.current_conversation.messages) - 1, -1, -1):
+            if self.current_conversation.messages[i]["role"] == "user":
+                user_msg_index = i
+                break
+        if user_msg_index == -1:
+            QMessageBox.information(self, "提示", "没有用户消息可供重新生成")
+            return
+
+        # 如果最后一条是 AI 消息，则删除它
+        if (len(self.current_conversation.messages) > user_msg_index + 1 and
+                self.current_conversation.messages[-1]["role"] == "assistant"):
+            self._remove_last_ai_message()
+
+        # 构建消息列表（包含系统提示和当前对话所有消息）
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in self.current_conversation.messages:
+            messages.append(msg.copy())
+        messages = self.clean_messages_for_api(messages)
+
+        # 启动生成
+        self._run_with_messages(messages)
+
+    def _remove_last_ai_message(self):
+        """删除最后一条 AI 消息（UI 和历史）"""
+        if not self.current_conversation:
+            return
+        if self.current_conversation.messages and self.current_conversation.messages[-1]["role"] == "assistant":
+            # 从历史中移除
+            self.current_conversation.messages.pop()
+            self.current_conversation.updated_at = datetime.now().isoformat()
+            # 从 UI 中移除最后一个 .ai 容器
+            js = """
+            (function() {
+                var containers = document.querySelectorAll('.message-container.ai');
+                if (containers.length > 0) {
+                    containers[containers.length - 1].remove();
+                    return true;
+                }
+                return false;
+            })();
+            """
+            self.chat_view.page().runJavaScript(js)
+            self._last_ai_message_id = None  # 重置流式追加标记
+
+    def _run_with_messages(self, messages):
+        """使用给定的消息列表启动生成（公用方法）"""
+        mode = self.mode_combo.currentText()
+        self.processing = True
+        self.send_btn.setEnabled(False)
+        self.input_edit.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.regenerate_btn.setEnabled(False)
+        self._last_ai_message_id = None   # 重置，使新消息作为独立气泡
+
+        self.worker = Worker(messages, mode)
+        self.worker.stream_chunk.connect(self.on_stream_chunk)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
 
     def refresh_conv_list(self):
         """刷新左侧对话列表"""
@@ -173,6 +268,7 @@ class ChatWindow(QMainWindow):
         self.clear_chat()
         # 添加系统欢迎消息
         self.add_chat_message("system", "新对话已创建。")
+        self.update_regenerate_button_state()
 
     def switch_conversation(self, item):
         """切换对话"""
@@ -193,6 +289,7 @@ class ChatWindow(QMainWindow):
                 self.add_chat_message(msg["role"], msg["content"])
             # 滚动到底部
             self.scroll_to_bottom()
+        self.update_regenerate_button_state()
 
     def clear_chat(self):
         """清空 WebView 中的聊天内容"""
@@ -484,9 +581,6 @@ class ChatWindow(QMainWindow):
         cleaned = []
         for i, msg in enumerate(messages):
             new_msg = msg.copy()
-            # 移除 reasoning_content（如果存在）
-            if "reasoning_content" in new_msg:
-                del new_msg["reasoning_content"]
 
             # 检查 tool 消息的完整性
             if new_msg.get("role") == "tool":
@@ -524,29 +618,18 @@ class ChatWindow(QMainWindow):
         if self.current_conversation:
             self.current_conversation.add_message("user", text)
 
-            # 构建完整的消息列表：系统提示 + 所有历史消息（包括刚添加的用户消息）
+            # 构建完整的消息列表
+            # 替换原来的循环
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             for msg in self.current_conversation.messages:
-                messages.append({"role": msg["role"], "content": msg["content"]})
-
-            # === 新增：清理消息，移除所有 reasoning_content ===
+                messages.append(msg.copy())  # ✅ 复制完整消息，保留所有字段
             messages = self.clean_messages_for_api(messages)
-
-            mode = self.mode_combo.currentText()
-            self.processing = True
         else:
-            # 如果没有当前对话（不应发生），则临时创建
+            # 没有当前对话（不应发生）
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
 
-        mode = self.mode_combo.currentText()
-        self.processing = True
-        self.send_btn.setEnabled(False)
-        self.input_edit.setEnabled(False)
-
-        self.worker = Worker(messages, mode)
-        self.worker.stream_chunk.connect(self.on_stream_chunk)
-        self.worker.finished.connect(self.on_worker_finished)
-        self.worker.start()
+        # 启动生成
+        self._run_with_messages(messages)
 
     def on_stream_chunk(self, sender, chunk):
         if not hasattr(self, '_last_ai_message_id') or self._last_ai_message_id is None:
@@ -609,24 +692,22 @@ class ChatWindow(QMainWindow):
         self.processing = False
         self.send_btn.setEnabled(True)
         self.input_edit.setEnabled(True)
+        self.stop_btn.setEnabled(False)  # 中止按钮恢复禁用
+        self.update_regenerate_button_state()  # 更新重新生成按钮状态
         self.input_edit.setFocus()
         self._last_ai_message_id = None
 
+        # 原有错误处理和保存逻辑保持不变 ...
         if error:
             QMessageBox.critical(self, "错误", error)
             self.add_chat_message("system", f"错误：{error}")
         else:
-            # 更新当前对话的消息列表（过滤掉系统消息）
+            # 更新对话（原有代码不变）
             if self.current_conversation:
                 new_messages = [msg for msg in final_messages if msg["role"] != "system"]
                 self.current_conversation.messages = new_messages
-
-                for msg in self.current_conversation.messages:
-                    if msg.get("role") == "tool" and "tool_call_id" not in msg:
-                        print("!!! 警告：即将保存的 tool 消息缺少 tool_call_id !!!")
-
+                # ... 其余原有代码保持不变 ...
                 self.current_conversation.updated_at = datetime.now().isoformat()
-                # 如果标题还是默认，尝试自动生成
                 if self.current_conversation.title == "新对话":
                     new_title = self.history_manager.generate_title_from_messages(self.current_conversation)
                     if new_title:
@@ -635,6 +716,17 @@ class ChatWindow(QMainWindow):
                 self.refresh_conv_list()
 
         self.worker.deleteLater()
+
+    def update_regenerate_button_state(self):
+        """根据当前状态更新重新生成按钮的可用性"""
+        if self.processing:
+            self.regenerate_btn.setEnabled(False)
+        else:
+            # 检查对话历史中是否有用户消息
+            if self.current_conversation and any(msg['role'] == 'user' for msg in self.current_conversation.messages):
+                self.regenerate_btn.setEnabled(True)
+            else:
+                self.regenerate_btn.setEnabled(False)
 
     def add_chat_message(self, sender, text, isAppend=False):
         """通过JavaScript添加消息（非流式情况使用）"""
@@ -645,6 +737,7 @@ class ChatWindow(QMainWindow):
         safe_text = json.dumps(text)
         js = f"addMessage({safe_sender}, {safe_text}, {json.dumps(isAppend)});"
         self.chat_view.page().runJavaScript(js)
+        self.update_regenerate_button_state()
 
     def closeEvent(self, event):
         if self.current_conversation:
