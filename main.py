@@ -603,11 +603,11 @@ class ChatWindow(QMainWindow):
             return
 
         # 快捷指令处理（保持不变）
-        if text == "早上好":
-            text = "早上好，今天的新文章"
+        if text == "早上好 arxiv":
+            text = "早上好 arxiv，今天的新文章"
             self.input_edit.setPlainText(text)
-        elif text == "近期文章":
-            text = "近期文章，请整理一下"
+        elif text == "近期文章 arxiv":
+            text = "近期文章 arxiv，请整理一下"
             self.input_edit.setPlainText(text)
 
         self.input_edit.clear()

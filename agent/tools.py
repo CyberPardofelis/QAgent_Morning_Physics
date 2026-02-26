@@ -452,7 +452,7 @@ def _call_llm(prompt: str) -> str:
 # ----------------------------
 # 新增：生成 arXiv 量子物理每日总结
 # ----------------------------
-def generate_daily_summary():
+def generate_daily_summary_arxiv():
     """
     抓取 arXiv quant-ph 最新论文页面，解析每篇论文的ID、标题、摘要，
     调用LLM生成分类总结，并确保亮点论文包含arXiv ID和超链接。
@@ -542,7 +542,7 @@ def generate_daily_summary():
 
 
 
-def analyze_today_topic(topic: str):
+def analyze_today_topic_arxiv(topic: str):
     """
     针对当天 arXiv quant-ph 新论文中某个主题的论文进行详细分析。
     """

@@ -3,7 +3,7 @@ from openai import OpenAI
 from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
-    search_papers, run_python, generate_daily_summary, analyze_today_topic, update_paper_comment,
+    search_papers, run_python, generate_daily_summary_arxiv, analyze_today_topic_arxiv, update_paper_comment,
     search_arxiv, download_paper, analyze_paper, scan_local_papers, query_knowledge
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
@@ -127,15 +127,15 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_daily_summary",
-            "description": "Generate a daily summary of new quantum physics papers from arXiv (triggered by 'good morning')",
+            "name": "generate_daily_summary_arxiv",
+            "description": "Generate a daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
             "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "analyze_today_topic",
+            "name": "analyze_today_topic_arxiv",
             "description": "Analyze today's or new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
             "parameters": {
                 "type": "object",
@@ -221,14 +221,16 @@ def run_agent_stream(messages: list, mode="deepseek"):
 
         if tool_call_dict:
             current_sub_turn_message["tool_calls"] = list(tool_call_dict.values())
+        else:
+            # 关键：如果没有工具调用，删除 tool_calls 字段（避免空数组）
+            current_sub_turn_message.pop("tool_calls", None)
 
-        # ========== 关键修改点 1 ==========
         # 将当前子回合的完整消息（包含 reasoning_content）追加到历史
         # 这是 DeepSeek 多子回合能够继续推理的必要条件
         messages.append(current_sub_turn_message)
 
         # 如果没有工具调用，说明本轮（可能包含多子回合）已结束，可以退出循环
-        if not current_sub_turn_message["tool_calls"]:
+        if not current_sub_turn_message.get("tool_calls"):
             break
 
         # ========== 关键修改点 2 ==========
@@ -290,10 +292,10 @@ def run_agent_stream(messages: list, mode="deepseek"):
                     args.get("topic"),
                     args.get("author")
                 )
-            elif fn_name == "generate_daily_summary":
-                result = generate_daily_summary()
-            elif fn_name == "analyze_today_topic":
-                result = analyze_today_topic(args["topic"])
+            elif fn_name == "generate_daily_summary_arxiv":
+                result = generate_daily_summary_arxiv()
+            elif fn_name == "analyze_today_topic_arxiv":
+                result = analyze_today_topic_arxiv(args["topic"])
             else:
                 result = f"未知工具: {fn_name}"
 
@@ -369,10 +371,10 @@ def call_model(client, model_name, user_input):
                     args.get("topic"),
                     args.get("author")
                 )
-            elif fn == "generate_daily_summary":
-                result = generate_daily_summary()
-            elif fn == "analyze_today_topic":
-                result = analyze_today_topic(args["topic"])
+            elif fn == "generate_daily_summary_arxiv":
+                result = generate_daily_summary_arxiv()
+            elif fn == "analyze_today_topic_arxiv":
+                result = analyze_today_topic_arxiv(args["topic"])
             else:
                 result = "Unknown tool"
 
