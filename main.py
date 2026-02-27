@@ -724,6 +724,25 @@ class ChatWindow(QMainWindow):
             self.history_manager.save_conversation(self.current_conversation)
         event.accept()
 
+    def delete_conversation(self, conv: Conversation, item: QListWidgetItem):
+        reply = QMessageBox.question(self, "确认删除", f"确定要删除对话“{conv.title}”吗？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            # 1. 调用历史管理器删除（仅传递ID）
+            self.history_manager.delete_conversation(conv.conv_id)
+
+            # 2. 从列表控件中移除该项
+            row = self.conv_list.row(item)
+            self.conv_list.takeItem(row)
+
+            # 3. 如果删除的是当前对话，则切换或新建
+            if self.current_conversation and self.current_conversation.conv_id == conv.conv_id:
+                self.current_conversation = None  # 关键：先清除当前对话引用
+                if self.conv_list.count() > 0:
+                    self.conv_list.setCurrentRow(0)
+                    self.switch_conversation(self.conv_list.item(0))
+                else:
+                    self.create_new_conversation()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

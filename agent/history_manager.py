@@ -84,11 +84,11 @@ class HistoryManager:
             json.dump(conv.to_dict(), f, ensure_ascii=False, indent=2)
 
     def delete_conversation(self, conv_id: str):
+        """仅根据ID删除对话，不涉及UI"""
         print(f"尝试删除对话 {conv_id}")
         if conv_id in self.conversations:
             del self.conversations[conv_id]
         file_path = self._get_file_path(conv_id)
-        print(f"文件路径: {file_path}")
         if file_path.exists():
             file_path.unlink()
             print(f"文件已删除")

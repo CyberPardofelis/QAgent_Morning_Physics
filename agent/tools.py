@@ -773,7 +773,7 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
     playwright = sync_playwright().start()
     browser = None
     try:
-        browser = playwright.chromium.launch(headless=False, args=['--disable-blink-features=AutomationControlled'])
+        browser = playwright.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
         context = browser.new_context(
             accept_downloads=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
