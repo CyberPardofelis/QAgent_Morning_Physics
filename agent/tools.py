@@ -23,8 +23,11 @@ from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from openai import OpenAI
 from typing import List, Dict, Optional
 from playwright.sync_api import sync_playwright
-from config import INTERESTED_TOPICS
+from playwright.async_api import async_playwright
+from urllib.parse import urlparse
+import asyncio
 
+from config import INTERESTED_TOPICS
 # ----------------------------
 # 路径配置
 # ----------------------------
@@ -223,7 +226,7 @@ def search_arxiv(query: str, max_results: int = 10):
 # ----------------------------
 # 新增：下载arXiv论文PDF
 # ----------------------------
-def download_paper(arxiv_id: str):
+def download_arxiv_paper(arxiv_id: str):
     """根据arXiv ID下载论文到PAPER_DIR"""
     client = arxiv.Client()
     paper = next(client.results(arxiv.Search(id_list=[arxiv_id])))
@@ -292,7 +295,7 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     - research_topic: main topic or subject
     - basic_method: Technical methods and innovative points
     - main_conclusion: the primary conclusion and mathematical expression
-    - citations: list of cited paper IDs (arXiv IDs or DOIs if available)
+    - citations: important citations in method
     - outlook: the meaning, impact and outlook of this paper
     - summary: a one-paragraph summary
 
@@ -665,8 +668,10 @@ def parse_prl_papers_from_html(html: str) -> list:
                 relative_link = link_tag['href']
                 paper['link'] = 'https://journals.aps.org' + relative_link
                 # 从链接中提取 DOI 作为 ID
-                doi_match = re.search(r'10\.1103/[\w\.]+', relative_link)
-                paper['id'] = doi_match.group() if doi_match else 'unknown'
+                doi_match = re.search(r'10\.1103/[\w\.-]+', relative_link)
+                if doi_match:
+                    paper['doi'] = doi_match.group()
+                    paper['id'] = paper['doi'].split('/')[-1]  # 提取ID部分作为本地标识
             else:
                 continue
         else:
@@ -749,3 +754,78 @@ def generate_prl_daily_summary():
     except Exception as e:
         return f"❌ 抓取或总结失败: {str(e)}"
 
+
+def download_aps_paper(doi: str, save_dir: str = None) -> str:
+    if save_dir is None:
+        save_dir = PAPER_DIR
+    os.makedirs(save_dir, exist_ok=True)
+
+    try:
+        # 直接使用同步 Playwright 下载
+        return _download_with_playwright(doi, save_dir)
+    except Exception as e:
+        return f"❌ 下载失败: {str(e)}"
+
+
+def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+
+    playwright = sync_playwright().start()
+    browser = None
+    try:
+        browser = playwright.chromium.launch(headless=False, args=['--disable-blink-features=AutomationControlled'])
+        context = browser.new_context(
+            accept_downloads=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={'width': 1280, 'height': 800}
+        )
+        page = context.new_page()
+
+        # 访问DOI获取摘要页
+        page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=30000)
+        final_url = page.url
+        print(f"摘要页 URL: {final_url}")
+
+        # 获取PDF下载链接（从页面中提取）
+        # 尝试多种选择器找到PDF链接
+        pdf_link = page.locator('a[href*="/pdf/"]').first
+        if pdf_link.count() == 0:
+            # 如果没有，可能链接是别的形式，尝试从元数据或直接构造
+            pdf_url = final_url.replace('/abstract/', '/pdf/')
+        else:
+            pdf_url = pdf_link.get_attribute('href')
+            if not pdf_url.startswith('http'):
+                pdf_url = 'https://journals.aps.org' + pdf_url
+
+        # 使用JavaScript强制下载
+        with page.expect_download() as download_info:
+            page.evaluate(f"""
+                const a = document.createElement('a');
+                a.href = '{pdf_url}';
+                a.download = '';  // 空字符串表示使用URL最后部分作为文件名
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            """)
+
+        download = download_info.value
+
+        # 确定文件名
+        if filename is None:
+            article_id = final_url.split('/')[-1]
+            filename = f"{article_id}.pdf"
+
+        filepath = os.path.join(save_dir, filename)
+        print(f"正在保存到: {filepath}")
+        download.save_as(filepath)
+        print("下载完成")
+
+        return filepath
+
+    except Exception as e:
+        print(f"下载过程中出错: {e}")
+        raise
+    finally:
+        if browser:
+            browser.close()
+        playwright.stop()

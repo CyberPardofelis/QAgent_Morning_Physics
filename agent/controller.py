@@ -5,8 +5,8 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     search_papers, run_python, update_paper_comment,
     generate_daily_summary_arxiv, analyze_today_topic_arxiv,
-    generate_prl_daily_summary,
-    search_arxiv, download_paper, analyze_paper, scan_local_papers, query_knowledge
+    generate_prl_daily_summary, download_aps_paper,
+    search_arxiv, download_arxiv_paper, analyze_paper, scan_local_papers, query_knowledge
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
 
@@ -61,7 +61,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "download_paper",
+            "name": "download_arxiv_paper",
             "description": "Download an arXiv paper by ID to local folder",
             "parameters": {
                 "type": "object",
@@ -154,6 +154,20 @@ TOOLS = [
             "name": "generate_prl_daily_summary",
             "description": "Generate a daily summary of new quantum information papers from PRL (Physical Review Letters), triggered by 'good morning, prl'.",
             "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_aps_paper",
+            "description": "通过DOI下载APS期刊论文（PRL, PRA, PRB等）的PDF到本地，如果DOI开头是10.1103，即为APS.当需要下载 APS 论文时，请直接调用 `download_aps_paper` 工具，并传入 DOI 参数。该工具会自动处理所有细节（包括获取重定向、下载PDF），无需额外运行 Python 代码。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doi": {"type": "string", "description": "论文DOI，例如 10.1103/PhysRevLett.136.080203"}
+                },
+                "required": ["doi"]
+            }
         }
     }
 ]
@@ -269,8 +283,8 @@ def run_agent_stream(messages: list, mode="deepseek"):
                 result = run_python(args["code"])
             elif fn_name == "search_arxiv":
                 result = search_arxiv(args["query"], args.get("max_results", 10))
-            elif fn_name == "download_paper":
-                result = download_paper(args["arxiv_id"])
+            elif fn_name == "download_arxiv_paper":
+                result = download_arxiv_paper(args["arxiv_id"])
             elif fn_name == "analyze_paper":
                 paper_id = args.get("paper_id")
                 pdf_path = args.get("pdf_path")
@@ -318,6 +332,8 @@ def run_agent_stream(messages: list, mode="deepseek"):
                     error_msg = f"❌ PRL总结生成失败：{e}"
                     yield error_msg
                     result = error_msg  # 将错误信息作为结果传给后续的 tool 消息
+            elif fn_name == "download_aps_paper":
+                result = download_aps_paper(args["doi"])
             else:
                 result = f"未知工具: {fn_name}"
 
@@ -377,8 +393,8 @@ def call_model(client, model_name, user_input):
                 result = run_python(args["code"])
             elif fn == "search_arxiv":
                 result = search_arxiv(args["query"], args.get("max_results", 10))
-            elif fn == "download_paper":
-                result = download_paper(args["arxiv_id"])
+            elif fn == "download_arxiv_paper":
+                result = download_arxiv_paper(args["arxiv_id"])
             elif fn == "analyze_paper":
                 result = analyze_paper(
                     args["paper_id"],
@@ -399,6 +415,8 @@ def call_model(client, model_name, user_input):
                 result = analyze_today_topic_arxiv(args["topic"])
             elif fn == "generate_prl_daily_summary":
                 result = generate_prl_daily_summary()
+            elif fn == "download_aps_paper":
+                result = download_aps_paper(args["doi"])
             else:
                 result = "Unknown tool"
 

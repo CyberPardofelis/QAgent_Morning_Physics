@@ -10,6 +10,8 @@ OPENAI_MODEL = "gpt-4o-mini"
 DEEPSEEK_MODEL = "deepseek-reasoner"
 DEEPSEEK_MODEL_CHAT = "deepseek-chat"
 
+MODEL_PATH = r"D:\pythonProject\BGE_Large_en_v1.5"
+
 DATA_DIR = "data/papers"
 VECTOR_DIR = "data/vector_store"
 
