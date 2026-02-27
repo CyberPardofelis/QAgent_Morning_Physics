@@ -3,7 +3,9 @@ from openai import OpenAI
 from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
-    search_papers, run_python, generate_daily_summary_arxiv, analyze_today_topic_arxiv, update_paper_comment,
+    search_papers, run_python, update_paper_comment,
+    generate_daily_summary_arxiv, analyze_today_topic_arxiv,
+    generate_prl_daily_summary,
     search_arxiv, download_paper, analyze_paper, scan_local_papers, query_knowledge
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
@@ -145,6 +147,14 @@ TOOLS = [
                 "required": ["topic"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_prl_daily_summary",
+            "description": "Generate a daily summary of new quantum information papers from PRL (Physical Review Letters), triggered by 'good morning, prl'.",
+            "parameters": {"type": "object", "properties": {}}
+        }
     }
 ]
 
@@ -221,6 +231,9 @@ def run_agent_stream(messages: list, mode="deepseek"):
 
         if tool_call_dict:
             current_sub_turn_message["tool_calls"] = list(tool_call_dict.values())
+            # 新增：打印所有请求的工具名称
+            for tc in current_sub_turn_message["tool_calls"]:
+                print(f"模型请求调用工具: {tc['function']['name']}")
         else:
             # 关键：如果没有工具调用，删除 tool_calls 字段（避免空数组）
             current_sub_turn_message.pop("tool_calls", None)
@@ -296,6 +309,15 @@ def run_agent_stream(messages: list, mode="deepseek"):
                 result = generate_daily_summary_arxiv()
             elif fn_name == "analyze_today_topic_arxiv":
                 result = analyze_today_topic_arxiv(args["topic"])
+            elif fn_name == "generate_prl_daily_summary":
+                try:
+                    result = generate_prl_daily_summary()  # 调用你的函数
+                    # 如果你的函数直接返回最终总结（字符串），可以像下面这样输出
+                    yield result  # 如果需要实时输出，也可以逐字返回
+                except Exception as e:
+                    error_msg = f"❌ PRL总结生成失败：{e}"
+                    yield error_msg
+                    result = error_msg  # 将错误信息作为结果传给后续的 tool 消息
             else:
                 result = f"未知工具: {fn_name}"
 
@@ -375,6 +397,8 @@ def call_model(client, model_name, user_input):
                 result = generate_daily_summary_arxiv()
             elif fn == "analyze_today_topic_arxiv":
                 result = analyze_today_topic_arxiv(args["topic"])
+            elif fn == "generate_prl_daily_summary":
+                result = generate_prl_daily_summary()
             else:
                 result = "Unknown tool"
 

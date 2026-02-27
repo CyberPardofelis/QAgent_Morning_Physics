@@ -367,24 +367,6 @@ class ChatWindow(QMainWindow):
         <!-- MathJax 配置：启用noerrors扩展，处理轻微语法错误 -->
         <script>
         
-        function linkArxivIds(element) {
-            // 避免重复处理，如果已经包含我们添加的链接类，则跳过
-            if (element.querySelector('a.arxiv-link')) return;
-            
-            // 匹配 arXiv ID 的正则：4-5位数字.4-5位数字，可选版本号
-            // 使用负向前瞻避免匹配已存在的链接
-            var arxivRegex = /(?:^|\s|\(|\[|\:)(\d{4}\.\d{4,5}(?:v\d+)?)(?=$|\s|\)|\]|\.|,)/g;
-            
-            // 递归遍历文本节点进行替换（简单起见，先直接替换 innerHTML，但可能破坏已有 HTML）
-            // 更稳妥的方式是遍历文本节点，但为了简化，我们使用带回调的 replace
-            element.innerHTML = element.innerHTML.replace(arxivRegex, function(match, p1, offset, string) {
-                // 检查前后是否已经是链接的一部分
-                var before = string.slice(Math.max(0, offset-20), offset);
-                if (before.includes('href=')) return match; // 已经在链接内
-                return match.replace(p1, '<a href="https://arxiv.org/abs/' + p1 + '" target="_blank" class="arxiv-link">' + p1 + '</a>');
-            });
-        }
-        
         MathJax = {
             tex: {
                 inlineMath: [['$', '$'], ['\\(', '\\)']],
@@ -525,7 +507,6 @@ class ChatWindow(QMainWindow):
                 bubble.className = 'bubble';
                 bubble.setAttribute('data-fulltext', fullText);
                 bubble.innerHTML = htmlContent;
-                linkArxivIds(bubble);
                 container.appendChild(bubble);
                 document.getElementById('chat').appendChild(container);
                 if (window.MathJax && MathJax.typesetPromise) {
@@ -669,7 +650,6 @@ class ChatWindow(QMainWindow):
                                          .replace(/\\\\n/g, '<br>');
                 }}
                 bubble.innerHTML = htmlContent;
-                linkArxivIds(bubble);
                 if (window.MathJax && MathJax.typesetPromise) {{
                     MathJax.typesetPromise([bubble]).catch(err => console.error(err));
                 }}

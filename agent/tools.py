@@ -7,26 +7,22 @@ import numpy as np
 from PyPDF2 import PdfReader
 import re
 from collections import Counter
-
 from agent.local_embedder import LocalEmbedder
 from config import DATA_DIR, VECTOR_DIR
-
 import arxiv
 import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-import requests  # arxiv可能已包含，但下载可能需要
-# 可能需要 PyMuPDF 或 fitz
 import fitz  # PyMuPDF
-
 import requests
 from bs4 import BeautifulSoup
 import time
-
 from agent.local_embedder import LocalEmbedder
 from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from openai import OpenAI
+from typing import List, Dict, Optional
+from playwright.sync_api import sync_playwright
 from config import INTERESTED_TOPICS
 
 # ----------------------------
@@ -294,8 +290,10 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     - authors: list of authors
     - keywords: list of keywords
     - research_topic: main topic or subject
-    - main_conclusion: the primary conclusion
+    - basic_method: Technical methods and innovative points
+    - main_conclusion: the primary conclusion and mathematical expression
     - citations: list of cited paper IDs (arXiv IDs or DOIs if available)
+    - outlook: the meaning, impact and outlook of this paper
     - summary: a one-paragraph summary
 
     Paper text:
@@ -605,4 +603,149 @@ def analyze_today_topic_arxiv(topic: str):
 
     analysis = _call_llm(prompt)
     return analysis
+
+
+def fetch_prl_page_via_browser(
+        url: str = "https://journals.aps.org/prl/recent?toc_section%5B%5D=quantum-information-science-and-technology") -> str:
+    print('正在通过浏览器抓取PRL页面...')
+    try:
+        with sync_playwright() as p:
+            # 您已经设置为 headless=False，很好，这样可以看到浏览器行为
+            browser = p.firefox.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            page.set_default_timeout(60000)
+
+            response = page.goto(url, wait_until="networkidle")
+            print(f"HTTP状态码: {response.status}")
+
+            # 等待文章链接出现
+            page.wait_for_selector('a[href*="/prl/abstract/"]', timeout=15000)
+            print("成功找到文章链接，内容可能已加载。")
+
+            # 获取页面 HTML
+            html = page.content()
+            '''
+            # 尝试保存 HTML 到当前目录（用于调试），忽略保存失败
+            try:
+                with open('prl_page_debug.html', 'w', encoding='utf-8') as f:
+                    f.write(html)
+                print("HTML已保存到当前目录的 prl_page_debug.html")
+            except Exception as e:
+                print(f"保存HTML到文件失败（可忽略）: {e}")
+            #'''
+            browser.close()
+            return html
+    except Exception as e:
+        raise Exception(f"浏览器自动化抓取失败: {str(e)}")
+
+def parse_prl_papers_from_html(html: str) -> list:
+    """
+    从 PRL 页面 HTML 中解析论文列表。
+    基于当前实际页面结构：每篇文章在 div.browse-result-card 中。
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    papers = []
+
+    # 定位所有文章卡片
+    article_cards = soup.find_all('div', class_='browse-result-card')
+    print(f"找到 {len(article_cards)} 个文章卡片")
+
+    for card in article_cards:
+        paper = {}
+
+        # 1. 提取标题和链接
+        title_tag = card.find('h4', class_='title')
+        if title_tag:
+            link_tag = title_tag.find('a', href=True)
+            if link_tag:
+                paper['title'] = link_tag.get_text().strip()
+                relative_link = link_tag['href']
+                paper['link'] = 'https://journals.aps.org' + relative_link
+                # 从链接中提取 DOI 作为 ID
+                doi_match = re.search(r'10\.1103/[\w\.]+', relative_link)
+                paper['id'] = doi_match.group() if doi_match else 'unknown'
+            else:
+                continue
+        else:
+            continue
+
+        # 2. 提取作者（第一个包含作者列表的 <p> 标签）
+        # 通常作者在第一个 <p class="t-sm-regular text-text-regular-neutral"> 中
+        author_paragraphs = card.find_all('p', class_='t-sm-regular text-text-regular-neutral')
+        if author_paragraphs:
+            # 第一个 <p> 通常是作者
+            paper['authors'] = author_paragraphs[0].get_text().strip()
+        else:
+            paper['authors'] = ''
+
+        # 3. 提取摘要：摘要位于隐藏的 <div class="summary ..."> 中
+        # 这个 div 包含 data-abstract 属性
+        abstract_div = card.find('div', class_='summary', attrs={'data-abstract': True})
+        if abstract_div:
+            paper['abstract'] = abstract_div.get('data-abstract', '').strip()
+        else:
+            # 如果没有 data-abstract，尝试获取 div 内的文本（但通常 data-abstract 存在）
+            abstract_div = card.find('div', class_='summary')
+            if abstract_div:
+                paper['abstract'] = abstract_div.get_text().strip()
+            else:
+                paper['abstract'] = ''
+
+        # 4. 提取发表日期（可选，用于信息丰富）
+        # 日期通常在第二个 <p class="t-sm-regular text-text-regular-neutral"> 中
+        if len(author_paragraphs) > 1:
+            date_text = author_paragraphs[1].get_text().strip()
+            # 尝试提取日期部分，例如 "Published 26 February, 2026"
+            date_match = re.search(r'Published (.+)$', date_text)
+            if date_match:
+                paper['published_date'] = date_match.group(1)
+            else:
+                paper['published_date'] = date_text
+        else:
+            paper['published_date'] = ''
+
+        papers.append(paper)
+
+    return papers
+
+def generate_prl_daily_summary():
+    """
+    通过浏览器自动化抓取 PRL 最新论文，调用 LLM 生成总结。
+    """
+    try:
+        html = fetch_prl_page_via_browser()
+        papers = parse_prl_papers_from_html(html)
+        if not papers:
+            return "未找到 PRL 论文列表，请稍后重试。"
+
+        # 格式化论文文本（同之前）
+        papers_text = ""
+        for i, p in enumerate(papers, 1):
+            papers_text += f"{i}. **{p['title']}**\n"
+            papers_text += f"   - ID: `{p['id']}` | [PRL链接]({p['link']})\n"
+            papers_text += f"   - 作者: {p.get('authors', 'N/A')[:150]}...\n"
+            papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
+
+        # 构建 prompt（同上）
+        prompt = f"""
+        你现在是一个科研助手。以下是从 PRL 期刊抓取的“量子信息科学与技术”类别最新论文列表（共 {len(papers)} 篇）。
+        请按研究方向分类总结，每个类别挑选 2-3 篇亮点论文，并确保在描述亮点时包含该论文的 ID（DOI）和超链接。
+
+        **任务要求**：
+        1. 整体概览：一句话说明今天新上榜论文总数。
+        2. 分类总结：根据标题和摘要分类。
+        3. 亮点提取：每篇亮点格式为 `[标题](链接)`：一句核心贡献。
+        4. 输出格式：Markdown。
+
+        论文列表：
+        {papers_text}
+        """
+
+        analysis = _call_llm(prompt)
+        return analysis
+    except Exception as e:
+        return f"❌ 抓取或总结失败: {str(e)}"
 
