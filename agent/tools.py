@@ -6,9 +6,6 @@ import faiss
 import numpy as np
 from PyPDF2 import PdfReader
 import re
-from collections import Counter
-from agent.local_embedder import LocalEmbedder
-from config import DATA_DIR, VECTOR_DIR
 import arxiv
 import json
 import hashlib
@@ -18,14 +15,11 @@ import fitz  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
 import time
-from agent.local_embedder import LocalEmbedder
+from agent.local_embedder import Embedder
 from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from openai import OpenAI
 from typing import List, Dict, Optional
 from playwright.sync_api import sync_playwright
-from playwright.async_api import async_playwright
-from urllib.parse import urlparse
-import asyncio
 
 from config import INTERESTED_TOPICS
 # ----------------------------
@@ -49,7 +43,7 @@ META_FILE = os.path.join(VECTOR_DIR, "meta.pkl")
 # ----------------------------
 # 工具函数：提取PDF文本（支持两种库）
 # ----------------------------
-def extract_text_from_pdf(filepath, method="fitz"):
+def extract_text_from_pdf(filepath, method="pypdf2"):
     """提取PDF文本，method可选 'fitz' 或 'pypdf2'"""
     if method == "fitz":
         doc = fitz.open(filepath)
@@ -114,7 +108,7 @@ def build_index():
     if not all_chunks:
         raise ValueError("No PDF documents found in DATA_DIR.")
 
-    embeddings = LocalEmbedder.embed(all_chunks)
+    embeddings = Embedder.embed(all_chunks)
 
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
@@ -161,7 +155,7 @@ def get_index():
 def search_papers(query: str, top_k=5):
     index, metadata = get_index()
 
-    query_embedding = LocalEmbedder.embed([query])
+    query_embedding = Embedder.embed([query])
 
     scores, indices = index.search(query_embedding, top_k)
 
@@ -291,11 +285,13 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     Analyze the following paper text and return a **valid JSON object** with these fields:
     - title: the paper title
     - authors: list of authors
+    - link: The online link of the paper. If not available, please record the arXiv ID or DOI number.
     - keywords: list of keywords
     - research_topic: main topic or subject
     - basic_method: Technical methods and innovative points
     - main_conclusion: the primary conclusion and mathematical expression
     - citations: important citations in method
+    - intro_cites: important citations in introduction
     - outlook: the meaning, impact and outlook of this paper
     - summary: a one-paragraph summary
 

@@ -1,6 +1,6 @@
 import json
 from openai import OpenAI
-from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY
+from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY, EMBEDDING_ENABLED
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     search_papers, run_python, update_paper_comment,
@@ -14,21 +14,8 @@ from agent.llm_clients import get_openai_client, get_deepseek_client
 # 工具定义
 # =============================
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_papers",
-            "description": "Search local research papers using vector index",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
+# 不依赖embedding的论文查询、分析工具（始终可用）
+BASE_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -114,21 +101,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "query_knowledge",
-            "description": "Search the knowledge base by keyword/topic/author",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string"},
-                    "topic": {"type": "string"},
-                    "author": {"type": "string"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "generate_daily_summary_arxiv",
             "description": "Generate a daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
             "parameters": {"type": "object", "properties": {}}
@@ -172,7 +144,39 @@ TOOLS = [
     }
 ]
 
+EMBEDDING_TOOLS=[
+    {
+        "type": "function",
+        "function": {
+            "name": "search_papers",
+            "description": "Search local research papers using vector index",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_knowledge",
+            "description": "Search the knowledge base by keyword/topic/author",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "author": {"type": "string"}
+                }
+            }
+        }
+    },
+]
 
+EMBEDDING_TOOL_NAMES = {tool["function"]["name"] for tool in EMBEDDING_TOOLS}
 
 # =============================
 # 创建 DeepSeek client
@@ -198,6 +202,11 @@ def run_agent_stream(messages: list, mode="deepseek"):
     else:  # deepseek
         client = get_deepseek_client()
         model = DEEPSEEK_MODEL
+
+    if EMBEDDING_ENABLED:
+        TOOLS = BASE_TOOLS+EMBEDDING_TOOLS
+    else:
+        TOOLS = BASE_TOOLS
 
     while True:
         stream = client.chat.completions.create(
@@ -264,6 +273,17 @@ def run_agent_stream(messages: list, mode="deepseek"):
         # 执行工具调用，并将结果以 "tool" 角色追加
         for tool_call in current_sub_turn_message["tool_calls"]:
             fn_name = tool_call["function"]["name"]
+
+            # 检查是否因embedding禁用而拒绝执行
+            if not EMBEDDING_ENABLED and fn_name in EMBEDDING_TOOL_NAMES:
+                error_result = f"工具 {fn_name} 需要 embedding 支持，但当前已在配置中禁用。"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": error_result
+                })
+                continue
+
             # 注意：这里需要异常处理，因为参数可能不完整
             try:
                 args = json.loads(tool_call["function"]["arguments"])
@@ -369,6 +389,12 @@ def call_model(client, model_name, user_input):
         {"role": "user", "content": user_input}
     ]
 
+    if EMBEDDING_ENABLED:
+        TOOLS = BASE_TOOLS+EMBEDDING_TOOLS
+    else:
+        TOOLS = BASE_TOOLS
+
+
     while True:
         response = client.chat.completions.create(
             model=model_name,
@@ -384,6 +410,16 @@ def call_model(client, model_name, user_input):
 
         for tool_call in msg.tool_calls:
             fn = tool_call.function.name
+            if not EMBEDDING_ENABLED and fn in EMBEDDING_TOOL_NAMES:
+                result = f"工具 {fn} 需要 embedding 支持，但当前已在配置中禁用。"
+                # 直接构造结果，不调用实际函数
+                messages.append(msg)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+                continue
             args = json.loads(tool_call.function.arguments)
             result = None
 
