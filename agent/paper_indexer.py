@@ -1,4 +1,3 @@
-import os
 import PyPDF2
 from agent.local_embedder import Embedder
 from agent.vector_store import VectorStore

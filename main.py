@@ -1,20 +1,55 @@
+
 import sys
 import traceback
-import json
-import re
-import time
-from datetime import datetime
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from agent.history_manager import HistoryManager, Conversation
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPlainTextEdit, QPushButton, QComboBox, QMessageBox, QLabel, QSizePolicy,
-    QSplitter, QListWidget, QListWidgetItem, QMenu, QInputDialog, QFrame
-)
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QPoint
-from PySide6.QtGui import QDesktopServices, QAction
-from agent.controller import run_agent_stream
-from agent.prompts import SYSTEM_PROMPT
+import os
+import datetime
+
+try:
+    # 你的原始导入和代码
+    import json
+    from datetime import datetime
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from agent.history_manager import HistoryManager, Conversation
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPlainTextEdit, QPushButton, QComboBox, QMessageBox, QLabel, QSizePolicy,
+        QSplitter, QListWidget, QListWidgetItem, QMenu, QInputDialog, QFrame
+    )
+    from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QPoint
+    from PySide6.QtGui import QDesktopServices, QAction
+    from agent.controller import run_agent_stream
+    from agent.prompts import SYSTEM_PROMPT
+
+except Exception:
+    # 确定日志路径
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(base_dir, 'error.log')
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f"\n--- {datetime.datetime.now()} ---\n")
+        traceback.print_exc(file=f)
+    # 重新抛出，让系统处理（可选）
+    raise
+
+def excepthook(exc_type, exc_value, exc_traceback):
+    # 确定日志文件存放位置（与 exe 同目录或当前目录）
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(base_dir, 'error.log')
+
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f"\n--- {datetime.datetime.now()} ---\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    # 也可以打印到控制台（如果有）
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+
+
+sys.excepthook = excepthook
+
 
 class Worker(QThread):
     """支持流式输出的工作线程"""

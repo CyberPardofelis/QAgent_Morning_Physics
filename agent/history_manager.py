@@ -1,10 +1,8 @@
 # agent/history_manager.py
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
-import hashlib
 
 HISTORY_DIR = Path("data/conversations")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)

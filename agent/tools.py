@@ -3,22 +3,18 @@ import subprocess
 import tempfile
 import pickle
 import faiss
-import numpy as np
 from PyPDF2 import PdfReader
 import re
 import arxiv
 import json
-import hashlib
 from datetime import datetime
 from pathlib import Path
 import fitz  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
-import time
 from agent.local_embedder import Embedder
 from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from openai import OpenAI
-from typing import List, Dict, Optional
 from playwright.sync_api import sync_playwright
 
 from config import INTERESTED_TOPICS
@@ -667,7 +663,7 @@ def parse_prl_papers_from_html(html: str) -> list:
                 doi_match = re.search(r'10\.1103/[\w\.-]+', relative_link)
                 if doi_match:
                     paper['doi'] = doi_match.group()
-                    paper['id'] = paper['doi'].split('/')[-1]  # 提取ID部分作为本地标识
+                    paper['id'] = paper['doi']#.split('/')[-1]  # 提取ID部分作为本地标识
             else:
                 continue
         else:
@@ -738,7 +734,7 @@ def generate_prl_daily_summary():
         **任务要求**：
         1. 整体概览：一句话说明今天新上榜论文总数。
         2. 分类总结：根据标题和摘要分类。
-        3. 亮点提取：每篇亮点格式为 `[标题](链接)`：一句核心贡献。
+        3. 亮点提取：**每篇亮点必须使用以下格式：** `[标题](id:)`：一句核心贡献。
         4. 输出格式：Markdown。
 
         论文列表：
