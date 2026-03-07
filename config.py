@@ -22,5 +22,4 @@ LOCAL_EMBEDDER_NAME = "BAAI/bge-base-zh" # 或其他模型
 DATA_DIR = "data/papers"
 VECTOR_DIR = "data/vector_store"
 
-PRL_SEC = "quantum-information-science"
-PRA_SEC = "quantum-information-science-and-technology"
+ARXIV_SEC = "quant-ph"

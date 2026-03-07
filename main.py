@@ -1,12 +1,12 @@
 import sys
 import traceback
 import os
-import datetime
+from datetime import datetime
 
 try:
     # 你的原始导入和代码
     import json
-    import datetime
+    from datetime import datetime
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from agent.history_manager import HistoryManager, Conversation
     from PySide6.QtWidgets import (
@@ -18,6 +18,14 @@ try:
     from PySide6.QtGui import QDesktopServices, QAction
     from agent.controller import run_agent_stream
     from agent.prompts import SYSTEM_PROMPT
+
+    from PySide6.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QCheckBox, QComboBox,
+        QDialogButtonBox, QMessageBox, QGroupBox
+    )
+    from PySide6.QtCore import QSettings
+    import config
+    import yaml
 
 except Exception:
     # 确定日志路径
@@ -178,6 +186,13 @@ class ChatWindow(QMainWindow):
 
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(1, 5)  # 右侧占更多空间
+
+        # 添加菜单栏
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu("设置")
+        settings_action = QAction("首选项", self)
+        settings_action.triggered.connect(self.open_settings_dialog)
+        settings_menu.addAction(settings_action)
 
         # 其他原有属性
         self.input_edit.installEventFilter(self)
@@ -777,8 +792,220 @@ class ChatWindow(QMainWindow):
                 else:
                     self.create_new_conversation()
 
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self)
+        dialog.exec()
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(600)
+
+        main_layout = QVBoxLayout()
+
+        # ========== 通用 API 配置部分 ==========
+        form_layout = QFormLayout()
+
+        self.openai_api_key = QLineEdit()
+        self.openai_api_key.setEchoMode(QLineEdit.Password)
+        form_layout.addRow("OpenAI API Key:", self.openai_api_key)
+
+        self.openai_model = QLineEdit()
+        form_layout.addRow("OpenAI Model:", self.openai_model)
+
+        self.deepseek_api_key = QLineEdit()
+        self.deepseek_api_key.setEchoMode(QLineEdit.Password)
+        form_layout.addRow("DeepSeek API Key:", self.deepseek_api_key)
+
+        self.deepseek_model = QLineEdit()
+        form_layout.addRow("DeepSeek Model:", self.deepseek_model)
+
+        self.deepseek_chat_model = QLineEdit()
+        form_layout.addRow("DeepSeek Chat Model:", self.deepseek_chat_model)
+
+        self.embedding_enabled = QCheckBox()
+        form_layout.addRow("启用 Embedding:", self.embedding_enabled)
+
+        self.embedder_type = QComboBox()
+        self.embedder_type.addItems(["local", "openai"])
+        form_layout.addRow("Embedder 类型:", self.embedder_type)
+
+        self.openai_embedding_model = QLineEdit()
+        form_layout.addRow("OpenAI Embedding 模型:", self.openai_embedding_model)
+
+        self.local_embedder_name = QLineEdit()
+        form_layout.addRow("本地 Embedder 名称:", self.local_embedder_name)
+
+        self.model_path = QLineEdit()
+        form_layout.addRow("模型路径:", self.model_path)
+
+        self.data_dir = QLineEdit()
+        form_layout.addRow("数据目录:", self.data_dir)
+
+        self.vector_dir = QLineEdit()
+        form_layout.addRow("向量存储目录:", self.vector_dir)
+
+        main_layout.addLayout(form_layout)
+
+        # ========== 期刊配置部分（来自 aps_journals.yaml）==========
+        journals_group = QGroupBox("期刊配置 (section 字段)")
+        journals_layout = QFormLayout(journals_group)
+        self.journal_section_inputs = {}  # 存储每个期刊的输入控件
+
+        self._create_journal_inputs(journals_layout)
+        main_layout.addWidget(journals_group)
+
+        # ========== 按钮 ==========
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        main_layout.addWidget(button_box)
+
+        self.setLayout(main_layout)
+
+        # 加载现有配置
+        self._load_config()
+        self._load_journals_config()
+
+    def _create_journal_inputs(self, layout):
+        """读取 YAML 文件，为每个期刊创建 section 输入框"""
+        yaml_path = self._get_yaml_path()
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                journals_data = yaml.safe_load(f)
+            journals = journals_data.get('journals', {})
+        except Exception as e:
+            print(f"读取期刊配置失败: {e}")
+            journals = {}
+
+        for journal_key, journal_info in journals.items():
+            section_input = QLineEdit(journal_info.get('section', ''))
+            self.journal_section_inputs[journal_key] = section_input
+            layout.addRow(f"{journal_key} section:", section_input)
+
+    def _get_yaml_path(self):
+        """获取 aps_journals.yaml 的绝对路径"""
+        # SettingsDialog 所在文件位于项目根目录，agent 是子目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(current_dir, 'agent', 'aps_journals.yaml')
+
+    def _load_config(self):
+        """从 config 模块加载通用配置到控件"""
+        self.openai_api_key.setText(getattr(config, 'OPENAI_API_KEY', ''))
+        self.openai_model.setText(getattr(config, 'OPENAI_MODEL', ''))
+        self.deepseek_api_key.setText(getattr(config, 'DEEPSEEK_API_KEY', ''))
+        self.deepseek_model.setText(getattr(config, 'DEEPSEEK_MODEL', ''))
+        self.deepseek_chat_model.setText(getattr(config, 'DEEPSEEK_MODEL_CHAT', ''))
+        self.embedding_enabled.setChecked(getattr(config, 'EMBEDDING_ENABLED', False))
+        self.embedder_type.setCurrentText(getattr(config, 'EMBEDDER_TYPE', 'local'))
+        self.openai_embedding_model.setText(getattr(config, 'OPENAI_EMBEDDING_MODEL', ''))
+        self.local_embedder_name.setText(getattr(config, 'LOCAL_EMBEDDER_NAME', ''))
+        self.model_path.setText(getattr(config, 'MODEL_PATH', ''))
+        self.data_dir.setText(getattr(config, 'DATA_DIR', ''))
+        self.vector_dir.setText(getattr(config, 'VECTOR_DIR', ''))
+
+    def _load_journals_config(self):
+        """从 YAML 文件加载期刊 section 值到输入框"""
+        yaml_path = self._get_yaml_path()
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                journals_data = yaml.safe_load(f)
+            journals = journals_data.get('journals', {})
+            for journal_key, section_input in self.journal_section_inputs.items():
+                if journal_key in journals:
+                    section_input.setText(journals[journal_key].get('section', ''))
+        except Exception as e:
+            print(f"加载期刊配置失败: {e}")
+
+    def _save_journals_config(self):
+        """将用户修改的期刊 section 值写回 YAML 文件"""
+        yaml_path = self._get_yaml_path()
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                journals_data = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            journals_data = {'journals': {}}
+
+        if 'journals' not in journals_data:
+            journals_data['journals'] = {}
+
+        for journal_key, section_input in self.journal_section_inputs.items():
+            if journal_key not in journals_data['journals']:
+                journals_data['journals'][journal_key] = {}
+            journals_data['journals'][journal_key]['section'] = section_input.text()
+
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            yaml.dump(journals_data, f, allow_unicode=True, default_flow_style=False)
+
+    def accept(self):
+        """保存所有配置"""
+        # 保存通用配置到 config 模块
+        config.OPENAI_API_KEY = self.openai_api_key.text()
+        config.OPENAI_MODEL = self.openai_model.text()
+        config.DEEPSEEK_API_KEY = self.deepseek_api_key.text()
+        config.DEEPSEEK_MODEL = self.deepseek_model.text()
+        config.DEEPSEEK_MODEL_CHAT = self.deepseek_chat_model.text()
+        config.EMBEDDING_ENABLED = self.embedding_enabled.isChecked()
+        config.EMBEDDER_TYPE = self.embedder_type.currentText()
+        config.OPENAI_EMBEDDING_MODEL = self.openai_embedding_model.text()
+        config.LOCAL_EMBEDDER_NAME = self.local_embedder_name.text()
+        config.MODEL_PATH = self.model_path.text()
+        config.DATA_DIR = self.data_dir.text()
+        config.VECTOR_DIR = self.vector_dir.text()
+
+        # 保存期刊配置到 YAML
+        self._save_journals_config()
+
+        # 保存到 QSettings（便于下次启动自动加载）
+        settings = QSettings("YourCompany", "LLM科研助手")
+        settings.setValue("OPENAI_API_KEY", config.OPENAI_API_KEY)
+        settings.setValue("OPENAI_MODEL", config.OPENAI_MODEL)
+        settings.setValue("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY)
+        settings.setValue("DEEPSEEK_MODEL", config.DEEPSEEK_MODEL)
+        settings.setValue("DEEPSEEK_MODEL_CHAT", config.DEEPSEEK_MODEL_CHAT)
+        settings.setValue("EMBEDDING_ENABLED", config.EMBEDDING_ENABLED)
+        settings.setValue("EMBEDDER_TYPE", config.EMBEDDER_TYPE)
+        settings.setValue("OPENAI_EMBEDDING_MODEL", config.OPENAI_EMBEDDING_MODEL)
+        settings.setValue("LOCAL_EMBEDDER_NAME", config.LOCAL_EMBEDDER_NAME)
+        settings.setValue("MODEL_PATH", config.MODEL_PATH)
+        settings.setValue("DATA_DIR", config.DATA_DIR)
+        settings.setValue("VECTOR_DIR", config.VECTOR_DIR)
+
+        QMessageBox.information(self, "提示", "配置已保存，将在后续对话中生效。")
+        super().accept()
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    settings = QSettings("YourCompany", "LLM科研助手")
+    if settings.contains("OPENAI_API_KEY"):
+        config.OPENAI_API_KEY = settings.value("OPENAI_API_KEY")
+    if settings.contains("OPENAI_MODEL"):
+        config.OPENAI_MODEL = settings.value("OPENAI_MODEL")
+    if settings.contains("DEEPSEEK_API_KEY"):
+        config.DEEPSEEK_API_KEY = settings.value("DEEPSEEK_API_KEY")
+    if settings.contains("DEEPSEEK_MODEL"):
+        config.DEEPSEEK_MODEL = settings.value("DEEPSEEK_MODEL")
+    if settings.contains("DEEPSEEK_MODEL_CHAT"):
+        config.DEEPSEEK_MODEL_CHAT = settings.value("DEEPSEEK_MODEL_CHAT")
+    if settings.contains("EMBEDDING_ENABLED"):
+        val = settings.value("EMBEDDING_ENABLED")
+        config.EMBEDDING_ENABLED = val in [True, "true", "1"]
+    if settings.contains("EMBEDDER_TYPE"):
+        config.EMBEDDER_TYPE = settings.value("EMBEDDER_TYPE")
+    if settings.contains("OPENAI_EMBEDDING_MODEL"):
+        config.OPENAI_EMBEDDING_MODEL = settings.value("OPENAI_EMBEDDING_MODEL")
+    if settings.contains("LOCAL_EMBEDDER_NAME"):
+        config.LOCAL_EMBEDDER_NAME = settings.value("LOCAL_EMBEDDER_NAME")
+    if settings.contains("MODEL_PATH"):
+        config.MODEL_PATH = settings.value("MODEL_PATH")
+    if settings.contains("DATA_DIR"):
+        config.DATA_DIR = settings.value("DATA_DIR")
+    if settings.contains("VECTOR_DIR"):
+        config.VECTOR_DIR = settings.value("VECTOR_DIR")
+
     window = ChatWindow()
     window.show()
     sys.exit(app.exec())

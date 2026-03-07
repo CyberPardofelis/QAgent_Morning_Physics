@@ -1,47 +1,51 @@
 journals:
-  prl:
-    name: "Physical Review Letters"
-    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
-    section: "quantum-information-science-and-technology"
-    link_selector: 'a[href*="/prl/abstract/"]'  # 用于等待的特定选择器
+  arxiv:
+    link_selector: ''
+    name: arXiv
+    section: quant-ph
+    url_template: https://arxiv.org/list/{section}/new
   pra:
-    name: "Physical Review A"
-    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
-    section: "quantum-information-science"
-    link_selector: 'a[href*="/pra/abstract/"]'
-  # 可以继续添加 prb, prc, prx 等
+    link_selector: a[href*="/pra/abstract/"]
+    name: Physical Review A
+    section: quantum-information-science
+    url_template: https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}
   prb:
-    name: "Physical Review B"
-    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
-    section: "structure-structural-phase-transitions-mechanical-properties-defects"
-    link_selector: 'a[href*="/prb/abstract/"]'
+    link_selector: a[href*="/prb/abstract/"]
+    name: Physical Review B
+    section: structure-structural-phase-transitions-mechanical-properties-defects
+    url_template: https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}
   prc:
-    name: "Physical Review C"
-    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
-    section: "nucleon-nucleon-interaction-few-body-systems"
-    link_selector: 'a[href*="/prc/abstract/"]'
+    link_selector: a[href*="/prc/abstract/"]
+    name: Physical Review C
+    section: nucleon-nucleon-interaction-few-body-systems
+    url_template: https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}
   prd:
-    name: "Physical Review D"
-    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
-    section: "article"
-    link_selector: 'a[href*="/prd/abstract/"]'
+    link_selector: a[href*="/prd/abstract/"]
+    name: Physical Review D
+    section: article
+    url_template: https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}
   pre:
-    name: "Physical Review E"
-    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
-    section: "computational-physics-machine-learning-and-artificial-intelligence"
-    link_selector: 'a[href*="/pre/abstract/"]'
+    link_selector: a[href*="/pre/abstract/"]
+    name: Physical Review E
+    section: computational-physics-machine-learning-and-artificial-intelligence
+    url_template: https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}
+  prl:
+    link_selector: a[href*="/prl/abstract/"]
+    name: Physical Review Letters
+    section: quantum-information-science-and-technology
+    url_template: https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}
   prx:
-    name: "Physical Review X"
-    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
-    section: "article"
-    link_selector: 'a[href*="/prx/abstract/"]'
+    link_selector: a[href*="/prx/abstract/"]
+    name: Physical Review X
+    section: article
+    url_template: https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}
   prxquantum:
-    name: "PRX Quantum"
-    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
-    section: "article"
-    link_selector: 'a[href*="/prxquantum/abstract/"]'
+    link_selector: a[href*="/prxquantum/abstract/"]
+    name: PRX Quantum
+    section: article
+    url_template: https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}
   rmp:
-    name: "Reviews of Modern Physics"
-    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
-    section: "review"
-    link_selector: 'a[href*="/rmp/abstract/"]'
+    link_selector: a[href*="/rmp/abstract/"]
+    name: Reviews of Modern Physics
+    section: review
+    url_template: https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}
