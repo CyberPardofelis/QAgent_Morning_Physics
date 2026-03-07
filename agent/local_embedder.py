@@ -1,10 +1,17 @@
-import torch
-from sentence_transformers import SentenceTransformer
+import importlib
 import numpy as np
-from config import EMBEDDER_TYPE, OPENAI_EMBEDDING_MODEL, MODEL_PATH, OPENAI_API_KEY, LOCAL_EMBEDDER_NAME
+from config import EMBEDDING_ENABLED, EMBEDDER_TYPE, OPENAI_EMBEDDING_MODEL, MODEL_PATH, OPENAI_API_KEY, LOCAL_EMBEDDER_NAME
 import os
 import openai
-
+torch = None
+SentenceTransformer = None
+if EMBEDDING_ENABLED:
+    try:
+        torch = importlib.import_module('torch')
+        sentence_transformers = importlib.import_module('sentence_transformers')
+        SentenceTransformer = sentence_transformers.SentenceTransformer
+    except ImportError:
+        pass
 
 class Embedder:
     _model = None  # 本地模型缓存

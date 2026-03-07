@@ -12,11 +12,19 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
-from agent.local_embedder import Embedder
-from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
+from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, EMBEDDING_ENABLED
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
 import yaml
+
+import importlib
+Embedder = None
+if EMBEDDING_ENABLED:
+    try:
+        embedder_module = importlib.import_module('agent.local_embedder')
+        Embedder = embedder_module.Embedder
+    except:
+        pass
 
 # ----------------------------
 # 路径配置

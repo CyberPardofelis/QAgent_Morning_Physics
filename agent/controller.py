@@ -3,12 +3,14 @@ from openai import OpenAI
 from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY, EMBEDDING_ENABLED
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
-    search_papers, run_python, update_paper_comment,
+    scan_local_papers, run_python, update_paper_comment,
     generate_daily_summary_arxiv, analyze_today_topic_arxiv,
     generate_aps_daily_summary, download_aps_paper,
-    search_arxiv, download_arxiv_paper, analyze_paper, scan_local_papers, query_knowledge
+    search_arxiv, download_arxiv_paper, analyze_paper
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
+if EMBEDDING_ENABLED:
+    from agent.tools import (search_papers, query_knowledge)
 
 # =============================
 # 工具定义

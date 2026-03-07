@@ -35,7 +35,7 @@ except Exception:
         base_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(base_dir, 'error.log')
     with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(f"\n--- {datetime.datetime.now()} ---\n")
+        f.write(f"\n--- {datetime.now()} ---\n")
         traceback.print_exc(file=f)
     # 重新抛出，让系统处理（可选）
     raise
@@ -958,7 +958,7 @@ class SettingsDialog(QDialog):
         self._save_journals_config()
 
         # 保存到 QSettings（便于下次启动自动加载）
-        settings = QSettings("YourCompany", "LLM科研助手")
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
         settings.setValue("OPENAI_API_KEY", config.OPENAI_API_KEY)
         settings.setValue("OPENAI_MODEL", config.OPENAI_MODEL)
         settings.setValue("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY)
@@ -979,7 +979,7 @@ class SettingsDialog(QDialog):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    settings = QSettings("YourCompany", "LLM科研助手")
+    settings = QSettings("CyberPardofelis", "LLM科研助手")
     if settings.contains("OPENAI_API_KEY"):
         config.OPENAI_API_KEY = settings.value("OPENAI_API_KEY")
     if settings.contains("OPENAI_MODEL"):

@@ -1,6 +1,15 @@
 import PyPDF2
-from agent.local_embedder import Embedder
+from config import EMBEDDING_ENABLED
 from agent.vector_store import VectorStore
+
+import importlib
+Embedder = None
+if EMBEDDING_ENABLED:
+    try:
+        embedder_module = importlib.import_module('agent.local_embedder')
+        Embedder = embedder_module.Embedder
+    except:
+        pass
 
 def extract_text(pdf_path):
     reader = PyPDF2.PdfReader(pdf_path)
