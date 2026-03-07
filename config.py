@@ -22,9 +22,5 @@ LOCAL_EMBEDDER_NAME = "BAAI/bge-base-zh" # 或其他模型
 DATA_DIR = "data/papers"
 VECTOR_DIR = "data/vector_store"
 
-INTERESTED_TOPICS = [
-    "quantum information",
-    "quantum computing",
-    "quantum error correction",
-    "quantum machine learning"
-]
+PRL_SEC = "quantum-information-science"
+PRA_SEC = "quantum-information-science-and-technology"

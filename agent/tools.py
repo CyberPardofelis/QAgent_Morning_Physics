@@ -16,8 +16,8 @@ from agent.local_embedder import Embedder
 from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
+import yaml
 
-from config import INTERESTED_TOPICS
 # ----------------------------
 # 路径配置
 # ----------------------------
@@ -600,24 +600,44 @@ def analyze_today_topic_arxiv(topic: str):
     return analysis
 
 
-def fetch_prl_page_via_browser(
-        url: str = "https://journals.aps.org/prl/recent?toc_section%5B%5D=quantum-information-science-and-technology") -> str:
-    print('正在通过浏览器抓取PRL页面...')
+def load_journal_config(config_path='agent/aps_journals.yaml'):
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+        return config.get('journals', {})
+
+JOURNAL_CONFIG = load_journal_config()
+
+def fetch_aps_page_via_browser(journal: str = 'prl'):
+    """
+    通用APS期刊页面抓取函数。
+    Args:
+        journal: 期刊标识，如 'prl', 'pra'，对应配置文件中的键。
+    """
+    config = JOURNAL_CONFIG.get(journal)
+    if not config:
+        raise ValueError(f"不支持的期刊: {journal}")
+
+    # 从配置动态构建URL
+    url = config['url_template'].format(journal=journal, section=config['section'])
+    link_selector = config['link_selector']
+    print('正在通过浏览器抓取APS页面...')
+
+
     try:
         with sync_playwright() as p:
             # 您已经设置为 headless=False，很好，这样可以看到浏览器行为
-            browser = p.firefox.launch(headless=True)
+            browser = p.firefox.launch(headless=False)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = context.new_page()
             page.set_default_timeout(60000)
 
-            response = page.goto(url, wait_until="networkidle")
+            response = page.goto(url, wait_until="domcontentloaded")
             print(f"HTTP状态码: {response.status}")
 
             # 等待文章链接出现
-            page.wait_for_selector('a[href*="/prl/abstract/"]', timeout=15000)
+            page.wait_for_selector(link_selector, timeout=15000)
             print("成功找到文章链接，内容可能已加载。")
 
             # 获取页面 HTML
@@ -636,9 +656,9 @@ def fetch_prl_page_via_browser(
     except Exception as e:
         raise Exception(f"浏览器自动化抓取失败: {str(e)}")
 
-def parse_prl_papers_from_html(html: str) -> list:
+def parse_aps_papers_from_html(html: str) -> list:
     """
-    从 PRL 页面 HTML 中解析论文列表。
+    从 APS 页面 HTML 中解析论文列表。
     基于当前实际页面结构：每篇文章在 div.browse-result-card 中。
     """
     soup = BeautifulSoup(html, 'html.parser')
@@ -708,15 +728,19 @@ def parse_prl_papers_from_html(html: str) -> list:
 
     return papers
 
-def generate_prl_daily_summary():
+def generate_aps_daily_summary(journal: str = 'prl'):
     """
-    通过浏览器自动化抓取 PRL 最新论文，调用 LLM 生成总结。
+    通过浏览器自动化抓取 APS 最新论文，调用 LLM 生成总结。
     """
+    config = JOURNAL_CONFIG.get(journal)
+    if not config:
+        raise ValueError(f"不支持的期刊: {journal}")
+
     try:
-        html = fetch_prl_page_via_browser()
-        papers = parse_prl_papers_from_html(html)
+        html = fetch_aps_page_via_browser(journal)
+        papers = parse_aps_papers_from_html(html)
         if not papers:
-            return "未找到 PRL 论文列表，请稍后重试。"
+            return "未找到 {config['name']} 论文列表，请稍后重试。"
 
         # 格式化论文文本（同之前）
         papers_text = ""
@@ -728,13 +752,13 @@ def generate_prl_daily_summary():
 
         # 构建 prompt（同上）
         prompt = f"""
-        你现在是一个科研助手。以下是从 PRL 期刊抓取的“量子信息科学与技术”类别最新论文列表（共 {len(papers)} 篇）。
+        你现在是一个科研助手。以下是从 {config['name']} 期刊抓取的“量子信息科学与技术”类别最新论文列表（共 {len(papers)} 篇）。
         请按研究方向分类总结，每个类别挑选 2-3 篇亮点论文，并确保在描述亮点时包含该论文的 ID（DOI）和超链接。
 
         **任务要求**：
         1. 整体概览：一句话说明今天新上榜论文总数。
         2. 分类总结：根据标题和摘要分类。
-        3. 亮点提取：**每篇亮点必须使用以下格式：** `[标题](id:)`：一句核心贡献。
+        3. 亮点提取：**每篇亮点必须使用以下格式：** `**标题**(id:)`：一句核心贡献。
         4. 输出格式：Markdown。
 
         论文列表：

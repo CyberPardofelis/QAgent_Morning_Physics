@@ -5,7 +5,7 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     search_papers, run_python, update_paper_comment,
     generate_daily_summary_arxiv, analyze_today_topic_arxiv,
-    generate_prl_daily_summary, download_aps_paper,
+    generate_aps_daily_summary, download_aps_paper,
     search_arxiv, download_arxiv_paper, analyze_paper, scan_local_papers, query_knowledge
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
@@ -123,9 +123,19 @@ BASE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_prl_daily_summary",
-            "description": "Generate a daily summary of new quantum information papers from PRL (Physical Review Letters), triggered by 'good morning, prl'.",
-            "parameters": {"type": "object", "properties": {}}
+            "name": "generate_aps_daily_summary",
+            "description": "Generate a daily summary of new quantum information papers from an APS journal. Use this when the user says 'good morning' followed by a journal name like 'PRL' or 'PRA'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "journal": {
+                        "type": "string",
+                        "enum": ["prl", "pra", "prb", "prc", "prd", "pre", "prx","prxquantum","rmp","prapplied"],
+                        "description": "The APS journal code (e.g., 'prl' for Physical Review Letters, 'pra' for Physical Review A)."
+                    }
+                },
+                "required": ["journal"]
+            }
         }
     },
     {
@@ -343,13 +353,14 @@ def run_agent_stream(messages: list, mode="deepseek"):
                 result = generate_daily_summary_arxiv()
             elif fn_name == "analyze_today_topic_arxiv":
                 result = analyze_today_topic_arxiv(args["topic"])
-            elif fn_name == "generate_prl_daily_summary":
+            elif fn_name == "generate_aps_daily_summary":
+                journal = args.get("journal")
                 try:
-                    result = generate_prl_daily_summary()  # 调用你的函数
+                    result = generate_aps_daily_summary(journal)  # 调用你的函数
                     # 如果你的函数直接返回最终总结（字符串），可以像下面这样输出
-                    yield result  # 如果需要实时输出，也可以逐字返回
+                    # yield result  # 如果需要实时输出，也可以逐字返回
                 except Exception as e:
-                    error_msg = f"❌ PRL总结生成失败：{e}"
+                    error_msg = f"❌ aps总结生成失败：{e}"
                     yield error_msg
                     result = error_msg  # 将错误信息作为结果传给后续的 tool 消息
             elif fn_name == "download_aps_paper":
@@ -449,8 +460,8 @@ def call_model(client, model_name, user_input):
                 result = generate_daily_summary_arxiv()
             elif fn == "analyze_today_topic_arxiv":
                 result = analyze_today_topic_arxiv(args["topic"])
-            elif fn == "generate_prl_daily_summary":
-                result = generate_prl_daily_summary()
+            elif fn == "generate_aps_daily_summary":
+                result = generate_aps_daily_summary(args["journal"])
             elif fn == "download_aps_paper":
                 result = download_aps_paper(args["doi"])
             else:

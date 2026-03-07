@@ -1,0 +1,47 @@
+journals:
+  prl:
+    name: "Physical Review Letters"
+    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
+    section: "quantum-information-science-and-technology"
+    link_selector: 'a[href*="/prl/abstract/"]'  # 用于等待的特定选择器
+  pra:
+    name: "Physical Review A"
+    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
+    section: "quantum-information-science"
+    link_selector: 'a[href*="/pra/abstract/"]'
+  # 可以继续添加 prb, prc, prx 等
+  prb:
+    name: "Physical Review B"
+    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
+    section: "structure-structural-phase-transitions-mechanical-properties-defects"
+    link_selector: 'a[href*="/prb/abstract/"]'
+  prc:
+    name: "Physical Review C"
+    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
+    section: "nucleon-nucleon-interaction-few-body-systems"
+    link_selector: 'a[href*="/prc/abstract/"]'
+  prd:
+    name: "Physical Review D"
+    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
+    section: "article"
+    link_selector: 'a[href*="/prd/abstract/"]'
+  pre:
+    name: "Physical Review E"
+    url_template: "https://journals.aps.org/{journal}/recent?toc_section%5B%5D={section}"
+    section: "computational-physics-machine-learning-and-artificial-intelligence"
+    link_selector: 'a[href*="/pre/abstract/"]'
+  prx:
+    name: "Physical Review X"
+    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
+    section: "article"
+    link_selector: 'a[href*="/prx/abstract/"]'
+  prxquantum:
+    name: "PRX Quantum"
+    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
+    section: "article"
+    link_selector: 'a[href*="/prxquantum/abstract/"]'
+  rmp:
+    name: "Reviews of Modern Physics"
+    url_template: "https://journals.aps.org/{journal}/recent?article_type%5B%5D={section}"
+    section: "review"
+    link_selector: 'a[href*="/rmp/abstract/"]'
