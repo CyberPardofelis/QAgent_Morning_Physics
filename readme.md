@@ -1,5 +1,11 @@
-**Quantum-Physics Agent**\
-运行 main 以启动\
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/CyberPardofelis/QAgent_Morning_Physics)](https://github.com/CyberPardofelis/QAgent_Morning_Physics/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/CyberPardofelis/QAgent_Morning_Physics/total)](https://github.com/CyberPardofelis/QAgent_Morning_Physics/releases)
+
+## **Quantum-Physics Agent**
+
+### 预编译版本
+从[GitHub Releases](https://github.com/CyberPardofelis/QAgent_Morning_Physics/releases/latest) 页面下载最新的文件压缩包，解压后运行`light.exe`
+
 发送 早上好 + 名称以获取新文章（或近期文章）总结，如 早上好 arxiv，早上好 prl 等\
 可以继续展开其中某一个领域总结所有文章（目前只针对arxiv）\
 期刊目前仅支持APS的部分期刊，如PRA/B/C/D/E/L/X,PRX Quantum, Rev. Mod. Phys.\
@@ -7,12 +13,14 @@
 对文章有评论也可以保存至分析结果\
 目前的问题：依靠DOI的APS文章下载方案是基于playwright的，如果觉得慢可以按题目搜索，会自动使用arxiv搜索和下载工具。
 
+**注意** 运行需要配置API密钥\
 分区选择以及LLM的API密钥在设置界面\
 密钥也可以写入.env文件，格式如下：\
 DEEPSEEK_API_KEY=\
 OPENAI_API_KEY=\
 本项目默认使用deepseek，调试也是在deepseek上调试的。\
-虽然加入了Open AI功能，但并没有用过。原则上可以，实际上难说。
+虽然加入了Open AI功能，但并没有用过。原则上可以，实际上难说。\
+保存文件后重新启动程序即可
 
 如果需要向量检索知识库，可用在config.py中打开相应选项（EMBEDDING_ENABLED = True）\
 Embedder可选“local”或“openai”，因为deepseek并没有embedding接口\
