@@ -6,7 +6,7 @@ import datetime
 try:
     # 你的原始导入和代码
     import json
-    from datetime import datetime
+    import datetime
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from agent.history_manager import HistoryManager, Conversation
     from PySide6.QtWidgets import (
@@ -275,13 +275,12 @@ class ChatWindow(QMainWindow):
     def refresh_conv_list(self):
         """刷新左侧对话列表"""
         self.conv_list.clear()
-        conversations = self.history_manager.get_all_sorted()
-        for conv in conversations:
-            # 显示标题和最后更新时间（简短）
-            updated = datetime.fromisoformat(conv.updated_at).strftime("%m-%d %H:%M")
-            display_text = f"{conv.title}\n{updated}"
+        conversations = self.history_manager.get_all_sorted()  # 返回元数据列表
+        for meta in conversations:  # meta 是字典
+            updated = datetime.fromisoformat(meta["updated_at"]).strftime("%m-%d %H:%M")
+            display_text = f"{meta['title']}\n{updated}"
             item = QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, conv.conv_id)
+            item.setData(Qt.UserRole, meta["conv_id"])
             self.conv_list.addItem(item)
 
     def create_new_conversation(self):

@@ -56,13 +56,113 @@ class Conversation:
 class HistoryManager:
     """管理所有对话历史"""
     def __init__(self):
-        self.conversations: Dict[str, Conversation] = {}
+        self.conversations: Dict[str, dict] = {}  # 只存储元数据
         self.current_id: Optional[str] = None
-        self.load_all()
+        self.index_path = HISTORY_DIR / "index.json"
+        self._load_index()
+
+    def _load_index(self):
+        """加载索引文件（快速）"""
+        if self.index_path.exists():
+            try:
+                with open(self.index_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # data 应为 [{"conv_id": "...", "title": "...", "updated_at": "..."}, ...]
+                    for item in data:
+                        self.conversations[item["conv_id"]] = item
+            except Exception as e:
+                print(f"加载索引失败: {e}，将重建索引")
+                self._rebuild_index()
+        else:
+            self._rebuild_index()
+
+    def _rebuild_index(self):
+        """扫描所有对话文件，重建索引（通常在文件损坏或首次运行时调用）"""
+        self.conversations.clear()
+        for file in HISTORY_DIR.glob("*.json"):
+            if file.name == "index.json":
+                continue
+            try:
+                with open(file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # 只提取元数据
+                    meta = {
+                        "conv_id": data["conv_id"],
+                        "title": data["title"],
+                        "updated_at": data["updated_at"]
+                    }
+                    self.conversations[data["conv_id"]] = meta
+            except Exception as e:
+                print(f"重建索引时跳过文件 {file}: {e}")
+        self._save_index()
+
+    def _save_index(self):
+        """保存索引到文件"""
+        with open(self.index_path, "w", encoding="utf-8") as f:
+            json.dump(list(self.conversations.values()), f, ensure_ascii=False, indent=2)
+
+    def create_conversation(self, title="新对话") -> Conversation:
+        conv = Conversation(title=title)
+        # 保存完整对话内容到文件
+        self.save_conversation(conv)
+        # 更新索引
+        self.conversations[conv.conv_id] = {
+            "conv_id": conv.conv_id,
+            "title": conv.title,
+            "updated_at": conv.updated_at
+        }
+        self._save_index()
+        return conv
+
+    def save_conversation(self, conv: Conversation):
+        """保存完整对话内容"""
+        file_path = HISTORY_DIR / f"{conv.conv_id}.json"
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(conv.to_dict(), f, ensure_ascii=False, indent=2)
+        # 更新索引中的元数据（如果存在）
+        if conv.conv_id in self.conversations:
+            self.conversations[conv.conv_id].update({
+                "title": conv.title,
+                "updated_at": conv.updated_at
+            })
+        else:
+            self.conversations[conv.conv_id] = {
+                "conv_id": conv.conv_id,
+                "title": conv.title,
+                "updated_at": conv.updated_at
+            }
+        self._save_index()
+
+    def delete_conversation(self, conv_id: str):
+        """删除对话"""
+        if conv_id in self.conversations:
+            del self.conversations[conv_id]
+        file_path = HISTORY_DIR / f"{conv_id}.json"
+        if file_path.exists():
+            file_path.unlink()
+        self._save_index()
+
+    def get_conversation(self, conv_id: str) -> Optional[Conversation]:
+        """按需加载完整对话内容"""
+        file_path = HISTORY_DIR / f"{conv_id}.json"
+        if file_path.exists():
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return Conversation.from_dict(data)
+            except Exception as e:
+                print(f"加载对话 {conv_id} 失败: {e}")
+        return None
+
+    def get_all_sorted(self) -> List[dict]:
+        """返回元数据列表，按更新时间排序"""
+        return sorted(self.conversations.values(),
+                      key=lambda x: x["updated_at"], reverse=True)
 
     def _get_file_path(self, conv_id: str) -> Path:
         return HISTORY_DIR / f"{conv_id}.json"
 
+    '''
     def load_all(self):
         """加载所有对话历史"""
         self.conversations.clear()
@@ -74,43 +174,10 @@ class HistoryManager:
                     self.conversations[conv.conv_id] = conv
             except Exception as e:
                 print(f"加载对话历史失败 {file}: {e}")
-
-    def save_conversation(self, conv: Conversation):
-        """保存单个对话"""
-        file_path = self._get_file_path(conv.conv_id)
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(conv.to_dict(), f, ensure_ascii=False, indent=2)
-
-    def delete_conversation(self, conv_id: str):
-        """仅根据ID删除对话，不涉及UI"""
-        print(f"尝试删除对话 {conv_id}")
-        if conv_id in self.conversations:
-            del self.conversations[conv_id]
-        file_path = self._get_file_path(conv_id)
-        if file_path.exists():
-            file_path.unlink()
-            print(f"文件已删除")
-        else:
-            print(f"文件不存在，可能已删除")
-
-    def create_conversation(self, title: str = "新对话") -> Conversation:
-        """创建新对话"""
-        conv = Conversation(title=title)
-        self.conversations[conv.conv_id] = conv
-        self.current_id = conv.conv_id
-        self.save_conversation(conv)
-        return conv
-
-    def get_conversation(self, conv_id: str) -> Optional[Conversation]:
-        return self.conversations.get(conv_id)
+    # '''
 
     def set_current(self, conv_id: str):
         self.current_id = conv_id
-
-    def get_all_sorted(self) -> List[Conversation]:
-        """按更新时间倒序返回所有对话"""
-        return sorted(self.conversations.values(),
-                     key=lambda x: x.updated_at, reverse=True)
 
     def generate_title_from_messages(self, conv: Conversation) -> str:
         """根据对话内容自动生成标题（简单规则：取第一条用户消息的前10字）"""
