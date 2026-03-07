@@ -626,7 +626,7 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     try:
         with sync_playwright() as p:
             # 您已经设置为 headless=False，很好，这样可以看到浏览器行为
-            browser = p.firefox.launch(headless=False)
+            browser = p.firefox.launch(headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
