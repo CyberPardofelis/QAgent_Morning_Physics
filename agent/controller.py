@@ -228,7 +228,7 @@ def run_agent_stream(messages: list, mode="deepseek"):
             tool_choice="auto",
             stream=True,
             temperature=0.3,
-            max_tokens=2000,
+            max_tokens=8192 if mode == "deepseek" else 4096,
             extra_body={"thinking": {"type": "enabled"}} if mode == "deepseek" else {}
         )
 
@@ -390,7 +390,7 @@ def _stream_openai(client, model, user_input):
         messages=messages,
         stream=True,
         temperature=0.3,
-        max_tokens=2000
+        max_tokens=8192
     )
     for chunk in stream:
         if chunk.choices[0].delta.content:
