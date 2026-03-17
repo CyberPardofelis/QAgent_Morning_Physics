@@ -10,12 +10,13 @@ try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from agent.history_manager import HistoryManager, Conversation
     from PySide6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPlainTextEdit, QPushButton, QComboBox, QMessageBox, QLabel, QSizePolicy,
-        QSplitter, QListWidget, QListWidgetItem, QMenu, QInputDialog, QFrame
+        QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+        QSplitter, QPushButton, QListWidget, QListWidgetItem,
+        QLabel, QComboBox, QPlainTextEdit, QMenu, QMessageBox,
+        QInputDialog, QApplication, QSizePolicy
     )
     from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QPoint
-    from PySide6.QtGui import QDesktopServices, QAction
+    from PySide6.QtGui import QDesktopServices, QAction, QIcon
     from agent.controller import run_agent_stream
     from agent.prompts import SYSTEM_PROMPT
 
@@ -23,7 +24,7 @@ try:
         QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QCheckBox, QComboBox,
         QDialogButtonBox, QMessageBox, QGroupBox
     )
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QSettings,Qt,QPoint,QTimer,QUrl
     import config
     import yaml
 
@@ -94,6 +95,217 @@ class ChatWindow(QMainWindow):
         self.setWindowTitle("LLM科研助手: 早上好，物理学")
         self.setMinimumSize(1200, 800)
 
+        # ========== 全局样式表 ==========
+        self.setStyleSheet("""
+            /* 全局字体和背景 */
+            QMainWindow, QDialog {
+                background-color: #fafaff;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+                font-size: 14px;
+            }
+            /* 分割器样式：细线、透明色 */
+            QSplitter::handle {
+                background-color: #e0e4e9;
+                width: 1px;
+            }
+            QSplitter::handle:hover {
+                background-color: #b0b8c5;
+            }
+            /* 左侧边栏整体背景 */
+            QWidget#leftWidget {
+                background-color: white;
+                border-right: 1px solid #eaeef2;
+            }
+            /* 新建对话按钮 */
+            QPushButton#newConvBtn {
+                background-color: #0d6efd;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 16px;
+                font-weight: 500;
+                text-align: left;
+            }
+            QPushButton#newConvBtn:hover {
+                background-color: #0b5ed7;
+            }
+            QPushButton#newConvBtn:pressed {
+                background-color: #0a58ca;
+            }
+            /* 对话列表 */
+            QListWidget {
+                background-color: transparent;
+                border: none;
+                outline: none;
+            }
+            QListWidget::item {
+                background-color: transparent;
+                border-radius: 8px;
+                padding: 10px;
+                margin: 4px 8px;
+                color: #1e293b;
+            }
+            QListWidget::item:selected {
+                background-color: #e9f0ff;
+                color: #0d6efd;
+            }
+            QListWidget::item:hover {
+                background-color: #f1f5f9;
+            }
+            /* 顶部模式选择 */
+            QComboBox {
+                background-color: white;
+                border: 1px solid #dde1e6;
+                border-radius: 20px;
+                padding: 6px 16px;
+                min-width: 120px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                image: none;  /* 可以自定义箭头，这里保持简单 */
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #5f6b7a;
+                width: 0;
+                height: 0;
+                margin-right: 8px;
+            }
+            QComboBox:hover {
+                border-color: #0d6efd;
+            }
+            /* 聊天区域背景 */
+            QWidget#rightWidget {
+                background-color: #ffffff;
+            }
+            /* 输入框 */
+            QPlainTextEdit {
+                background-color: white;
+                border: 1px solid #dde1e6;
+                border-radius: 24px;
+                padding: 12px 18px;
+                font-size: 14px;
+                selection-background-color: #b2d3ff;
+                color: #000000
+            }
+            QPlainTextEdit:focus {
+                border-color: #0d6efd;
+                outline: none;
+            }
+            /* 发送、中止、重新生成按钮 */
+            QPushButton#sendBtn, QPushButton#stopBtn, QPushButton#regenerateBtn {
+                background-color: #0d6efd;
+                color: white;
+                border: none;
+                border-radius: 20px;
+                padding: 12px;
+                font-weight: 500;
+            }
+            QPushButton#sendBtn:hover, QPushButton#stopBtn:hover, QPushButton#regenerateBtn:hover {
+                background-color: #0b5ed7;
+            }
+            QPushButton#sendBtn:pressed, QPushButton#stopBtn:pressed, QPushButton#regenerateBtn:pressed {
+                background-color: #0a58ca;
+            }
+            QPushButton#sendBtn:disabled, QPushButton#stopBtn:disabled, QPushButton#regenerateBtn:disabled {
+                background-color: #b6c2d0;
+                color: #eef2f6;
+            }
+            /* 中止按钮单独设色（可选） */
+            QPushButton#stopBtn {
+                background-color: #dc3545;
+            }
+            QPushButton#stopBtn:hover {
+                background-color: #bb2d3b;
+            }
+            /* 重新生成按钮 */
+            QPushButton#regenerateBtn {
+                background-color: #6c757d;
+            }
+            QPushButton#regenerateBtn:hover {
+                background-color: #5c636a;
+            }
+            /* 菜单栏 */
+            QMenuBar {
+                background-color: white;
+                border-bottom: 1px solid #eaeef2;
+            }
+            QMenuBar::item {
+                padding: 8px 12px;
+                background: transparent;
+                border-radius: 6px;
+            }
+            QMenuBar::item:selected {
+                background-color: #e9f0ff;
+            }
+            QMenu {
+                background-color: white;
+                border: 1px solid #dde1e6;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QMenu::item {
+                padding: 6px 24px 6px 12px;
+                border-radius: 6px;
+            }
+            QMenu::item:selected {
+                background-color: #e9f0ff;
+                color: #0d6efd;
+            }
+            /* 垂直滚动条 */
+            QScrollBar:vertical {
+                border: none;
+                background: transparent;
+                width: 8px;
+                border-radius: 4px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #c1c9d2;
+                border-radius: 4px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #a0aab5;
+            }
+            QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical {
+                border: none;
+                background: transparent;
+                height: 0px;
+            }
+            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+                border: none;
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            
+            /* 水平滚动条（如果需要） */
+            QScrollBar:horizontal {
+                border: none;
+                background: transparent;
+                height: 8px;
+                border-radius: 4px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #c1c9d2;
+                border-radius: 4px;
+                min-width: 30px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #a0aab5;
+            }
+            QScrollBar::sub-line:horizontal, QScrollBar::add-line:horizontal {
+                border: none;
+                background: transparent;
+                width: 0px;
+            }
+        """)
+
         # 初始化历史管理器
         self.history_manager = HistoryManager()
         self.current_conversation = None  # 当前对话对象
@@ -114,6 +326,7 @@ class ChatWindow(QMainWindow):
 
         # 新建对话按钮
         self.new_conv_btn = QPushButton("＋ 新建对话")
+        self.new_conv_btn.setObjectName("newConvBtn")
         self.new_conv_btn.clicked.connect(self.create_new_conversation)
         left_layout.addWidget(self.new_conv_btn)
 
@@ -156,21 +369,24 @@ class ChatWindow(QMainWindow):
         self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText("输入消息... (Enter发送，Shift+Enter换行)")
         self.input_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.input_edit.setMinimumHeight(self.line_height() * 2 + 10)
-        self.input_edit.setMaximumHeight(self.line_height() * 6 + 10)
-        self.input_edit.textChanged.connect(self.adjust_input_height)
+        self.input_edit.setMinimumHeight(self.line_height() * 2 + 20)
+        self.input_edit.setMaximumHeight(self.line_height() * 8 + 10)
+        # self.input_edit.textChanged.connect(self.adjust_input_height)
         self.send_btn = QPushButton("发送")
-        self.send_btn.setFixedWidth(80)
+        self.send_btn.setObjectName("sendBtn")
+        self.send_btn.setFixedWidth(50)
         self.send_btn.clicked.connect(self.send_message)
 
         # 新增：中止和重新生成按钮，垂直排列
         self.stop_btn = QPushButton("中止")
-        self.stop_btn.setFixedWidth(60)
+        self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.setFixedWidth(80)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_generation)
 
         self.regenerate_btn = QPushButton("重新生成")
-        self.regenerate_btn.setFixedWidth(60)
+        self.regenerate_btn.setObjectName("regenerateBtn")
+        self.regenerate_btn.setFixedWidth(80)
         self.regenerate_btn.setEnabled(False)
         self.regenerate_btn.clicked.connect(self.regenerate_message)
 
@@ -185,7 +401,7 @@ class ChatWindow(QMainWindow):
         right_layout.addLayout(bottom_layout)
 
         splitter.addWidget(right_widget)
-        splitter.setStretchFactor(1, 5)  # 右侧占更多空间
+        splitter.setStretchFactor(1, 3)  # 右侧占更多空间
 
         # 添加菜单栏
         menubar = self.menuBar()
@@ -193,6 +409,12 @@ class ChatWindow(QMainWindow):
         settings_action = QAction("首选项", self)
         settings_action.triggered.connect(self.open_settings_dialog)
         settings_menu.addAction(settings_action)
+
+        # 事件过滤、状态等
+        self.input_edit.installEventFilter(self)
+        self.processing = False
+        self.current_message_id = None
+        self._last_ai_message_id = None
 
         # 其他原有属性
         self.input_edit.installEventFilter(self)
@@ -210,6 +432,10 @@ class ChatWindow(QMainWindow):
             self.create_new_conversation()
 
         self.update_regenerate_button_state()
+
+        # ICON
+        icon_path = "resources/app_icon.ico"  # 根据实际路径调整
+        self.setWindowIcon(QIcon(icon_path))
 
     def stop_generation(self):
         """中止当前的生成"""
@@ -436,54 +662,101 @@ class ChatWindow(QMainWindow):
             }
         };
         </script>
-        <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
         <style>
-            body { font-family: '微软雅黑', Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }
-            #chat { display: flex; flex-direction: column; }
+            /* 整个滚动条区域 */
+            ::-webkit-scrollbar {
+                width: 8px;
+                height: 8px;
+                background: transparent;
+            }
+            /* 滚动条轨道 */
+            ::-webkit-scrollbar-track {
+                background: transparent;
+                border-radius: 4px;
+            }
+            /* 滚动条滑块 */
+            ::-webkit-scrollbar-thumb {
+                background: #c1c9d2;
+                border-radius: 4px;
+            }
+            ::-webkit-scrollbar-thumb:hover {
+                background: #a0aab5;
+            }
+            body {
+                font-family: 'Segoe UI', '微软雅黑', Arial, sans-serif;
+                background: #f5f7fa;
+                margin: 0;
+                padding: 20px;
+            }
+            #chat {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
             .message-container {
                 display: flex;
-                margin-bottom: 10px;
+                margin-bottom: 4px;
             }
-            .message-container.user { justify-content: flex-end; }
-            .message-container.ai { justify-content: flex-start; }
-            .message-container.system { justify-content: center; }
+            .message-container.user {
+                justify-content: flex-end;
+            }
+            .message-container.ai {
+                justify-content: flex-start;
+            }
+            .message-container.system {
+                justify-content: center;
+            }
             .bubble {
                 max-width: 70%;
-                padding: 10px 14px;
-                border-radius: 18px;
+                padding: 12px 18px;
+                border-radius: 24px;
                 word-wrap: break-word;
                 white-space: normal;
                 font-size: 14px;
-                line-height: 1.4;
+                line-height: 1.5;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.04);
             }
             .user .bubble {
-                background-color: #007AFF;
+                background-color: #0d6efd;
                 color: white;
                 border-bottom-right-radius: 4px;
             }
             .ai .bubble {
-                background-color: #E5E5EA;
-                color: black;
+                background-color: white;
+                color: #1e293b;
                 border-bottom-left-radius: 4px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.04);
             }
             .system .bubble {
-                background-color: #d0d0d0;
-                color: #333;
+                background-color: #e9ecef;
+                color: #495057;
                 font-size: 12px;
-                border-radius: 8px;
-                padding: 4px 10px;
+                border-radius: 16px;
+                padding: 6px 14px;
+                box-shadow: none;
             }
             pre {
-                background: #f0f0f0;
-                padding: 8px;
-                border-radius: 5px;
+                background: #f8f9fa;
+                padding: 12px;
+                border-radius: 12px;
                 overflow-x: auto;
+                border: 1px solid #e9ecef;
             }
             code {
-                font-family: Consolas, Monaco, 'Courier New', monospace;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
                 font-size: 13px;
+                background: #f1f3f5;
+                padding: 2px 6px;
+                border-radius: 6px;
             }
-            .MathJax_SVG { display: inline-block; }
+            pre code {
+                background: transparent;
+                padding: 0;
+            }
+            .MathJax_SVG {
+                display: inline-block;
+            }
         </style>
         </head>
         <body>

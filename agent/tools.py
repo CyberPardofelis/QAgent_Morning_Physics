@@ -16,6 +16,7 @@ from config import DATA_DIR, VECTOR_DIR, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, EMBED
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
 import yaml
+import sqlite3
 
 import importlib
 Embedder = None
@@ -35,6 +36,7 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 INDEX_FILE = KNOWLEDGE_DIR / "index.json"
 os.makedirs(PAPER_DIR, exist_ok=True)
 os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+DB_PATH = KNOWLEDGE_DIR / "papers.db"
 
 # ----------------------------
 # 全局索引缓存（原有FAISS）
@@ -85,7 +87,7 @@ def index_exists():
 
 
 # ----------------------------
-# 构建新索引
+# 构建新索引 - 需要embedding - 目前embedding相关函数有问题
 # ----------------------------
 def build_index():
     print("Building new vector index (first time, may take a while)...")
@@ -129,7 +131,7 @@ def build_index():
 
 
 # ----------------------------
-# 加载或获取索引（延迟加载）
+# 加载或获取索引（延迟加载）- 需要embedding
 # ----------------------------
 def get_index():
     global _index, _metadata
@@ -154,7 +156,7 @@ def get_index():
 
 
 # ----------------------------
-# 文献检索工具
+# 文献检索工具 - 需要embedding
 # ----------------------------
 def search_papers(query: str, top_k=5):
     index, metadata = get_index()
@@ -191,6 +193,68 @@ def run_python(code: str):
     )
 
     return (result.stdout or "") + (result.stderr or "")
+
+
+# ----------------------------
+# 数据库初始化
+# ----------------------------
+def init_db():
+    """创建数据库表（如果不存在）"""
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+
+    # 主表：存储所有结构化字段，并将 user_comments 存为 JSON 字符串
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS papers (
+            paper_id TEXT PRIMARY KEY,
+            title TEXT,
+            authors TEXT,               -- JSON 数组字符串
+            link TEXT,
+            keywords TEXT,               -- JSON 数组字符串
+            research_topic TEXT,
+            basic_method TEXT,
+            main_conclusion TEXT,
+            citations TEXT,              -- JSON 数组字符串
+            intro_cites TEXT,             -- JSON 数组字符串
+            outlook TEXT,
+            summary TEXT,
+            local_path TEXT,
+            user_comments TEXT,           -- JSON 数组字符串
+            analyzed_at TEXT
+        )
+    ''')
+
+    # FTS5 虚拟表：包含所有需要全文检索的字段
+    # 注意：FTS5 表通过 rowid 与主表关联，此处使用 content 选项指向主表（可选，但推荐）
+    c.execute('''
+        CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+            title,
+            research_topic,
+            basic_method,
+            main_conclusion,
+            outlook,
+            summary,
+            keywords,           -- 虽然 keywords 是数组，但我们会将其转为空格分隔的字符串存入 FTS
+            user_comments_text,
+            content=papers       -- 可选，关联主表以便使用 "content=" 选项，但需要主表存在且列名匹配
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+# 初始化数据库
+init_db()
+
+
+# ----------------------------
+# 辅助函数：获取数据库连接（每次调用都新建连接，避免多线程问题）
+# ----------------------------
+def get_db_connection():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row   # 便于按列名访问
+    return conn
+
 
 # ----------------------------
 # 新增：arXiv 论文检索（返回带链接的文本）
@@ -242,7 +306,7 @@ def _call_llm(prompt: str) -> str:
         model=DEEPSEEK_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
-        max_tokens=2000
+        max_tokens=8192
     )
     return response.choices[0].message.content
 
@@ -290,12 +354,12 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     - title: the paper title
     - authors: list of authors
     - link: The online link of the paper. If not available, please record the arXiv ID or DOI number.
-    - keywords: list of keywords
+    - keywords: list of keywords, about 6 to 10 keywords
     - research_topic: main topic or subject
-    - basic_method: Technical methods and innovative points
-    - main_conclusion: the primary conclusion and mathematical expression
+    - basic_method: Technical methods and innovative points, about 200-400 words
+    - main_conclusion: the primary conclusion and mathematical expression, about 100-300 words
     - citations: important citations in method
-    - intro_cites: important citations in introduction
+    - intro_cites: important citations in introduction, about 10 citations
     - outlook: the meaning, impact and outlook of this paper
     - summary: a one-paragraph summary
 
@@ -324,46 +388,138 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     if pdf_path and os.path.exists(pdf_path):
         result["local_path"] = pdf_path
 
+    '''
     # 保存JSON（覆盖）
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     # 更新索引
     _update_index(paper_id)
+    # '''
+
+    # ---------- 存入数据库 ----------
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # 将列表字段转为 JSON 字符串
+    authors_json = json.dumps(result.get("authors", []), ensure_ascii=False)
+    keywords_json = json.dumps(result.get("keywords", []), ensure_ascii=False)
+    citations_json = json.dumps(result.get("citations", []), ensure_ascii=False)
+    intro_cites_json = json.dumps(result.get("intro_cites", []), ensure_ascii=False)
+    user_comments_json = json.dumps(result.get("user_comments", []), ensure_ascii=False)
+
+    # 插入或替换主表记录
+    c.execute('''
+        INSERT OR REPLACE INTO papers (
+            paper_id, title, authors, link, keywords, research_topic,
+            basic_method, main_conclusion, citations, intro_cites,
+            outlook, summary, local_path, user_comments, analyzed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        result["paper_id"],
+        result.get("title", ""),
+        authors_json,
+        result.get("link", ""),
+        keywords_json,
+        result.get("research_topic", ""),
+        result.get("basic_method", ""),
+        result.get("main_conclusion", ""),
+        citations_json,
+        intro_cites_json,
+        result.get("outlook", ""),
+        result.get("summary", ""),
+        result.get("local_path", ""),
+        user_comments_json,
+        result["analyzed_at"]
+    ))
+
+    # 插入或更新 FTS 表（通过 rowid 关联主表）
+    # 注意：FTS5 会自动与主表同步（如果使用了 content 选项），但此处我们显式插入以确保索引更新
+    # 我们构造一个用于 FTS 的字符串，将 keywords 数组转为空格分隔
+    keywords_str = ' '.join(result.get("keywords", []))
+    comments_str = ' '.join(result.get("user_comments", []))
+    c.execute('''
+        INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords)
+        VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        result.get("title", ""),
+        result.get("research_topic", ""),
+        result.get("basic_method", ""),
+        result.get("main_conclusion", ""),
+        result.get("outlook", ""),
+        result.get("summary", ""),
+        keywords_str,
+        comments_str
+    ))
+
+    conn.commit()
+    conn.close()
+
+    print(f"论文 {paper_id} 已存入数据库")
+
     return result
 
 
+# ----------------------------
+# 更新评论函数
+# ----------------------------
 def update_paper_comment(paper_id: str, user_comment: str):
     """
-    更新已有分析记录的 user_comments 字段（追加模式或覆盖模式，此处以追加为例）。
-    如果分析记录不存在，则抛出异常。
+    更新已有记录的 user_comments 字段（追加模式）。
+    如果记录不存在，抛出异常。
     """
-    json_path = KNOWLEDGE_DIR / f"{paper_id}.json"
-    if not json_path.exists():
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # 获取现有记录
+    row = c.execute("SELECT user_comments FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+    if not row:
+        conn.close()
         raise ValueError(f"论文 {paper_id} 的分析记录不存在，无法更新评论。请先运行 analyze_paper 进行分析。")
 
-    # 读取现有记录
-    with open(json_path, "r", encoding="utf-8") as f:
-        article = json.load(f)
+    # 解析现有评论列表
+    comments = json.loads(row['user_comments']) if row['user_comments'] else []
+    if not isinstance(comments, list):
+        comments = [comments] if comments else []
 
-    # 确保 user_comments 是列表（方便追加历史评论）
-    if "user_comments" not in article or not isinstance(article["user_comments"], list):
-        # 如果原来是字符串，转换为列表
-        old_comment = article.get("user_comments", "")
-        article["user_comments"] = [old_comment] if old_comment else []
-
-    # 追加新评论（可根据需要改为覆盖）
+    # 追加新评论
     if user_comment:
-        article["user_comments"].append(user_comment)
+        comments.append(user_comment)
 
-    # 更新时间戳
-    article["analyzed_at"] = datetime.now().isoformat()
+    # 更新数据库
+    c.execute('''
+        UPDATE papers SET user_comments = ?, analyzed_at = ?
+        WHERE paper_id = ?
+    ''', (json.dumps(comments, ensure_ascii=False), datetime.now().isoformat(), paper_id))
 
-    # 写回文件
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(article, f, ensure_ascii=False, indent=2)
+    comments_str = ' '.join(comments)  # 拼接所有评论
+    c.execute('''
+            UPDATE papers_fts SET user_comments_text = ?
+            WHERE rowid = (SELECT rowid FROM papers WHERE paper_id = ?)
+        ''', (comments_str, paper_id))
 
-    return article
+    conn.commit()
+    conn.close()
+
+    # 返回完整记录（可选）
+    return get_paper_by_id(paper_id)
+
+
+def get_paper_by_id(paper_id: str):
+    """根据 ID 获取论文完整信息（转换为字典）"""
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    # 将 Row 对象转为 dict，并解析 JSON 字段
+    paper = dict(row)
+    for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
+        if paper.get(field):
+            paper[field] = json.loads(paper[field])
+        else:
+            paper[field] = []
+    return paper
 
 
 def _update_index(paper_id: str):
@@ -377,20 +533,18 @@ def _update_index(paper_id: str):
         json.dump(index, f)
 
 # ----------------------------
-# 新增：扫描本地PDF文件夹，增量分析新论文
+# 增量扫描本地论文
 # ----------------------------
 def scan_local_papers():
-    """扫描PAPER_DIR，分析新出现的PDF（增量更新）"""
-    if INDEX_FILE.exists():
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            index = json.load(f)
-    else:
-        index = {}
+    """扫描 PAPER_DIR，分析新出现的 PDF（增量更新）"""
+    conn = get_db_connection()
+    existing_ids = set(row['paper_id'] for row in conn.execute("SELECT paper_id FROM papers").fetchall())
+    conn.close()
 
     new_papers = []
     for pdf_file in PAPER_DIR.glob("*.pdf"):
-        paper_id = pdf_file.stem  # 假设文件名是arXiv ID
-        if paper_id not in index:
+        paper_id = pdf_file.stem
+        if paper_id not in existing_ids:
             print(f"分析新论文: {paper_id}")
             result = analyze_paper(paper_id, pdf_path=str(pdf_file))
             new_papers.append(result)
@@ -399,33 +553,132 @@ def scan_local_papers():
     return new_papers
 
 # ----------------------------
-# 新增：在知识库中检索文章
+# 检索函数（使用 FTS）
 # ----------------------------
 def query_knowledge(keyword: str = None, topic: str = None, author: str = None):
     """
-    在知识库JSON文件中搜索匹配的文章。
+    在知识库中搜索匹配的文章。
+    支持全文关键词搜索，以及按主题、作者过滤。
     返回匹配的文章列表（每个文章为dict）。
     """
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # 构建查询条件
+    conditions = []
+    params = []
+
+    # 全文检索：使用 FTS 的 MATCH 语法
+    if keyword:
+        # 在 FTS 表中搜索所有字段（我们构建了一个包含所有文本字段的 FTS 表）
+        # 注意：FTS 的 MATCH 默认搜索所有已索引列
+        conditions.append("p.rowid IN (SELECT rowid FROM papers_fts WHERE papers_fts MATCH ?)")
+        params.append(keyword)
+
+    # 按主题过滤（research_topic 精确匹配或模糊匹配？这里用 LIKE，也可以考虑 FTS）
+    if topic:
+        conditions.append("p.research_topic LIKE ?")
+        params.append(f"%{topic}%")
+
+    # 按作者过滤（authors 是 JSON 数组，需要特殊处理）
+    if author:
+        # SQLite 没有直接查询 JSON 数组元素的内置函数，但可以使用 json_each 或 LIKE 简单处理
+        # 这里用 JSON1 扩展的 json_each 进行精确作者匹配（需要 SQLite 编译了 JSON1）
+        # 为简化，使用 LIKE 模糊匹配（可能误匹配）
+        conditions.append("p.authors LIKE ?")
+        params.append(f"%{author}%")
+
+    # 构建最终 SQL
+    base_sql = "SELECT p.* FROM papers p"
+    if conditions:
+        where_clause = " WHERE " + " AND ".join(conditions)
+    else:
+        where_clause = ""
+
+    sql = base_sql + where_clause
+    rows = c.execute(sql, params).fetchall()
+    conn.close()
+
+    # 转换为字典并解析 JSON 字段
     results = []
+    for row in rows:
+        paper = dict(row)
+        for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
+            if paper.get(field):
+                paper[field] = json.loads(paper[field])
+            else:
+                paper[field] = []
+        results.append(paper)
+    return results
+
+
+# ----------------------------
+# （可选）迁移现有 JSON 文件到数据库
+# ----------------------------
+def migrate_json_to_db():
+    """将 KNOWLEDGE_DIR 下所有 .json 文件（除了 index.json）导入数据库"""
+    conn = get_db_connection()
+    c = conn.cursor()
+
     for json_file in KNOWLEDGE_DIR.glob("*.json"):
         if json_file.name == "index.json":
             continue
         with open(json_file, "r", encoding="utf-8") as f:
-            article = json.load(f)
-        if keyword:
-            if keyword.lower() in article.get("summary", "").lower() or \
-               keyword.lower() in article.get("title", "").lower():
-                results.append(article)
-                continue
-        if topic:
-            if topic.lower() in article.get("research_topic", "").lower():
-                results.append(article)
-                continue
-        if author:
-            if any(author.lower() in a.lower() for a in article.get("authors", [])):
-                results.append(article)
-                continue
-    return results
+            data = json.load(f)
+
+        paper_id = data.get("paper_id", json_file.stem)   # 兼容旧文件可能无 paper_id
+        # 检查是否已存在，若存在可跳过或覆盖，这里采用覆盖
+        # 准备字段（与 analyze_paper 类似）
+        authors_json = json.dumps(data.get("authors", []), ensure_ascii=False)
+        keywords_json = json.dumps(data.get("keywords", []), ensure_ascii=False)
+        citations_json = json.dumps(data.get("citations", []), ensure_ascii=False)
+        intro_cites_json = json.dumps(data.get("intro_cites", []), ensure_ascii=False)
+        user_comments_json = json.dumps(data.get("user_comments", []), ensure_ascii=False)
+
+        c.execute('''
+            INSERT OR REPLACE INTO papers (
+                paper_id, title, authors, link, keywords, research_topic,
+                basic_method, main_conclusion, citations, intro_cites,
+                outlook, summary, local_path, user_comments, analyzed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            paper_id,
+            data.get("title", ""),
+            authors_json,
+            data.get("link", ""),
+            keywords_json,
+            data.get("research_topic", ""),
+            data.get("basic_method", ""),
+            data.get("main_conclusion", ""),
+            citations_json,
+            intro_cites_json,
+            data.get("outlook", ""),
+            data.get("summary", ""),
+            data.get("local_path", ""),
+            user_comments_json,
+            data.get("analyzed_at", datetime.now().isoformat())
+        ))
+
+        # 插入 FTS
+        keywords_str = ' '.join(data.get("keywords", []))
+        comments_str = ' '.join(data.get("user_comments", []))
+        c.execute('''
+            INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords)
+            VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data.get("title", ""),
+            data.get("research_topic", ""),
+            data.get("basic_method", ""),
+            data.get("main_conclusion", ""),
+            data.get("outlook", ""),
+            data.get("summary", ""),
+            keywords_str,
+            comments_str
+        ))
+
+    conn.commit()
+    conn.close()
+    print("JSON 文件迁移完成。")
 
 
 # ----------------------------
@@ -443,7 +696,7 @@ def _call_llm(prompt: str) -> str:
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=5000
+            max_tokens=8000
         )
         return response.choices[0].message.content
     except Exception as e:
