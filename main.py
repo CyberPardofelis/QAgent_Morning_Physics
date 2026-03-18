@@ -4,8 +4,9 @@ import os
 from datetime import datetime
 
 try:
-    # 你的原始导入和代码
+    # 原始导入和代码
     import json
+    import sqlite3
     from datetime import datetime
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from agent.history_manager import HistoryManager, Conversation
@@ -13,16 +14,20 @@ try:
         QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
         QSplitter, QPushButton, QListWidget, QListWidgetItem,
         QLabel, QComboBox, QPlainTextEdit, QMenu, QMessageBox,
-        QInputDialog, QApplication, QSizePolicy
+        QInputDialog, QApplication, QSizePolicy, QTableWidget, QTableWidgetItem, QTextEdit, QScrollArea
     )
     from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QPoint
-    from PySide6.QtGui import QDesktopServices, QAction, QIcon
+    from PySide6.QtGui import QDesktopServices, QAction, QIcon, QFont, QFontInfo
     from agent.controller import run_agent_stream
     from agent.prompts import SYSTEM_PROMPT
+    from agent.tools import (
+        update_paper_comment, DB_PATH, query_knowledge, get_paper_by_id, get_db_connection, get_recent_papers,
+        update_full_paper
+    )
 
     from PySide6.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QCheckBox, QComboBox,
-        QDialogButtonBox, QMessageBox, QGroupBox
+        QDialogButtonBox, QMessageBox, QGroupBox, QTabWidget
     )
     from PySide6.QtCore import QSettings,Qt,QPoint,QTimer,QUrl
     import config
@@ -50,13 +55,288 @@ def excepthook(exc_type, exc_value, exc_traceback):
     log_path = os.path.join(base_dir, 'error.log')
 
     with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(f"\n--- {datetime.datetime.now()} ---\n")
+        f.write(f"\n--- {datetime.now()} ---\n")
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
     # 也可以打印到控制台（如果有）
     traceback.print_exception(exc_type, exc_value, exc_traceback)
 
 
 sys.excepthook = excepthook
+
+
+# ------ 全局样式 ------
+
+GLOBAL_STYLESHEET = """
+/* 全局字体和背景 */
+QMainWindow, QDialog {
+    background-color: #fafaff;
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    font-size: 14px;
+}
+/* 分割器样式 */
+QSplitter::handle {
+    background-color: #e0e4e9;
+    width: 1px;
+}
+QSplitter::handle:hover {
+    background-color: #b0b8c5;
+}
+/* 左侧边栏 */
+QWidget#leftWidget {
+    background-color: white;
+    border-right: 1px solid #eaeef2;
+}
+/* 新建对话按钮 */
+QPushButton#newConvBtn {
+    background-color: #0d6efd;
+    color: white;
+    border: none;
+    border-radius: 20px;  /* 统一圆角 */
+    padding: 12px 16px;
+    font-weight: 500;
+    text-align: left;
+}
+QPushButton#newConvBtn:hover {
+    background-color: #0b5ed7;
+}
+/* 对话列表 */
+QListWidget {
+    background-color: transparent;
+    border: none;
+    outline: none;
+}
+QListWidget::item {
+    background-color: transparent;
+    border-radius: 8px;
+    padding: 10px;
+    margin: 4px 8px;
+    color: #1e293b;
+}
+QListWidget::item:selected {
+    background-color: #e9f0ff;
+    color: #0d6efd;
+}
+/* 通用 QComboBox 样式 */
+QComboBox {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 20px;
+    padding: 6px 16px;
+    min-width: 120px;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+QComboBox::down-arrow {
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 5px solid #5f6b7a;
+    width: 0;
+    height: 0;
+    margin-right: 8px;
+}
+QComboBox:hover {
+    border-color: #0d6efd;
+}
+QComboBox QAbstractItemView {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #e9f0ff;
+    selection-color: #0d6efd;
+}
+QComboBox QAbstractItemView::item {
+    padding: 8px 12px;
+    border-radius: 6px;
+}
+/* 通用 QLineEdit 样式（用于搜索框等） */
+QLineEdit {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 24px;
+    padding: 12px 16px;
+    selection-background-color: #b2d3ff;
+}
+QLineEdit:focus {
+    border-color: #0d6efd;
+    outline: none;
+}
+/* 通用 QTextEdit 样式（用于多行输入） */
+QTextEdit {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 16px;
+    padding: 12px 12px;
+    selection-background-color: #b2d3ff;
+}
+QTextEdit:focus {
+    border-color: #0d6efd;
+    outline: none;
+}
+/* 主页面文本输入样式 */
+QPlainTextEdit {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 24px;
+    padding: 12px 18px;
+    selection-background-color: #b2d3ff;
+}
+/* 通用按钮样式 */
+QPushButton {
+    background-color: #0d6efd;
+    color: white;
+    border: none;
+    border-radius: 20px;
+    padding: 12px 14px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #0b5ed7;
+}
+QPushButton:pressed {
+    background-color: #0a58ca;
+}
+QPushButton:disabled {
+    background-color: #b6c2d0;
+    color: #eef2f6;
+}
+/* 特殊按钮颜色覆盖 */
+QPushButton#stopBtn {
+    background-color: #dc3545;
+}
+QPushButton#stopBtn:hover {
+    background-color: #bb2d3b;
+}
+QPushButton#regenerateBtn {
+    background-color: #6c757d;
+}
+QPushButton#regenerateBtn:hover {
+    background-color: #5c636a;
+}
+/* 表格样式 */
+QTableWidget {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 12px;
+    gridline-color: #e9ecef;
+    selection-background-color: #e9f0ff;
+    selection-color: #0d6efd;
+}
+QTableWidget::item {
+    padding: 8px;
+    border-bottom: 1px solid #f1f3f5;
+}
+QHeaderView::section {
+    background-color: #f8f9fa;
+    padding: 8px;
+    border: none;
+    font-weight: bold;
+}
+/* 滚动条样式（扁平圆角） */
+QScrollBar:vertical {
+    border: none;
+    background: transparent;
+    width: 8px;
+    border-radius: 4px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical {
+    background: #c1c9d2;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #a0aab5;
+}
+QScrollBar:horizontal {
+    border: none;
+    background: transparent;
+    height: 8px;
+    border-radius: 4px;
+    margin: 0px;
+}
+QScrollBar::handle:horizontal {
+    background: #c1c9d2;
+    border-radius: 4px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #a0aab5;
+}
+/* 菜单栏 */
+QMenuBar {
+    background-color: white;
+    border-bottom: 1px solid #eaeef2;
+}
+QMenuBar::item {
+    padding: 8px 12px;
+    background: transparent;
+    border-radius: 6px;
+}
+QMenuBar::item:selected {
+    background-color: #e9f0ff;
+}
+QMenu {
+    background-color: white;
+    border: 1px solid #dde1e6;
+    border-radius: 8px;
+    padding: 6px;
+}
+QMenu::item {
+    padding: 6px 24px 6px 12px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background-color: #e9f0ff;
+    color: #0d6efd;
+}
+/* ---------- 扁平化标签页 ---------- */
+QTabWidget::pane {
+    border: 1px solid #dde1e6;
+    border-radius: 12px;
+    background: white;
+    top: -1px;  /* 让 pane 与 tab 条对齐 */
+}
+
+QTabBar::tab {
+    background-color: #f1f5f9;
+    border: 1px solid #dde1e6;
+    border-bottom: none;  /* 避免双边框 */
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    padding: 8px 20px;
+    margin-right: 2px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #1e293b;
+}
+
+QTabBar::tab:selected {
+    background-color: white;
+    border-bottom: 1px solid white;  /* 与 pane 背景融合 */
+    color: #0d6efd;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #e9f0ff;
+}
+
+QTabBar::tab:first {
+    margin-left: 8px;  /* 左侧留空 */
+}
+
+QTabBar::tab:last {
+    margin-right: 8px; /* 右侧留空 */
+}
+
+/* 如果标签页数量少，可以固定高度 */
+QTabBar::tab {
+    min-height: 36px;
+}
+"""
 
 
 class Worker(QThread):
@@ -96,215 +376,7 @@ class ChatWindow(QMainWindow):
         self.setMinimumSize(1200, 800)
 
         # ========== 全局样式表 ==========
-        self.setStyleSheet("""
-            /* 全局字体和背景 */
-            QMainWindow, QDialog {
-                background-color: #fafaff;
-                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-                font-size: 14px;
-            }
-            /* 分割器样式：细线、透明色 */
-            QSplitter::handle {
-                background-color: #e0e4e9;
-                width: 1px;
-            }
-            QSplitter::handle:hover {
-                background-color: #b0b8c5;
-            }
-            /* 左侧边栏整体背景 */
-            QWidget#leftWidget {
-                background-color: white;
-                border-right: 1px solid #eaeef2;
-            }
-            /* 新建对话按钮 */
-            QPushButton#newConvBtn {
-                background-color: #0d6efd;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 10px 16px;
-                font-weight: 500;
-                text-align: left;
-            }
-            QPushButton#newConvBtn:hover {
-                background-color: #0b5ed7;
-            }
-            QPushButton#newConvBtn:pressed {
-                background-color: #0a58ca;
-            }
-            /* 对话列表 */
-            QListWidget {
-                background-color: transparent;
-                border: none;
-                outline: none;
-            }
-            QListWidget::item {
-                background-color: transparent;
-                border-radius: 8px;
-                padding: 10px;
-                margin: 4px 8px;
-                color: #1e293b;
-            }
-            QListWidget::item:selected {
-                background-color: #e9f0ff;
-                color: #0d6efd;
-            }
-            QListWidget::item:hover {
-                background-color: #f1f5f9;
-            }
-            /* 顶部模式选择 */
-            QComboBox {
-                background-color: white;
-                border: 1px solid #dde1e6;
-                border-radius: 20px;
-                padding: 6px 16px;
-                min-width: 120px;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;  /* 可以自定义箭头，这里保持简单 */
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #5f6b7a;
-                width: 0;
-                height: 0;
-                margin-right: 8px;
-            }
-            QComboBox:hover {
-                border-color: #0d6efd;
-            }
-            /* 聊天区域背景 */
-            QWidget#rightWidget {
-                background-color: #ffffff;
-            }
-            /* 输入框 */
-            QPlainTextEdit {
-                background-color: white;
-                border: 1px solid #dde1e6;
-                border-radius: 24px;
-                padding: 12px 18px;
-                font-size: 14px;
-                selection-background-color: #b2d3ff;
-                color: #000000
-            }
-            QPlainTextEdit:focus {
-                border-color: #0d6efd;
-                outline: none;
-            }
-            /* 发送、中止、重新生成按钮 */
-            QPushButton#sendBtn, QPushButton#stopBtn, QPushButton#regenerateBtn {
-                background-color: #0d6efd;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                padding: 12px;
-                font-weight: 500;
-            }
-            QPushButton#sendBtn:hover, QPushButton#stopBtn:hover, QPushButton#regenerateBtn:hover {
-                background-color: #0b5ed7;
-            }
-            QPushButton#sendBtn:pressed, QPushButton#stopBtn:pressed, QPushButton#regenerateBtn:pressed {
-                background-color: #0a58ca;
-            }
-            QPushButton#sendBtn:disabled, QPushButton#stopBtn:disabled, QPushButton#regenerateBtn:disabled {
-                background-color: #b6c2d0;
-                color: #eef2f6;
-            }
-            /* 中止按钮单独设色（可选） */
-            QPushButton#stopBtn {
-                background-color: #dc3545;
-            }
-            QPushButton#stopBtn:hover {
-                background-color: #bb2d3b;
-            }
-            /* 重新生成按钮 */
-            QPushButton#regenerateBtn {
-                background-color: #6c757d;
-            }
-            QPushButton#regenerateBtn:hover {
-                background-color: #5c636a;
-            }
-            /* 菜单栏 */
-            QMenuBar {
-                background-color: white;
-                border-bottom: 1px solid #eaeef2;
-            }
-            QMenuBar::item {
-                padding: 8px 12px;
-                background: transparent;
-                border-radius: 6px;
-            }
-            QMenuBar::item:selected {
-                background-color: #e9f0ff;
-            }
-            QMenu {
-                background-color: white;
-                border: 1px solid #dde1e6;
-                border-radius: 8px;
-                padding: 6px;
-            }
-            QMenu::item {
-                padding: 6px 24px 6px 12px;
-                border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background-color: #e9f0ff;
-                color: #0d6efd;
-            }
-            /* 垂直滚动条 */
-            QScrollBar:vertical {
-                border: none;
-                background: transparent;
-                width: 8px;
-                border-radius: 4px;
-                margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #c1c9d2;
-                border-radius: 4px;
-                min-height: 30px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #a0aab5;
-            }
-            QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical {
-                border: none;
-                background: transparent;
-                height: 0px;
-            }
-            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-                border: none;
-                background: transparent;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: transparent;
-            }
-            
-            /* 水平滚动条（如果需要） */
-            QScrollBar:horizontal {
-                border: none;
-                background: transparent;
-                height: 8px;
-                border-radius: 4px;
-                margin: 0px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #c1c9d2;
-                border-radius: 4px;
-                min-width: 30px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #a0aab5;
-            }
-            QScrollBar::sub-line:horizontal, QScrollBar::add-line:horizontal {
-                border: none;
-                background: transparent;
-                width: 0px;
-            }
-        """)
+        self.setStyleSheet(GLOBAL_STYLESHEET)
 
         # 初始化历史管理器
         self.history_manager = HistoryManager()
@@ -374,19 +446,19 @@ class ChatWindow(QMainWindow):
         # self.input_edit.textChanged.connect(self.adjust_input_height)
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("sendBtn")
-        self.send_btn.setFixedWidth(50)
+        #self.send_btn.setFixedWidth(60)
         self.send_btn.clicked.connect(self.send_message)
 
         # 新增：中止和重新生成按钮，垂直排列
         self.stop_btn = QPushButton("中止")
         self.stop_btn.setObjectName("stopBtn")
-        self.stop_btn.setFixedWidth(80)
+        #self.stop_btn.setFixedWidth(80)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_generation)
 
         self.regenerate_btn = QPushButton("重新生成")
         self.regenerate_btn.setObjectName("regenerateBtn")
-        self.regenerate_btn.setFixedWidth(80)
+        #self.regenerate_btn.setFixedWidth(80)
         self.regenerate_btn.setEnabled(False)
         self.regenerate_btn.clicked.connect(self.regenerate_message)
 
@@ -405,10 +477,16 @@ class ChatWindow(QMainWindow):
 
         # 添加菜单栏
         menubar = self.menuBar()
-        settings_menu = menubar.addMenu("设置")
+        #settings_menu = menubar.addMenu("设置")
         settings_action = QAction("首选项", self)
         settings_action.triggered.connect(self.open_settings_dialog)
-        settings_menu.addAction(settings_action)
+        #settings_menu.addAction(settings_action)
+        menubar.addAction(settings_action)
+
+        # 添加“知识库”菜单
+        search_action = QAction("知识库", self)
+        search_action.triggered.connect(self.open_knowledge_base)
+        menubar.addAction(search_action)
 
         # 事件过滤、状态等
         self.input_edit.installEventFilter(self)
@@ -436,6 +514,10 @@ class ChatWindow(QMainWindow):
         # ICON
         icon_path = "resources/app_icon.ico"  # 根据实际路径调整
         self.setWindowIcon(QIcon(icon_path))
+
+    def open_knowledge_base(self):
+        dialog = KnowledgeBaseDialog(self)
+        dialog.exec()
 
     def stop_generation(self):
         """中止当前的生成"""
@@ -559,8 +641,10 @@ class ChatWindow(QMainWindow):
             self.history_manager.set_current(conv_id)
             # 清空聊天界面并加载历史消息
             self.clear_chat()
+            # 只显示用户、助手、系统消息，跳过工具消息
             for msg in conv.messages:
-                self.add_chat_message(msg["role"], msg["content"])
+                if msg["role"] in ("user", "assistant", "system"):
+                    self.add_chat_message(msg["role"], msg["content"])
             # 滚动到底部
             self.scroll_to_bottom()
         self.update_regenerate_button_state()
@@ -846,11 +930,11 @@ class ChatWindow(QMainWindow):
     def on_page_loaded(self, ok):
         if ok:
             self.page_loaded = True
-            # 如果已经有当前对话，加载它的消息
             if self.current_conversation:
                 self.clear_chat()
                 for msg in self.current_conversation.messages:
-                    self.add_chat_message(msg["role"], msg["content"])
+                    if msg["role"] in ("user", "assistant", "system"):
+                        self.add_chat_message(msg["role"], msg["content"])
             else:
                 self.add_chat_message("system", "LLM科研助手已启动。请选择模式并开始对话。")
         else:
@@ -1016,6 +1100,8 @@ class ChatWindow(QMainWindow):
                 self.history_manager.save_conversation(self.current_conversation)
                 self.refresh_conv_list()
 
+        self._save_llm_summary(final_messages)
+
         self.worker.deleteLater()
 
     def update_regenerate_button_state(self):
@@ -1069,17 +1155,71 @@ class ChatWindow(QMainWindow):
         dialog = SettingsDialog(self)
         dialog.exec()
 
+    def _save_llm_summary(self, final_messages):
+        """从 final_messages 中提取论文 ID 和最后一条助手消息，保存到数据库"""
+        import json
+        from agent.tools import update_paper_llm_summary
+
+        # 1. 查找工具调用 analyze_paper 的结果，获取 paper_id
+        paper_id = None
+        for msg in final_messages:
+            if msg.get("role") == "tool":
+                # 尝试解析内容，假设它包含了 paper_id
+                try:
+                    content = msg.get("content", "")
+                    if content:
+                        result = json.loads(content)
+                        if isinstance(result, dict) and "paper_id" in result:
+                            paper_id = result["paper_id"]
+                            break
+                except:
+                    continue
+
+        if not paper_id:
+            return
+
+        # 2. 获取最后一条 assistant 消息作为总结
+        assistant_msgs = [msg for msg in final_messages if msg["role"] == "assistant"]
+        if not assistant_msgs:
+            return
+        last_assistant = assistant_msgs[-1]["content"]
+
+        # 3. 存入数据库
+        try:
+            update_paper_llm_summary(paper_id, last_assistant)
+            print(f"LLM 总结已保存到论文 {paper_id}")
+        except Exception as e:
+            print(f"保存 LLM 总结失败: {e}")
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setMinimumWidth(600)
+        self.setMinimumSize(700, 500)  # 稍微增大以容纳标签页
+        self.setStyleSheet(GLOBAL_STYLESHEET)
 
-        main_layout = QVBoxLayout()
+        # 主布局
+        main_layout = QVBoxLayout(self)
 
-        # ========== 通用 API 配置部分 ==========
+        # 创建标签页
+        tab_widget = QTabWidget()
+        tab_widget.setDocumentMode(True)  # 扁平风格
+        main_layout.addWidget(tab_widget)
+
+        # ----- 标签页1：首选项 -----
+        pref_tab = QWidget()
+        pref_layout = QVBoxLayout(pref_tab)
+
         form_layout = QFormLayout()
+        form_layout.setSpacing(10)
 
+        # 字体大小
+        self.font_size_combo = QComboBox()
+        self.font_size_combo.addItems(["10px", "11px", "12px", "13px", "14px", "15px", "16px"])
+        self.font_size_combo.setCurrentText("14px")
+        form_layout.addRow("全局字体大小:", self.font_size_combo)
+
+        # 通用 API 配置
         self.openai_api_key = QLineEdit()
         self.openai_api_key.setEchoMode(QLineEdit.Password)
         form_layout.addRow("OpenAI API Key:", self.openai_api_key)
@@ -1097,51 +1237,102 @@ class SettingsDialog(QDialog):
         self.deepseek_chat_model = QLineEdit()
         form_layout.addRow("DeepSeek Chat Model:", self.deepseek_chat_model)
 
-        self.embedding_enabled = QCheckBox()
-        form_layout.addRow("启用 Embedding:", self.embedding_enabled)
+        # Embedding 开关（首选项版本）
+        self.embedding_enabled_pref = QCheckBox()
+        form_layout.addRow("启用 Embedding:", self.embedding_enabled_pref)
+
+        # 添加一个说明标签（可选）
+        form_layout.addRow("", QLabel("注：详细 Embedding 配置请前往「Embedding 设置」标签页"))
+
+        pref_layout.addLayout(form_layout)
+        pref_layout.addStretch()
+
+        # ----- 标签页2：期刊设置 -----
+        journal_tab = QWidget()
+        journal_layout = QVBoxLayout(journal_tab)
+
+        # 使用 QScrollArea 容纳期刊配置
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        journal_layout.addWidget(scroll_area)
+
+        # 期刊配置内容部件
+        journal_content = QWidget()
+        scroll_area.setWidget(journal_content)
+        self.journal_form_layout = QFormLayout(journal_content)
+        self.journal_form_layout.setSpacing(10)
+
+        # 存储每个期刊的输入控件
+        self.journal_section_inputs = {}
+        self._create_journal_inputs()  # 从 YAML 加载并创建输入框
+
+        journal_layout.addStretch()
+
+        # ----- 标签页3：Embedding 设置 -----
+        embed_tab = QWidget()
+        embed_layout = QVBoxLayout(embed_tab)
+
+        embed_form = QFormLayout()
+        embed_form.setSpacing(10)
+
+        # Embedding 开关（Embedding 页面版本）
+        self.embedding_enabled_embed = QCheckBox()
+        embed_form.addRow("启用 Embedding:", self.embedding_enabled_embed)
 
         self.embedder_type = QComboBox()
         self.embedder_type.addItems(["local", "openai"])
-        form_layout.addRow("Embedder 类型:", self.embedder_type)
+        embed_form.addRow("Embedder 类型:", self.embedder_type)
 
         self.openai_embedding_model = QLineEdit()
-        form_layout.addRow("OpenAI Embedding 模型:", self.openai_embedding_model)
+        embed_form.addRow("OpenAI Embedding 模型:", self.openai_embedding_model)
 
         self.local_embedder_name = QLineEdit()
-        form_layout.addRow("本地 Embedder 名称:", self.local_embedder_name)
+        embed_form.addRow("本地 Embedder 名称:", self.local_embedder_name)
 
         self.model_path = QLineEdit()
-        form_layout.addRow("模型路径:", self.model_path)
+        embed_form.addRow("模型路径:", self.model_path)
 
         self.data_dir = QLineEdit()
-        form_layout.addRow("数据目录:", self.data_dir)
+        embed_form.addRow("数据目录:", self.data_dir)
 
         self.vector_dir = QLineEdit()
-        form_layout.addRow("向量存储目录:", self.vector_dir)
+        embed_form.addRow("向量存储目录:", self.vector_dir)
 
-        main_layout.addLayout(form_layout)
+        embed_layout.addLayout(embed_form)
+        embed_layout.addStretch()
 
-        # ========== 期刊配置部分（来自 aps_journals.yaml）==========
-        journals_group = QGroupBox("期刊配置 (section 字段)")
-        journals_layout = QFormLayout(journals_group)
-        self.journal_section_inputs = {}  # 存储每个期刊的输入控件
+        # 将三个标签页添加到 tab_widget
+        tab_widget.addTab(pref_tab, "首选项")
+        tab_widget.addTab(journal_tab, "期刊设置")
+        tab_widget.addTab(embed_tab, "Embedding 设置")
 
-        self._create_journal_inputs(journals_layout)
-        main_layout.addWidget(journals_group)
-
-        # ========== 按钮 ==========
+        # ----- 底部按钮 -----
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         main_layout.addWidget(button_box)
 
-        self.setLayout(main_layout)
-
         # 加载现有配置
         self._load_config()
         self._load_journals_config()
+        self._load_font_size()
 
-    def _create_journal_inputs(self, layout):
+        # 同步两个 Embedding 开关的状态（双向连接）
+        self.embedding_enabled_pref.stateChanged.connect(
+            lambda state: self.embedding_enabled_embed.setCheckState(state)
+        )
+        self.embedding_enabled_embed.stateChanged.connect(
+            lambda state: self.embedding_enabled_pref.setCheckState(state)
+        )
+
+    def _load_font_size(self):
+        """从 QSettings 加载字体大小设置"""
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        font_size = settings.value("font_size", "10px")
+        self.font_size_combo.setCurrentText(font_size)
+
+    def _create_journal_inputs(self):
         """读取 YAML 文件，为每个期刊创建 section 输入框"""
         yaml_path = self._get_yaml_path()
         try:
@@ -1152,31 +1343,47 @@ class SettingsDialog(QDialog):
             print(f"读取期刊配置失败: {e}")
             journals = {}
 
+        # 清空原有布局（防止重复）
+        while self.journal_form_layout.rowCount() > 0:
+            self.journal_form_layout.removeRow(0)
+
+        self.journal_section_inputs.clear()
         for journal_key, journal_info in journals.items():
             section_input = QLineEdit(journal_info.get('section', ''))
             self.journal_section_inputs[journal_key] = section_input
-            layout.addRow(f"{journal_key} section:", section_input)
+            self.journal_form_layout.addRow(f"{journal_key} section:", section_input)
 
     def _get_yaml_path(self):
-        """获取 aps_journals.yaml 的绝对路径"""
+        """获取 journals.yaml 的绝对路径"""
         # SettingsDialog 所在文件位于项目根目录，agent 是子目录
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(current_dir, 'agent', 'aps_journals.yaml')
+        return os.path.join(current_dir, 'agent', 'journals.yaml')
 
     def _load_config(self):
-        """从 config 模块加载通用配置到控件"""
-        self.openai_api_key.setText(getattr(config, 'OPENAI_API_KEY', ''))
-        self.openai_model.setText(getattr(config, 'OPENAI_MODEL', ''))
-        self.deepseek_api_key.setText(getattr(config, 'DEEPSEEK_API_KEY', ''))
-        self.deepseek_model.setText(getattr(config, 'DEEPSEEK_MODEL', ''))
-        self.deepseek_chat_model.setText(getattr(config, 'DEEPSEEK_MODEL_CHAT', ''))
-        self.embedding_enabled.setChecked(getattr(config, 'EMBEDDING_ENABLED', False))
-        self.embedder_type.setCurrentText(getattr(config, 'EMBEDDER_TYPE', 'local'))
-        self.openai_embedding_model.setText(getattr(config, 'OPENAI_EMBEDDING_MODEL', ''))
-        self.local_embedder_name.setText(getattr(config, 'LOCAL_EMBEDDER_NAME', ''))
-        self.model_path.setText(getattr(config, 'MODEL_PATH', ''))
-        self.data_dir.setText(getattr(config, 'DATA_DIR', ''))
-        self.vector_dir.setText(getattr(config, 'VECTOR_DIR', ''))
+        """从 QSettings 加载首选项和 Embedding 配置"""
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+
+        # 首选项
+        self.openai_api_key.setText(settings.value("OPENAI_API_KEY", ""))
+        self.openai_model.setText(settings.value("OPENAI_MODEL", ""))
+        self.deepseek_api_key.setText(settings.value("DEEPSEEK_API_KEY", ""))
+        self.deepseek_model.setText(settings.value("DEEPSEEK_MODEL", ""))
+        self.deepseek_chat_model.setText(settings.value("DEEPSEEK_MODEL_CHAT", ""))
+
+        # Embedding 开关（同时设置两个）
+        enabled = settings.value("EMBEDDING_ENABLED", False)
+        if isinstance(enabled, str):
+            enabled = enabled.lower() in ["true", "1", "yes"]
+        self.embedding_enabled_pref.setChecked(enabled)
+        self.embedding_enabled_embed.setChecked(enabled)
+
+        # Embedding 其他配置
+        self.embedder_type.setCurrentText(settings.value("EMBEDDER_TYPE", "local"))
+        self.openai_embedding_model.setText(settings.value("OPENAI_EMBEDDING_MODEL", ""))
+        self.local_embedder_name.setText(settings.value("LOCAL_EMBEDDER_NAME", ""))
+        self.model_path.setText(settings.value("MODEL_PATH", ""))
+        self.data_dir.setText(settings.value("DATA_DIR", ""))
+        self.vector_dir.setText(settings.value("VECTOR_DIR", ""))
 
     def _load_journals_config(self):
         """从 YAML 文件加载期刊 section 值到输入框"""
@@ -1213,44 +1420,457 @@ class SettingsDialog(QDialog):
 
     def accept(self):
         """保存所有配置"""
-        # 保存通用配置到 config 模块
-        config.OPENAI_API_KEY = self.openai_api_key.text()
-        config.OPENAI_MODEL = self.openai_model.text()
-        config.DEEPSEEK_API_KEY = self.deepseek_api_key.text()
-        config.DEEPSEEK_MODEL = self.deepseek_model.text()
-        config.DEEPSEEK_MODEL_CHAT = self.deepseek_chat_model.text()
-        config.EMBEDDING_ENABLED = self.embedding_enabled.isChecked()
-        config.EMBEDDER_TYPE = self.embedder_type.currentText()
-        config.OPENAI_EMBEDDING_MODEL = self.openai_embedding_model.text()
-        config.LOCAL_EMBEDDER_NAME = self.local_embedder_name.text()
-        config.MODEL_PATH = self.model_path.text()
-        config.DATA_DIR = self.data_dir.text()
-        config.VECTOR_DIR = self.vector_dir.text()
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+
+        # 保存字体大小
+        settings.setValue("font_size", self.font_size_combo.currentText())
+
+        # 保存首选项 API 配置
+        settings.setValue("OPENAI_API_KEY", self.openai_api_key.text())
+        settings.setValue("OPENAI_MODEL", self.openai_model.text())
+        settings.setValue("DEEPSEEK_API_KEY", self.deepseek_api_key.text())
+        settings.setValue("DEEPSEEK_MODEL", self.deepseek_model.text())
+        settings.setValue("DEEPSEEK_MODEL_CHAT", self.deepseek_chat_model.text())
+
+        # 保存 Embedding 配置（开关以任一为准，两者已同步）
+        settings.setValue("EMBEDDING_ENABLED", self.embedding_enabled_pref.isChecked())
+        settings.setValue("EMBEDDER_TYPE", self.embedder_type.currentText())
+        settings.setValue("OPENAI_EMBEDDING_MODEL", self.openai_embedding_model.text())
+        settings.setValue("LOCAL_EMBEDDER_NAME", self.local_embedder_name.text())
+        settings.setValue("MODEL_PATH", self.model_path.text())
+        settings.setValue("DATA_DIR", self.data_dir.text())
+        settings.setValue("VECTOR_DIR", self.vector_dir.text())
 
         # 保存期刊配置到 YAML
         self._save_journals_config()
 
-        # 保存到 QSettings（便于下次启动自动加载）
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
-        settings.setValue("OPENAI_API_KEY", config.OPENAI_API_KEY)
-        settings.setValue("OPENAI_MODEL", config.OPENAI_MODEL)
-        settings.setValue("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY)
-        settings.setValue("DEEPSEEK_MODEL", config.DEEPSEEK_MODEL)
-        settings.setValue("DEEPSEEK_MODEL_CHAT", config.DEEPSEEK_MODEL_CHAT)
-        settings.setValue("EMBEDDING_ENABLED", config.EMBEDDING_ENABLED)
-        settings.setValue("EMBEDDER_TYPE", config.EMBEDDER_TYPE)
-        settings.setValue("OPENAI_EMBEDDING_MODEL", config.OPENAI_EMBEDDING_MODEL)
-        settings.setValue("LOCAL_EMBEDDER_NAME", config.LOCAL_EMBEDDER_NAME)
-        settings.setValue("MODEL_PATH", config.MODEL_PATH)
-        settings.setValue("DATA_DIR", config.DATA_DIR)
-        settings.setValue("VECTOR_DIR", config.VECTOR_DIR)
-
-        QMessageBox.information(self, "提示", "配置已保存，将在后续对话中生效。")
+        # 应用字体大小（需要重启，但可以提示）
+        QMessageBox.information(self, "提示",
+                                "配置已保存。部分更改（如字体）需要重启应用才能生效。")
         super().accept()
+
+
+class KnowledgeBaseDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("论文知识库")
+        self.setMinimumSize(1000, 700)
+        self.setStyleSheet(GLOBAL_STYLESHEET)
+        # 主布局
+        layout = QVBoxLayout(self)
+
+        # ---- 搜索区域 ----
+        search_layout = QHBoxLayout()
+        self.keyword_edit = QLineEdit()
+        self.keyword_edit.setPlaceholderText("输入搜索关键词...")
+        self.search_combo = QComboBox()
+        self.search_combo.addItems(["全文检索", "按标题", "按作者", "按主题"])
+        search_btn = QPushButton("搜索")
+        search_btn.clicked.connect(self.perform_search)
+
+        search_layout.addWidget(QLabel("搜索:"))
+        search_layout.addWidget(self.keyword_edit)
+        search_layout.addWidget(self.search_combo)
+        search_layout.addWidget(search_btn)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
+
+        # ---- 结果表格 ----
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(3)
+        self.result_table.setHorizontalHeaderLabels(["论文ID", "标题", "分析时间"])
+        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.doubleClicked.connect(self.open_edit_dialog)
+        layout.addWidget(self.result_table)
+        self.load_recent_papers()
+
+    def load_recent_papers(self):
+        """加载最近的论文并显示在表格中"""
+        recent = get_recent_papers(15)  # 调用新函数
+        self.display_papers(recent)
+
+    def display_papers(self, papers):
+        """将论文列表填充到表格中，并格式化时间"""
+        self.result_table.setRowCount(len(papers))
+        for row, article in enumerate(papers):
+            paper_id = article.get("paper_id", "")
+            title = article.get("title", "")
+            analyzed_at = article.get("analyzed_at", "")
+
+            # 格式化时间：去掉 'T' 和毫秒部分
+            formatted_time = self.format_analyzed_time(analyzed_at)
+
+            self.result_table.setItem(row, 0, QTableWidgetItem(paper_id))
+            self.result_table.setItem(row, 1, QTableWidgetItem(title))
+            self.result_table.setItem(row, 2, QTableWidgetItem(formatted_time))
+        self.result_table.resizeColumnsToContents()
+
+    def format_analyzed_time(self, iso_time):
+        """将 ISO 格式时间 'YYYY-MM-DDTHH:MM:SS.ffffff' 转换为 'YYYY-MM-DD HH:MM:SS'"""
+        if not iso_time:
+            return ""
+        # 替换 'T' 为空格，并截断小数点及以后
+        if 'T' in iso_time:
+            base = iso_time.replace('T', ' ')
+        else:
+            base = iso_time
+        # 去掉毫秒部分
+        if '.' in base:
+            base = base.split('.')[0]
+        return base
+
+    def perform_search(self):
+        """执行搜索并更新表格"""
+        keyword = self.keyword_edit.text().strip()
+        search_type = self.search_combo.currentText()
+
+        # 根据搜索类型调用 query_knowledge 函数
+        # 你需要根据 search_type 来设置 query_knowledge 的参数
+        # 例如，如果选择"按作者"，则调用 query_knowledge(author=keyword)
+        # 这里以全文检索为例
+        if not keyword:
+            QMessageBox.warning(self, "提示", "请输入搜索关键词")
+            return
+
+        # 调用数据库查询函数（请根据你的实际函数调整）
+        # from your_database_module import query_knowledge
+        # results = query_knowledge(keyword=keyword)  # 这需要你的 query_knowledge 支持全文检索
+
+        # --- 示例：直接使用 SQL 查询（假设你的 query_knowledge 已支持 FTS）---
+        try:
+            # 这是一个简化的调用，你需要根据你的实际函数来
+            # 假设你的 query_knowledge 返回一个包含 dict 的列表
+            results = query_knowledge(keyword=keyword)  # 这是你之前定义的函数
+        except Exception as e:
+            QMessageBox.critical(self, "数据库错误", f"查询失败：{e}")
+            return
+
+        # 更新表格
+        self.result_table.setRowCount(len(results))
+        for row, article in enumerate(results):
+            self.result_table.setItem(row, 0, QTableWidgetItem(article.get("paper_id", "")))
+            self.result_table.setItem(row, 1, QTableWidgetItem(article.get("title", "")))
+            self.result_table.setItem(row, 2, QTableWidgetItem(article.get("analyzed_at", "")))
+        self.result_table.resizeColumnsToContents()
+
+    def open_edit_dialog(self, index):
+        """双击表格行，打开编辑对话框"""
+        row = index.row()
+        paper_id_item = self.result_table.item(row, 0)
+        if not paper_id_item:
+            return
+        paper_id = paper_id_item.text()
+
+        # 从数据库获取完整论文信息
+        article = get_paper_by_id(paper_id)  # 使用你之前定义的函数
+        if not article:
+            QMessageBox.warning(self, "错误", "无法获取论文详情")
+            return
+
+        dialog = PaperEditDialog(article, self)
+        if dialog.exec() == QDialog.Accepted:
+            # 如果编辑对话框保存成功，刷新搜索结果（可选）
+            self.perform_search()
+
+
+class PaperEditDialog(QDialog):
+    def __init__(self, article: dict, parent=None):
+        super().__init__(parent)
+        self.article = article
+        self.paper_id = article.get("paper_id")
+        self.setWindowTitle(f"论文详情 - {self.paper_id}")
+        self.setMinimumSize(850, 750)
+        self.setStyleSheet(GLOBAL_STYLESHEET)  # 应用全局样式
+
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # 获取内容区域字体
+        app_font = QApplication.font()
+        base_size = app_font.pointSize()
+        if base_size <= 0:
+            base_size = 14
+        content_font = QFont(app_font)
+        content_font.setPointSize(base_size + 2)
+
+        # 创建标签页控件
+        tab_widget = QTabWidget()
+        tab_widget.setDocumentMode(True)  # 更现代的标签页风格
+        main_layout.addWidget(tab_widget)
+
+        # ----- 标签页1：基本信息 -----
+        basic_tab = QWidget()
+        basic_layout = QVBoxLayout(basic_tab)
+        basic_layout.setSpacing(15)
+
+        # 使用 QFormLayout 组织基本信息
+        form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignRight)
+        form_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form_layout.setSpacing(12)
+
+        # 论文ID（只读）
+        id_label = QLabel(self.paper_id)
+        id_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        id_label.setWordWrap(True)
+        form_layout.addRow("论文ID:", id_label)
+
+        # 标题（只读）
+        title_label = QLabel(article.get("title", ""))
+        title_label.setWordWrap(True)
+        title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form_layout.addRow("标题:", title_label)
+
+        # 作者（只读，逗号分隔）
+        authors_str = ", ".join(article.get("authors", []))
+        authors_label = QLabel(authors_str)
+        authors_label.setWordWrap(True)
+        authors_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form_layout.addRow("作者:", authors_label)
+
+        # 链接（只读，超链接）
+        link = article.get("link", "")
+        link_label = QLabel()
+        if link:
+            link_label.setText(f'<a href="{link}">{link}</a>')
+            link_label.setOpenExternalLinks(True)
+        else:
+            link_label.setText("无")
+        link_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        form_layout.addRow("链接:", link_label)
+
+        # 分析时间（只读，格式化）
+        analyzed_time = article.get("analyzed_at", "")
+        formatted_time = self.format_analyzed_time(analyzed_time)
+        time_label = QLabel(formatted_time)
+        time_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form_layout.addRow("分析时间:", time_label)
+
+        # 关键词（可编辑，多行，每行一个）
+        self.keywords_edit = QTextEdit()
+        self.keywords_edit.setFont(content_font)  # 应用大字体
+        self.keywords_edit.setPlainText("\n".join(article.get("keywords", [])))
+        self.keywords_edit.setMinimumHeight(120)
+        form_layout.addRow("关键词 (每行一个):", self.keywords_edit)
+
+        # 研究主题（可编辑，多行）
+        self.topic_edit = QTextEdit()
+        self.topic_edit.setFont(content_font)
+        self.topic_edit.setPlainText(article.get("research_topic", ""))
+        self.topic_edit.setMinimumHeight(80)
+        form_layout.addRow("研究主题:", self.topic_edit)
+
+        basic_layout.addLayout(form_layout)
+        basic_layout.addStretch()  # 顶起，防止控件过度拉伸
+
+        # ----- 标签页2：总结 -----
+        summary_tab = QWidget()
+        summary_layout = QVBoxLayout(summary_tab)
+        self.summary_edit = QTextEdit()
+        self.summary_edit.setFont(content_font)
+        self.summary_edit.setPlainText(article.get("summary", ""))
+        self.summary_edit.setMinimumHeight(300)
+        summary_layout.addWidget(QLabel("总结:"))
+        summary_layout.addWidget(self.summary_edit)
+
+        # ----- 标签页3：基本方法 -----
+        method_tab = QWidget()
+        method_layout = QVBoxLayout(method_tab)
+        self.method_edit = QTextEdit()
+        self.method_edit.setFont(content_font)
+        self.method_edit.setPlainText(article.get("basic_method", ""))
+        self.method_edit.setMinimumHeight(300)
+        method_layout.addWidget(QLabel("基本方法:"))
+        method_layout.addWidget(self.method_edit)
+
+        # ----- 标签页4：主要结论 -----
+        conclusion_tab = QWidget()
+        conclusion_layout = QVBoxLayout(conclusion_tab)
+        self.conclusion_edit = QTextEdit()
+        self.conclusion_edit.setFont(content_font)
+        self.conclusion_edit.setPlainText(article.get("main_conclusion", ""))
+        self.conclusion_edit.setMinimumHeight(300)
+        conclusion_layout.addWidget(QLabel("主要结论:"))
+        conclusion_layout.addWidget(self.conclusion_edit)
+
+        # ----- 标签页5：引用文献 -----
+        cites_tab = QWidget()
+        cites_layout = QVBoxLayout(cites_tab)
+        cites_layout.setSpacing(20)
+
+        # 重要引用
+        cites_layout.addWidget(QLabel("重要引用 (每行一个):"))
+        self.citations_edit = QTextEdit()
+        self.citations_edit.setFont(content_font)
+        # print("intro_cites type:", type(article.get("intro_cites")))
+        # print("intro_cites content:", article.get("intro_cites"))
+        #self.citations_edit.setPlainText("\n".join(article.get("citations", [])))
+        citations_text = self.format_citations(article.get("citations", []))
+        self.citations_edit.setPlainText(citations_text)
+        self.citations_edit.setMinimumHeight(80)
+        cites_layout.addWidget(self.citations_edit)
+
+        # 引言引用
+        cites_layout.addWidget(QLabel("引言引用 (每行一个):"))
+        self.intro_cites_edit = QTextEdit()
+        self.intro_cites_edit.setFont(content_font)
+        # self.intro_cites_edit.setPlainText("\n".join(article.get("intro_cites", [])))
+        intro_cites_text = self.format_citations(article.get("intro_cites", []))
+        self.intro_cites_edit.setPlainText(intro_cites_text)
+        self.intro_cites_edit.setMinimumHeight(160)
+        cites_layout.addWidget(self.intro_cites_edit)
+
+        # ----- 标签页6：展望 -----
+        outlook_tab = QWidget()
+        outlook_layout = QVBoxLayout(outlook_tab)
+        self.outlook_edit = QTextEdit()
+        self.outlook_edit.setFont(content_font)
+        self.outlook_edit.setPlainText(article.get("outlook", ""))
+        self.outlook_edit.setMinimumHeight(300)
+        outlook_layout.addWidget(QLabel("展望:"))
+        outlook_layout.addWidget(self.outlook_edit)
+
+        # ----- 标签页7：用户评论 -----
+        comments_tab = QWidget()
+        comments_layout = QVBoxLayout(comments_tab)
+        self.comments_edit = QTextEdit()
+        self.comments_edit.setFont(content_font)
+        self.comments_edit.setPlainText("\n".join(article.get("user_comments", [])))
+        self.comments_edit.setMinimumHeight(350)
+        comments_layout.addWidget(QLabel("用户评论 (每行一条):"))
+        comments_layout.addWidget(self.comments_edit)
+
+        # ----- 标签页8：LLM总结
+        llm_summary_tab = QWidget()
+        llm_summary_layout = QVBoxLayout(llm_summary_tab)
+        self.llm_summary_edit = QTextEdit()
+        self.llm_summary_edit.setPlainText(article.get("llm_summary", ""))
+        self.llm_summary_edit.setReadOnly(True)
+        llm_summary_layout.addWidget(QLabel("对话总结:"))
+        llm_summary_layout.addWidget(self.llm_summary_edit)
+        # print("llm_summary in article:", article.get("llm_summary", "NOT FOUND"))
+
+        # 将所有标签页添加到 tab_widget
+        tab_widget.addTab(basic_tab, "基本信息")
+        tab_widget.addTab(summary_tab, "总结")
+        tab_widget.addTab(method_tab, "基本方法")
+        tab_widget.addTab(conclusion_tab, "主要结论")
+        tab_widget.addTab(cites_tab, "引用文献")
+        tab_widget.addTab(outlook_tab, "展望")
+        tab_widget.addTab(comments_tab, "用户评论")
+        tab_widget.addTab(llm_summary_tab, "LLM总结")
+
+        # ----- 底部按钮区域 -----
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("保存修改")
+        save_btn.setObjectName("saveBtn")
+        save_btn.clicked.connect(self.save_changes)
+
+        comment_btn = QPushButton("仅追加评论")
+        comment_btn.setObjectName("commentBtn")
+        comment_btn.clicked.connect(self.save_comment_only)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("cancelBtn")
+        cancel_btn.clicked.connect(self.reject)
+
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(comment_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        main_layout.addLayout(btn_layout)
+
+    def format_analyzed_time(self, iso_time):
+        """将 ISO 时间格式化为 YYYY-MM-DD HH:MM:SS"""
+        if not iso_time:
+            return ""
+        if 'T' in iso_time:
+            base = iso_time.replace('T', ' ')
+        else:
+            base = iso_time
+        if '.' in base:
+            base = base.split('.')[0]
+        return base
+
+    def save_changes(self):
+        """保存所有可编辑字段的修改"""
+        try:
+            updated = {
+                "paper_id": self.paper_id,
+                # 只读字段直接从原数据复制
+                "title": self.article.get("title", ""),
+                "authors": self.article.get("authors", []),
+                "link": self.article.get("link", ""),
+                "analyzed_at": self.article.get("analyzed_at", ""),
+                "local_path": self.article.get("local_path", ""),
+                # 可编辑字段从各个控件获取
+                "keywords": [line.strip() for line in self.keywords_edit.toPlainText().split('\n') if line.strip()],
+                "research_topic": self.topic_edit.toPlainText(),
+                "basic_method": self.method_edit.toPlainText(),
+                "main_conclusion": self.conclusion_edit.toPlainText(),
+                "citations": [line.strip() for line in self.citations_edit.toPlainText().split('\n') if line.strip()],
+                "intro_cites": [line.strip() for line in self.intro_cites_edit.toPlainText().split('\n') if line.strip()],
+                "outlook": self.outlook_edit.toPlainText(),
+                "summary": self.summary_edit.toPlainText(),
+                "user_comments": [line.strip() for line in self.comments_edit.toPlainText().split('\n') if line.strip()],
+            }
+            update_full_paper(updated)  # 需要实现此函数
+            QMessageBox.information(self, "成功", "论文信息已更新")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败：{e}")
+
+    def save_comment_only(self):
+        """仅追加评论（复用原有 update_paper_comment 函数）"""
+        new_comment = self.comments_edit.toPlainText().strip()
+        if not new_comment:
+            QMessageBox.warning(self, "提示", "请输入要追加的评论")
+            return
+        try:
+            updated_article = update_paper_comment(self.paper_id, new_comment)
+            # 更新评论显示
+            comments = updated_article.get("user_comments", [])
+            self.comments_edit.setPlainText("\n".join(comments))
+            QMessageBox.information(self, "成功", "评论已追加")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"评论更新失败：{e}")
+
+    def format_citations(self, cites):
+        """将引文字典列表格式化为多行字符串"""
+        if not cites:
+            return ""
+        lines = []
+        for cite in cites:
+            # 根据你的引文字典结构生成一行文本
+            authors = ", ".join(cite.get("authors", []))
+            year = cite.get("year", "")
+            title = cite.get("title", "")
+            journal = cite.get("journal", "")
+            doi = cite.get("doi", "")
+            line = f"{title}. {authors}. {year}. {journal}"
+            if doi:
+                line += f" DOI: {doi}"
+            lines.append(line)
+        return "\n\n".join(lines)  # 用空行分隔不同引文
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    # 读取字体大小设置
+    settings = QSettings("CyberPardofelis", "LLM科研助手")
+    font_size_str = settings.value("font_size", "10px")  # 默认10px
+    try:
+        # 提取数字部分，例如 "14px" -> 14
+        font_size = int(font_size_str.replace('px', ''))
+    except:
+        font_size = 10
+
+    # 设置全局字体
+    font = app.font()
+    font.setPointSize(font_size)
+    app.setFont(font)
 
     settings = QSettings("CyberPardofelis", "LLM科研助手")
     if settings.contains("OPENAI_API_KEY"):

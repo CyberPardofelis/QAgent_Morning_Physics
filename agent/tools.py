@@ -240,6 +240,13 @@ def init_db():
         )
     ''')
 
+    # 尝试添加 llm_summary 列（如果尚未添加）
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN llm_summary TEXT")
+    except sqlite3.OperationalError:
+        # 列已存在，忽略
+        pass
+
     conn.commit()
     conn.close()
 
@@ -356,10 +363,15 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     - link: The online link of the paper. If not available, please record the arXiv ID or DOI number.
     - keywords: list of keywords, about 6 to 10 keywords
     - research_topic: main topic or subject
-    - basic_method: Technical methods and innovative points, about 200-400 words
+    - basic_method: Technical methods and innovative points, about 100-400 words
     - main_conclusion: the primary conclusion and mathematical expression, about 100-300 words
-    - citations: important citations in method
-    - intro_cites: important citations in introduction, about 10 citations
+   - citations: list of important citations in the method section. Each citation should be an object with the following fields: 
+        * title: the title of the cited paper
+        * authors: list of authors
+        * year: publication year (as integer)
+        * journal: journal name or venue
+        * doi: DOI if available (optional)
+    - intro_cites: list of important citations in the introduction section. Each citation should have the same structure as in 'citations'.
     - outlook: the meaning, impact and outlook of this paper
     - summary: a one-paragraph summary
 
@@ -439,8 +451,8 @@ def analyze_paper(paper_id: str, pdf_path: str = None, user_comment: str = ""):
     keywords_str = ' '.join(result.get("keywords", []))
     comments_str = ' '.join(result.get("user_comments", []))
     c.execute('''
-        INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords)
-        VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords, user_comments_text)
+        VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         result.get("title", ""),
         result.get("research_topic", ""),
@@ -516,7 +528,14 @@ def get_paper_by_id(paper_id: str):
     paper = dict(row)
     for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
         if paper.get(field):
-            paper[field] = json.loads(paper[field])
+            try:
+                parsed = json.loads(paper[field])
+                # 如果解析后还是字符串（说明可能是双重 JSON），则再次解析
+                if isinstance(parsed, str):
+                    parsed = json.loads(parsed)
+                paper[field] = parsed
+            except:
+                paper[field] = []
         else:
             paper[field] = []
     return paper
@@ -605,7 +624,14 @@ def query_knowledge(keyword: str = None, topic: str = None, author: str = None):
         paper = dict(row)
         for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
             if paper.get(field):
-                paper[field] = json.loads(paper[field])
+                try:
+                    parsed = json.loads(paper[field])
+                    # 如果解析后还是字符串（说明可能是双重 JSON），则再次解析
+                    if isinstance(parsed, str):
+                        parsed = json.loads(parsed)
+                    paper[field] = parsed
+                except:
+                    paper[field] = []
             else:
                 paper[field] = []
         results.append(paper)
@@ -663,8 +689,8 @@ def migrate_json_to_db():
         keywords_str = ' '.join(data.get("keywords", []))
         comments_str = ' '.join(data.get("user_comments", []))
         c.execute('''
-            INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords)
-            VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords, user_comments_text)
+            VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data.get("title", ""),
             data.get("research_topic", ""),
@@ -689,7 +715,7 @@ def _call_llm(prompt: str) -> str:
     client = OpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com",
-        timeout=60
+        timeout=150
     )
     try:
         response = client.chat.completions.create(
@@ -1106,3 +1132,67 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         if browser:
             browser.close()
         playwright.stop()
+
+def get_recent_papers(limit=15):
+    """获取最近分析的论文，按 analyzed_at 倒序"""
+    conn = get_db_connection()
+    rows = conn.execute('''
+        SELECT paper_id, title, analyzed_at
+        FROM papers
+        ORDER BY analyzed_at DESC
+        LIMIT ?
+    ''', (limit,)).fetchall()
+    conn.close()
+    # 转换为字典列表
+    return [dict(row) for row in rows]
+
+def update_full_paper(updated_data):
+    """更新论文完整信息到数据库（包括主表和FTS表）"""
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # 将列表字段转为 JSON 字符串
+    authors_json = json.dumps(updated_data["authors"], ensure_ascii=False)
+    keywords_json = json.dumps(updated_data["keywords"], ensure_ascii=False)
+    citations_json = json.dumps(updated_data["citations"], ensure_ascii=False)
+    intro_cites_json = json.dumps(updated_data["intro_cites"], ensure_ascii=False)
+    user_comments_json = json.dumps(updated_data["user_comments"], ensure_ascii=False)
+
+    c.execute('''
+        UPDATE papers SET
+            title=?, authors=?, link=?, keywords=?, research_topic=?,
+            basic_method=?, main_conclusion=?, citations=?, intro_cites=?,
+            outlook=?, summary=?, local_path=?, user_comments=?, analyzed_at=?
+        WHERE paper_id=?
+    ''', (
+        updated_data["title"], authors_json, updated_data["link"], keywords_json,
+        updated_data["research_topic"], updated_data["basic_method"],
+        updated_data["main_conclusion"], citations_json, intro_cites_json,
+        updated_data["outlook"], updated_data["summary"], updated_data["local_path"],
+        user_comments_json, updated_data["analyzed_at"], updated_data["paper_id"]
+    ))
+
+    # 更新 FTS 表（假设已有 user_comments_text 列）
+    keywords_str = ' '.join(updated_data["keywords"])
+    comments_str = ' '.join(updated_data["user_comments"])
+    c.execute('''
+        UPDATE papers_fts SET
+            title=?, research_topic=?, basic_method=?, main_conclusion=?,
+            outlook=?, summary=?, keywords=?, user_comments_text=?
+        WHERE rowid = (SELECT rowid FROM papers WHERE paper_id=?)
+    ''', (
+        updated_data["title"], updated_data["research_topic"], updated_data["basic_method"],
+        updated_data["main_conclusion"], updated_data["outlook"], updated_data["summary"],
+        keywords_str, comments_str, updated_data["paper_id"]
+    ))
+    conn.commit()
+    conn.close()
+
+
+def update_paper_llm_summary(paper_id: str, summary: str):
+    """将对话中生成的 LLM 总结保存到论文记录"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE papers SET llm_summary = ? WHERE paper_id = ?", (summary, paper_id))
+    conn.commit()
+    conn.close()
