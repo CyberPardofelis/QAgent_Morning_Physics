@@ -1162,14 +1162,15 @@ def update_full_paper(updated_data):
         UPDATE papers SET
             title=?, authors=?, link=?, keywords=?, research_topic=?,
             basic_method=?, main_conclusion=?, citations=?, intro_cites=?,
-            outlook=?, summary=?, local_path=?, user_comments=?, analyzed_at=?
+            outlook=?, summary=?, local_path=?, user_comments=?, analyzed_at=?, llm_summary=?
         WHERE paper_id=?
     ''', (
         updated_data["title"], authors_json, updated_data["link"], keywords_json,
         updated_data["research_topic"], updated_data["basic_method"],
         updated_data["main_conclusion"], citations_json, intro_cites_json,
         updated_data["outlook"], updated_data["summary"], updated_data["local_path"],
-        user_comments_json, updated_data["analyzed_at"], updated_data["paper_id"]
+        user_comments_json, updated_data["analyzed_at"], updated_data.get("llm_summary", ""),
+        updated_data["paper_id"]
     ))
 
     # 更新 FTS 表（假设已有 user_comments_text 列）

@@ -13,7 +13,7 @@ try:
     from PySide6.QtWidgets import (
         QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
         QSplitter, QPushButton, QListWidget, QListWidgetItem,
-        QLabel, QComboBox, QPlainTextEdit, QMenu, QMessageBox,
+        QLabel, QComboBox, QPlainTextEdit, QMenu, QMessageBox, QStackedWidget,
         QInputDialog, QApplication, QSizePolicy, QTableWidget, QTableWidgetItem, QTextEdit, QScrollArea
     )
     from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QPoint
@@ -517,7 +517,8 @@ class ChatWindow(QMainWindow):
 
     def open_knowledge_base(self):
         dialog = KnowledgeBaseDialog(self)
-        dialog.exec()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.show()
 
     def stop_generation(self):
         """中止当前的生成"""
@@ -1153,7 +1154,8 @@ class ChatWindow(QMainWindow):
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
-        dialog.exec()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)  # 关闭时自动销毁
+        dialog.show()
 
     def _save_llm_summary(self, final_messages):
         """从 final_messages 中提取论文 ID 和最后一条助手消息，保存到数据库"""
@@ -1554,23 +1556,21 @@ class KnowledgeBaseDialog(QDialog):
         self.result_table.resizeColumnsToContents()
 
     def open_edit_dialog(self, index):
-        """双击表格行，打开编辑对话框"""
         row = index.row()
         paper_id_item = self.result_table.item(row, 0)
         if not paper_id_item:
             return
         paper_id = paper_id_item.text()
-
-        # 从数据库获取完整论文信息
-        article = get_paper_by_id(paper_id)  # 使用你之前定义的函数
+        article = get_paper_by_id(paper_id)
         if not article:
             QMessageBox.warning(self, "错误", "无法获取论文详情")
             return
 
         dialog = PaperEditDialog(article, self)
-        if dialog.exec() == QDialog.Accepted:
-            # 如果编辑对话框保存成功，刷新搜索结果（可选）
-            self.perform_search()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        # 当对话框关闭时（无论保存或取消），如果状态是 Accepted，则刷新列表
+        dialog.finished.connect(lambda result: self.perform_search() if result == QDialog.Accepted else None)
+        dialog.show()
 
 
 class PaperEditDialog(QDialog):
@@ -1741,15 +1741,15 @@ class PaperEditDialog(QDialog):
         comments_layout.addWidget(QLabel("用户评论 (每行一条):"))
         comments_layout.addWidget(self.comments_edit)
 
-        # ----- 标签页8：LLM总结
+        # ----- 标签页8：LLM总结 -----
         llm_summary_tab = QWidget()
         llm_summary_layout = QVBoxLayout(llm_summary_tab)
         self.llm_summary_edit = QTextEdit()
+        self.llm_summary_edit.setFont(content_font)  # 与其它标签页字体一致
         self.llm_summary_edit.setPlainText(article.get("llm_summary", ""))
-        self.llm_summary_edit.setReadOnly(True)
-        llm_summary_layout.addWidget(QLabel("对话总结:"))
+        self.llm_summary_edit.setMinimumHeight(400)
+        llm_summary_layout.addWidget(QLabel("LLM总结:"))
         llm_summary_layout.addWidget(self.llm_summary_edit)
-        # print("llm_summary in article:", article.get("llm_summary", "NOT FOUND"))
 
         # 将所有标签页添加到 tab_widget
         tab_widget.addTab(basic_tab, "基本信息")
@@ -1815,6 +1815,7 @@ class PaperEditDialog(QDialog):
                 "summary": self.summary_edit.toPlainText(),
                 "user_comments": [line.strip() for line in self.comments_edit.toPlainText().split('\n') if line.strip()],
             }
+            updated["llm_summary"] = self.llm_summary_edit.toPlainText()
             update_full_paper(updated)  # 需要实现此函数
             QMessageBox.information(self, "成功", "论文信息已更新")
             self.accept()
