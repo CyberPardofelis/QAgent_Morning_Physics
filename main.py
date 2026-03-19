@@ -380,7 +380,7 @@ class Worker(QThread):
                     break
                 if chunk:
                     full_reply += chunk
-                    self.stream_chunk.emit("ai", chunk)
+                    self.stream_chunk.emit("assistant", chunk)
             # 生成结束，self.messages 已被 run_agent_stream 更新
             self.finished.emit(full_reply, "", self.messages)
         except Exception as e:
@@ -399,6 +399,9 @@ class ChatWindow(QMainWindow):
 
         # ========== 全局样式表 ==========
         self.setStyleSheet(GLOBAL_STYLESHEET)
+
+        # 创建滚动区域
+        self.scroll_area = QScrollArea()
 
         # 初始化历史管理器
         self.history_manager = HistoryManager()
@@ -457,12 +460,24 @@ class ChatWindow(QMainWindow):
         right_layout.addLayout(top_layout)
 
         # 聊天 WebView
+        '''
         self.chat_view = QWebEngineView()
         self.setup_chat_html()
         self.page_loaded = False
         self.chat_view.loadFinished.connect(self.on_page_loaded)
         self.chat_view.page().navigationRequested.connect(self.on_navigation_requested)
         right_layout.addWidget(self.chat_view)
+        # '''
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setAlignment(Qt.AlignTop)
+        self.scroll_layout.setSpacing(10)
+        self.scroll_area.setWidget(self.scroll_content)
+        self.scroll_content.setStyleSheet("background-color: #fafaff;")  # 例如浅灰色
+        right_layout.addWidget(self.scroll_area)
 
         # 底部输入区
         bottom_layout = QVBoxLayout()
@@ -615,7 +630,7 @@ class ChatWindow(QMainWindow):
                 return false;
             })();
             """
-            self.chat_view.page().runJavaScript(js)
+            # self.chat_view.page().runJavaScript(js)
             self._last_ai_message_id = None  # 重置流式追加标记
 
     def _run_with_messages(self, messages):
@@ -690,13 +705,15 @@ class ChatWindow(QMainWindow):
         self.update_regenerate_button_state()
 
     def clear_chat(self):
-        """清空 WebView 中的聊天内容"""
-        js = "document.getElementById('chat').innerHTML = '';"
-        self.chat_view.page().runJavaScript(js)
+        while self.scroll_layout.count():
+            child = self.scroll_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
 
     def scroll_to_bottom(self):
-        js = "window.scrollTo(0, document.body.scrollHeight);"
-        self.chat_view.page().runJavaScript(js)
+        QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(
+            self.scroll_area.verticalScrollBar().maximum()
+        ))
 
     def show_conv_context_menu(self, pos: QPoint):
         """右键菜单：重命名、删除"""
@@ -745,6 +762,7 @@ class ChatWindow(QMainWindow):
                 else:
                     self.create_new_conversation()
 
+    '''
     def on_navigation_requested(self, request):
         """拦截导航，http/https链接在外部浏览器打开，其他放行"""
         url = request.url()
@@ -753,7 +771,9 @@ class ChatWindow(QMainWindow):
             request.reject()  # 阻止在WebView内加载
         else:
             request.accept()
+    # '''
 
+    '''
     def setup_chat_html(self):
         """设置WebView的HTML内容，增强公式容错"""
         html = """
@@ -969,7 +989,9 @@ class ChatWindow(QMainWindow):
         </html>
         """
         self.chat_view.setHtml(html)
+    # '''
 
+    '''
     def on_page_loaded(self, ok):
         if ok:
             self.page_loaded = True
@@ -980,6 +1002,7 @@ class ChatWindow(QMainWindow):
                         self.add_chat_message(msg["role"], msg["content"])
         else:
             print("页面加载失败")
+    # '''
 
     def line_height(self):
         fm = self.input_edit.fontMetrics()
@@ -1066,21 +1089,31 @@ class ChatWindow(QMainWindow):
         self._run_with_messages(messages)
 
     def on_stream_chunk(self, sender, chunk):
-        if not hasattr(self, '_last_ai_message_id') or self._last_ai_message_id is None:
-            self.add_chat_message(sender, chunk, isAppend=False)
-            self._last_ai_message_id = sender
-            # 初始化最后一条消息内容
+        # print(f"on_stream_chunk: sender={sender}, chunk='{chunk[:50]}'")  # 调试
+        if sender != "assistant":
+            return  # 忽略非助理消息（如 tool）
+
+        if not chunk.strip():  # 过滤空内容
+            return
+
+        if self._last_ai_message_id is None:
+            # 第一个块：创建新气泡
+            self.add_chat_message("assistant", chunk, isAppend=False)
+            self._last_ai_message_id = "assistant"  # 标记已有助理消息
+            # 初始化历史记录
             if self.current_conversation:
                 self.current_conversation.add_message("assistant", chunk)
         else:
-            self.append_to_last_ai_message(chunk)
-            # 更新内存中最后一条消息
+            # 后续块：追加到最后一个助理气泡
+            self.add_chat_message("assistant", chunk, isAppend=True)
+            # 更新历史记录中的最后一条消息
             if self.current_conversation and self.current_conversation.messages:
                 last_msg = self.current_conversation.messages[-1]
                 if last_msg["role"] == "assistant":
                     last_msg["content"] += chunk
                     self.current_conversation.updated_at = datetime.now().isoformat()
 
+    '''
     def append_to_last_ai_message(self, chunk):
         """向最后一条AI消息追加内容"""
         safe_chunk = json.dumps(chunk)
@@ -1119,7 +1152,8 @@ class ChatWindow(QMainWindow):
             return false;
         }})();
         """
-        self.chat_view.page().runJavaScript(js)
+        # self.chat_view.page().runJavaScript(js)
+    # '''
 
     def on_worker_finished(self, reply, error, final_messages):
         self.processing = False
@@ -1135,11 +1169,11 @@ class ChatWindow(QMainWindow):
             QMessageBox.critical(self, "错误", error)
             self.add_chat_message("system", f"错误：{error}")
         else:
-            # 更新对话（原有代码不变）
+            # 更新对话
             if self.current_conversation:
                 new_messages = [msg for msg in final_messages if msg["role"] != "system"]
                 self.current_conversation.messages = new_messages
-                # ... 其余原有代码保持不变 ...
+
                 self.current_conversation.updated_at = datetime.now().isoformat()
                 if self.current_conversation.title == "新对话":
                     new_title = self.history_manager.generate_title_from_messages(self.current_conversation)
@@ -1147,6 +1181,10 @@ class ChatWindow(QMainWindow):
                         self.current_conversation.title = new_title
                 self.history_manager.save_conversation(self.current_conversation)
                 self.refresh_tree()
+
+        last_bubble = self.find_last_assistant_bubble()
+        if last_bubble:
+            last_bubble.finalize()
 
         self._save_llm_summary(final_messages)
 
@@ -1163,16 +1201,47 @@ class ChatWindow(QMainWindow):
             else:
                 self.regenerate_btn.setEnabled(False)
 
-    def add_chat_message(self, sender, text, isAppend=False):
-        """通过JavaScript添加消息（非流式情况使用）"""
-        if not self.page_loaded:
-            QTimer.singleShot(100, lambda: self.add_chat_message(sender, text, isAppend))
+    def add_chat_message(self, role: str, text: str, isAppend: bool = False):
+        # 过滤空文本（无论是新消息还是追加，空内容都不应处理）
+        if not text or not text.strip():
+            # print(f"add_chat_message: 忽略空消息 role={role}")
             return
-        safe_sender = json.dumps(sender)
-        safe_text = json.dumps(text)
-        js = f"addMessage({safe_sender}, {safe_text}, {json.dumps(isAppend)});"
-        self.chat_view.page().runJavaScript(js)
-        self.update_regenerate_button_state()
+
+        # print(f"add_chat_message: role={role}, text='{text[:50]}', isAppend={isAppend}")
+        if isAppend and role == 'assistant':
+            last_bubble = self.find_last_assistant_bubble()
+            if last_bubble:
+                last_bubble.update_content(text)
+                # 延迟判断滚动，确保布局已更新
+                QTimer.singleShot(0, self.scroll_if_needed)
+                return
+
+        # 创建新气泡
+        bubble = MessageBubble(role, text)
+        self.scroll_layout.addWidget(bubble)
+        self.scroll_if_needed()
+
+    def find_last_assistant_bubble(self):
+        for i in range(self.scroll_layout.count() - 1, -1, -1):
+            item = self.scroll_layout.itemAt(i)
+            widget = item.widget()
+            if widget and isinstance(widget, MessageBubble) and widget.role == 'assistant':
+                return widget
+        return None
+
+    def _remove_last_ai_message(self):
+        """删除最后一条 AI 消息（UI 和历史）"""
+        if not self.current_conversation:
+            return
+        if self.current_conversation.messages and self.current_conversation.messages[-1]["role"] == "assistant":
+            # 从历史中移除
+            self.current_conversation.messages.pop()
+            self.current_conversation.updated_at = datetime.now().isoformat()
+
+        # 从 UI 中移除最后一个助理气泡
+        last_bubble = self.find_last_assistant_bubble()
+        if last_bubble:
+            last_bubble.deleteLater()
 
     def closeEvent(self, event):
         if self.current_conversation:
@@ -1227,6 +1296,12 @@ class ChatWindow(QMainWindow):
         if not paper_id:
             return
 
+        # 检查是否已有 LLM 总结
+        paper = get_paper_by_id(paper_id)
+        if paper and paper.get("llm_summary"):
+            print(f"论文 {paper_id} 已有 LLM 总结，跳过保存")
+            return
+
         # 2. 获取最后一条 assistant 消息作为总结
         assistant_msgs = [msg for msg in final_messages if msg["role"] == "assistant"]
         if not assistant_msgs:
@@ -1242,7 +1317,7 @@ class ChatWindow(QMainWindow):
 
     def refresh_tree(self):
         """刷新左侧树形结构"""
-        print("刷新树形结构")
+        # print("刷新树形结构")
         grouped = self.history_manager.get_conversations_by_group()
         groups_info = {g["group_id"]: g for g in self.history_manager.get_all_groups()}
 
@@ -1308,13 +1383,22 @@ class ChatWindow(QMainWindow):
         conv = self.history_manager.get_conversation(conv_id)
         if conv:
             self.current_conversation = conv
-            # 批量加载消息到 WebView
-            messages_html = self._generate_messages_html(conv.messages)
-            js = f"loadConversation({json.dumps(messages_html)});"
-            self.chat_view.page().runJavaScript(js)
-            # 在树中高亮选中
-            self._highlight_conversation_in_tree(conv_id)
+            self.clear_chat()
+            for msg in conv.messages:
+                if msg["role"] in ("user", "assistant", "system") and msg.get("content", "").strip():
+                    self.add_chat_message(msg["role"], msg["content"])
+            # 强制处理事件，确保布局完成
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            self._retry_scroll_to_bottom(4)
         self.update_regenerate_button_state()
+
+    def _retry_scroll_to_bottom(self, retries=4, interval=50):
+        scrollbar = self.scroll_area.verticalScrollBar()
+        if scrollbar.maximum() > 0:
+            scrollbar.setValue(scrollbar.maximum())
+        elif retries > 0:
+            QTimer.singleShot(interval, lambda: self._retry_scroll_to_bottom(retries - 1, interval))
 
     def _highlight_conversation_in_tree(self, conv_id):
         """在树中选中对应的对话项"""
@@ -1333,20 +1417,6 @@ class ChatWindow(QMainWindow):
         item = find_item(self.conv_tree.invisibleRootItem())
         if item:
             self.conv_tree.setCurrentItem(item)
-
-    def _generate_messages_html(self, messages):
-        """生成批量消息 HTML（需在 WebView 的 JS 中定义 loadConversation）"""
-        # 与之前相同，生成所有气泡的 HTML 字符串
-        parts = []
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role not in ("user", "assistant", "system"):
-                continue
-            # 根据 role 生成对应的 HTML 结构（参考 addMessage 中的创建逻辑）
-            # 这里简单模拟，实际应包含完整的 bubble 样式
-            parts.append(f'<div class="message-container {role}"><div class="bubble">{content}</div></div>')
-        return "\n".join(parts)
 
     def show_tree_context_menu(self, pos):
         """右键菜单：根据点击项类型显示不同菜单"""
@@ -1467,6 +1537,22 @@ class ChatWindow(QMainWindow):
                 else:
                     self.create_new_conversation()
 
+    def should_auto_scroll(self) -> bool:
+        scrollbar = self.scroll_area.verticalScrollBar()
+        max_val = scrollbar.maximum()
+        current_bottom = scrollbar.value() + scrollbar.pageStep()
+        distance_to_bottom = max_val - current_bottom
+        # 调试打印，可保留或删除
+        print(f"max={max_val}, bottom={current_bottom}, distance={distance_to_bottom}")
+        return distance_to_bottom <= 5
+
+    def scroll_if_needed(self):
+        print("scroll_if_needed called")  # 调试用，可删除
+        if self.should_auto_scroll():
+            print("should auto scroll, scrolling...")
+            self.scroll_to_bottom()
+        else:
+            print("not at bottom, skip scroll")
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -2113,23 +2199,166 @@ class PaperEditDialog(QDialog):
             QMessageBox.critical(self, "错误", f"评论更新失败：{e}")
 
     def format_citations(self, cites):
-        """将引文字典列表格式化为多行字符串"""
         if not cites:
             return ""
         lines = []
         for cite in cites:
-            # 根据你的引文字典结构生成一行文本
-            authors = ", ".join(cite.get("authors", []))
+            # 处理 authors 字段：可能是列表、字符串或 None
+            authors_raw = cite.get("authors", [])
+            if isinstance(authors_raw, list):
+                authors = ", ".join(authors_raw)
+            elif isinstance(authors_raw, str):
+                authors = authors_raw  # 直接使用字符串
+            else:
+                authors = ""
+
             year = cite.get("year", "")
             title = cite.get("title", "")
             journal = cite.get("journal", "")
             doi = cite.get("doi", "")
+
             line = f"{title}. {authors}. {year}. {journal}"
             if doi:
                 line += f" DOI: {doi}"
             lines.append(line)
-        return "\n\n".join(lines)  # 用空行分隔不同引文
+        return "\n\n".join(lines)
 
+
+class MessageBubble(QWidget):
+    def __init__(self, role: str, markdown_text: str, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.full_text = markdown_text
+        self.is_final = False
+        self.pending_text = ""  # 待追加的文本缓存
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(750)
+        self.update_timer.setSingleShot(True)  # 单次触发，每次有新文本时重启
+        self.update_timer.timeout.connect(self._flush_pending)
+
+        # 设置气泡整体样式（背景色、圆角、内边距），占满整个可用宽度
+        if role == 'user':
+            self.setStyleSheet("""
+                background-color: #77aaff;
+                border-radius: 10px;
+                padding: 8px;
+            """)
+            alignment = Qt.AlignRight  # 整体靠右（背景从右侧开始）
+            # 内容样式：文本左对齐，内容区块靠右（margin-left: auto），宽度限制80%
+            content_css = """
+                body {
+                    background: transparent;
+                    color: white;
+                    margin: 0;
+                    padding: 0;
+                    overflow: hidden;
+                    word-wrap: break-word;
+                    max-width: 100%;
+                    margin-left: auto;   /* 内容区块靠右 */
+                    text-align: left;     /* 文本本身左对齐 */
+                }
+            """
+        elif role == 'assistant':
+            self.setStyleSheet("""
+                background-color: white;
+                border-radius: 10px;
+                padding: 8px;
+            """)
+            alignment = Qt.AlignLeft  # 整体靠左
+            content_css = """
+                body {
+                    background: transparent;
+                    color: black;
+                    margin: 0;
+                    padding: 0;
+                    overflow: hidden;
+                    word-wrap: break-word;
+                    max-width: 100%;
+                    margin-right: auto;  /* 内容区块靠左 */
+                    text-align: left;
+                }
+            """
+        else:  # system
+            self.setStyleSheet("""
+                background-color: #e9ecef;
+                color: #495057;
+                border-radius: 10px;
+                padding: 6px;
+                font-size: 12px;
+            """)
+            alignment = Qt.AlignCenter
+            content_css = """
+                body {
+                    background: transparent;
+                    color: #495057;
+                    margin: 0 auto;
+                    padding: 0;
+                    overflow: hidden;
+                    word-wrap: break-word;
+                    max-width: 100%;
+                    text-align: center;
+                }
+            """
+
+        # 布局：让 QMView 填充整个气泡
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(alignment)
+
+        self.view = QMView()
+        self.view.setMarkdown(markdown_text)
+
+        # 注入内容样式 + 隐藏滚动条
+        full_css = content_css + """
+            ::-webkit-scrollbar {
+                display: none;
+            }
+        """
+        self.view.setHtmlStyle(full_css)
+
+        # 启用自动尺寸（高度自适应，宽度由父布局控制）
+        self.view.setAutoSize(True,max_width=900)
+
+        layout.addWidget(self.view)
+        # 确保在初始化后立即设置一次 Markdown
+        self.view.setMarkdown(markdown_text)
+
+    def update_content(self, new_text: str):
+        """追加内容（流式更新）"""
+        self.pending_text += new_text
+        if not self.update_timer.isActive():
+            self.update_timer.start()
+
+    def _flush_pending(self):
+        if self.pending_text:
+            # 预处理：确保以 '##' 开头的行后面有换行符（简单示例）
+            # 更完善的方案可以检测 Markdown 块边界
+            text_to_add = self.pending_text
+            # 如果当前 full_text 以标题开头且未换行，而新文本以换行开头，则可能解决问题
+            # 此处不做复杂处理，仅合并后重新设置
+            self.full_text += text_to_add
+            self.view.setMarkdown(self.full_text)
+            self.pending_text = ""
+
+    def finalize(self):
+        if self.is_final:
+            return
+        self.is_final = True
+
+        # 强制重新解析 Markdown（先清空再设置）
+        self.view.setMarkdown("")
+        self.view.setMarkdown(self.full_text)
+
+        # 触发重绘
+        self.view.update()
+
+        # 如果 QMView 基于 WebEngine，尝试触发 MathJax
+        if hasattr(self.view, 'page'):
+            self.view.page().runJavaScript("""
+                if (window.MathJax) {
+                    MathJax.typesetPromise();
+                }
+            """)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

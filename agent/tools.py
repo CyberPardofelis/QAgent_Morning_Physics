@@ -530,8 +530,8 @@ def get_paper_by_id(paper_id: str):
         if paper.get(field):
             try:
                 parsed = json.loads(paper[field])
-                # 如果解析后还是字符串（说明可能是双重 JSON），则再次解析
-                if isinstance(parsed, str):
+                # 如果解析后还是字符串，说明可能被双重 JSON 编码，继续解析直到不再是字符串
+                while isinstance(parsed, str):
                     parsed = json.loads(parsed)
                 paper[field] = parsed
             except:
@@ -887,7 +887,7 @@ def analyze_today_topic_arxiv(topic: str):
     return analysis
 
 
-def load_journal_config(config_path='agent/journals.yaml'):
+def load_journal_config(config_path='./agent/journals.yaml'):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
         return config.get('journals', {})
