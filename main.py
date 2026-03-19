@@ -1540,19 +1540,17 @@ class ChatWindow(QMainWindow):
     def should_auto_scroll(self) -> bool:
         scrollbar = self.scroll_area.verticalScrollBar()
         max_val = scrollbar.maximum()
-        current_bottom = scrollbar.value() + scrollbar.pageStep()
+        current_bottom = scrollbar.value()
         distance_to_bottom = max_val - current_bottom
         # 调试打印，可保留或删除
-        print(f"max={max_val}, bottom={current_bottom}, distance={distance_to_bottom}")
-        return distance_to_bottom <= 5
+        # print(f"max={max_val}, bottom={current_bottom}, distance={distance_to_bottom}")
+        return distance_to_bottom <= 20
 
     def scroll_if_needed(self):
-        print("scroll_if_needed called")  # 调试用，可删除
+        # print("scroll_if_needed called")  # 调试用，可删除
         if self.should_auto_scroll():
-            print("should auto scroll, scrolling...")
+            # print("should auto scroll, scrolling...")
             self.scroll_to_bottom()
-        else:
-            print("not at bottom, skip scroll")
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
