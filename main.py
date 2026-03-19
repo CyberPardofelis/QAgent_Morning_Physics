@@ -6,13 +6,14 @@ from datetime import datetime
 try:
     # 原始导入和代码
     import json
+    import html
     import sqlite3
     from datetime import datetime
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from agent.history_manager import HistoryManager, Conversation
     from PySide6.QtWidgets import (
         QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-        QSplitter, QPushButton, QListWidget, QListWidgetItem,
+        QSplitter, QPushButton, QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
         QLabel, QComboBox, QPlainTextEdit, QMenu, QMessageBox, QStackedWidget,
         QInputDialog, QApplication, QSizePolicy, QTableWidget, QTableWidgetItem, QTextEdit, QScrollArea
     )
@@ -30,6 +31,7 @@ try:
         QDialogButtonBox, QMessageBox, QGroupBox, QTabWidget
     )
     from PySide6.QtCore import QSettings,Qt,QPoint,QTimer,QUrl
+    from QMarkdownWidget import QMView
     import config
     import yaml
 
@@ -86,16 +88,7 @@ QWidget#leftWidget {
     background-color: white;
     border-right: 1px solid #eaeef2;
 }
-/* 新建对话按钮 */
-QPushButton#newConvBtn {
-    background-color: #0d6efd;
-    color: white;
-    border: none;
-    border-radius: 20px;  /* 统一圆角 */
-    padding: 12px 16px;
-    font-weight: 500;
-    text-align: left;
-}
+
 QPushButton#newConvBtn:hover {
     background-color: #0b5ed7;
 }
@@ -156,7 +149,7 @@ QComboBox QAbstractItemView::item {
 QLineEdit {
     background-color: white;
     border: 1px solid #dde1e6;
-    border-radius: 24px;
+    border-radius: 20px;
     padding: 12px 16px;
     selection-background-color: #b2d3ff;
 }
@@ -168,8 +161,8 @@ QLineEdit:focus {
 QTextEdit {
     background-color: white;
     border: 1px solid #dde1e6;
-    border-radius: 16px;
-    padding: 12px 12px;
+    border-radius: 14px;
+    padding: 8px 12px;
     selection-background-color: #b2d3ff;
 }
 QTextEdit:focus {
@@ -180,8 +173,8 @@ QTextEdit:focus {
 QPlainTextEdit {
     background-color: white;
     border: 1px solid #dde1e6;
-    border-radius: 24px;
-    padding: 12px 18px;
+    border-radius: 20px;
+    padding: 8px 18px;
     selection-background-color: #b2d3ff;
 }
 /* 通用按钮样式 */
@@ -189,8 +182,8 @@ QPushButton {
     background-color: #0d6efd;
     color: white;
     border: none;
-    border-radius: 20px;
-    padding: 12px 14px;
+    border-radius: 14px;
+    padding: 6px 14px;
     font-weight: 500;
 }
 QPushButton:hover {
@@ -336,6 +329,35 @@ QTabBar::tab:last {
 QTabBar::tab {
     min-height: 36px;
 }
+QTreeWidget {
+    background-color: transparent;
+    border: none;
+    outline: none;
+}
+QTreeWidget::item {
+    padding: 6px;
+    border-radius: 6px;
+}
+QTreeWidget::item:selected {
+    background-color: #e9f0ff;
+    color: #0d6efd;
+}
+QTreeWidget::item:hover {
+    background-color: #f1f5f9;
+}
+QTreeWidget::branch {
+    background: transparent;
+}
+QTreeWidget::branch:has-children:!has-siblings:closed,
+QTreeWidget::branch:closed:has-children:has-siblings {
+    border-image: none;
+    image: none;
+}
+QTreeWidget::branch:open:has-children:!has-siblings,
+QTreeWidget::branch:open:has-children:has-siblings {
+    border-image: none;
+    image: none;
+}
 """
 
 
@@ -391,26 +413,33 @@ class ChatWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # ---------- 左侧对话列表 ----------
+        # ---------- 左侧对话列表（树形） ----------
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(5, 5, 5, 5)
 
-        # 新建对话按钮
+        # 新建对话按钮（保持不变）
         self.new_conv_btn = QPushButton("＋ 新建对话")
         self.new_conv_btn.setObjectName("newConvBtn")
         self.new_conv_btn.clicked.connect(self.create_new_conversation)
         left_layout.addWidget(self.new_conv_btn)
 
-        # 对话列表
-        self.conv_list = QListWidget()
-        self.conv_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.conv_list.customContextMenuRequested.connect(self.show_conv_context_menu)
-        self.conv_list.itemClicked.connect(self.switch_conversation)
-        left_layout.addWidget(self.conv_list)
+        # 新增分组按钮
+        self.new_group_btn = QPushButton("＋ 新建分组")
+        self.new_group_btn.setObjectName("newGroupBtn")
+        self.new_group_btn.clicked.connect(self.create_new_group)
+        left_layout.addWidget(self.new_group_btn)
+
+        # 树形对话列表
+        self.conv_tree = QTreeWidget()
+        self.conv_tree.setHeaderHidden(True)
+        self.conv_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.conv_tree.customContextMenuRequested.connect(self.show_tree_context_menu)
+        self.conv_tree.itemClicked.connect(self.on_tree_item_clicked)
+        left_layout.addWidget(self.conv_tree)
 
         splitter.addWidget(left_widget)
-        splitter.setStretchFactor(0, 1)  # 左侧较小
+        splitter.setStretchFactor(0, 1)  # 左侧宽度可微调
 
         # ---------- 右侧聊天区域 ----------
         right_widget = QWidget()
@@ -500,14 +529,22 @@ class ChatWindow(QMainWindow):
         self.current_message_id = None  # 用于流式追加消息
         self._last_ai_message_id = None
 
-        # 加载历史对话列表
-        self.refresh_conv_list()
-        # 如果存在历史对话，加载最近的一个；否则新建一个
-        if self.conv_list.count() > 0:
-            self.conv_list.setCurrentRow(0)
-            self.switch_conversation(self.conv_list.item(0))
+        # 加载历史对话列表（树形）
+        self.refresh_tree()
+        # 获取所有对话 ID（从 history_manager 缓存中获取）
+        # all_conv_ids = list(self.history_manager.conversations.keys())
+        '''
+        if all_conv_ids:
+            # 默认选中第一个对话（按更新时间排序，我们可以在 refresh_tree 后手动选中第一个）
+            # 最简单的：直接切换到第一个对话
+            first_conv_id = all_conv_ids[0]
+            self.switch_conversation_by_id(first_conv_id)
         else:
             self.create_new_conversation()
+        # '''
+        self.current_conversation = None
+        self.clear_chat()
+        self.add_chat_message("system", "LLM科研助手已启动。请选择模式并开始对话。")
 
         self.update_regenerate_button_state()
 
@@ -614,8 +651,10 @@ class ChatWindow(QMainWindow):
             self.history_manager.save_conversation(self.current_conversation)
         # 创建新对话
         conv = self.history_manager.create_conversation(title="新对话")
+        # print("新建对话 ID:", conv.conv_id)
+        # print("当前缓存中的对话 IDs:", list(self.history_manager.conversations.keys()))
         self.current_conversation = conv
-        self.refresh_conv_list()
+        self.refresh_tree()
         # 选中新对话
         for i in range(self.conv_list.count()):
             if self.conv_list.item(i).data(Qt.UserRole) == conv.conv_id:
@@ -686,7 +725,7 @@ class ChatWindow(QMainWindow):
             conv.title = new_title.strip()
             conv.updated_at = datetime.now().isoformat()
             self.history_manager.save_conversation(conv)
-            self.refresh_conv_list()
+            self.refresh_tree()
             # 如果当前就是该对话，选中它
             if self.current_conversation and self.current_conversation.conv_id == conv.conv_id:
                 self.current_conversation.title = conv.title
@@ -725,7 +764,10 @@ class ChatWindow(QMainWindow):
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <!-- MathJax 配置：启用noerrors扩展，处理轻微语法错误 -->
         <script>
-        
+        window.loadConversation = function(html) {
+            document.getElementById('chat').innerHTML = html;
+            window.scrollTo(0, document.body.scrollHeight);
+        };
         MathJax = {
             tex: {
                 inlineMath: [['$', '$'], ['\\(', '\\)']],
@@ -936,8 +978,6 @@ class ChatWindow(QMainWindow):
                 for msg in self.current_conversation.messages:
                     if msg["role"] in ("user", "assistant", "system"):
                         self.add_chat_message(msg["role"], msg["content"])
-            else:
-                self.add_chat_message("system", "LLM科研助手已启动。请选择模式并开始对话。")
         else:
             print("页面加载失败")
 
@@ -988,6 +1028,13 @@ class ChatWindow(QMainWindow):
         text = self.input_edit.toPlainText().strip()
         if not text:
             return
+
+        # 如果没有当前对话，自动创建一个
+        if self.current_conversation is None:
+            conv = self.history_manager.create_conversation(title="新对话", group_id=None)
+            self.current_conversation = conv
+            self.refresh_tree()
+            self._highlight_conversation_in_tree(conv.conv_id)
 
         # 快捷指令处理（保持不变）
         if text == "早上好 arxiv":
@@ -1099,7 +1146,7 @@ class ChatWindow(QMainWindow):
                     if new_title:
                         self.current_conversation.title = new_title
                 self.history_manager.save_conversation(self.current_conversation)
-                self.refresh_conv_list()
+                self.refresh_tree()
 
         self._save_llm_summary(final_messages)
 
@@ -1192,6 +1239,234 @@ class ChatWindow(QMainWindow):
             print(f"LLM 总结已保存到论文 {paper_id}")
         except Exception as e:
             print(f"保存 LLM 总结失败: {e}")
+
+    def refresh_tree(self):
+        """刷新左侧树形结构"""
+        print("刷新树形结构")
+        grouped = self.history_manager.get_conversations_by_group()
+        groups_info = {g["group_id"]: g for g in self.history_manager.get_all_groups()}
+
+        self.conv_tree.clear()
+
+        # 1. 先为所有分组创建节点（即使没有对话）
+        group_items = {}
+        for group_id, group_meta in groups_info.items():
+            group_item = QTreeWidgetItem(self.conv_tree)
+            group_item.setText(0, group_meta['name'])
+            group_item.setData(0, Qt.UserRole, f"group:{group_id}")
+            group_items[group_id] = group_item
+
+        # 2. 将对话添加到对应的分组节点下
+        for group_id, convs in grouped.items():
+            if group_id is None:
+                # 未分组对话稍后处理
+                continue
+            if group_id in group_items:
+                group_item = group_items[group_id]
+                for conv_meta in convs:
+                    self._add_conversation_item(group_item, conv_meta)
+
+        # 3. 处理未分组对话
+        ungrouped_convs = grouped.get(None, [])
+        if ungrouped_convs:
+            ungrouped_item = QTreeWidgetItem(self.conv_tree)
+            ungrouped_item.setText(0, "未分组")
+            ungrouped_item.setData(0, Qt.UserRole, "group:ungrouped")
+            for conv_meta in ungrouped_convs:
+                self._add_conversation_item(ungrouped_item, conv_meta)
+
+        self.conv_tree.expandAll()
+
+        self.conv_tree.expandAll()
+
+    def _add_conversation_item(self, parent_item, conv_meta):
+        # print("添加对话项:", conv_meta["conv_id"], conv_meta["title"])
+        """在指定父项下添加一个对话项"""
+        item = QTreeWidgetItem(parent_item)
+        # 格式化时间
+        updated = datetime.fromisoformat(conv_meta["updated_at"]).strftime("%m-%d %H:%M")
+        display_text = f"{conv_meta['title']}\n{updated}"
+        item.setText(0, display_text)
+        item.setData(0, Qt.UserRole, f"conv:{conv_meta['conv_id']}")
+        # 设置图标（可选）
+        # item.setIcon(0, QIcon("resources/chat_icon.png"))
+
+    def on_tree_item_clicked(self, item, column):
+        """处理树项点击：如果是对话则切换，如果是分组则展开/折叠"""
+        data = item.data(0, Qt.UserRole)
+        if data and data.startswith("conv:"):
+            conv_id = data.split(":", 1)[1]
+            self.switch_conversation_by_id(conv_id)
+
+    def switch_conversation_by_id(self, conv_id: str):
+        """根据 ID 切换对话（由树点击或外部调用）"""
+        if self.current_conversation and self.current_conversation.conv_id == conv_id:
+            return  # 已经是当前对话
+        # 保存当前
+        if self.current_conversation:
+            self.history_manager.save_conversation(self.current_conversation)
+        conv = self.history_manager.get_conversation(conv_id)
+        if conv:
+            self.current_conversation = conv
+            # 批量加载消息到 WebView
+            messages_html = self._generate_messages_html(conv.messages)
+            js = f"loadConversation({json.dumps(messages_html)});"
+            self.chat_view.page().runJavaScript(js)
+            # 在树中高亮选中
+            self._highlight_conversation_in_tree(conv_id)
+        self.update_regenerate_button_state()
+
+    def _highlight_conversation_in_tree(self, conv_id):
+        """在树中选中对应的对话项"""
+
+        def find_item(root):
+            for i in range(root.childCount()):
+                child = root.child(i)
+                data = child.data(0, Qt.UserRole)
+                if data and data == f"conv:{conv_id}":
+                    return child
+                found = find_item(child)
+                if found:
+                    return found
+            return None
+
+        item = find_item(self.conv_tree.invisibleRootItem())
+        if item:
+            self.conv_tree.setCurrentItem(item)
+
+    def _generate_messages_html(self, messages):
+        """生成批量消息 HTML（需在 WebView 的 JS 中定义 loadConversation）"""
+        # 与之前相同，生成所有气泡的 HTML 字符串
+        parts = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if role not in ("user", "assistant", "system"):
+                continue
+            # 根据 role 生成对应的 HTML 结构（参考 addMessage 中的创建逻辑）
+            # 这里简单模拟，实际应包含完整的 bubble 样式
+            parts.append(f'<div class="message-container {role}"><div class="bubble">{content}</div></div>')
+        return "\n".join(parts)
+
+    def show_tree_context_menu(self, pos):
+        """右键菜单：根据点击项类型显示不同菜单"""
+        item = self.conv_tree.itemAt(pos)
+        if not item:
+            # 在空白处点击，显示全局菜单（新建分组等）
+            menu = QMenu()
+            new_group_action = QAction("新建分组", self)
+            new_group_action.triggered.connect(self.create_new_group)
+            menu.addAction(new_group_action)
+            menu.exec(self.conv_tree.mapToGlobal(pos))
+            return
+
+        data = item.data(0, Qt.UserRole)
+        if data and data.startswith("group:"):
+            # 分组项
+            group_id = data.split(":", 1)[1]
+            menu = QMenu()
+            rename_action = QAction("重命名分组", self)
+            rename_action.triggered.connect(lambda: self.rename_group(group_id))
+            delete_action = QAction("删除分组", self)
+            delete_action.triggered.connect(lambda: self.delete_group(group_id))
+            new_conv_action = QAction("在此分组新建对话", self)
+            new_conv_action.triggered.connect(lambda: self.create_new_conversation(group_id))
+            menu.addAction(rename_action)
+            menu.addAction(delete_action)
+            menu.addAction(new_conv_action)
+            menu.exec(self.conv_tree.mapToGlobal(pos))
+        elif data and data.startswith("conv:"):
+            # 对话项
+            conv_id = data.split(":", 1)[1]
+            conv = self.history_manager.get_conversation(conv_id)
+            if not conv:
+                return
+            menu = QMenu()
+            rename_action = QAction("重命名对话", self)
+            rename_action.triggered.connect(lambda: self.rename_conversation(conv))
+            delete_action = QAction("删除对话", self)
+            delete_action.triggered.connect(lambda: self.delete_conversation(conv, None))  # 注意 item 参数
+            # 移动对话到其他分组
+            move_menu = QMenu("移动到分组", self)
+            # 获取所有分组
+            groups = self.history_manager.get_all_groups()
+            # 添加一个“未分组”选项
+            move_to_ungrouped = QAction("未分组", self)
+            move_to_ungrouped.triggered.connect(lambda: self.move_conversation(conv_id, None))
+            move_menu.addAction(move_to_ungrouped)
+            for group in groups:
+                group_action = QAction(group["name"], self)
+                group_action.triggered.connect(
+                    lambda checked, gid=group["group_id"]: self.move_conversation(conv_id, gid))
+                move_menu.addAction(group_action)
+            menu.addMenu(move_menu)
+            menu.addAction(rename_action)
+            menu.addAction(delete_action)
+            menu.exec(self.conv_tree.mapToGlobal(pos))
+
+    def create_new_group(self):
+        """新建分组（弹出输入框）"""
+        name, ok = QInputDialog.getText(self, "新建分组", "输入分组名称：", text="新分组")
+        if ok and name.strip():
+            self.history_manager.create_group(name.strip())
+            self.refresh_tree()
+
+    def rename_group(self, group_id):
+        """重命名分组"""
+        current_name = self.history_manager.groups[group_id]["name"]
+        new_name, ok = QInputDialog.getText(self, "重命名分组", "新名称：", text=current_name)
+        if ok and new_name.strip():
+            self.history_manager.rename_group(group_id, new_name.strip())
+            self.refresh_tree()
+
+    def delete_group(self, group_id):
+        """删除分组（询问是否移动对话）"""
+        # 简单实现：移动对话到未分组后删除分组
+        reply = QMessageBox.question(self, "删除分组", f"确定删除分组？该分组下的对话将移至「未分组」。",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.history_manager.delete_group(group_id, move_to_group_id=None)
+            self.refresh_tree()
+
+    def move_conversation(self, conv_id, target_group_id):
+        """移动对话到指定分组"""
+        self.history_manager.move_conversation(conv_id, target_group_id)
+        # 如果移动的是当前对话，同步更新 current_conversation 的 group_id
+        if self.current_conversation and self.current_conversation.conv_id == conv_id:
+            self.current_conversation.group_id = target_group_id
+        self.refresh_tree()
+
+    def create_new_conversation(self, group_id=None):
+        """创建新对话，可指定分组"""
+        # 保存当前对话
+        if self.current_conversation:
+            self.history_manager.save_conversation(self.current_conversation)
+        conv = self.history_manager.create_conversation(title="新对话", group_id=group_id)
+        self.current_conversation = conv
+        self.refresh_tree()
+        self.clear_chat()
+        self.add_chat_message("system", "新对话已创建。")
+        # 在树中选中新对话
+        self._highlight_conversation_in_tree(conv.conv_id)
+        self.update_regenerate_button_state()
+
+    def delete_conversation(self, conv: Conversation, item: QTreeWidgetItem):
+        """删除对话（item 参数在此处不需要，可改为直接用 conv_id）"""
+        # 这里简化：直接使用 conv 参数
+        reply = QMessageBox.question(self, "确认删除", f"确定要删除对话“{conv.title}”吗？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.history_manager.delete_conversation(conv.conv_id)
+            self.refresh_tree()
+            if self.current_conversation and self.current_conversation.conv_id == conv.conv_id:
+                # 当前对话被删除，切换到另一个
+                # 简单切换到第一个可用的对话
+                all_convs = list(self.history_manager.conversations.keys())
+                if all_convs:
+                    self.switch_conversation_by_id(all_convs[0])
+                else:
+                    self.create_new_conversation()
+
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):

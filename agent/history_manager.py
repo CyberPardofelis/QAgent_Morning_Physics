@@ -1,23 +1,25 @@
 # agent/history_manager.py
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
 HISTORY_DIR = Path("data/conversations")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = HISTORY_DIR / "conversations.db"
 
 class Conversation:
     """单个对话的数据模型"""
-    def __init__(self, conv_id: str = None, title: str = "新对话"):
+    def __init__(self, conv_id: str = None, title: str = "新对话", group_id: str = None):
         self.conv_id = conv_id or self._generate_id()
         self.title = title
+        self.group_id = group_id  # 所属分组ID，None 表示未分组
         self.created_at = datetime.now().isoformat()
         self.updated_at = self.created_at
         self.messages = []  # 格式: [{"role": "user"/"assistant"/"system", "content": "..."}]
 
     def _generate_id(self) -> str:
-        """生成唯一ID，基于时间戳和随机数"""
         import time
         import random
         timestamp = int(time.time() * 1000)
@@ -25,12 +27,10 @@ class Conversation:
         return f"{timestamp}-{rand}"
 
     def add_message(self, role: str, content: str):
-        """添加消息并更新更新时间"""
         self.messages.append({"role": role, "content": content})
         self.updated_at = datetime.now().isoformat()
 
     def update_last_message(self, content: str):
-        """更新最后一条消息的内容（用于流式追加）"""
         if self.messages and self.messages[-1]["role"] in ("assistant", "user"):
             self.messages[-1]["content"] = content
             self.updated_at = datetime.now().isoformat()
@@ -39,6 +39,7 @@ class Conversation:
         return {
             "conv_id": self.conv_id,
             "title": self.title,
+            "group_id": self.group_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "messages": self.messages
@@ -46,141 +47,236 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, data: dict):
-        conv = cls(data["conv_id"], data["title"])
+        conv = cls(data["conv_id"], data["title"], data.get("group_id"))
         conv.created_at = data["created_at"]
         conv.updated_at = data["updated_at"]
         conv.messages = data["messages"]
         return conv
 
 
-class HistoryManager:
-    """管理所有对话历史"""
-    def __init__(self):
-        self.conversations: Dict[str, dict] = {}  # 只存储元数据
-        self.current_id: Optional[str] = None
-        self.index_path = HISTORY_DIR / "index.json"
-        self._load_index()
+class Group:
+    """分组数据模型"""
+    def __init__(self, group_id: str = None, name: str = "新分组"):
+        self.group_id = group_id or self._generate_id()
+        self.name = name
+        self.created_at = datetime.now().isoformat()
 
-    def _load_index(self):
-        """加载索引文件（快速）"""
-        if self.index_path.exists():
-            try:
-                with open(self.index_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # data 应为 [{"conv_id": "...", "title": "...", "updated_at": "..."}, ...]
-                    for item in data:
-                        self.conversations[item["conv_id"]] = item
-            except Exception as e:
-                print(f"加载索引失败: {e}，将重建索引")
-                self._rebuild_index()
-        else:
-            self._rebuild_index()
+    def _generate_id(self) -> str:
+        import time
+        import random
+        timestamp = int(time.time() * 1000)
+        rand = random.randint(1000, 9999)
+        return f"group-{timestamp}-{rand}"
 
-    def _rebuild_index(self):
-        """扫描所有对话文件，重建索引（通常在文件损坏或首次运行时调用）"""
-        self.conversations.clear()
-        for file in HISTORY_DIR.glob("*.json"):
-            if file.name == "index.json":
-                continue
-            try:
-                with open(file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # 只提取元数据
-                    meta = {
-                        "conv_id": data["conv_id"],
-                        "title": data["title"],
-                        "updated_at": data["updated_at"]
-                    }
-                    self.conversations[data["conv_id"]] = meta
-            except Exception as e:
-                print(f"重建索引时跳过文件 {file}: {e}")
-        self._save_index()
-
-    def _save_index(self):
-        """保存索引到文件"""
-        with open(self.index_path, "w", encoding="utf-8") as f:
-            json.dump(list(self.conversations.values()), f, ensure_ascii=False, indent=2)
-
-    def create_conversation(self, title="新对话") -> Conversation:
-        conv = Conversation(title=title)
-        # 保存完整对话内容到文件
-        self.save_conversation(conv)
-        # 更新索引
-        self.conversations[conv.conv_id] = {
-            "conv_id": conv.conv_id,
-            "title": conv.title,
-            "updated_at": conv.updated_at
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "name": self.name,
+            "created_at": self.created_at
         }
-        self._save_index()
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        group = cls(data["group_id"], data["name"])
+        group.created_at = data["created_at"]
+        return group
+
+
+class HistoryManager:
+    """管理对话和分组，使用 SQLite 存储"""
+    def __init__(self):
+        self._init_db()
+        self._load_cache()
+
+    def _get_connection(self):
+        return sqlite3.connect(str(DB_PATH))
+
+    def _init_db(self):
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            # 分组表
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    created_at TEXT
+                )
+            ''')
+            # 对话表
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    conv_id TEXT PRIMARY KEY,
+                    group_id TEXT,
+                    title TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE SET NULL
+                )
+            ''')
+            # 消息表
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conv_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    message_data TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY (conv_id) REFERENCES conversations(conv_id) ON DELETE CASCADE
+                )
+            ''')
+            conn.commit()
+
+    def _load_cache(self):
+        """加载所有分组和对话元数据到内存（用于快速显示）"""
+        self.groups: Dict[str, dict] = {}      # group_id -> {name, created_at}
+        self.conversations: Dict[str, dict] = {}  # conv_id -> {title, group_id, updated_at}
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            # 加载分组
+            c.execute("SELECT group_id, name, created_at FROM groups")
+            for row in c.fetchall():
+                self.groups[row[0]] = {"name": row[1], "created_at": row[2]}
+            # 加载对话元数据
+            c.execute("SELECT conv_id, group_id, title, updated_at FROM conversations")
+            for row in c.fetchall():
+                self.conversations[row[0]] = {
+                    "group_id": row[1],
+                    "title": row[2],
+                    "updated_at": row[3]
+                }
+
+    # ---------- 分组操作 ----------
+    def create_group(self, name: str = "新分组") -> Group:
+        group = Group(name=name)
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO groups (group_id, name, created_at) VALUES (?, ?, ?)",
+                      (group.group_id, group.name, group.created_at))
+            conn.commit()
+        self.groups[group.group_id] = {"name": group.name, "created_at": group.created_at}
+        return group
+
+    def rename_group(self, group_id: str, new_name: str):
+        if group_id not in self.groups:
+            return
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE groups SET name = ? WHERE group_id = ?", (new_name, group_id))
+            conn.commit()
+        self.groups[group_id]["name"] = new_name
+
+    def delete_group(self, group_id: str, move_to_group_id: str = None):
+        """删除分组，如果 move_to_group_id 指定，则将该分组下的对话移动到目标分组，否则移动到 None（未分组）"""
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            # 移动对话
+            c.execute("UPDATE conversations SET group_id = ? WHERE group_id = ?",
+                      (move_to_group_id, group_id))
+            # 删除分组
+            c.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
+            conn.commit()
+        # 更新缓存
+        if group_id in self.groups:
+            del self.groups[group_id]
+        for conv_id, meta in self.conversations.items():
+            if meta["group_id"] == group_id:
+                meta["group_id"] = move_to_group_id
+
+    def get_all_groups(self) -> List[dict]:
+        """返回所有分组信息（用于左侧列表）"""
+        return [{"group_id": gid, **info} for gid, info in self.groups.items()]
+
+    # ---------- 对话操作 ----------
+    def create_conversation(self, title="新对话", group_id: str = None) -> Conversation:
+        conv = Conversation(title=title, group_id=group_id)
+        self.save_conversation(conv)
         return conv
 
     def save_conversation(self, conv: Conversation):
-        """保存完整对话内容"""
-        file_path = HISTORY_DIR / f"{conv.conv_id}.json"
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(conv.to_dict(), f, ensure_ascii=False, indent=2)
-        # 更新索引中的元数据（如果存在）
-        if conv.conv_id in self.conversations:
-            self.conversations[conv.conv_id].update({
-                "title": conv.title,
-                "updated_at": conv.updated_at
-            })
-        else:
-            self.conversations[conv.conv_id] = {
-                "conv_id": conv.conv_id,
-                "title": conv.title,
-                "updated_at": conv.updated_at
-            }
-        self._save_index()
+        # 将 group_id 统一为 None 或有效字符串
+        group_id = conv.group_id if conv.group_id else None
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            # 插入或替换对话元数据
+            c.execute('''
+                INSERT OR REPLACE INTO conversations (conv_id, group_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (conv.conv_id, group_id, conv.title, conv.created_at, conv.updated_at))
+            # 删除该对话的所有现有消息
+            c.execute("DELETE FROM messages WHERE conv_id = ?", (conv.conv_id,))
+            # 插入所有消息
+            for msg in conv.messages:
+                msg_json = json.dumps(msg, ensure_ascii=False)
+                c.execute('''
+                    INSERT INTO messages (conv_id, role, content, message_data, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (conv.conv_id, msg.get("role", ""), msg.get("content", ""), msg_json, datetime.now().isoformat()))
+            conn.commit()
+        # 更新缓存
+        self.conversations[conv.conv_id] = {
+            "group_id": group_id,
+            "title": conv.title,
+            "updated_at": conv.updated_at
+        }
 
     def delete_conversation(self, conv_id: str):
-        """删除对话"""
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM conversations WHERE conv_id = ?", (conv_id,))
+            conn.commit()
         if conv_id in self.conversations:
             del self.conversations[conv_id]
-        file_path = HISTORY_DIR / f"{conv_id}.json"
-        if file_path.exists():
-            file_path.unlink()
-        self._save_index()
+
+    def move_conversation(self, conv_id: str, target_group_id: str):
+        """移动对话到指定分组（target_group_id 可为 None 表示未分组）"""
+        if conv_id not in self.conversations:
+            return
+        # 将假值转换为 None
+        if not target_group_id:
+            target_group_id = None
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE conversations SET group_id = ? WHERE conv_id = ?",
+                      (target_group_id, conv_id))
+            conn.commit()
+        self.conversations[conv_id]["group_id"] = target_group_id
 
     def get_conversation(self, conv_id: str) -> Optional[Conversation]:
-        """按需加载完整对话内容"""
-        file_path = HISTORY_DIR / f"{conv_id}.json"
-        if file_path.exists():
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return Conversation.from_dict(data)
-            except Exception as e:
-                print(f"加载对话 {conv_id} 失败: {e}")
-        return None
+        with self._get_connection() as conn:
+            c = conn.cursor()
+            # 获取对话元数据
+            c.execute("SELECT group_id, title, created_at, updated_at FROM conversations WHERE conv_id = ?", (conv_id,))
+            row = c.fetchone()
+            if not row:
+                return None
+            group_id, title, created_at, updated_at = row
+            # 获取所有消息
+            c.execute("SELECT message_data FROM messages WHERE conv_id = ? ORDER BY id", (conv_id,))
+            msg_rows = c.fetchall()
+            messages = [json.loads(row[0]) for row in msg_rows]
 
-    def get_all_sorted(self) -> List[dict]:
-        """返回元数据列表，按更新时间排序"""
-        return sorted(self.conversations.values(),
-                      key=lambda x: x["updated_at"], reverse=True)
+        conv = Conversation(conv_id, title, group_id)
+        conv.created_at = created_at
+        conv.updated_at = updated_at
+        conv.messages = messages
+        return conv
 
-    def _get_file_path(self, conv_id: str) -> Path:
-        return HISTORY_DIR / f"{conv_id}.json"
-
-    '''
-    def load_all(self):
-        """加载所有对话历史"""
-        self.conversations.clear()
-        for file in HISTORY_DIR.glob("*.json"):
-            try:
-                with open(file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    conv = Conversation.from_dict(data)
-                    self.conversations[conv.conv_id] = conv
-            except Exception as e:
-                print(f"加载对话历史失败 {file}: {e}")
-    # '''
-
-    def set_current(self, conv_id: str):
-        self.current_id = conv_id
+    def get_conversations_by_group(self) -> Dict[Optional[str], List[dict]]:
+        result = {}
+        for conv_id, meta in self.conversations.items():
+            group_id = meta["group_id"]
+            # 将假值（None, False, 0, "" 等）统一为 None
+            if not group_id:
+                group_id = None
+            if group_id not in result:
+                result[group_id] = []
+            result[group_id].append({"conv_id": conv_id, **meta})
+        for group_id in result:
+            result[group_id].sort(key=lambda x: x["updated_at"], reverse=True)
+        return result
 
     def generate_title_from_messages(self, conv: Conversation) -> str:
-        """根据对话内容自动生成标题（简单规则：取第一条用户消息的前10字）"""
         for msg in conv.messages:
             if msg["role"] == "user":
                 title = msg["content"][:20].strip()
