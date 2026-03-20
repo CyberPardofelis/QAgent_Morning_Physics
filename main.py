@@ -1095,7 +1095,7 @@ class ChatWindow(QMainWindow):
             for msg in self.current_conversation.messages:
                 messages.append(msg.copy())  # ✅ 复制完整消息，保留所有字段
             messages = self.clean_messages_for_api(messages)
-            # print(messages)
+            print(messages)
         else:
             # 没有当前对话（不应发生）
             messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]

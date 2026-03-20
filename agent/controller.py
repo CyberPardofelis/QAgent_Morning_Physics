@@ -65,7 +65,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_paper",
-            "description": "分析一篇论文（通过 arXiv ID 或本地 PDF），提取结构化信息并保存到知识库。如果论文已存在，会覆盖原有记录。当用户说到本地时，将提供的论文id作为本地pdf文件名，优先在本地查找。",
+            "description": "分析一篇论文（通过 arXiv ID 或本地 PDF），提取结构化信息并保存到知识库。如果论文已存在，会覆盖原有记录。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -112,7 +112,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_today_topic_arxiv",
-            "description": "Generate a daily summary of new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
+            "description": "Analyze today's or new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
             "parameters": {
                 "type": "object",
                 "properties": {
