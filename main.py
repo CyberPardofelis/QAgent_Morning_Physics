@@ -566,6 +566,10 @@ class ChatWindow(QMainWindow):
 
         self.update_regenerate_button_state()
 
+        # 默认系统提示词
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        self.default_system_prompt = settings.value("default_system_prompt", SYSTEM_PROMPT)
+
         # ICON
         icon_path = "resources/app_icon.ico"  # 根据实际路径调整
         self.setWindowIcon(QIcon(icon_path))
@@ -606,7 +610,8 @@ class ChatWindow(QMainWindow):
             self._remove_last_ai_message()
 
         # 构建消息列表（包含系统提示和当前对话所有消息）
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        system_prompt = self._get_current_system_prompt()
+        messages = [{"role": "system", "content": system_prompt}]
         for msg in self.current_conversation.messages:
             messages.append(msg.copy())
         messages = self.clean_messages_for_api(messages)
@@ -662,6 +667,7 @@ class ChatWindow(QMainWindow):
             item.setData(Qt.UserRole, meta["conv_id"])
             self.conv_list.addItem(item)
 
+    '''
     def create_new_conversation(self):
         """创建新对话并切换到它"""
         # 如果有正在进行的对话，先保存
@@ -683,6 +689,7 @@ class ChatWindow(QMainWindow):
         # 添加系统欢迎消息
         self.add_chat_message("system", "新对话已创建。")
         self.update_regenerate_button_state()
+    # '''
 
     def switch_conversation(self, item):
         """切换对话"""
@@ -750,6 +757,7 @@ class ChatWindow(QMainWindow):
             if self.current_conversation and self.current_conversation.conv_id == conv.conv_id:
                 self.current_conversation.title = conv.title
 
+    '''
     def delete_conversation(self, conv: Conversation, item: QListWidgetItem):
         reply = QMessageBox.question(self, "确认删除", f"确定要删除对话“{conv.title}”吗？",
                                      QMessageBox.Yes | QMessageBox.No)
@@ -764,7 +772,7 @@ class ChatWindow(QMainWindow):
                     self.switch_conversation(self.conv_list.item(0))
                 else:
                     self.create_new_conversation()
-
+    # '''
     '''
     def on_navigation_requested(self, request):
         """拦截导航，http/https链接在外部浏览器打开，其他放行"""
@@ -1073,20 +1081,21 @@ class ChatWindow(QMainWindow):
         self.input_edit.clear()
         self.adjust_input_height()
         self.add_chat_message("user", text)
-
+        system_prompt = self._get_current_system_prompt()
         # 将用户消息添加到当前对话对象
         if self.current_conversation:
             self.current_conversation.add_message("user", text)
 
             # 构建完整的消息列表
-            # 替换原来的循环
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+            messages = [{"role": "system", "content": system_prompt}]
             for msg in self.current_conversation.messages:
                 messages.append(msg.copy())  # ✅ 复制完整消息，保留所有字段
             messages = self.clean_messages_for_api(messages)
+            print(messages)
         else:
             # 没有当前对话（不应发生）
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
 
         # 启动生成
         self._run_with_messages(messages)
@@ -1274,7 +1283,11 @@ class ChatWindow(QMainWindow):
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)  # 关闭时自动销毁
+        dialog.default_prompt_changed.connect(self.on_default_prompt_changed)
         dialog.show()
+
+    def on_default_prompt_changed(self, new_prompt):
+        self.default_system_prompt = new_prompt
 
     def _save_llm_summary(self, final_messages):
         """从 final_messages 中提取论文 ID 和最后一条助手消息，保存到数据库"""
@@ -1320,7 +1333,16 @@ class ChatWindow(QMainWindow):
 
     def refresh_tree(self):
         """刷新左侧树形结构"""
-        # print("刷新树形结构")
+        '''
+        print("刷新树形结构")
+        grouped = self.history_manager.get_conversations_by_group()
+        # 打印所有对话 ID
+        all_ids = []
+        for group_id, convs in grouped.items():
+            for conv in convs:
+                all_ids.append(conv['conv_id'])
+        print("当前对话 ID 列表:", all_ids)
+        # '''
         grouped = self.history_manager.get_conversations_by_group()
         groups_info = {g["group_id"]: g for g in self.history_manager.get_all_groups()}
 
@@ -1381,7 +1403,7 @@ class ChatWindow(QMainWindow):
         if self.current_conversation and self.current_conversation.conv_id == conv_id:
             return  # 已经是当前对话
         # 保存当前
-        if self.current_conversation:
+        if self.current_conversation and self.current_conversation.conv_id in self.history_manager.conversations:
             self.history_manager.save_conversation(self.current_conversation)
         conv = self.history_manager.get_conversation(conv_id)
         if conv:
@@ -1444,9 +1466,13 @@ class ChatWindow(QMainWindow):
             delete_action.triggered.connect(lambda: self.delete_group(group_id))
             new_conv_action = QAction("在此分组新建对话", self)
             new_conv_action.triggered.connect(lambda: self.create_new_conversation(group_id))
+            set_prompt_action = QAction("设置系统提示词", self)
+            set_prompt_action.triggered.connect(lambda: self.open_group_prompt_dialog(group_id))
+
             menu.addAction(rename_action)
             menu.addAction(delete_action)
             menu.addAction(new_conv_action)
+            menu.addAction(set_prompt_action)
             menu.exec(self.conv_tree.mapToGlobal(pos))
         elif data and data.startswith("conv:"):
             # 对话项
@@ -1499,6 +1525,8 @@ class ChatWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.history_manager.delete_group(group_id, move_to_group_id=None)
+            settings = QSettings("CyberPardofelis", "LLM科研助手")
+            settings.remove(f"group_system_prompt/{group_id}")
             self.refresh_tree()
 
     def move_conversation(self, conv_id, target_group_id):
@@ -1555,7 +1583,26 @@ class ChatWindow(QMainWindow):
             # print("should auto scroll, scrolling...")
             self.scroll_to_bottom()
 
+    def _get_current_system_prompt(self):
+        """获取当前对话应使用的系统提示词"""
+        if self.current_conversation and self.current_conversation.group_id:
+            group_id = self.current_conversation.group_id
+            settings = QSettings("CyberPardofelis", "LLM科研助手")
+            group_prompt = settings.value(f"group_system_prompt/{group_id}")
+            if group_prompt:
+                return group_prompt
+        return self.default_system_prompt
+
+    def open_group_prompt_dialog(self, group_id):
+        # 获取分组名称
+        groups = self.history_manager.get_all_groups()
+        group_name = next((g['name'] for g in groups if g['group_id'] == group_id), "未知分组")
+        dialog = GroupSystemPromptDialog(group_id, group_name, self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.show()  # 非模态
+
 class SettingsDialog(QDialog):
+    default_prompt_changed = Signal(str)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
@@ -1666,10 +1713,30 @@ class SettingsDialog(QDialog):
         embed_layout.addLayout(embed_form)
         embed_layout.addStretch()
 
-        # 将三个标签页添加到 tab_widget
+        # ----- 标签页4：系统提示词 -----
+        prompt_tab = QWidget()
+        prompt_layout = QVBoxLayout(prompt_tab)
+
+        # 说明标签
+        info_label = QLabel("设置默认系统提示词（将作为所有新对话的初始系统提示，分组可单独覆盖）")
+        info_label.setWordWrap(True)
+        prompt_layout.addWidget(info_label)
+
+        # 多行文本编辑框
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setPlaceholderText("输入默认系统提示词...")
+        prompt_layout.addWidget(self.prompt_edit)
+
+        # 恢复默认按钮
+        reset_btn = QPushButton("恢复默认提示词")
+        reset_btn.clicked.connect(self.reset_default_prompt)
+        prompt_layout.addWidget(reset_btn)
+
+        # 标签页添加到 tab_widget
         tab_widget.addTab(pref_tab, "首选项")
         tab_widget.addTab(journal_tab, "期刊设置")
         tab_widget.addTab(embed_tab, "Embedding 设置")
+        tab_widget.addTab(prompt_tab, "系统提示词")
 
         # ----- 底部按钮 -----
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1689,6 +1756,10 @@ class SettingsDialog(QDialog):
         self.embedding_enabled_embed.stateChanged.connect(
             lambda state: self.embedding_enabled_pref.setCheckState(state)
         )
+
+    def reset_default_prompt(self):
+        from agent.prompts import SYSTEM_PROMPT
+        self.prompt_edit.setPlainText(SYSTEM_PROMPT)
 
     def _load_font_size(self):
         """从 QSettings 加载字体大小设置"""
@@ -1811,7 +1882,12 @@ class SettingsDialog(QDialog):
         # 应用字体大小（需要重启，但可以提示）
         QMessageBox.information(self, "提示",
                                 "配置已保存。部分更改（如字体）需要重启应用才能生效。")
+        new_prompt = self.prompt_edit.toPlainText()
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings.setValue("default_system_prompt", new_prompt)
+        self.default_prompt_changed.emit(new_prompt)
         super().accept()
+
 
 
 class KnowledgeBaseDialog(QDialog):
@@ -2414,6 +2490,64 @@ class MessageBubble(QWidget):
         # 最终全量渲染（确保格式正确）
         self.view.setMarkdown("")
         self.view.setMarkdown(self.full_text)
+
+
+class GroupSystemPromptDialog(QDialog):
+    def __init__(self, group_id, group_name, parent=None):
+        super().__init__(parent)
+        self.group_id = group_id
+        self.group_name = group_name
+        self.setWindowTitle(f"设置系统提示词 - {group_name}")
+        self.setMinimumSize(600, 400)
+        self.setStyleSheet(GLOBAL_STYLESHEET)  # 复用全局样式
+
+        layout = QVBoxLayout(self)
+
+        # 提示标签
+        label = QLabel(f"为分组「{group_name}」设置自定义系统提示词（留空则使用全局默认）")
+        layout.addWidget(label)
+
+        # 文本编辑框
+        self.prompt_edit = QTextEdit()
+        layout.addWidget(self.prompt_edit)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.save_prompt)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        # 加载已有设置
+        self.load_prompt()
+
+    def load_prompt(self):
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        prompt = settings.value(f"group_system_prompt/{self.group_id}")
+        if prompt:
+            self.prompt_edit.setPlainText(prompt)
+
+    def save_prompt(self):
+        # 检查分组是否仍然存在（防止删除后保存）
+        parent = self.parent()
+        if parent and hasattr(parent, 'history_manager'):
+            groups = parent.history_manager.get_all_groups()
+            if not any(g['group_id'] == self.group_id for g in groups):
+                QMessageBox.warning(self, "错误", "该分组已被删除，无法保存")
+                self.reject()
+                return
+
+        new_prompt = self.prompt_edit.toPlainText().strip()
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        if new_prompt:
+            settings.setValue(f"group_system_prompt/{self.group_id}", new_prompt)
+        else:
+            settings.remove(f"group_system_prompt/{self.group_id}")  # 空字符串视为使用默认
+        self.accept()
 
 
 if __name__ == "__main__":

@@ -221,12 +221,20 @@ class HistoryManager:
         }
 
     def delete_conversation(self, conv_id: str):
+        print(f"准备删除对话 {conv_id}")
         with self._get_connection() as conn:
             c = conn.cursor()
             c.execute("DELETE FROM conversations WHERE conv_id = ?", (conv_id,))
             conn.commit()
+            # 检查是否删除成功
+            c.execute("SELECT COUNT(*) FROM conversations WHERE conv_id = ?", (conv_id,))
+            count = c.fetchone()[0]
+            print(f"删除后 conversations 表中该 ID 剩余记录数: {count}")
         if conv_id in self.conversations:
             del self.conversations[conv_id]
+            print("已从缓存中删除")
+        else:
+            print("缓存中未找到该 ID")
 
     def move_conversation(self, conv_id: str, target_group_id: str):
         """移动对话到指定分组（target_group_id 可为 None 表示未分组）"""
