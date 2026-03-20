@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=['./agent'],
     binaries=[],
-    datas=[('agent/aps_journals.yaml', 'agent')],
+    datas=[('agent/aps_journals.yaml', 'agent', 'resources')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
