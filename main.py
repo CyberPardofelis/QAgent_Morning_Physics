@@ -562,7 +562,13 @@ class ChatWindow(QMainWindow):
         # '''
         self.current_conversation = None
         self.clear_chat()
-        self.add_chat_message("system", "LLM科研助手已启动。请选择模式并开始对话。")
+        self.add_chat_message("system",
+                              "LLM科研助手已启动。请选择模式并开始对话。\n\n"
+                              "发送 早上好 arxiv/pra/prl等 以获取对应平台新文章摘要.\n\n"
+                              "发送 分析+文章DOI 以下载并分析对应文章，分析结果会保存至知识库。\n\n"
+                              "在分析文章之后可以发送 保存评论：评论内容 以将文章评论保存到知识库\n\n"
+                              "菜单栏中打开知识库，可以进行检索并打开相关文章的详情页面查看\n\n"
+                              "在详情页面可以查看和修改总结信息、引用信息、评论和LLM详细总结等")
 
         self.update_regenerate_button_state()
 
