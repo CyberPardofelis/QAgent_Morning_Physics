@@ -203,7 +203,19 @@ def get_deepseek_client():
 # =============================
 # 流式输出函数（核心）
 # =============================
-def run_agent_stream(messages: list, mode="deepseek"):
+def run_agent_stream(
+    messages: list,
+    mode: str = "deepseek",
+    # 以下全部可配置
+    model: str = None,                     # 如果为 None，则使用 config.DEEPSEEK_MODEL
+    temperature: float = 0.3,
+    top_p: float = 0.9,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    max_tokens: int = 8192,                # 根据 model 自动调整也行，但就给个默认值
+    timeout: int = 180,
+    enable_thinking: bool = True,          # 是否开启思考模式
+    reasoning_effort: str = "high"):
     """
     流式调用 DeepSeek (支持思考模式、工具调用)，返回 token 生成器
     """
@@ -227,9 +239,14 @@ def run_agent_stream(messages: list, mode="deepseek"):
             tools=TOOLS,
             tool_choice="auto",
             stream=True,
-            temperature=0.3,
-            max_tokens=8192 if mode == "deepseek" else 4096,
-            extra_body={"thinking": {"type": "enabled"}} if mode == "deepseek" else {}
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            extra_body={"thinking": {"type": "enabled"}} if enable_thinking else {},
+            reasoning_effort=reasoning_effort if enable_thinking else None
         )
 
         # 用于累积当前子回合（sub-turn）的完整响应

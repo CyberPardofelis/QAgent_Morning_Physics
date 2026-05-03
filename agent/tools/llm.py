@@ -31,8 +31,8 @@ def _call_llm(
         model: str = "deepseek-v4-flash",
         enable_thinking: bool = False,
         reasoning_effort: str = "high",  # "high" 或 "max"
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        temperature: float = 0.3,
+        top_p: float = 0.8,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         max_tokens: int = 8192,  # V4 最大384k

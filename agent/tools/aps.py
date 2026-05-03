@@ -56,75 +56,63 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
         raise Exception(f"浏览器自动化抓取失败: {str(e)}")
 
 def parse_aps_papers_from_html(html: str) -> list:
-    """
-    从 APS 页面 HTML 中解析论文列表。
-    基于当前实际页面结构：每篇文章在 div.browse-result-card 中。
-    """
     soup = BeautifulSoup(html, 'html.parser')
     papers = []
-
-    # 定位所有文章卡片
     article_cards = soup.find_all('div', class_='browse-result-card')
     print(f"找到 {len(article_cards)} 个文章卡片")
 
-    for card in article_cards:
-        paper = {}
+    for idx, card in enumerate(article_cards):
+        try:
+            paper = {}
 
-        # 1. 提取标题和链接
-        title_tag = card.find('h4', class_='title')
-        if title_tag:
-            link_tag = title_tag.find('a', href=True)
-            if link_tag:
-                paper['title'] = link_tag.get_text().strip()
-                relative_link = link_tag['href']
-                paper['link'] = 'https://journals.aps.org' + relative_link
-                # 从链接中提取 DOI 作为 ID
-                doi_match = re.search(r'10\.1103/[\w\.-]+', relative_link)
-                if doi_match:
-                    paper['doi'] = doi_match.group()
-                    paper['id'] = paper['doi']#.split('/')[-1]  # 提取ID部分作为本地标识
-            else:
+            # 1. 标题和链接：直接从 a.default-link-no-flex 获取
+            link_tag = card.find('a', class_='default-link-no-flex', href=True)
+            if not link_tag:
+                print(f"卡片 {idx} 没有找到链接标签，跳过")
                 continue
-        else:
+            relative_link = link_tag['href']
+            paper['link'] = 'https://journals.aps.org' + relative_link
+            paper['title'] = link_tag.get_text().strip()
+            if not paper['title']:
+                print(f"卡片 {idx} 标题为空，跳过")
+                continue
+
+            # 提取 DOI
+            doi_match = re.search(r'10\.1103/[\w\.-]+', relative_link)
+            if not doi_match:
+                print(f"卡片 {idx} 未找到 DOI，跳过")
+                continue
+            paper['doi'] = doi_match.group()
+            paper['id'] = paper['doi']
+
+            # 2. 作者和日期：获取所有 p.t-sm-regular.text-text-regular-neutral
+            info_paragraphs = card.find_all('p', class_='t-sm-regular text-text-regular-neutral')
+            # 第一个 p 是作者
+            paper['authors'] = info_paragraphs[0].get_text().strip() if len(info_paragraphs) > 0 else ""
+            # 第二个 p 包含期刊和日期
+            if len(info_paragraphs) > 1:
+                date_text = info_paragraphs[1].get_text().strip()
+                # 提取 "Published 1 May, 2026" 部分
+                date_match = re.search(r'Published (.+)$', date_text)
+                paper['published_date'] = date_match.group(1) if date_match else date_text
+            else:
+                paper['published_date'] = ""
+
+            # 3. 摘要：在 div.summary 内部的 p 标签中
+            summary_div = card.find('div', class_='summary')
+            if summary_div:
+                abstract_p = summary_div.find('p')
+                paper['abstract'] = abstract_p.get_text().strip() if abstract_p else ""
+            else:
+                paper['abstract'] = ""
+
+            papers.append(paper)
+
+        except Exception as e:
+            print(f"解析卡片 {idx} 时发生异常: {e}，跳过该论文")
             continue
 
-        # 2. 提取作者（第一个包含作者列表的 <p> 标签）
-        # 通常作者在第一个 <p class="t-sm-regular text-text-regular-neutral"> 中
-        author_paragraphs = card.find_all('p', class_='t-sm-regular text-text-regular-neutral')
-        if author_paragraphs:
-            # 第一个 <p> 通常是作者
-            paper['authors'] = author_paragraphs[0].get_text().strip()
-        else:
-            paper['authors'] = ''
-
-        # 3. 提取摘要：摘要位于隐藏的 <div class="summary ..."> 中
-        # 这个 div 包含 data-abstract 属性
-        abstract_div = card.find('div', class_='summary', attrs={'data-abstract': True})
-        if abstract_div:
-            paper['abstract'] = abstract_div.get('data-abstract', '').strip()
-        else:
-            # 如果没有 data-abstract，尝试获取 div 内的文本（但通常 data-abstract 存在）
-            abstract_div = card.find('div', class_='summary')
-            if abstract_div:
-                paper['abstract'] = abstract_div.get_text().strip()
-            else:
-                paper['abstract'] = ''
-
-        # 4. 提取发表日期（可选，用于信息丰富）
-        # 日期通常在第二个 <p class="t-sm-regular text-text-regular-neutral"> 中
-        if len(author_paragraphs) > 1:
-            date_text = author_paragraphs[1].get_text().strip()
-            # 尝试提取日期部分，例如 "Published 26 February, 2026"
-            date_match = re.search(r'Published (.+)$', date_text)
-            if date_match:
-                paper['published_date'] = date_match.group(1)
-            else:
-                paper['published_date'] = date_text
-        else:
-            paper['published_date'] = ''
-
-        papers.append(paper)
-
+    print(f"成功解析 {len(papers)} 篇论文")
     return papers
 
 def generate_aps_daily_summary(journal: str = 'prl'):
@@ -163,7 +151,7 @@ def generate_aps_daily_summary(journal: str = 'prl'):
         论文列表：
         {papers_text}
         """
-
+        # print(prompt)
         analysis = _call_llm(prompt)
         return analysis
     except Exception as e:

@@ -15,7 +15,7 @@ from ui.message_bubble import MessageBubble
 from ui.settings_dialog import SettingsDialog
 from ui.knowledge_base_dialog import KnowledgeBaseDialog
 from ui.group_prompt_dialog import GroupSystemPromptDialog
-from agent.tools import update_paper_comment, DB_PATH, query_knowledge, get_paper_by_id, get_db_connection, get_recent_papers, update_full_paper
+from agent.tools import get_paper_by_id
 from agent.prompts import SYSTEM_PROMPT
 import config
 
@@ -251,41 +251,6 @@ class ChatWindow(QMainWindow):
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
 
-    def refresh_conv_list(self):
-        """刷新左侧对话列表"""
-        self.conv_list.clear()
-        conversations = self.history_manager.get_all_sorted()  # 返回元数据列表
-        for meta in conversations:  # meta 是字典
-            updated = datetime.fromisoformat(meta["updated_at"]).strftime("%m-%d %H:%M")
-            display_text = f"{meta['title']}\n{updated}"
-            item = QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, meta["conv_id"])
-            self.conv_list.addItem(item)
-
-
-    def switch_conversation(self, item):
-        """切换对话"""
-        conv_id = item.data(Qt.UserRole)
-        if not conv_id:
-            return
-        # 保存当前对话
-        if self.current_conversation:
-            self.history_manager.save_conversation(self.current_conversation)
-        # 加载新对话
-        conv = self.history_manager.get_conversation(conv_id)
-        if conv:
-            self.current_conversation = conv
-            self.history_manager.set_current(conv_id)
-            # 清空聊天界面并加载历史消息
-            self.clear_chat()
-            # 只显示用户、助手、系统消息，跳过工具消息
-            for msg in conv.messages:
-                if msg["role"] in ("user", "assistant", "system"):
-                    self.add_chat_message(msg["role"], msg["content"])
-            # 滚动到底部
-            self.scroll_to_bottom()
-        self.update_regenerate_button_state()
-
     def clear_chat(self):
         while self.scroll_layout.count():
             child = self.scroll_layout.takeAt(0)
@@ -296,26 +261,6 @@ class ChatWindow(QMainWindow):
         QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(
             self.scroll_area.verticalScrollBar().maximum()
         ))
-
-    def show_conv_context_menu(self, pos: QPoint):
-        """右键菜单：重命名、删除"""
-        item = self.conv_list.itemAt(pos)
-        if not item:
-            return
-        conv_id = item.data(Qt.UserRole)
-        conv = self.history_manager.get_conversation(conv_id)
-        if not conv:
-            return
-        menu = QMenu()
-        rename_action = QAction("重命名", self)
-        delete_action = QAction("删除", self)
-        menu.addAction(rename_action)
-        menu.addAction(delete_action)
-        action = menu.exec(self.conv_list.mapToGlobal(pos))
-        if action == rename_action:
-            self.rename_conversation(conv)
-        elif action == delete_action:
-            self.delete_conversation(conv, item)
 
     def rename_conversation(self, conv: Conversation):
         new_title, ok = QInputDialog.getText(self, "重命名对话", "输入新标题：",
@@ -531,26 +476,6 @@ class ChatWindow(QMainWindow):
         if self.current_conversation:
             self.history_manager.save_conversation(self.current_conversation)
         event.accept()
-
-    def delete_conversation(self, conv: Conversation, item: QListWidgetItem):
-        reply = QMessageBox.question(self, "确认删除", f"确定要删除对话“{conv.title}”吗？",
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            # 1. 调用历史管理器删除（仅传递ID）
-            self.history_manager.delete_conversation(conv.conv_id)
-
-            # 2. 从列表控件中移除该项
-            row = self.conv_list.row(item)
-            self.conv_list.takeItem(row)
-
-            # 3. 如果删除的是当前对话，则切换或新建
-            if self.current_conversation and self.current_conversation.conv_id == conv.conv_id:
-                self.current_conversation = None  # 关键：先清除当前对话引用
-                if self.conv_list.count() > 0:
-                    self.conv_list.setCurrentRow(0)
-                    self.switch_conversation(self.conv_list.item(0))
-                else:
-                    self.create_new_conversation()
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
