@@ -1,12 +1,12 @@
 import json
 import traceback
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, QUrl, QSettings, QPoint
-from PySide6.QtGui import QDesktopServices, QAction, QIcon
+from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QMenu,
     QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QComboBox, QInputDialog,
-    QPlainTextEdit, QMessageBox, QScrollArea, QSizePolicy, QListWidgetItem
+    QPlainTextEdit, QMessageBox, QScrollArea, QSizePolicy, QCheckBox
 )
 from agent.history_manager import HistoryManager, Conversation
 from ui.styles import GLOBAL_STYLESHEET
@@ -15,6 +15,7 @@ from ui.message_bubble import MessageBubble
 from ui.settings_dialog import SettingsDialog
 from ui.knowledge_base_dialog import KnowledgeBaseDialog
 from ui.group_prompt_dialog import GroupSystemPromptDialog
+from ui.comparison_config_dialog import ComparisonConfigDialog
 from agent.tools import get_paper_by_id
 from agent.prompts import SYSTEM_PROMPT
 import config
@@ -82,9 +83,17 @@ class ChatWindow(QMainWindow):
         top_layout = QHBoxLayout()
         top_layout.addWidget(QLabel("模式："))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["openai", "deepseek", "compare"])
+        self.mode_combo.addItems(["openai", "deepseek-flash", "deepseek-pro", "compare"])
         self.mode_combo.setCurrentIndex(1)
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         top_layout.addWidget(self.mode_combo)
+        # top_layout.addStretch()
+
+        # 思考模式开关
+        self.think_checkbox = QCheckBox("思考模式")
+        self.think_checkbox.setChecked(True)
+        top_layout.addWidget(self.think_checkbox)
+
         top_layout.addStretch()
         right_layout.addLayout(top_layout)
 
@@ -115,7 +124,7 @@ class ChatWindow(QMainWindow):
         #self.send_btn.setFixedWidth(60)
         self.send_btn.clicked.connect(self.send_message)
 
-        # 新增：中止和重新生成按钮，垂直排列
+        # 中止和重新生成按钮，垂直排列
         self.stop_btn = QPushButton("中止")
         self.stop_btn.setObjectName("stopBtn")
         #self.stop_btn.setFixedWidth(80)
@@ -154,16 +163,15 @@ class ChatWindow(QMainWindow):
         search_action.triggered.connect(self.open_knowledge_base)
         menubar.addAction(search_action)
 
+        # 对比模式设置
+        compare_config_action = QAction("对比模式设置", self)
+        compare_config_action.triggered.connect(self.show_comparison_config_dialog)
+        menubar.addAction(compare_config_action)
+
         # 事件过滤、状态等
         self.input_edit.installEventFilter(self)
         self.processing = False
         self.current_message_id = None
-        self._last_ai_message_id = None
-
-        # 其他原有属性
-        self.input_edit.installEventFilter(self)
-        self.processing = False
-        self.current_message_id = None  # 用于流式追加消息
         self._last_ai_message_id = None
 
         # 加载历史对话列表（树形）
@@ -182,6 +190,7 @@ class ChatWindow(QMainWindow):
                               "在详情页面可以查看和修改总结信息、引用信息、评论和LLM详细总结等")
 
         self.update_regenerate_button_state()
+        self._load_comparison_config()
 
         # 默认系统提示词
         settings = QSettings("CyberPardofelis", "LLM科研助手")
@@ -306,7 +315,6 @@ class ChatWindow(QMainWindow):
             if new_msg.get("role") == "tool":
                 if "tool_call_id" not in new_msg:
                     print(f"!!! 发现损坏的 tool 消息 (索引 {i}):")
-                    #print(json.dumps(new_msg, ensure_ascii=False, indent=2))
                     print("    临时将角色改为 assistant 并继续")
                     # 临时修复：将其视为 assistant 消息
                     new_msg["role"] = "assistant"
@@ -344,20 +352,31 @@ class ChatWindow(QMainWindow):
         # 将用户消息添加到当前对话对象
         if self.current_conversation:
             self.current_conversation.add_message("user", text)
-
-            # 构建完整的消息列表
-
+            system_prompt = self._get_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
             for msg in self.current_conversation.messages:
-                messages.append(msg.copy())  # ✅ 复制完整消息，保留所有字段
+                messages.append(msg.copy())
             messages = self.clean_messages_for_api(messages)
-            # print(messages)
         else:
-            # 没有当前对话（不应发生）
-            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
+            messages = [{"role": "system", "content": self.default_system_prompt}, {"role": "user", "content": text}]
 
-        # 启动生成
-        self._run_with_messages(messages)
+        mode = self.mode_combo.currentText()
+        if mode == "compare":
+            self._run_comparison(messages)
+        else:
+            # 单模型模式：收集额外参数
+            model_name = self._get_model_name_by_mode(mode)
+            enable_thinking = self.think_checkbox.isChecked() if mode != "compare" else True
+            extra_params = {
+                "model": model_name,
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": "high" if enable_thinking else None
+            }
+            self._run_single_model(messages, mode, extra_params)
 
     def on_stream_chunk(self, sender, chunk):
         # print(f"on_stream_chunk: sender={sender}, chunk='{chunk[:50]}'")  # 调试
@@ -563,9 +582,8 @@ class ChatWindow(QMainWindow):
             for conv_meta in ungrouped_convs:
                 self._add_conversation_item(ungrouped_item, conv_meta)
 
-        self.conv_tree.expandAll()
+        # self.conv_tree.expandAll()
 
-        self.conv_tree.expandAll()
 
     def _add_conversation_item(self, parent_item, conv_meta):
         # print("添加对话项:", conv_meta["conv_id"], conv_meta["title"])
@@ -788,3 +806,198 @@ class ChatWindow(QMainWindow):
         dialog = GroupSystemPromptDialog(group_id, group_name, self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.show()  # 非模态
+
+    def _load_comparison_config(self):
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        try:
+            self.compare_config_a = json.loads(settings.value("comparison/config_a",
+                                                              '{"model":"deepseek-flash","thinking":true,"temperature":0.3,"top_p":0.9,"frequency_penalty":0.0,"presence_penalty":0.0}'))
+            self.compare_config_b = json.loads(settings.value("comparison/config_b",
+                                                              '{"model":"deepseek-pro","thinking":true,"temperature":0.3,"top_p":0.9,"frequency_penalty":0.0,"presence_penalty":0.0}'))
+        except:
+            self.compare_config_a = {"model": "deepseek-flash", "thinking": True, "temperature": 0.3, "top_p": 0.9,
+                                     "frequency_penalty": 0.0, "presence_penalty": 0.0}
+            self.compare_config_b = {"model": "deepseek-pro", "thinking": True, "temperature": 0.3, "top_p": 0.9,
+                                     "frequency_penalty": 0.0, "presence_penalty": 0.0}
+
+    def show_comparison_config_dialog(self):
+        dialog = ComparisonConfigDialog(self)
+        if dialog.exec():
+            # 重新加载配置
+            self._load_comparison_config()
+
+    def on_mode_changed(self, mode):
+        """模式切换时，思考模式开关的可用性变化"""
+        if mode == "compare":
+            self.think_checkbox.setEnabled(False)
+            self.think_checkbox.setToolTip("对比模式下，请使用「对比模式设置」分别配置各模型的思考开关")
+        else:
+            self.think_checkbox.setEnabled(True)
+            self.think_checkbox.setToolTip("思考模式已开启")
+
+    def _get_model_name_by_mode(self, mode: str) -> str:
+        if mode == "openai":
+            return config.OPENAI_MODEL
+        # deepseek-flash 和 deepseek-pro 直接返回
+        return mode
+
+    def _run_single_model(self, messages, mode, extra_params):
+        self.processing = True
+        self.send_btn.setEnabled(False)
+        self.input_edit.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.regenerate_btn.setEnabled(False)
+        self._last_ai_message_id = None
+
+        self.worker = Worker(messages, mode, extra_params=extra_params)
+        self.worker.stream_chunk.connect(self.on_stream_chunk)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def _run_comparison(self, messages):
+        """顺序调用两个模型，分别生成气泡"""
+        if self.processing:
+            return
+        self.processing = True
+        self.send_btn.setEnabled(False)
+        self.input_edit.setEnabled(False)
+        self.stop_btn.setEnabled(True)     # 中止会同时停止当前正在进行的worker
+        self.regenerate_btn.setEnabled(False)
+
+        # 将对比配置转换为两份额外参数
+        params_a = {
+            "model": self._resolve_model_name(self.compare_config_a["model"]),
+            "temperature": self.compare_config_a["temperature"],
+            "top_p": self.compare_config_a["top_p"],
+            "frequency_penalty": self.compare_config_a["frequency_penalty"],
+            "presence_penalty": self.compare_config_a["presence_penalty"],
+            "enable_thinking": self.compare_config_a["thinking"],
+            "reasoning_effort": "high" if self.compare_config_a["thinking"] else None
+        }
+        params_b = {
+            "model": self._resolve_model_name(self.compare_config_b["model"]),
+            "temperature": self.compare_config_b["temperature"],
+            "top_p": self.compare_config_b["top_p"],
+            "frequency_penalty": self.compare_config_b["frequency_penalty"],
+            "presence_penalty": self.compare_config_b["presence_penalty"],
+            "enable_thinking": self.compare_config_b["thinking"],
+            "reasoning_effort": "high" if self.compare_config_b["thinking"] else None
+        }
+
+        # 先显示一个提示消息
+        self.add_chat_message("system", "⚖️ 对比模式开始，将先后展示两个模型的回复...")
+
+        # 使用队列顺序执行
+        self._comparison_index = 0
+        self._comparison_params = [params_a, params_b]
+        self._comparison_messages = messages.copy()   # 每个模型独立的历史？
+        # 注意：对比模式下，两个模型应该使用相同的对话历史（当前消息），但互不干扰，所以每个模型独立拷贝一份。
+        self._run_next_comparison()
+
+    def _run_next_comparison(self):
+        if self._comparison_index >= len(self._comparison_params):
+            # 对比结束
+            self.processing = False
+            self.send_btn.setEnabled(True)
+            self.input_edit.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.update_regenerate_button_state()
+            self.input_edit.setFocus()
+
+            if self.current_conversation:
+                self.history_manager.save_conversation(self.current_conversation)
+                self.refresh_tree()
+            return
+
+        model_label = "模型 A" if self._comparison_index == 0 else "模型 B"
+        self.add_chat_message("system", f"🤖 {model_label} 开始生成...")
+        extra_params = self._comparison_params[self._comparison_index]
+        # 每个模型使用独立的messages拷贝，避免相互污染
+        msgs_copy = [msg.copy() for msg in self._comparison_messages]
+        self.worker = Worker(msgs_copy, "custom", extra_params=extra_params)   # mode 可以传任意值，内部会用extra_params中的model_name
+        self.worker.stream_chunk.connect(self.on_comparison_chunk)
+        self.worker.finished.connect(self.on_comparison_finished)
+        self.worker.start()
+
+    def on_comparison_chunk(self, sender, chunk):
+        # 需要区分是哪个模型正在输出，但由于顺序执行，直接调用原有方法
+        if self._comparison_index == 0:
+            prefix = "🔵 模型 A: "
+        else:
+            prefix = "🟢 模型 B: "
+        # 第一个块加入前缀，后续块直接追加
+        if not hasattr(self, "_comparison_last_bubble") or self._comparison_last_bubble is None:
+            self.add_chat_message("assistant", prefix + chunk, isAppend=False)
+            self._comparison_last_bubble = "assistant"
+            # 更新历史记录
+            if self.current_conversation:
+                self.current_conversation.add_message("assistant", prefix + chunk)
+        else:
+            self.add_chat_message("assistant", chunk, isAppend=True)
+            if self.current_conversation and self.current_conversation.messages:
+                last_msg = self.current_conversation.messages[-1]
+                if last_msg["role"] == "assistant":
+                    last_msg["content"] += chunk
+
+    def on_comparison_finished(self, reply, error, final_messages):
+        if error:
+            self.add_chat_message("system", f"对比模型生成出错: {error}")
+        else:
+            # 确保完整内容已追加到UI和历史
+            last_bubble = self.find_last_assistant_bubble()
+            if last_bubble:
+                last_bubble.finalize()
+        self._comparison_index += 1
+        self._comparison_last_bubble = None
+        # 继续下一个模型
+        self._run_next_comparison()
+
+    def regenerate_message(self):
+        if self.processing:
+            return
+        if not self.current_conversation:
+            return
+        # 找到最后一条用户消息
+        user_msg_index = -1
+        for i in range(len(self.current_conversation.messages) - 1, -1, -1):
+            if self.current_conversation.messages[i]["role"] == "user":
+                user_msg_index = i
+                break
+        if user_msg_index == -1:
+            QMessageBox.information(self, "提示", "没有用户消息可供重新生成")
+            return
+        if (len(self.current_conversation.messages) > user_msg_index + 1 and
+                self.current_conversation.messages[-1]["role"] == "assistant"):
+            self._remove_last_ai_message()
+        system_prompt = self._get_current_system_prompt()
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in self.current_conversation.messages:
+            messages.append(msg.copy())
+        messages = self.clean_messages_for_api(messages)
+        mode = self.mode_combo.currentText()
+        if mode == "compare":
+            # 重新生成时默认使用对比模式配置，且不保留之前对比产生的两个回复
+            # 先清空最后两个assistant消息（如果有）
+            while self.current_conversation.messages and self.current_conversation.messages[-1]["role"] == "assistant":
+                self.current_conversation.messages.pop()
+            self._run_comparison(messages)
+        else:
+            model_name = self._get_model_name_by_mode(mode)
+            enable_thinking = self.think_checkbox.isChecked()
+            extra_params = {
+                "model": model_name,
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": "high" if enable_thinking else None
+            }
+            self._run_single_model(messages, mode, extra_params)
+
+    def _resolve_model_name(self, model_type: str) -> str:
+        """将配置中存储的模型类型转换为实际 API 模型名"""
+        if model_type == "openai":
+            return config.OPENAI_MODEL
+        # deepseek-flash 和 deepseek-pro 直接返回自身
+        return model_type
