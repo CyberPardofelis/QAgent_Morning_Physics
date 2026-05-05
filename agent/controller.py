@@ -1,4 +1,5 @@
 import json
+import re
 from openai import OpenAI
 from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY, EMBEDDING_ENABLED
 from agent.prompts import SYSTEM_PROMPT
@@ -104,7 +105,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_daily_summary_arxiv",
-            "description": "Generate a daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
+            "description": "Generate a detailed daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -112,7 +113,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_today_topic_arxiv",
-            "description": "Generate a daily summary of new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
+            "description": "Generate a detailed daily summary of new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -126,7 +127,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_aps_daily_summary",
-            "description": "Generate a daily summary of new quantum information papers from an APS journal. Use this when the user says 'good morning' followed by a journal name like 'PRL' or 'PRA'.",
+            "description": "Generate a detailed daily summary of new quantum information papers from an APS journal. Use this when the user says 'good morning' followed by a journal name like 'PRL' or 'PRA'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -212,10 +213,14 @@ def run_agent_stream(
     top_p: float = 0.9,
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
-    max_tokens: int = 8192,                # 根据 model 自动调整也行，但就给个默认值
+    max_tokens: int = 40000,                # 根据 model 自动调整也行，但就给个默认值
     timeout: int = 180,
     enable_thinking: bool = True,          # 是否开启思考模式
     reasoning_effort: str = "high"):
+
+    # 直接输出工具：这些工具返回的内容就是最终答案，不需要再交给模型处理
+    DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
+
     """
     流式调用 DeepSeek (支持思考模式、工具调用)，返回 token 生成器
     """
@@ -299,33 +304,25 @@ def run_agent_stream(
             break
 
         # ========== 关键修改点 2 ==========
-        # 执行工具调用，并将结果以 "tool" 角色追加
+        # 先收集本轮所有工具调用结果
+        tool_responses = []  # 存储 (tool_call_id, content)
         for tool_call in current_sub_turn_message["tool_calls"]:
             fn_name = tool_call["function"]["name"]
 
             # 检查是否因embedding禁用而拒绝执行
             if not EMBEDDING_ENABLED and fn_name in EMBEDDING_TOOL_NAMES:
-                error_result = f"工具 {fn_name} 需要 embedding 支持，但当前已在配置中禁用。"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": error_result
-                })
+                content = f"工具 {fn_name} 需要 embedding 支持，但当前已在配置中禁用。"
+                tool_responses.append((tool_call["id"], content))
                 continue
 
-            # 注意：这里需要异常处理，因为参数可能不完整
             try:
                 args = json.loads(tool_call["function"]["arguments"])
             except json.JSONDecodeError as e:
-                error_result = f"工具 {fn_name} 参数解析失败: {e}"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": error_result
-                })
+                content = f"工具 {fn_name} 参数解析失败: {e}"
+                tool_responses.append((tool_call["id"], content))
                 continue
-            result = None
 
+            result = None
             if fn_name == "search_papers":
                 result = search_papers(args["query"])
             elif fn_name == "run_python":
@@ -387,15 +384,56 @@ def run_agent_stream(
             else:
                 result = f"未知工具: {fn_name}"
 
-            # 在添加 tool 消息之前
-            if not tool_call.get("id"):
-                print(f"错误：tool_call 缺少 id，跳过该工具调用")
-                continue
+            # 将结果转换为字符串
+            if result is None:
+                content = f"工具 {fn_name} 执行无返回"
+            elif isinstance(result, str):
+                content = result
+            else:
+                content = json.dumps(result, ensure_ascii=False)
+            tool_responses.append((tool_call["id"], content))
+
+        # 将所有 tool 消息追加到 messages
+        for tool_call_id, content in tool_responses:
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call["id"],  # 必须有此字段，且值来自对应的工具调用ID
-                "content": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
+                "tool_call_id": tool_call_id,
+                "content": content
             })
+
+        # 检查本轮调用的工具是否属于直接输出类型
+        called_tool_names = {tc["function"]["name"] for tc in current_sub_turn_message["tool_calls"]}
+        if called_tool_names & DIRECT_OUTPUT_TOOLS:
+            for _, content in tool_responses:
+                # 按主要章节分割（整体概览、1. 量子算法...）
+                content = '\n' + content
+                parts = re.split(r'(?=^###\s+(?:整体概览|\d+\.))', content, flags=re.MULTILINE)
+                for part in parts:
+                    if not part.strip():
+                        continue
+                    # 进一步将章节内的论文按 "#### " 或 "论文 X." 分割
+                    # 注意：整体概览部分可能没有论文标题，直接作为一个气泡
+                    if part.startswith('### 整体概览'):
+                        yield part
+                        yield "\x1cNEW_BUBBLE"
+                        continue
+                    # 匹配 "#### 论文 X." 或 "\n#### 论文 X." 或 "\n论文 X."
+                    # 使用正则按行分割论文条目
+                    paper_parts = re.split(r'(?=\n####\s+论文\s+\d+\.|\n论文\s+\d+\.)', part)
+                    for i, paper_part in enumerate(paper_parts):
+                        if not paper_part.strip():
+                            continue
+                        # 如果是章节头（第一个 part 可能是章节标题和引言）
+                        if i == 0:
+                            # 章节标题单独显示为一个气泡
+                            yield paper_part
+                        else:
+                            # 每篇论文单独气泡
+                            yield paper_part
+                        yield "\x1cNEW_BUBBLE"
+            break
+
+
 
 def _stream_openai(client, model, user_input):
     messages = [

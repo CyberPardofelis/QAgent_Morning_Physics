@@ -1,5 +1,6 @@
 import os
 import yaml
+import json
 from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QCheckBox,
@@ -151,6 +152,29 @@ class SettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
         main_layout.addWidget(button_box)
 
+        #----- 标签页5：每日总结范围 -----
+
+        daily_scope_tab = QWidget()
+        daily_scope_layout = QVBoxLayout(daily_scope_tab)
+
+        # 使用 QScrollArea 容纳复选框列表
+        daily_scroll = QScrollArea()
+        daily_scroll.setWidgetResizable(True)
+        daily_scope_layout.addWidget(daily_scroll)
+
+        daily_content = QWidget()
+        daily_content_layout = QVBoxLayout(daily_content)
+        daily_scroll.setWidget(daily_content)
+
+        # 存储复选框的字典 self.daily_checkboxes
+        self.daily_checkboxes = {}
+
+        # 加载期刊列表（包括 arxiv 和 YAML 中的 journal keys）
+        self._populate_daily_checkboxes(daily_content_layout)
+
+        daily_scope_layout.addStretch()
+        tab_widget.addTab(daily_scope_tab, "每日总结范围")
+
         # 加载现有配置
         self._load_config()
         self._load_journals_config()
@@ -198,8 +222,8 @@ class SettingsDialog(QDialog):
     def _get_yaml_path(self):
         """获取 journals.yaml 的绝对路径"""
         # SettingsDialog 所在文件位于项目根目录，agent 是子目录
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(current_dir, 'agent', 'journals.yaml')
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base_dir, 'agent', 'journals.yaml')
 
     def _load_config(self):
         """从 QSettings 加载首选项和 Embedding 配置"""
@@ -226,6 +250,11 @@ class SettingsDialog(QDialog):
         self.model_path.setText(settings.value("MODEL_PATH", ""))
         self.data_dir.setText(settings.value("DATA_DIR", ""))
         self.vector_dir.setText(settings.value("VECTOR_DIR", ""))
+
+        # 加载每日总结范围
+        daily_journals = json.loads(settings.value("daily_summary_journals", '["arxiv"]'))
+        for journal_key, cb in self.daily_checkboxes.items():
+            cb.setChecked(journal_key in daily_journals)
 
     def _load_journals_config(self):
         """从 YAML 文件加载期刊 section 值到输入框"""
@@ -293,4 +322,41 @@ class SettingsDialog(QDialog):
         settings = QSettings("CyberPardofelis", "LLM科研助手")
         settings.setValue("default_system_prompt", new_prompt)
         self.default_prompt_changed.emit(new_prompt)
+
+        # 保存每日总结范围
+        selected = [key for key, cb in self.daily_checkboxes.items() if cb.isChecked()]
+        settings.setValue("daily_summary_journals", json.dumps(selected))
+
         super().accept()
+
+    def _get_journal_keys_from_yaml(self):
+        """从 journals.yaml 读取所有期刊键名（如 prl, pra...）"""
+        yaml_path = self._get_yaml_path()
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            return list(data.get('journals', {}).keys())
+        except Exception as e:
+            print(f"读取期刊列表失败: {e}")
+            return []
+
+    def _populate_daily_checkboxes(self, layout):
+        """创建每日总结范围的复选框"""
+        # 清除已有
+        for cb in self.daily_checkboxes.values():
+            cb.deleteLater()
+        self.daily_checkboxes.clear()
+
+        # 添加 arxiv
+        cb_arxiv = QCheckBox("arXiv")
+        self.daily_checkboxes["arxiv"] = cb_arxiv
+        layout.addWidget(cb_arxiv)
+
+        # 添加 YAML 中的期刊
+        journal_keys = self._get_journal_keys_from_yaml()
+        for key in journal_keys:
+            cb = QCheckBox(key.upper())  # 显示大写，如 PRL
+            self.daily_checkboxes[key] = cb
+            layout.addWidget(cb)
+
+        layout.addStretch()

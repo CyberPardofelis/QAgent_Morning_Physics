@@ -35,7 +35,7 @@ def _call_llm(
         top_p: float = 0.8,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
-        max_tokens: int = 8192,  # V4 最大384k
+        max_tokens: int = 40000,  # V4 最大384k
         timeout: int = 180,
 ) -> str:
 

@@ -107,16 +107,19 @@ def generate_daily_summary_arxiv():
     # 构建提示词，要求LLM输出包含ID和链接的亮点
     prompt = f"""
     你现在是一个科研助手。以下是从 arXiv.org 抓取的“量子物理（quant-ph）”类别最新论文列表（共 {len(papers)} 篇）。
-    请按研究方向分类总结，每个类别挑选 **2-3 篇** 亮点论文，并确保在描述亮点时**包含该论文的 arXiv ID 和超链接**（使用格式 `[标题](链接)`）。
+    请按研究方向分类总结，每个类别挑选 **4-5 篇** 亮点论文，并确保在描述亮点时**包含该论文的 arXiv ID 和超链接**（使用格式 `[标题](链接)`）。
 
     **任务要求：**
     1. **整体概览**：一句话说明今天新上榜论文总数。
     2. **分类总结**：根据标题和摘要，将论文分为合理的研究方向（例如：量子算法与纠错、量子模拟、量子信息理论、实验与测量技术、量子机器学习等）。
-     3. **亮点提取**：每个分类下列出 **2-3 篇** 亮点论文。**每篇亮点必须使用以下格式：**
-       - `**标题** [arxiv:ID]`：一句核心贡献说明
-       **确保每个亮点单独一行，不要有多余换行。**
-       例如:**QSolver: A Quantum Constraint Solver** [arXiv:2602.20171]：首个针对量子程序的约束求解框架，用于确保程序正确性。
-    4. **输出格式**：使用清晰 Markdown 格式（### 小标题、- 列表等）。
+    3. **格式要求**：
+        #### 论文序号. 论文标题（超链接）
+        - **作者**：列出所有作者（如果超过5位，列出前3位加“等”）
+        - **arXiv ID**：[id]
+        - **核心贡献**：用 2-3 句话概括论文的主要创新点
+        - **方法**：简述使用的方法或技术路线（50字左右）
+        - **意义与展望**：该工作的潜在影响或后续研究方向（40字左右）
+    4. **输出格式**：使用清晰 Markdown 格式（### 小标题、- 列表等）。总字数在50000字符以内。
 
     论文列表：
     {papers_text}
@@ -132,7 +135,7 @@ def generate_daily_summary_arxiv():
 
     summary = _call_llm(prompt)
     summary = _add_arxiv_links(summary)
-
+    # print(summary)
     return summary
 
 def analyze_today_topic_arxiv(topic: str):
@@ -197,4 +200,5 @@ def analyze_today_topic_arxiv(topic: str):
     """
 
     analysis = _call_llm(prompt)
+    # print(analysis)
     return analysis

@@ -94,6 +94,14 @@ class ChatWindow(QMainWindow):
         self.think_checkbox.setChecked(True)
         top_layout.addWidget(self.think_checkbox)
 
+        top_layout.addSpacing(20)
+
+        # 每日总结按钮
+        self.daily_summary_btn = QPushButton("每日总结")
+        self.daily_summary_btn.clicked.connect(self.on_daily_summary_clicked)
+        top_layout.addWidget(self.daily_summary_btn)
+        top_layout.addStretch()
+
         top_layout.addStretch()
         right_layout.addLayout(top_layout)
 
@@ -380,6 +388,9 @@ class ChatWindow(QMainWindow):
 
     def on_stream_chunk(self, sender, chunk):
         # print(f"on_stream_chunk: sender={sender}, chunk='{chunk[:50]}'")  # 调试
+        if chunk == "\x1cNEW_BUBBLE":
+            self._last_ai_message_id = None  # 下一个块将创建新气泡
+            return
         if sender != "assistant":
             return  # 忽略非助理消息（如 tool）
 
@@ -1001,3 +1012,50 @@ class ChatWindow(QMainWindow):
             return config.OPENAI_MODEL
         # deepseek-flash 和 deepseek-pro 直接返回自身
         return model_type
+
+    def on_daily_summary_clicked(self):
+        import json
+        from datetime import datetime
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QMessageBox
+
+        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        selected = json.loads(settings.value("daily_summary_journals", '["arxiv"]'))
+        if not selected:
+            QMessageBox.information(self, "提示", "请先在设置中勾选需要每日总结的期刊")
+            return
+
+        # 确保“每日总结”分组存在
+        group_name = "每日总结"
+        groups = self.history_manager.get_all_groups()
+        group_id = next((g["group_id"] for g in groups if g["name"] == group_name), None)
+        if group_id is None:
+            group_id = self.history_manager.create_group(group_name)
+
+        # 创建对话（可能会产生 datetime 对象）
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        conv = self.history_manager.create_conversation(title=f"{today_str}", group_id=group_id)
+
+        # 将 datetime 对象转换为 ISO 字符串（避免 SQLite 绑定错误）
+        if hasattr(conv.created_at, 'isoformat'):
+            conv.created_at = conv.created_at.isoformat()
+        if hasattr(conv.updated_at, 'isoformat'):
+            conv.updated_at = conv.updated_at.isoformat()
+
+        # 重新保存
+        self.history_manager.save_conversation(conv)
+        self.refresh_tree()
+        self.switch_conversation_by_id(conv.conv_id)
+
+        # 构造消息内容
+        lines = []
+        for j in selected:
+            if j == "arxiv":
+                lines.append("早上好 arxiv")
+            else:
+                lines.append(f"早上好 {j}")
+        full_msg = "\n".join(lines)
+
+        # 自动填入输入框并发送
+        self.input_edit.setPlainText(full_msg)
+        self.send_message()
