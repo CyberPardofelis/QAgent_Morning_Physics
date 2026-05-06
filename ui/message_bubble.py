@@ -3,9 +3,10 @@ import re
 import markdown
 import os
 import html as html_module
-from PySide6.QtCore import Qt, QTimer, QUrl, QEvent
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLayout
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLayout, QApplication
 from PySide6.QtWebEngineWidgets import QWebEngineView
+
 
 class MarkdownView(QWebEngineView):
     MAX_HEIGHT = 26000
@@ -17,13 +18,26 @@ class MarkdownView(QWebEngineView):
         self._base_loaded = False
         self._pending_markdown = ""
         self._html_style = ""
-        self._max_width = 1800   # 默认最大宽度
+        self._max_width = 1800
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
+        # 关键 CSS：让 #content 既不过宽也不过窄
         base_html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style id="custom-style"></style>
-<style>html,body{margin:0;padding:0;background:transparent;overflow:hidden;word-wrap:break-word;}#content{background:transparent;}</style>
+<style>
+html,body{
+    margin:0; padding:0; background:transparent; overflow:hidden;
+}
+#content{
+    background:transparent;
+    display: inline-block;
+    white-space: normal;
+    word-wrap: break-word;
+    box-sizing: border-box;
+    max-width: 100%;
+}
+</style>
 <script>
 window.MathJax = {
     tex: {
@@ -89,17 +103,33 @@ window.MathJax = {
         }}
         """
         self.page().runJavaScript(js)
-        # 延长等待时间，给 MathJax 充分的渲染时间
-        QTimer.singleShot(350, lambda: self.adjust_to_max_width(self._max_width))
+        # 等待渲染完成后测量
+        QTimer.singleShot(100, lambda: self.adjust_to_max_width(self._max_width))
 
     def adjust_to_max_width(self, max_w: int):
-        """设置最大宽度限制，并重新测量内容尺寸"""
-        if max_w != self._max_width:
-            self.setMaximumWidth(max_w)
-            self.setMinimumWidth(0)
         self._max_width = max_w
-        # 临时设为最大宽度以测量真实宽度
+        # 临时放开宽度上限，保证内容有足够空间测量
         self.setFixedWidth(max_w)
+        self.page().runJavaScript(
+            "document.getElementById('content').scrollWidth",
+            self._on_natural_width_measured
+        )
+
+    def _on_natural_width_measured(self, width):
+        try:
+            natural_w = int(width)
+            print(width)
+        except (ValueError, TypeError):
+            natural_w = 180
+        final_w = max(180, min(natural_w, self._max_width))
+        self.setFixedWidth(final_w)
+        self.updateGeometry()
+        # 宽度变化后高度可能改变，延迟重测
+        QTimer.singleShot(100, self._remeasure_height)
+
+    def _remeasure_height(self):
+        if not self._auto_size:
+            return
         self.page().runJavaScript("document.body.scrollHeight", self._apply_height)
 
     def _apply_height(self, height):
@@ -109,38 +139,13 @@ window.MathJax = {
             h = int(height)
         except (ValueError, TypeError):
             return
-        # 超高时启用滚动
         if h > self.MAX_HEIGHT:
             self.page().runJavaScript("document.body.style.overflow = 'auto';")
             self.setFixedHeight(self.MAX_HEIGHT)
         else:
             self.page().runJavaScript("document.body.style.overflow = 'hidden';")
-            # 只有高度确实变化才更新，避免循环
             if h != self.height():
                 self.setFixedHeight(h)
-        # 接着测量内容宽度
-        self.page().runJavaScript(
-            "document.getElementById('content').scrollWidth",
-            self._apply_width
-        )
-
-    def _apply_width(self, width):
-        try:
-            w = int(width)
-        except (ValueError, TypeError):
-            w = 80
-        max_w = self._max_width
-        final_w = max(80, min(w, max_w))
-        self.setFixedWidth(final_w)
-        # 宽度变化可能导致高度改变（换行变化），延迟后重新测量高度
-        QTimer.singleShot(100, self._remeasure_height)
-        self.updateGeometry()
-
-    def _remeasure_height(self):
-        """宽度锁定后重新测量高度，确保高度与最终宽度匹配"""
-        if not self._auto_size:
-            return
-        self.page().runJavaScript("document.body.scrollHeight", self._apply_height)
 
     def _markdown_to_html(self, text: str) -> str:
         placeholders = []
@@ -169,6 +174,44 @@ window.MathJax = {
         html = html.replace('\x00MATHIN', '<span class="math inline">')
         return html
 
+    def adjust_to_max_width(self, max_w: int):
+        self._max_width = max_w
+        # 临时给一个较大的宽度，确保内容不换行，然后再测量真实宽度
+        self.setFixedWidth(max_w)
+        # 延迟让渲染完成，再测量宽度，避免拿到 0 或旧值
+        QTimer.singleShot(50, self._measure_content_width)
+
+    def _measure_content_width(self):
+        # 使用 offsetWidth 更稳定，并强制转为数字
+        js = """
+        (function() {
+            var el = document.getElementById('content');
+            return parseFloat(el.offsetWidth) || parseFloat(el.scrollWidth) || 0;
+        })()
+        """
+        self.page().runJavaScript(js, self._on_natural_width_measured)
+
+    def _on_natural_width_measured(self, width):
+        # 防御性转换，兼容 QVariant
+        try:
+            if hasattr(width, 'toInt'):
+                natural_w = width.toInt()[0] if width.toInt()[1] else int(width.toFloat()[0])
+            else:
+                natural_w = int(float(width))
+        except (ValueError, TypeError, AttributeError):
+            natural_w = 0
+            # 打印一下便于你确认
+            # print(f"[width debug] raw value: {width} type: {type(width)} → fallback to 0")
+
+        # 如果测量结果不正常（比如还是0），可以再重试一次（最多一次）
+        if natural_w <= 0:
+            natural_w = self._max_width  # 兜底使用上限
+
+        final_w = max(80, min(natural_w, self._max_width))
+        self.setFixedWidth(final_w)
+        self.updateGeometry()
+        QTimer.singleShot(100, self._remeasure_height)
+
 
 class MessageBubble(QWidget):
     def __init__(self, role: str, markdown_text: str, parent=None):
@@ -184,22 +227,20 @@ class MessageBubble(QWidget):
         self.update_timer.timeout.connect(self._flush_complete_lines)
         self._in_math_block = False
 
-        # 气泡背景与文本颜色
+        # 气泡样式
         if role == 'user':
             self.setStyleSheet("background-color: #77aaff; border-radius: 10px;")
             text_color = "white"
         elif role == 'assistant':
             self.setStyleSheet("background-color: white; border-radius: 10px;")
             text_color = "black"
-        else:  # system
+        else:
             self.setStyleSheet("background-color: #e9ecef; border-radius: 10px;")
             text_color = "#495057"
 
-        # 创建 MarkdownView
         self.view = MarkdownView()
         self.view.setAutoSize(True)
 
-        # 注入文本颜色
         if role == 'system':
             text_css = f"body {{ color: {text_color}; text-align: center; }} h1,h2,h3,h4,h5,h6 {{ color: {text_color} !important; }}"
         else:
@@ -207,58 +248,48 @@ class MessageBubble(QWidget):
         self.view.setHtmlStyle(text_css)
         self.view.setMarkdown(markdown_text)
 
-        # 布局
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(self.view)
-
-        # 关键：气泡尺寸完全由布局计算，自动跟随内容变化
         layout.setSizeConstraint(QLayout.SetFixedSize)
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         self._max_view_width = 1800
-
-        # 监听顶层窗口大小变化，保证对话区域缩放时气泡也更新
-        self._top_level = None
-        self._install_resize_filter()
-
-        # 首次计算宽度限制并开始测量内容
-        self.updateMaxWidth()
-
-    def _install_resize_filter(self):
-        """为顶层窗口安装事件过滤器，监听大小变化"""
-        # 通过 parent 逐级找到顶层窗口，不一定在 __init__ 时已经有 parent
-        # 所以放到 showEvent 或直接定时检测
-        self._top_level = self.window()
-        if self._top_level:
-            self._top_level.installEventFilter(self)
+        # 初始化时多次尝试获取正确宽度
+        QTimer.singleShot(0, self._delayed_update_max_width)
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 确保顶层窗口的过滤器已安装
-        if not self._top_level or self._top_level != self.window():
-            self._top_level = self.window()
-            if self._top_level:
-                self._top_level.installEventFilter(self)
-        # 显示时也更新一次宽度限制
-        self.updateMaxWidth()
+        QTimer.singleShot(0, self.updateMaxWidth)
 
-    def eventFilter(self, watched, event):
-        # 顶层窗口大小变化时，重新计算80%限制
-        if watched == self._top_level and event.type() == QEvent.Resize:
-            self.updateMaxWidth()
-        return super().eventFilter(watched, event)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.updateMaxWidth)
+
+    def _delayed_update_max_width(self):
+        # 尝试从父控件获取宽度
+        parent = self.parent()
+        if parent:
+            area_w = parent.width()
+        if not parent or area_w <= 0:
+            # 回退：取顶层窗口宽度的60%
+            top = self.window()
+            area_w = top.width() * 0.6 if top else 800
+        max_w = max(200, int(area_w * 0.8))
+        self._max_view_width = max_w
+        self.view.adjust_to_max_width(max_w)
 
     def updateMaxWidth(self):
         parent = self.parent()
         if parent:
             area_w = parent.width()
-            max_w = max(200, int(area_w * 0.8))
-        else:
-            max_w = 1800
-        if max_w != getattr(self, '_max_view_width', 0):
+        if not parent or area_w <= 0:
+            top = self.window()
+            area_w = top.width() * 0.6 if top else 800
+        max_w = max(200, int(area_w * 0.8))
+        if max_w != self._max_view_width:
             self._max_view_width = max_w
             self.view.adjust_to_max_width(max_w)
 
@@ -281,7 +312,6 @@ class MessageBubble(QWidget):
         safe_chunk = self._preprocess(chunk)
         self.full_text += safe_chunk
         self.view.setMarkdown(self.full_text)
-        # setMarkdown 会异步测量并调用 updateGeometry，无需额外操作
         self.update_timer.stop()
 
     def _preprocess(self, text: str) -> str:
