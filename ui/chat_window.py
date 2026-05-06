@@ -1099,3 +1099,32 @@ class ChatWindow(QMainWindow):
             widget = item.widget()
             if widget and isinstance(widget, MessageBubble):
                 widget.updateMaxWidth()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for i in range(self.scroll_layout.count()):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, MessageBubble):
+                widget.updateMaxWidth()
+        self.scroll_content.updateGeometry()
+
+    def add_chat_message(self, role: str, text: str, isAppend: bool = False):
+        if text == '':
+            return
+        if isAppend and role == 'assistant':
+            last_bubble = self.find_last_assistant_bubble()
+            if last_bubble:
+                last_bubble.update_content(text)
+                QTimer.singleShot(0, self.scroll_if_needed)
+                return
+
+        bubble = MessageBubble(role, text)
+        alignment_map = {
+            'user': Qt.AlignRight,
+            'assistant': Qt.AlignLeft,
+            'system': Qt.AlignCenter
+        }
+        self.scroll_layout.addWidget(bubble, 0, alignment_map.get(role, Qt.AlignLeft))
+        bubble.updateMaxWidth()
+        QTimer.singleShot(0, bubble.adjustSize)
+        self.scroll_if_needed()
