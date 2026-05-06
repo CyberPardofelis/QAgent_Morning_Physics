@@ -1,7 +1,7 @@
 import json
 import traceback
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtCore import Qt, QTimer, QSettings, QEvent
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QMenu,
@@ -303,8 +303,8 @@ class ChatWindow(QMainWindow):
         self.input_edit.setFixedHeight(desired)
 
     def eventFilter(self, obj, event):
-        if obj == self.input_edit and event.type() == event.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        if obj == self.input_edit and event.type() == 6:  # QEvent.KeyPress
+            if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
                 if event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
                     self.input_edit.insertPlainText("\n")
                     return True
@@ -414,7 +414,7 @@ class ChatWindow(QMainWindow):
                     last_msg["content"] += chunk
                     self.current_conversation.updated_at = datetime.now().isoformat()
 
-    def on_worker_finished(self, reply, error, final_messages):
+    def on_worker_finished(self, reply, error, final_messages, bubble_list):
         self.processing = False
         self.send_btn.setEnabled(True)
         self.input_edit.setEnabled(True)
@@ -430,16 +430,37 @@ class ChatWindow(QMainWindow):
         else:
             # 更新对话
             if self.current_conversation:
-                new_messages = [msg for msg in final_messages if msg["role"] != "system"]
-                self.current_conversation.messages = new_messages
-
-                self.current_conversation.updated_at = datetime.now().isoformat()
-                if self.current_conversation.title == "新对话":
-                    new_title = self.history_manager.generate_title_from_messages(self.current_conversation)
-                    if new_title:
-                        self.current_conversation.title = new_title
-                self.history_manager.save_conversation(self.current_conversation)
-                self.refresh_tree()
+                if bubble_list:
+                    # 直接输出工具产生的多个气泡
+                    # 保留用户消息，删除该用户消息之后的所有旧 assistant 消息
+                    # 找到最后一条用户消息的索引
+                    user_indices = [i for i, msg in enumerate(self.current_conversation.messages) if
+                                    msg["role"] == "user"]
+                    if user_indices:
+                        last_user_idx = user_indices[-1]
+                        # 保留到该用户消息（含），删除之后的消息
+                        self.current_conversation.messages = self.current_conversation.messages[:last_user_idx + 1]
+                    # 添加所有气泡作为 assistant 消息
+                    for bubble in bubble_list:
+                        self.current_conversation.add_message("assistant", bubble)
+                    self.current_conversation.updated_at = datetime.now().isoformat()
+                    if self.current_conversation.title == "新对话":
+                        new_title = self.history_manager.generate_title_from_messages(self.current_conversation)
+                        if new_title:
+                            self.current_conversation.title = new_title
+                    self.history_manager.save_conversation(self.current_conversation)
+                    self.refresh_tree()
+                else:
+                    # 非直接输出工具，保持原有逻辑
+                    new_messages = [msg for msg in final_messages if msg["role"] != "system"]
+                    self.current_conversation.messages = new_messages
+                    self.current_conversation.updated_at = datetime.now().isoformat()
+                    if self.current_conversation.title == "新对话":
+                        new_title = self.history_manager.generate_title_from_messages(self.current_conversation)
+                        if new_title:
+                            self.current_conversation.title = new_title
+                    self.history_manager.save_conversation(self.current_conversation)
+                    self.refresh_tree()
 
         last_bubble = self.find_last_assistant_bubble()
         if last_bubble:
@@ -477,7 +498,14 @@ class ChatWindow(QMainWindow):
 
         # 创建新气泡
         bubble = MessageBubble(role, text)
-        self.scroll_layout.addWidget(bubble)
+        # 根据角色设置气泡在布局中的对齐方式
+        alignment_map = {
+            'user': Qt.AlignRight,
+            'assistant': Qt.AlignLeft,
+            'system': Qt.AlignCenter
+        }
+        self.scroll_layout.addWidget(bubble, 0, alignment_map.get(role, Qt.AlignLeft))
+        QTimer.singleShot(0, bubble.adjustSize)
         self.scroll_if_needed()
 
     def find_last_assistant_bubble(self):
@@ -927,7 +955,9 @@ class ChatWindow(QMainWindow):
         msgs_copy = [msg.copy() for msg in self._comparison_messages]
         self.worker = Worker(msgs_copy, "custom", extra_params=extra_params)   # mode 可以传任意值，内部会用extra_params中的model_name
         self.worker.stream_chunk.connect(self.on_comparison_chunk)
-        self.worker.finished.connect(self.on_comparison_finished)
+        #self.worker.finished.connect(self.on_comparison_finished)
+        self.worker.finished.connect(
+            lambda reply, error, final_messages, _: self.on_comparison_finished(reply, error, final_messages))
         self.worker.start()
 
     def on_comparison_chunk(self, sender, chunk):
@@ -1059,3 +1089,13 @@ class ChatWindow(QMainWindow):
         # 自动填入输入框并发送
         self.input_edit.setPlainText(full_msg)
         self.send_message()
+
+    def resizeEvent(self, event):
+        """窗口大小改变时，让所有消息气泡重新计算宽度"""
+        super().resizeEvent(event)
+        # 遍历聊天区域中的所有气泡
+        for i in range(self.scroll_layout.count()):
+            item = self.scroll_layout.itemAt(i)
+            widget = item.widget()
+            if widget and isinstance(widget, MessageBubble):
+                widget.updateMaxWidth()

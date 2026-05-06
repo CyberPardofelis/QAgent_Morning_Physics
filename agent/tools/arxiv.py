@@ -84,11 +84,25 @@ def generate_daily_summary_arxiv():
             abstract_tag = dd.find('p', class_='mathjax')
             abstract = abstract_tag.get_text().strip() if abstract_tag else ''
 
+            # 提取作者
+            authors_tag = dd.find('div', class_='list-authors')
+            if authors_tag:
+                authors_text = authors_tag.get_text().replace('Authors:', '').strip()
+                # 可选：格式化作者列表（限制数量）
+                author_list = [a.strip() for a in authors_text.split(',') if a.strip()]
+                if len(author_list) > 5:
+                    authors = ', '.join(author_list[:3]) + ' 等'
+                else:
+                    authors = ', '.join(author_list)
+            else:
+                authors = "未知"
+
             papers.append({
                 'id': arxiv_id,
                 'title': title,
                 'abstract': abstract,
-                'link': f"https://arxiv.org/abs/{arxiv_id}"
+                'link': f"https://arxiv.org/abs/{arxiv_id}",
+                'authors': authors
             })
 
         if not papers:
@@ -98,6 +112,7 @@ def generate_daily_summary_arxiv():
         papers_text = ""
         for i, p in enumerate(papers, 1):
             papers_text += f"{i}. **{p['title']}**\n"
+            papers_text += f"   - 作者: {p.get('authors', '未知')}\n"
             papers_text += f"   - ID: `{p['id']}` | [arXiv链接]({p['link']})\n"
             papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
 
@@ -113,6 +128,7 @@ def generate_daily_summary_arxiv():
     1. **整体概览**：一句话说明今天新上榜论文总数。
     2. **分类总结**：根据标题和摘要，将论文分为合理的研究方向（例如：量子算法与纠错、量子模拟、量子信息理论、实验与测量技术、量子机器学习等）。
     3. **格式要求**：
+        ### 研究方向
         #### 论文序号. 论文标题（超链接）
         - **作者**：列出所有作者（如果超过5位，列出前3位加“等”）
         - **arXiv ID**：[id]
@@ -135,7 +151,7 @@ def generate_daily_summary_arxiv():
 
     summary = _call_llm(prompt)
     summary = _add_arxiv_links(summary)
-    # print(summary)
+    print(summary)
     return summary
 
 def analyze_today_topic_arxiv(topic: str):
