@@ -2,6 +2,7 @@ import sys
 import traceback
 import os
 from datetime import datetime
+from ui.message_bubble import MarkdownView
 
 try:
     # 原始导入和代码
@@ -44,6 +45,7 @@ sys.excepthook = excepthook
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # MarkdownView.preload_engine()
 
     # 读取字体大小设置
     settings = QSettings("CyberPardofelis", "LLM科研助手")

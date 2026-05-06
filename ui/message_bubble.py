@@ -4,12 +4,15 @@ import markdown
 import os
 import html as html_module
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLayout, QApplication
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLayout
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
 class MarkdownView(QWebEngineView):
     MAX_HEIGHT = 26000
+
+    # 预加载用的静态变量
+    _preloaded_engine = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -21,7 +24,7 @@ class MarkdownView(QWebEngineView):
         self._max_width = 1800
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        # 关键 CSS：让 #content 既不过宽也不过窄
+        # 基础 HTML 模板（外链 MathJax，稳定且可缓存）
         base_html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style id="custom-style"></style>
@@ -63,13 +66,65 @@ window.MathJax = {
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setMinimumWidth(10)
 
+    @staticmethod
+    def preload_engine(parent=None):
+        """在应用启动时调用：预加载一个隐藏的页面，预热浏览器引擎与 MathJax"""
+        if MarkdownView._preloaded_engine is not None:
+            return  # 已经预加载过
+        view = QWebEngineView()
+        view.setAttribute(Qt.WA_DontShowOnScreen, True)  # 完全隐藏
+        view.setVisible(False)
+        # 与正式视图使用相同的基础页面，确保 MathJax 被加载并缓存
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style id="custom-style"></style>
+<style>
+html,body{
+    margin:0; padding:0; background:transparent; overflow:hidden;
+}
+#content{
+    background:transparent;
+    display: inline-block;
+    white-space: normal;
+    word-wrap: break-word;
+    box-sizing: border-box;
+    max-width: 100%;
+}
+</style>
+<script>
+window.MathJax = {
+    tex: {
+        inlineMath: [['$','$'], ['\\(','\\)']],
+        displayMath: [['$$','$$'], ['\\[','\\]']]
+    },
+    options: {
+        renderActions: {
+            addMenu: []
+        }
+    },
+    svg: {
+        fontCache: 'global'
+    }
+};
+</script>
+<script type="text/javascript" async src="mathjax/tex-svg.js"></script>
+</head><body><div id="content"> </div></body></html>"""
+        view.setHtml(base_html, QUrl.fromLocalFile(base_dir + '/'))
+        # 保存实例防止被回收，等待加载完成
+        view.loadFinished.connect(lambda ok: setattr(view, '_loaded', True))
+        MarkdownView._preloaded_engine = view
+
     def _on_base_loaded(self, ok):
+        if not ok:
+            return
         self._base_loaded = True
         self.page().setBackgroundColor(Qt.transparent)
         if self._html_style:
             self._inject_style(self._html_style)
         if self._pending_markdown:
             self._update_content()
+            QTimer.singleShot(0, lambda: self.adjust_to_max_width(self._max_width))
 
     def _inject_style(self, css: str):
         css_escaped = json.dumps(css)
@@ -91,10 +146,12 @@ window.MathJax = {
         self._content_html = html_body
         if self._base_loaded:
             self._update_content()
+            QTimer.singleShot(0, lambda: self.adjust_to_max_width(self._max_width))
         else:
             self._pending_markdown = html_body
 
     def _update_content(self):
+        # 安全注入，json.dumps 保证任何 HTML 特殊字符都不会破坏 DOM
         html_escaped = json.dumps(self._content_html)
         js = f"""
         document.getElementById('content').innerHTML = {html_escaped};
@@ -103,29 +160,35 @@ window.MathJax = {
         }}
         """
         self.page().runJavaScript(js)
-        # 等待渲染完成后测量
-        QTimer.singleShot(100, lambda: self.adjust_to_max_width(self._max_width))
 
     def adjust_to_max_width(self, max_w: int):
         self._max_width = max_w
-        # 临时放开宽度上限，保证内容有足够空间测量
         self.setFixedWidth(max_w)
-        self.page().runJavaScript(
-            "document.getElementById('content').scrollWidth",
-            self._on_natural_width_measured
-        )
+        QTimer.singleShot(0, self._measure_content_width)
+
+    def _measure_content_width(self):
+        js = """
+        (function() {
+            var el = document.getElementById('content');
+            return parseFloat(el.offsetWidth) || parseFloat(el.scrollWidth) || 0;
+        })()
+        """
+        self.page().runJavaScript(js, self._on_natural_width_measured)
 
     def _on_natural_width_measured(self, width):
         try:
-            natural_w = int(width)
-            print(width)
-        except (ValueError, TypeError):
-            natural_w = 180
-        final_w = max(180, min(natural_w, self._max_width))
+            if hasattr(width, 'toInt'):
+                natural_w = width.toInt()[0] if width.toInt()[1] else int(width.toFloat()[0])
+            else:
+                natural_w = int(float(width))
+        except (ValueError, TypeError, AttributeError):
+            natural_w = 0
+        if natural_w <= 0:
+            natural_w = self._max_width
+        final_w = max(80, min(natural_w, self._max_width))
         self.setFixedWidth(final_w)
         self.updateGeometry()
-        # 宽度变化后高度可能改变，延迟重测
-        QTimer.singleShot(100, self._remeasure_height)
+        QTimer.singleShot(30, self._remeasure_height)   # 30ms 足够重排且肉眼看不出延迟
 
     def _remeasure_height(self):
         if not self._auto_size:
@@ -174,44 +237,6 @@ window.MathJax = {
         html = html.replace('\x00MATHIN', '<span class="math inline">')
         return html
 
-    def adjust_to_max_width(self, max_w: int):
-        self._max_width = max_w
-        # 临时给一个较大的宽度，确保内容不换行，然后再测量真实宽度
-        self.setFixedWidth(max_w)
-        # 延迟让渲染完成，再测量宽度，避免拿到 0 或旧值
-        QTimer.singleShot(50, self._measure_content_width)
-
-    def _measure_content_width(self):
-        # 使用 offsetWidth 更稳定，并强制转为数字
-        js = """
-        (function() {
-            var el = document.getElementById('content');
-            return parseFloat(el.offsetWidth) || parseFloat(el.scrollWidth) || 0;
-        })()
-        """
-        self.page().runJavaScript(js, self._on_natural_width_measured)
-
-    def _on_natural_width_measured(self, width):
-        # 防御性转换，兼容 QVariant
-        try:
-            if hasattr(width, 'toInt'):
-                natural_w = width.toInt()[0] if width.toInt()[1] else int(width.toFloat()[0])
-            else:
-                natural_w = int(float(width))
-        except (ValueError, TypeError, AttributeError):
-            natural_w = 0
-            # 打印一下便于你确认
-            # print(f"[width debug] raw value: {width} type: {type(width)} → fallback to 0")
-
-        # 如果测量结果不正常（比如还是0），可以再重试一次（最多一次）
-        if natural_w <= 0:
-            natural_w = self._max_width  # 兜底使用上限
-
-        final_w = max(80, min(natural_w, self._max_width))
-        self.setFixedWidth(final_w)
-        self.updateGeometry()
-        QTimer.singleShot(100, self._remeasure_height)
-
 
 class MessageBubble(QWidget):
     def __init__(self, role: str, markdown_text: str, parent=None):
@@ -257,7 +282,6 @@ class MessageBubble(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         self._max_view_width = 1800
-        # 初始化时多次尝试获取正确宽度
         QTimer.singleShot(0, self._delayed_update_max_width)
 
     def showEvent(self, event):
@@ -269,12 +293,10 @@ class MessageBubble(QWidget):
         QTimer.singleShot(0, self.updateMaxWidth)
 
     def _delayed_update_max_width(self):
-        # 尝试从父控件获取宽度
         parent = self.parent()
         if parent:
             area_w = parent.width()
         if not parent or area_w <= 0:
-            # 回退：取顶层窗口宽度的60%
             top = self.window()
             area_w = top.width() * 0.6 if top else 800
         max_w = max(200, int(area_w * 0.8))
