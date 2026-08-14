@@ -1,3 +1,4 @@
+# agent/controller.py
 import json
 import re
 from openai import OpenAI
@@ -10,196 +11,38 @@ from agent.tools import (
     search_arxiv, download_arxiv_paper, analyze_paper
 )
 from agent.llm_clients import get_openai_client, get_deepseek_client
+from agent.tool_definitions import BASE_TOOLS, EMBEDDING_TOOLS, EMBEDDING_TOOL_NAMES
+from agent.stream_utils import split_markdown_bubbles
+
 if EMBEDDING_ENABLED:
     from agent.tools import (search_papers, query_knowledge)
 
-# =============================
-# 工具定义
-# =============================
-
-# 不依赖embedding的论文查询、分析工具（始终可用）
-BASE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": "Execute python code",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string"}
-                },
-                "required": ["code"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_arxiv",
-            "description": "Search papers about certain topic and not care about time on arXiv by query",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer", "default": 10}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "download_arxiv_paper",
-            "description": "Download an arXiv paper by ID to local folder",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "arxiv_id": {"type": "string"}
-                },
-                "required": ["arxiv_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_paper",
-            "description": "分析一篇论文（通过 arXiv ID 或本地 PDF），提取结构化信息并保存到知识库。如果论文已存在，会覆盖原有记录。当用户说到本地时，将提供的论文id作为本地pdf文件名，优先在本地查找。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "paper_id": {"type": "string", "description": "arXiv ID 或 PDF 文件名（不含扩展名）"},
-                    "pdf_path": {"type": "string", "description": "本地 PDF 路径（可选，如果不提供则尝试在默认目录查找）"},
-                    "user_comment": {"type": "string", "description": "用户对论文的评论（可选）"}
-                },
-                "required": ["paper_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_paper_comment",
-            "description": "为已分析过的论文追加一条用户评论（仅更新评论，不重新分析论文内容）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "paper_id": {"type": "string", "description": "论文标识符（与 analyze_paper 使用的 ID 一致）"},
-                    "user_comment": {"type": "string", "description": "要添加的评论内容"}
-                },
-                "required": ["paper_id", "user_comment"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "scan_local_papers",
-            "description": "Scan local PDF folder and analyze new papers (incremental)",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_daily_summary_arxiv",
-            "description": "Generate a detailed daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_today_topic_arxiv",
-            "description": "Generate a detailed daily summary of new arXiv papers on a specific topic (e.g., quantum algorithms, quantum error correction)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "The research topic to focus on"}
-                },
-                "required": ["topic"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_aps_daily_summary",
-            "description": "Generate a detailed daily summary of new quantum information papers from an APS journal. Use this when the user says 'good morning' followed by a journal name like 'PRL' or 'PRA'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "journal": {
-                        "type": "string",
-                        "enum": ["prl", "pra", "prb", "prc", "prd", "pre", "prx","prxquantum","rmp","prapplied"],
-                        "description": "The APS journal code (e.g., 'prl' for Physical Review Letters, 'pra' for Physical Review A)."
-                    }
-                },
-                "required": ["journal"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "download_aps_paper",
-            "description": "通过DOI下载APS期刊论文（PRL, PRA, PRB等）的PDF到本地，如果DOI开头是10.1103，即为APS.当需要下载 APS 论文时，请直接调用 `download_aps_paper` 工具，并传入 DOI 参数。该工具会自动处理所有细节（包括获取重定向、下载PDF），无需额外运行 Python 代码。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doi": {"type": "string", "description": "论文DOI，例如 10.1103/PhysRevLett.136.080203"}
-                },
-                "required": ["doi"]
-            }
-        }
-    }
-]
-
-EMBEDDING_TOOLS=[
-    {
-        "type": "function",
-        "function": {
-            "name": "search_papers",
-            "description": "Search local research papers using vector index",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_knowledge",
-            "description": "Search the knowledge base by keyword/topic/author",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string"},
-                    "topic": {"type": "string"},
-                    "author": {"type": "string"}
-                }
-            }
-        }
-    },
-]
-
-EMBEDDING_TOOL_NAMES = {tool["function"]["name"] for tool in EMBEDDING_TOOLS}
+# 直接输出工具：这些工具返回的内容就是最终答案，不需要再交给模型处理
+DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
 
 # =============================
 # 创建 DeepSeek client
 # =============================
-def get_deepseek_client():
+def get_deepseek_client():   # 保留原函数，避免外部依赖改动
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com"
     )
 
+# =============================
+# 内部辅助：将一段文本按 Markdown 标题分割为气泡并 yield
+# =============================
+NEW_BUBBLE = "\x1cNEW_BUBBLE"
+NEW_BUBBLE_BATCH = "\x1cNEW_BUBBLE_BATCH"
+
+def _yield_bubbles(content: str):
+    """对任意文本内容，按 Markdown 三级+标题分割气泡并 yield"""
+    if not content:
+        return
+    bubbles = split_markdown_bubbles(content)
+    for bubble in bubbles:
+        yield bubble
+        yield NEW_BUBBLE
 
 # =============================
 # 流式输出函数（核心）
@@ -218,12 +61,6 @@ def run_agent_stream(
     enable_thinking: bool = True,          # 是否开启思考模式
     reasoning_effort: str = "high"):
 
-    # 直接输出工具：这些工具返回的内容就是最终答案，不需要再交给模型处理
-    DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
-
-    """
-    流式调用 DeepSeek (支持思考模式、工具调用)，返回 token 生成器
-    """
     if mode == "openai":
         client = get_openai_client()
         model = OPENAI_MODEL
@@ -233,7 +70,7 @@ def run_agent_stream(
         model = DEEPSEEK_MODEL
 
     if EMBEDDING_ENABLED:
-        TOOLS = BASE_TOOLS+EMBEDDING_TOOLS
+        TOOLS = BASE_TOOLS + EMBEDDING_TOOLS
     else:
         TOOLS = BASE_TOOLS
 
@@ -271,7 +108,7 @@ def run_agent_stream(
 
             if delta.content:
                 current_sub_turn_message["content"] += delta.content
-                yield delta.content  # 实时输出文本块
+                # ✅ 关键修改：不再在此处实时 yield，改为完整累积后再分割气泡
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -288,31 +125,37 @@ def run_agent_stream(
 
         if tool_call_dict:
             current_sub_turn_message["tool_calls"] = list(tool_call_dict.values())
-            # 新增：打印所有请求的工具名称
             for tc in current_sub_turn_message["tool_calls"]:
                 print(f"模型请求调用工具: {tc['function']['name']}")
         else:
-            # 关键：如果没有工具调用，删除 tool_calls 字段（避免空数组）
             current_sub_turn_message.pop("tool_calls", None)
 
-        # 将当前子回合的完整消息（包含 reasoning_content）追加到历史
-        # 这是 DeepSeek 多子回合能够继续推理的必要条件
+        # 将当前子回合的完整消息追加到历史
         messages.append(current_sub_turn_message)
 
-        # 如果没有工具调用，说明本轮（可能包含多子回合）已结束，可以退出循环
+        # ========== ✅ 对累积的文本内容进行气泡分割并输出 ==========
+        accumulated_text = current_sub_turn_message.get("content", "")
+        # has_tool_calls = bool(current_sub_turn_message.get("tool_calls"))
+
+        if accumulated_text:
+            for chunk_text in _yield_bubbles(accumulated_text):
+                yield chunk_text
+
+        # 如果没有工具调用，说明本轮已结束
         if not current_sub_turn_message.get("tool_calls"):
             break
 
-        # ========== 关键修改点 2 ==========
-        # 先收集本轮所有工具调用结果
-        tool_responses = []  # 存储 (tool_call_id, content)
+        # ========== 工具调用执行 ==========
+        tool_responses = []
         for tool_call in current_sub_turn_message["tool_calls"]:
             fn_name = tool_call["function"]["name"]
 
-            # 检查是否因embedding禁用而拒绝执行
             if not EMBEDDING_ENABLED and fn_name in EMBEDDING_TOOL_NAMES:
                 content = f"工具 {fn_name} 需要 embedding 支持，但当前已在配置中禁用。"
                 tool_responses.append((tool_call["id"], content))
+                yield NEW_BUBBLE
+                yield content
+                yield NEW_BUBBLE
                 continue
 
             try:
@@ -320,6 +163,9 @@ def run_agent_stream(
             except json.JSONDecodeError as e:
                 content = f"工具 {fn_name} 参数解析失败: {e}"
                 tool_responses.append((tool_call["id"], content))
+                yield NEW_BUBBLE
+                yield content
+                yield NEW_BUBBLE
                 continue
 
             result = None
@@ -336,27 +182,41 @@ def run_agent_stream(
                 pdf_path = args.get("pdf_path")
                 user_comment = args.get("user_comment", "")
                 if not paper_id:
+                    yield NEW_BUBBLE
                     yield "❌ 缺少论文标识符（paper_id）"
+                    yield NEW_BUBBLE
                     continue
                 try:
                     result = analyze_paper(paper_id, pdf_path, user_comment)
+                    yield NEW_BUBBLE
                     yield f"✅ 论文分析完成，标题：{result.get('title', 'N/A')}"
+                    yield NEW_BUBBLE
                 except Exception as e:
+                    yield NEW_BUBBLE
                     yield f"❌ 分析失败：{e}"
+                    yield NEW_BUBBLE
             elif fn_name == "update_paper_comment":
                 paper_id = args.get("paper_id")
                 user_comment = args.get("user_comment", "")
                 if not paper_id:
+                    yield NEW_BUBBLE
                     yield "❌ 缺少论文标识符（paper_id）"
+                    yield NEW_BUBBLE
                     continue
                 if not user_comment:
+                    yield NEW_BUBBLE
                     yield "❌ 缺少评论内容（user_comment）"
+                    yield NEW_BUBBLE
                     continue
                 try:
                     result = update_paper_comment(paper_id, user_comment)
+                    yield NEW_BUBBLE
                     yield f"✅ 评论已更新至论文 {paper_id}，现有评论：{result['user_comments']}"
+                    yield NEW_BUBBLE
                 except Exception as e:
+                    yield NEW_BUBBLE
                     yield f"❌ 更新评论失败：{e}"
+                    yield NEW_BUBBLE
             elif fn_name == "scan_local_papers":
                 result = scan_local_papers()
             elif fn_name == "query_knowledge":
@@ -372,13 +232,13 @@ def run_agent_stream(
             elif fn_name == "generate_aps_daily_summary":
                 journal = args.get("journal")
                 try:
-                    result = generate_aps_daily_summary(journal)  # 调用你的函数
-                    # 如果你的函数直接返回最终总结（字符串），可以像下面这样输出
-                    # yield result  # 如果需要实时输出，也可以逐字返回
+                    result = generate_aps_daily_summary(journal)
                 except Exception as e:
                     error_msg = f"❌ aps总结生成失败：{e}"
+                    yield NEW_BUBBLE
                     yield error_msg
-                    result = error_msg  # 将错误信息作为结果传给后续的 tool 消息
+                    yield NEW_BUBBLE
+                    result = error_msg
             elif fn_name == "download_aps_paper":
                 result = download_aps_paper(args["doi"])
             else:
@@ -405,35 +265,11 @@ def run_agent_stream(
         called_tool_names = {tc["function"]["name"] for tc in current_sub_turn_message["tool_calls"]}
         if called_tool_names & DIRECT_OUTPUT_TOOLS:
             for _, content in tool_responses:
-                # 按主要章节分割（整体概览、1. 量子算法...）
-                content = '\n' + content
-                parts = re.split(r'(?=^###\s+(?:整体概览|\d+\.))', content, flags=re.MULTILINE)
-                for part in parts:
-                    if not part.strip():
-                        continue
-                    # 进一步将章节内的论文按 "#### " 或 "论文 X." 分割
-                    # 注意：整体概览部分可能没有论文标题，直接作为一个气泡
-                    if part.startswith('### 整体概览'):
-                        yield part
-                        yield "\x1cNEW_BUBBLE"
-                        continue
-                    # 匹配 "#### 论文 X." 或 "\n#### 论文 X." 或 "\n论文 X."
-                    # 使用正则按行分割论文条目
-                    paper_parts = re.split(r'(?=\n####\s+论文\s+\d+\.|\n论文\s+\d+\.)', part)
-                    for i, paper_part in enumerate(paper_parts):
-                        if not paper_part.strip():
-                            continue
-                        # 如果是章节头（第一个 part 可能是章节标题和引言）
-                        if i == 0:
-                            # 章节标题单独显示为一个气泡
-                            yield paper_part
-                        else:
-                            # 每篇论文单独气泡
-                            yield paper_part
-                        yield "\x1cNEW_BUBBLE"
+                bubbles = split_markdown_bubbles(content)
+                for bubble in bubbles:
+                    yield ('\n' + bubble).lstrip('\n')
+                    yield NEW_BUBBLE
             break
-
-
 
 def _stream_openai(client, model, user_input):
     messages = [
@@ -458,10 +294,9 @@ def call_model(client, model_name, user_input):
     ]
 
     if EMBEDDING_ENABLED:
-        TOOLS = BASE_TOOLS+EMBEDDING_TOOLS
+        TOOLS = BASE_TOOLS + EMBEDDING_TOOLS
     else:
         TOOLS = BASE_TOOLS
-
 
     while True:
         response = client.chat.completions.create(
@@ -480,7 +315,6 @@ def call_model(client, model_name, user_input):
             fn = tool_call.function.name
             if not EMBEDDING_ENABLED and fn in EMBEDDING_TOOL_NAMES:
                 result = f"工具 {fn} 需要 embedding 支持，但当前已在配置中禁用。"
-                # 直接构造结果，不调用实际函数
                 messages.append(msg)
                 messages.append({
                     "role": "tool",

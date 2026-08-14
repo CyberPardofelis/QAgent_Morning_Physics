@@ -2,7 +2,7 @@ import sys
 import traceback
 import os
 from datetime import datetime
-from ui.message_bubble import MarkdownView
+# from ui.message_bubble import MarkdownView
 
 try:
     # 原始导入和代码

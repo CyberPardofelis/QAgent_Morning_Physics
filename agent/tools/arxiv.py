@@ -12,7 +12,7 @@ def search_arxiv(query: str, max_results: int = 10):
     q = query.lower()
 
     """搜索arXiv，返回带Markdown链接的文本摘要"""
-    client = arxiv.Client()
+    client = arxiv.Client(num_retries=5)
     search = arxiv.Search(query=query, max_results=max_results)
     papers = list(client.results(search))
     if not papers:
