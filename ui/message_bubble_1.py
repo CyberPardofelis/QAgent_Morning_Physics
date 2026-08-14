@@ -1,15 +1,37 @@
+"""
+MessageBubble + MarkdownView（v3 — 稳定渲染版）
+
+修复历史问题：
+1. 流式过程中反复调整宽度 → "闪来闪去最后才落到适合的大小"
+2. MathJax typeset 触发布局重排 → 又触发新一轮测量
+3. showEvent / resizeEvent / 父窗口 resize 多个事件链重复触发 updateMaxWidth
+4. update_content 累积整段再 setMarkdown，O(n²) 性能
+
+设计目标（保留 QWebEngineView 以支持 MathJax 公式渲染）：
+- 流式过程：宽度锁住（用容器宽度的 75% 一次设置，不重测自然宽度）
+- finalize 时：才 typeset 一次（避免流式过程多次 typeset 引起的重排）
+- MathJax typeset：自己写 setTimeout-based 合并，避免每 chunk 都触发
+- resize 事件：防抖 80ms，只调宽度不重排
+- showEvent：只触发一次
+
+向后兼容：
+- MessageBubble(role, markdown_text, parent=...) 签名不变
+- update_content(new_text) / finalize() / updateMaxWidth() / adjustSize() 不变
+- find_last_assistant_bubble() 通过 widget.role 检查（self.role 已保留）
+"""
 import json
 import re
 import markdown
 import os
 import html as html_module
-from PySide6.QtCore import Qt, QTimer, QUrl, QEvent
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLayout
+from PySide6.QtCore import Qt, QTimer, QEvent, QUrl, QSize
+from PySide6.QtGui import QTextOption, QDesktopServices
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
 # ============================================================
-# HTML 模板（提取为常量，避免重复）
+# HTML 模板（MathJax typeset 用 setTimeout 合并）
 # ============================================================
 BASE_HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -17,7 +39,14 @@ BASE_HTML_TEMPLATE = """<!DOCTYPE html>
 <style>
 html,body{
     margin:0; padding:0; background:transparent; overflow:hidden;
+    height: 100%;  /* 让 body 撑满 viewport，flex 居中才有空间 */
 }
+/* body 用 flex，让 #content 垂直居中（短内容不再靠上） */
+body{
+    display: flex;
+    align-items: center;
+}
+/* 水平：默认靠左（assistant/user），system 由 text-align: center 居中 */
 #content{
     background:transparent;
     display: inline-block;
@@ -25,6 +54,41 @@ html,body{
     word-wrap: break-word;
     box-sizing: border-box;
     max-width: 100%;
+}
+/* 去掉 Markdown 元素默认的 1em margin（避免上下"看不见"的空白） */
+#content p,
+#content ul,
+#content ol,
+#content blockquote,
+#content pre,
+#content h1,
+#content h2,
+#content h3,
+#content h4,
+#content h5,
+#content h6,
+#content table {
+    margin: 0;
+    padding: 0;
+}
+#content ul, #content ol {
+    padding-left: 1.5em;
+}
+/* 相邻段落间留 0.3em（避免挤在一起），首末段不加 */
+#content p + p,
+#content p + ul,
+#content p + ol,
+#content p + blockquote,
+#content p + pre,
+#content ul + p,
+#content ol + p,
+#content pre + p,
+#content blockquote + p,
+#content h1 + p, #content h2 + p, #content h3 + p,
+#content h4 + p, #content h5 + p, #content h6 + p,
+#content p + h1, #content p + h2, #content p + h3,
+#content p + h4, #content p + h5, #content p + h6 {
+    margin-top: 0.3em;
 }
 </style>
 <script>
@@ -36,18 +100,36 @@ window.MathJax = {
     options: { renderActions: { addMenu: [] } },
     svg: { fontCache: 'global' }
 };
+// 合并短时间内多次 typeset 请求（流式场景：每个 chunk 进来不要立即 typeset）
+window.__qgTypesetTimer = null;
+window.qgTypeset = function() {
+    if (window.__qgTypesetTimer) {
+        clearTimeout(window.__qgTypesetTimer);
+    }
+    window.__qgTypesetTimer = setTimeout(function() {
+        window.__qgTypesetTimer = null;
+        if (window.MathJax && MathJax.typesetPromise) {
+            MathJax.typesetPromise().then(function() {
+                var el = document.getElementById('content');
+                var h = el ? el.scrollHeight : document.body.scrollHeight;
+                if (window.__qgOnHeight) window.__qgOnHeight(h);
+            });
+        }
+    }, 300);
+};
 </script>
 <script type="text/javascript" async src="mathjax/tex-svg.js"></script>
 </head><body><div id="content"></div></body></html>"""
 
 
 # ============================================================
-# MarkdownView — 渲染 Markdown + MathJax，自适应宽高
+# MarkdownView — 渲染 Markdown + MathJax（稳定版）
 # ============================================================
 class MarkdownView(QWebEngineView):
     MAX_HEIGHT = 26000
-
-    _preloaded_engine = None
+    MIN_WIDTH = 80
+    # 圆角视觉缓冲（垂直）：view 高度上额外加的像素，气泡最终高 = view_h + 2*MARGIN_V
+    BUBBLE_V_PADDING = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -56,7 +138,8 @@ class MarkdownView(QWebEngineView):
         self._base_loaded = False
         self._pending_markdown = ""
         self._html_style = ""
-        self._max_width = 2500    # 当前允许的最大宽度
+        self._max_width = 0
+        self._is_streaming = False  # 流式过程中不 typeset
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.setHtml(BASE_HTML_TEMPLATE, QUrl.fromLocalFile(base_dir + '/'))
@@ -64,23 +147,24 @@ class MarkdownView(QWebEngineView):
 
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setStyleSheet("background: transparent;")
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.setMinimumWidth(10)
+        # 关键：QWebEngineView 默认 sizeHint 在 PySide6 下不可靠（返回 0×0）
+        # 用 Expanding 让 layout 给 view 完整空间（fill bubble 内容区）
+        # 不依赖 sizeHint
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # 不设 setMinimumWidth（让它 fill layout 给的空间）
+        # 高度 setMinimumHeight(40) 兜底，避免初始高度为 0
+        self.setMinimumHeight(40)
 
-    # ---- 预加载引擎（静态方法） ----
-    @staticmethod
-    def preload_engine(parent=None):
-        if MarkdownView._preloaded_engine is not None:
-            return
-        view = QWebEngineView()
-        view.setAttribute(Qt.WA_DontShowOnScreen, True)
-        view.setVisible(False)
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        view.setHtml(BASE_HTML_TEMPLATE, QUrl.fromLocalFile(base_dir + '/'))
-        view.loadFinished.connect(lambda ok: setattr(view, '_loaded', True))
-        MarkdownView._preloaded_engine = view
+        # 高度变化时通过 JS 回调通知（防抖 200ms，在 MathJax typeset 完成后）
+        self._height_callback_pending = False
+        self._last_reported_height = 0
+        self._last_reported_width = 0
+        # 自然宽度（finalize 后由 JS 测得）
+        self._natural_width = 0
+        # 防止自然宽度测量并发 / 自动重试
+        self._natural_width_measuring = False
+        self._natural_width_retry_count = 0
 
-    # ---- 基础加载完成回调 ----
     def _on_base_loaded(self, ok):
         if not ok:
             return
@@ -90,19 +174,9 @@ class MarkdownView(QWebEngineView):
             self._inject_style(self._html_style)
         if self._pending_markdown:
             self._update_content()
-            # ★ 修复1：不再使用 adjust_to_max_width（可能提前返回）
-            # 直接触发完整的测量流程：先展开到最大宽度，再测量自然宽度
-            self._max_width = 2500  # 重置为默认
-            QTimer.singleShot(0, self._remeasure_all)
+        # load 完后立即测一次高度（避免初始 0px）
+        QTimer.singleShot(100, self.reportHeight)
 
-    def _remeasure_all(self):
-        """完整测量流程：展开→等待渲染→测量宽高"""
-        # 先展开视图让内容重排
-        self.setFixedWidth(self._max_width)
-        # 给 MathJax 和 DOM 重排时间
-        QTimer.singleShot(80, self._measure_natural_width)
-
-    # ---- 样式注入 ----
     def _inject_style(self, css: str):
         css_escaped = json.dumps(css)
         js = f"document.getElementById('custom-style').textContent = {css_escaped};"
@@ -113,112 +187,199 @@ class MarkdownView(QWebEngineView):
         if self._base_loaded:
             self._inject_style(css)
 
-    # ---- 自动尺寸开关 ----
     def setAutoSize(self, auto: bool, max_width: int = None):
         self._auto_size = auto
         if max_width:
+            self._max_width = max_width
             self.setMaximumWidth(max_width)
 
-    # ---- 设置 Markdown 内容 ----
     def setMarkdown(self, text: str):
+        """
+        设置 Markdown。
+        注意：不会重置 _is_streaming，调用方需自己管（如 endStreaming）。
+        """
         html_body = self._markdown_to_html(text)
+        # 内容未变 → 跳过（避免重复 setHtml）
+        if html_body == self._content_html:
+            return
         self._content_html = html_body
         if self._base_loaded:
             self._update_content()
-            QTimer.singleShot(0, lambda: self.adjust_to_max_width(self._max_width))
         else:
             self._pending_markdown = html_body
 
-    # ---- 将 HTML 注入页面 ----
+    def beginStreaming(self):
+        """标记进入流式状态（流式追加不 typeset，节省大量计算）"""
+        self._is_streaming = True
+
+    def endStreaming(self):
+        """
+        结束流式：触发一次 typeset 让 MathJax 渲染公式，然后报告高度。
+        调一次即可，不要每 chunk 调。
+        """
+        self._is_streaming = False
+        # 触发 typeset（不立即，setTimeout 300ms 合并）
+        self.page().runJavaScript("window.qgTypeset && window.qgTypeset();")
+        # 重新 setHtml（带 typeset 触发）
+        if self._base_loaded:
+            self._update_content()
+
     def _update_content(self):
         html_escaped = json.dumps(self._content_html)
+        # setHtml 后 qgTypeset 由 endStreaming 统一触发
+        # 但 base_loaded 第一次 setHtml 时需要立即 typeset
         js = f"""
         document.getElementById('content').innerHTML = {html_escaped};
-        if (window.MathJax && MathJax.typesetPromise) {{
-            MathJax.typesetPromise().then(() => {{}});
+        if ({str(self._is_streaming).lower()}) {{
+            // 流式中：等待 endStreaming 统一 typeset
+        }} else if (window.MathJax && MathJax.typesetPromise) {{
+            window.qgTypeset && window.qgTypeset();
         }}
         """
         self.page().runJavaScript(js)
 
-    # ================================================================
-    # ★ 修复后的自适应宽度方法（合并第一版和第二版的优点）
-    # ================================================================
-    def adjust_to_max_width(self, max_w: int):
-        """★ 修复2：移除提前返回逻辑，确保总是触发测量"""
-        self._max_width = max_w
-        self.setFixedWidth(max_w)
-        QTimer.singleShot(50, self._measure_natural_width)
-
-    def _delayed_update_max_width(self):
-        if not self.view._base_loaded:
-            # ★ 修复3：页面未就绪时重试
-            QTimer.singleShot(100, self._delayed_update_max_width)
+    def setMaxBubbleWidth(self, max_w: int):
+        """
+        设置气泡最大宽度（容器宽度的 80%）。
+        - 总是 setMaximumWidth 作为上限
+        - 通知 parent bubble，由 bubble 决定 setFixedWidth
+        """
+        if max_w == self._max_width:
             return
+        self._max_width = max_w
+        self.setMaximumWidth(max_w)
+        # 通知 parent bubble
+        parent = self.parent()
+        if parent and hasattr(parent, 'setMaxBubbleWidth'):
+            parent.setMaxBubbleWidth(max_w)
 
-    def _measure_natural_width(self):
-        """测量内容的自然宽度（不受父容器约束）"""
+    def reportHeight(self):
+        """外部触发高度报告（防抖 200ms，避免流式时频繁更新）"""
+        if not self._auto_size:
+            return
+        if self._height_callback_pending:
+            return
+        self._height_callback_pending = True
+        QTimer.singleShot(200, self._do_report_height)
+
+    def _do_report_height(self):
+        self._height_callback_pending = False
+        # 测 #content 的高度（不是 body），避免 body 撑满 viewport 后的循环依赖
+        self.page().runJavaScript(
+            "document.getElementById('content') ? document.getElementById('content').scrollHeight : 0",
+            self._on_height_measured
+        )
+
+    def reportNaturalWidth(self):
+        """
+        外部触发自然宽度测量。
+        - 如果 _base_loaded 未就绪 → 200ms 后重试
+        - 防止并发测量
+        """
+        if self._natural_width_measuring:
+            return
+        if not self._base_loaded:
+            QTimer.singleShot(200, self.reportNaturalWidth)
+            return
+        self._natural_width_measuring = True
+        # 重置重试计数（每次新调用都重置）
+        self._natural_width_retry_count = 0
+        QTimer.singleShot(250, self._do_measure_natural_width)
+
+    def _do_measure_natural_width(self):
+        """
+        测 #content 的真正自然宽度。
+        关键：position:absolute + white-space:nowrap + left:-9999px
+        把元素取出文档流，避免被 view 的 setMaximumWidth 限制，
+        也避免 white-space:normal 自动 wrap。
+        """
         js = """
         (function() {
             var el = document.getElementById('content');
-            var oldWidth = el.style.width;
-            var oldMaxWidth = el.style.maxWidth;
-            // 临时移除宽度约束，让元素按内容自然伸展
-            el.style.width = 'auto';
+            if (!el) return 0;
+            var saved = {
+                position: el.style.position,
+                left: el.style.left,
+                top: el.style.top,
+                maxWidth: el.style.maxWidth,
+                width: el.style.width,
+                whiteSpace: el.style.whiteSpace,
+                display: el.style.display
+            };
+            el.style.position = 'absolute';
+            el.style.left = '-9999px';
+            el.style.top = '0';
             el.style.maxWidth = 'none';
-            // 强制同步重排后读取宽度
-            var natural = el.offsetWidth;  // offsetWidth 触发重排
-            // 恢复原样式
-            el.style.width = oldWidth;
-            el.style.maxWidth = oldMaxWidth;
-            return natural;
+            el.style.width = 'auto';
+            el.style.whiteSpace = 'nowrap';
+            // 强制 inline-block 拿 offsetWidth
+            var computed = window.getComputedStyle(el).display;
+            if (computed === 'inline') {
+                el.style.display = 'inline-block';
+            }
+            var w = el.offsetWidth;
+            // 还原
+            el.style.position = saved.position;
+            el.style.left = saved.left;
+            el.style.top = saved.top;
+            el.style.maxWidth = saved.maxWidth;
+            el.style.width = saved.width;
+            el.style.whiteSpace = saved.whiteSpace;
+            el.style.display = saved.display;
+            return w;
         })()
         """
         self.page().runJavaScript(js, self._on_natural_width_measured)
 
     def _on_natural_width_measured(self, width):
+        self._natural_width_measuring = False
         try:
             if hasattr(width, 'toInt'):
-                natural_w = width.toInt()[0] if width.toInt()[1] else int(width.toFloat()[0])
+                ok, n = width.toInt()
+                natural_w = int(n) if ok else int(width.toFloat()[0])
             else:
                 natural_w = int(float(width))
         except (ValueError, TypeError, AttributeError):
             natural_w = 0
-
         if natural_w <= 0:
-            # 测量失败时使用最大宽度
-            natural_w = self._max_width
-
-        # 最终宽度：不低于 80px，不超过 _max_width
-        final_w = max(80, min(natural_w, self._max_width))
-        self.setFixedWidth(final_w)
-        self.updateGeometry()
-
-        # 宽度稳定后重新测量高度
-        QTimer.singleShot(30, self._remeasure_height)
-
-    # ---- 高度自适应 ----
-    def _remeasure_height(self):
-        if not self._auto_size:
+            # 测量失败（content 还没渲染好 / JS 异常）→ 重试，最多 3 次
+            if self._natural_width_retry_count < 3:
+                self._natural_width_retry_count += 1
+                QTimer.singleShot(400, self.reportNaturalWidth)
             return
-        self.page().runJavaScript("document.body.scrollHeight", self._apply_height)
+        self._natural_width = natural_w
+        # 通知 parent bubble
+        parent = self.parent()
+        if parent and hasattr(parent, 'setNaturalWidth'):
+            parent.setNaturalWidth(natural_w)
 
-    def _apply_height(self, height):
-        if not self._auto_size:
-            return
+    def _on_height_measured(self, height):
         try:
             h = int(height)
         except (ValueError, TypeError):
             return
+        if h == self._last_reported_height:
+            return
+        self._last_reported_height = h
         if h > self.MAX_HEIGHT:
             self.page().runJavaScript("document.body.style.overflow = 'auto';")
             self.setFixedHeight(self.MAX_HEIGHT)
         else:
             self.page().runJavaScript("document.body.style.overflow = 'hidden';")
-            if h != self.height():
-                self.setFixedHeight(h)
+            # 加 BUBBLE_V_PADDING 给圆角留视觉缓冲（顶部+底部）
+            self.setFixedHeight(max(40, h + self.BUBBLE_V_PADDING))
+        # 通知父气泡
+        parent = self.parent()
+        if parent and hasattr(parent, "_on_view_resized"):
+            parent._on_view_resized()
 
-    # ---- Markdown → HTML 转换 ----
+    # 不重写 sizeHint / minimumSizeHint：
+    # QWebEngineView 在 PySide6 下重写这两个会引发 native crash
+    # （PySide6 内部多次调用 sizeHint，可能带 QSizeF 参数，Python 重写易触发 ACCESS_VIOLATION）
+    # 宽度由父 MessageBubble 通过 setFixedWidth / setMaximumWidth 直接控制
+
     def _markdown_to_html(self, text: str) -> str:
+        """Markdown → HTML，保护 LaTeX 公式不被破坏"""
         placeholders = []
 
         def replace_display(m):
@@ -229,7 +390,6 @@ class MarkdownView(QWebEngineView):
             placeholders.append(m.group(0))
             return f"\x00MATHIN{len(placeholders)-1}\x00"
 
-        # 保护 LaTeX 数学公式不被 HTML escape 破坏
         text = re.sub(r'\$\$(.+?)\$\$', replace_display, text, flags=re.DOTALL)
         text = re.sub(r'\$(.+?)\$', replace_inline, text)
         text = html_module.escape(text, quote=False)
@@ -246,189 +406,243 @@ class MarkdownView(QWebEngineView):
         text = re.sub(r'\x00MATHIN(\d+)\x00', restore_inline, text)
 
         html = markdown.markdown(text, extensions=['fenced_code', 'tables'])
-        html = html.replace('\x00MATHHD', '<span class="math display">').replace('\x00', '</span>')
-        html = html.replace('\x00MATHIN', '<span class="math inline">')
+        # 还原占位符
+        for i, p in enumerate(placeholders):
+            html = html.replace(f"\x00MATHHD{i}\x00", p, 1).replace(f"\x00MATHIN{i}\x00", p, 1)
         return html
 
 
 # ============================================================
-# MessageBubble — 消息气泡（渲染 Markdown 内容）
+# MessageBubble — 消息气泡
 # ============================================================
 class MessageBubble(QWidget):
-    def __init__(self, role: str, markdown_text: str, parent=None):
+    """
+    消息气泡（稳定版）：
+    - 宽度由 setMaxBubbleWidth 一次设置，流式过程不重测
+    - 流式过程：appendMarkdown 增量渲染，**不 typeset**（省 MathJax 计算）
+    - finalize：endStreaming 触发一次 typeset，然后报告最终高度
+    - resize 事件：防抖 80ms
+    """
+    # 气泡最小宽度（防止内容太短时气泡过窄；system 角色尤其需要）
+    MIN_BUBBLE_WIDTH = 100
+    # 边距（与 QHBoxLayout.setContentsMargins(5,5,5,5) 对应）
+    MARGIN_H = 5
+    MARGIN_V = 5
+    # 圆角视觉缓冲（约半个字；防止最后一字被 border-radius 削掉 / 意外换行）
+    BUBBLE_W_PADDING = 12  # 水平（左 + 右）
+    BUBBLE_V_PADDING = 2   # 垂直（上 + 下）
+
+    def __init__(self, role: str, markdown_text: str = "", attachments=None, parent=None):
         super().__init__(parent)
         self.role = role
+        self.attachments = attachments or []
+        if self.attachments:
+            markdown_text = self._append_attachments_marker(markdown_text)
         self.full_text = markdown_text
         self.is_final = False
-        self._line_buffer = ""
-        self._complete_lines = []
-        self._in_math_block = False
 
-        # 流式更新定时器（防抖）
-        self.update_timer = QTimer()
-        self.update_timer.setInterval(100)
-        self.update_timer.setSingleShot(True)
-        self.update_timer.timeout.connect(self._flush_complete_lines)
+        # 流式状态：空内容 → 流式模式；非空内容 → 直接渲染模式
+        self._is_streaming = not bool(markdown_text)
+        self._natural_width = 0  # view 测出的内容自然宽度（finalize 后填）
 
-        # 气泡背景色 & 文字颜色
+        # 背景色
         if role == 'user':
-            self.setStyleSheet("background-color: #77aaff; border-radius: 10px;")
+            self.setStyleSheet("background-color: #77aaff; border-radius: 10px; border: none;")
             text_color = "white"
         elif role == 'assistant':
-            self.setStyleSheet("background-color: white; border-radius: 10px;")
+            self.setStyleSheet("background-color: white; border-radius: 10px; border: none;")
             text_color = "black"
         else:
-            self.setStyleSheet("background-color: #e9ecef; border-radius: 10px;")
+            self.setStyleSheet("background-color: #e9ecef; border-radius: 10px; border: none;")
             text_color = "#495057"
 
-        # Markdown 渲染视图
-        self.view = MarkdownView()
-        self.view.setAutoSize(True)
+        # 防抖 resize
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(80)
+        self._resize_timer.timeout.connect(self._do_resize)
 
+        # Markdown 视图
+        self.view = MarkdownView(self)
         if role == 'system':
             text_css = f"body {{ color: {text_color}; text-align: center; }} h1,h2,h3,h4,h5,h6 {{ color: {text_color} !important; }}"
         else:
             text_css = f"body {{ color: {text_color}; }} h1,h2,h3,h4,h5,h6 {{ color: {text_color} !important; }}"
         self.view.setHtmlStyle(text_css)
-        self.view.setMarkdown(markdown_text)
+        if markdown_text:
+            self.view.setMarkdown(markdown_text)
+        elif self._is_streaming:
+            self.view.beginStreaming()
 
-        # 布局 — ★ 修复：移除 SetFixedSize，改用默认约束
+        # 布局
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(5, 5, 5, 5)
         layout.addWidget(self.view)
-        # 移除 layout.setSizeConstraint(QLayout.SetFixedSize)
-        # 改用默认行为，让父布局可以自由调整气泡大小
-
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        # sizePolicy: 横向 Maximum（可以扩展到 maxSize，但更倾向 sizeHint）
+        #            纵向 Preferred（按内容高度）
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        self._max_view_width = 1800
-        self._top_level = None  # 用于事件过滤器的顶层窗口
+        self._max_view_width = 0  # 0 表示未设置，showEvent 后再算
+        self._top_level = None
+        # _update_max_width 推迟到 showEvent（那时 parent 已 layout，width 准确）
+        # 非流式场景（markdown_text 非空）→ 渲染完后调 view.reportNaturalWidth 测紧凑尺寸
+        if not self._is_streaming:
+            # 留够时间让 base HTML 加载 + content 渲染 + MathJax typeset
+            QTimer.singleShot(500, self.view.reportNaturalWidth)
 
-        # 延迟到事件循环启动后首次计算宽度
-        QTimer.singleShot(0, self._delayed_update_max_width)
+    def _append_attachments_marker(self, text: str) -> str:
+        if not self.attachments:
+            return text
+        names = " · ".join(f"📎 {a.get('name', '?')}" for a in self.attachments)
+        sizes = " · ".join(a.get("size", "") for a in self.attachments if a.get("size"))
+        suffix = f"> {names}  ({sizes})" if sizes and sizes.strip(" ·") else f"> {names}"
+        return f"{text}\n\n{suffix}" if text else suffix
 
-    # ---- 显示事件：安装父窗口事件过滤器 ----
+    def _bubble_width_for_text(self, text_w: int) -> int:
+        """
+        把 JS 测出的"内容自然宽度"换算成气泡宽度。
+        加上：2 * MARGIN_H（QHBoxLayout 水平边距） + BUBBLE_W_PADDING（圆角缓冲）
+        """
+        if text_w <= 0:
+            return 0
+        return text_w + 2 * self.MARGIN_H + self.BUBBLE_W_PADDING
+
+    def setMaxBubbleWidth(self, max_w: int):
+        """
+        外部调：设置气泡最大宽度（容器宽度的 80%）。
+        - _max_view_width 不变就不动
+        - 流式过程：固定 max_w（避免宽度抖动）
+        - 已 finalize / 非流式：min(natural+padding, max_w)，不低于 MIN_BUBBLE_WIDTH
+        - 如果自然宽度还没测到，主动触发一次测量（避免一直顶着 80%）
+        """
+        if max_w == self._max_view_width:
+            return
+        self._max_view_width = max_w
+        # view 的 max 也更新
+        self.view.setMaxBubbleWidth(max_w)
+        # 自身也设 max（防止 setFixedWidth 之外的场景超界）
+        self.setMaximumWidth(max_w)
+        # 决定实际 fixed width
+        if self._is_streaming:
+            # 流式中：锁最大宽度
+            self.setFixedWidth(max_w)
+        else:
+            # 已 finalize / 非流式加载：用自然宽度（如已知且 < max_w）
+            natural_w = getattr(self, '_natural_width', 0)
+            if natural_w and natural_w > 0:
+                bubble_w = self._bubble_width_for_text(natural_w)
+                w = max(self.MIN_BUBBLE_WIDTH, min(bubble_w, max_w))
+                self.setFixedWidth(w)
+            else:
+                # 自然宽度还没测出来 → 暂用 max_w，等 setNaturalWidth 回调再缩
+                self.setFixedWidth(max_w)
+                # 主动触发一次测量（如果 view 还没在测）
+                if hasattr(self.view, 'reportNaturalWidth'):
+                    QTimer.singleShot(50, self.view.reportNaturalWidth)
+
+    def setNaturalWidth(self, natural_w: int):
+        """
+        外部调：告知 view 内容的自然宽度。
+        - 流式过程：缓存 _natural_width，不缩（避免抖动）
+        - finalize 后 / 非流式：min(text+padding, max_w)，不低于 MIN_BUBBLE_WIDTH
+        """
+        if natural_w <= 0:
+            return
+        self._natural_width = natural_w
+        if self._is_streaming:
+            return
+        if self._max_view_width > 0:
+            bubble_w = self._bubble_width_for_text(natural_w)
+            w = max(self.MIN_BUBBLE_WIDTH, min(bubble_w, self._max_view_width))
+            self.setFixedWidth(w)
+
+    def _update_max_width(self):
+        """计算最大宽度（基于容器宽度，最大 80%）"""
+        parent = self.parent()
+        available = 0
+        if parent:
+            available = parent.width()
+        if available <= 0:
+            top = self.window()
+            available = top.width() if top else 800
+        # 用户期望：最大 80% 容器宽度（自适应内容；最宽不超过 80%）
+        max_w = max(self.view.MIN_WIDTH, min(int(available * 0.80), 1800))
+        self.setMaxBubbleWidth(max_w)
+
+    def updateMaxWidth(self):
+        """兼容旧接口：触发宽度更新（防抖）"""
+        self._resize_timer.start()
+
+    def _do_resize(self):
+        self._update_max_width()
+        # 不调 adjustSize（避免反复 layout）
+        self.updateGeometry()
+
+    def _on_view_resized(self):
+        """view 高度变化时通知"""
+        self.updateGeometry()
+
+    # ---------- 流式更新 ----------
+    def update_content(self, new_text: str):
+        """
+        流式追加内容
+        - 第一次 update_content 时，beginStreaming 进入流式状态
+        - 追加到 self.full_text 并 setMarkdown（**不 typeset**）
+        - 触发一次 reportHeight（200ms 防抖）
+        - 宽度保持 _max_view_width（容器 75%），不根据内容调整（避免流式中闪）
+        """
+        if self.is_final or not new_text:
+            return
+
+        # 第一次 update_content → 标记流式
+        if not self._is_streaming:
+            self._is_streaming = True
+            self.view.beginStreaming()
+
+        self.full_text = (self.full_text or "") + new_text
+        self.view.setMarkdown(self.full_text)
+        # 触发一次高度报告（防抖 200ms）
+        self.view.reportHeight()
+
+    def finalize(self):
+        """
+        流式结束：
+        - 触发一次 typeset（让 MathJax 渲染公式）
+        - 报告最终高度
+        - 测 view 的自然宽度（JS 测 offsetWidth），让 bubble 缩到紧凑尺寸
+        """
+        if self.is_final:
+            return
+        self.is_final = True
+        self._is_streaming = False
+        # 重渲一次确保内容完整
+        self.view.setMarkdown(self.full_text or "")
+        # 退出流式，触发 typeset
+        self.view.endStreaming()
+        # 报告最终高度（typeset 前后各一次）
+        QTimer.singleShot(100, self.view.reportHeight)
+        QTimer.singleShot(800, self.view.reportHeight)
+        # 测 view 自然宽度（多次重试，覆盖 MathJax 渲染节奏）
+        QTimer.singleShot(400, self.view.reportNaturalWidth)
+        QTimer.singleShot(1200, self.view.reportNaturalWidth)
+        QTimer.singleShot(2500, self.view.reportNaturalWidth)
+        # finalize 后：_is_streaming=False，会按 _natural_width 收缩
+        # 这里显式触发一次 _update_max_width，让 bubble 立即按当前状态决定宽度
+        QTimer.singleShot(50, self._update_max_width)
+
+    # ---------- 事件过滤（防抖） ----------
+    def eventFilter(self, watched, event):
+        if watched == self._top_level and event.type() == QEvent.Resize:
+            self._resize_timer.start()
+        return super().eventFilter(watched, event)
+
     def showEvent(self, event):
         super().showEvent(event)
-        # ★ 修复：安装顶层窗口的事件过滤器，捕获所有 Resize 事件
         top = self.window()
         if top and top != self._top_level:
             if self._top_level:
                 self._top_level.removeEventFilter(self)
             top.installEventFilter(self)
             self._top_level = top
-        QTimer.singleShot(0, self.updateMaxWidth)
-
-    # ---- 尺寸变化事件 ----
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        QTimer.singleShot(0, self.updateMaxWidth)
-
-    # ---- ★ 修复：事件过滤器（捕获顶层窗口 Resize） ----
-    def eventFilter(self, watched, event):
-        if watched == self._top_level and event.type() == QEvent.Resize:
-            self.updateMaxWidth()
-        return super().eventFilter(watched, event)
-
-    # ---- 首次延迟更新（用于 __init__ 后） ----
-    def _delayed_update_max_width(self):
-        """首次计算最大宽度（无条件执行）"""
-        parent = self.parent()
-        if parent:
-            area_w = parent.width()
-        if not parent or area_w <= 0:
-            top = self.window()
-            area_w = top.width() * 0.6 if top else 800
-        max_w = max(200, int(area_w * 0.8))
-        self._max_view_width = max_w
-        self.view.adjust_to_max_width(max_w)
-
-    # ---- 更新最大宽度（带变化检测） ----
-    def updateMaxWidth(self):
-        """
-        根据父容器宽度重新计算最大宽度。
-        仅当 max_w 实际变化时才调用 view.adjust_to_max_width。
-        """
-        parent = self.parent()
-        if parent:
-            area_w = parent.width()
-        if not parent or area_w <= 0:
-            top = self.window()
-            area_w = top.width() * 0.6 if top else 800
-        max_w = max(200, int(area_w * 0.8))
-        if max_w != self._max_view_width:
-            self._max_view_width = max_w
-            self.view.adjust_to_max_width(max_w)
-
-    # ---- 流式更新（追加新文本） ----
-    def update_content(self, new_text: str):
-        if self.is_final:
-            return
-        for char in new_text:
-            self._line_buffer += char
-            if char == '\n':
-                self._complete_lines.append(self._line_buffer)
-                self._line_buffer = ""
-        if self._complete_lines:
-            self._flush_complete_lines()
-
-    def _flush_complete_lines(self):
-        if not self._complete_lines or self.is_final:
-            return
-        chunk = ''.join(self._complete_lines)
-        self._complete_lines.clear()
-        safe_chunk = self._preprocess(chunk)
-        self.full_text += safe_chunk
-        self.view.setMarkdown(self.full_text)
-        self.update_timer.stop()
-
-    def _preprocess(self, text: str) -> str:
-        """预处理文本：处理数学公式跨行、标题后自动加空行"""
-        lines = text.split('\n')
-        processed_lines = []
-        in_math = self._in_math_block
-        for line in lines:
-            new_line = []
-            i = 0
-            while i < len(line):
-                if line[i] == '$' and i + 1 < len(line) and line[i + 1] == '$':
-                    new_line.append('$$')
-                    in_math = not in_math
-                    i += 2
-                elif in_math and line[i] == '$':
-                    i += 1
-                else:
-                    new_line.append(line[i])
-                    i += 1
-            processed_lines.append(''.join(new_line))
-        self._in_math_block = in_math
-
-        # 标题后添加空行（确保 Markdown 正确解析）
-        result = []
-        for idx, line in enumerate(processed_lines):
-            result.append(line)
-            if line.lstrip().startswith('#'):
-                if idx < len(processed_lines) - 1:
-                    next_line = processed_lines[idx + 1]
-                    if next_line.strip() and not next_line.lstrip().startswith('#'):
-                        result.append('')
-        return '\n'.join(result)
-
-    # ---- 完成流式更新 ----
-    def finalize(self):
-        if self.is_final:
-            return
-        self.is_final = True
-        if self._line_buffer:
-            self._complete_lines.append(self._line_buffer + '\n')
-            self._line_buffer = ""
-        if self._complete_lines:
-            self._flush_complete_lines()
-        # 重新渲染完整文本（确保 MathJax 正确处理）
-        self.view.setMarkdown("")
-        self.view.setMarkdown(self.full_text)
-        # ★ 修复：finalize 中不再有死代码
-        QTimer.singleShot(1000, self.updateMaxWidth)
-        QTimer.singleShot(2000, self.updateMaxWidth)
-        QTimer.singleShot(4000, self.updateMaxWidth)
+        QTimer.singleShot(0, self._update_max_width)

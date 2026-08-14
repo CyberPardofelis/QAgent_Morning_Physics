@@ -1,15 +1,18 @@
 import sqlite3
 import json
 from datetime import datetime
-from .config import DB_PATH
+from agent.tools.config import DB_PATH
+from agent.tools.registry import register_tool
+
 
 # ----------------------------
 # 辅助函数：获取数据库连接（每次调用都新建连接，避免多线程问题）
 # ----------------------------
 def get_db_connection():
     conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row   # 便于按列名访问
+    conn.row_factory = sqlite3.Row
     return conn
+
 
 # ----------------------------
 # 数据库初始化
@@ -40,8 +43,7 @@ def init_db():
         )
     ''')
 
-    # FTS5 虚拟表：包含所有需要全文检索的字段
-    # 注意：FTS5 表通过 rowid 与主表关联，此处使用 content 选项指向主表（可选，但推荐）
+    # FTS5 虚拟表
     c.execute('''
         CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
             title,
@@ -50,9 +52,9 @@ def init_db():
             main_conclusion,
             outlook,
             summary,
-            keywords,           -- 虽然 keywords 是数组，但我们会将其转为空格分隔的字符串存入 FTS
+            keywords,
             user_comments_text,
-            content=papers       -- 可选，关联主表以便使用 "content=" 选项，但需要主表存在且列名匹配
+            content=papers
         )
     ''')
 
@@ -60,71 +62,67 @@ def init_db():
     try:
         c.execute("ALTER TABLE papers ADD COLUMN llm_summary TEXT")
     except sqlite3.OperationalError:
-        # 列已存在，忽略
         pass
 
     conn.commit()
     conn.close()
 
-# ----------------------------
-# 获取论文信息
-# ----------------------------
+
+# ============================================================
+# KnowledgeBaseDialog 内部使用的查询函数（不是 LLM 工具，直接返回 dict/list）
+# ============================================================
 def get_paper_by_id(paper_id: str):
-    """根据 ID 获取论文完整信息（转换为字典）"""
+    """根据 ID 获取论文完整信息（转换为字典），供 UI 直接使用"""
     conn = get_db_connection()
     row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
     conn.close()
     if not row:
         return None
-    # 将 Row 对象转为 dict，并解析 JSON 字段
     paper = dict(row)
     for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
         if paper.get(field):
             try:
                 parsed = json.loads(paper[field])
-                # 如果解析后还是字符串，说明可能被双重 JSON 编码，继续解析直到不再是字符串
                 while isinstance(parsed, str):
                     parsed = json.loads(parsed)
                 paper[field] = parsed
-            except:
+            except Exception:
                 paper[field] = []
         else:
             paper[field] = []
     return paper
 
-# ----------------------------
-# 更新评论函数
-# ----------------------------
-def update_paper_comment(paper_id: str, user_comment: str):
+
+# ============================================================
+# LLM 工具：update_paper_comment
+# ============================================================
+@register_tool(name="update_paper_comment", is_streaming=False)
+def update_paper_comment(paper_id: str, user_comment: str) -> str:
     """
     更新已有记录的 user_comments 字段（追加模式）。
-    如果记录不存在，抛出异常。
+    如果记录不存在，抛出异常（工具层捕获后 yield 错误消息）。
     """
     conn = get_db_connection()
     c = conn.cursor()
 
-    # 获取现有记录
     row = c.execute("SELECT user_comments FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
     if not row:
         conn.close()
-        raise ValueError(f"论文 {paper_id} 的分析记录不存在，无法更新评论。请先运行 analyze_paper 进行分析。")
+        return f"❌ 论文 {paper_id} 的分析记录不存在，无法更新评论。请先运行 analyze_paper 进行分析。"
 
-    # 解析现有评论列表
     comments = json.loads(row['user_comments']) if row['user_comments'] else []
     if not isinstance(comments, list):
         comments = [comments] if comments else []
 
-    # 追加新评论
     if user_comment:
         comments.append(user_comment)
 
-    # 更新数据库
     c.execute('''
         UPDATE papers SET user_comments = ?, analyzed_at = ?
         WHERE paper_id = ?
     ''', (json.dumps(comments, ensure_ascii=False), datetime.now().isoformat(), paper_id))
 
-    comments_str = ' '.join(comments)  # 拼接所有评论
+    comments_str = ' '.join(comments)
     c.execute('''
             UPDATE papers_fts SET user_comments_text = ?
             WHERE rowid = (SELECT rowid FROM papers WHERE paper_id = ?)
@@ -132,20 +130,18 @@ def update_paper_comment(paper_id: str, user_comment: str):
 
     conn.commit()
     conn.close()
+    return f"✅ 评论已更新至论文 {paper_id}，现有 {len(comments)} 条评论"
 
-    # 返回完整记录（可选）
-    return get_paper_by_id(paper_id)
 
-def update_paper_llm_summary(paper_id: str, summary: str):
-    """将对话中生成的 LLM 总结保存到论文记录"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE papers SET llm_summary = ? WHERE paper_id = ?", (summary, paper_id))
-    conn.commit()
-    conn.close()
-
-def get_recent_papers(limit=15):
-    """获取最近分析的论文，按 analyzed_at 倒序"""
+# ============================================================
+# LLM 工具：get_recent_papers
+# ============================================================
+@register_tool(name="get_recent_papers", is_streaming=False)
+def get_recent_papers(limit: int = 15) -> str:
+    """
+    获取最近分析的论文列表（按时间倒序），用于回顾最近看过的文章。
+    返回 Markdown 格式的列表。
+    """
     conn = get_db_connection()
     rows = conn.execute('''
         SELECT paper_id, title, analyzed_at
@@ -154,15 +150,52 @@ def get_recent_papers(limit=15):
         LIMIT ?
     ''', (limit,)).fetchall()
     conn.close()
-    # 转换为字典列表
+
+    if not rows:
+        return "知识库中还没有论文记录。"
+
+    lines = [f"最近分析的 {len(rows)} 篇论文：\n"]
+    for i, row in enumerate(rows, 1):
+        title = row['title'] or '(无标题)'
+        paper_id = row['paper_id']
+        analyzed_at = row['analyzed_at'] or ''
+        lines.append(f"{i}. **{title}**")
+        lines.append(f"   - ID: `{paper_id}`")
+        lines.append(f"   - 分析时间: {analyzed_at}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ============================================================
+# 内部使用：UI 调用的同步函数（不是 LLM 工具）
+# ============================================================
+def get_recent_papers_raw(limit=15):
+    """UI 内部用的，返回 list of dict（KnowledgeBaseDialog 直接用）"""
+    conn = get_db_connection()
+    rows = conn.execute('''
+        SELECT paper_id, title, analyzed_at
+        FROM papers
+        ORDER BY analyzed_at DESC
+        LIMIT ?
+    ''', (limit,)).fetchall()
+    conn.close()
     return [dict(row) for row in rows]
 
+
+def update_paper_llm_summary(paper_id: str, summary: str):
+    """将对话中生成的 LLM 总结保存到论文记录（UI 内部使用）"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE papers SET llm_summary = ? WHERE paper_id = ?", (summary, paper_id))
+    conn.commit()
+    conn.close()
+
+
 def update_full_paper(updated_data):
-    """更新论文完整信息到数据库（包括主表和FTS表）"""
+    """更新论文完整信息到数据库（UI 内部使用）"""
     conn = get_db_connection()
     c = conn.cursor()
 
-    # 将列表字段转为 JSON 字符串
     authors_json = json.dumps(updated_data["authors"], ensure_ascii=False)
     keywords_json = json.dumps(updated_data["keywords"], ensure_ascii=False)
     citations_json = json.dumps(updated_data["citations"], ensure_ascii=False)
@@ -184,7 +217,6 @@ def update_full_paper(updated_data):
         updated_data["paper_id"]
     ))
 
-    # 更新 FTS 表（假设已有 user_comments_text 列）
     keywords_str = ' '.join(updated_data["keywords"])
     comments_str = ' '.join(updated_data["user_comments"])
     c.execute('''
@@ -199,5 +231,3 @@ def update_full_paper(updated_data):
     ))
     conn.commit()
     conn.close()
-
-

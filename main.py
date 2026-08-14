@@ -1,19 +1,27 @@
+"""
+main.py — 应用入口（重构版）
+
+变化：
+- 用 config.Config + agent.infra.api_keys 统一配置来源
+- 配置加载顺序：QSettings 显式值 > .api_keys.json（自动迁移自 QSettings 旧 key）> .env 兜底
+- 全局异常钩子保留（写 error.log）
+"""
 import sys
-import traceback
 import os
+import traceback
 from datetime import datetime
-# from ui.message_bubble import MarkdownView
 
 try:
-    # 原始导入和代码
-    import sys
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QIcon
     from ui import ChatWindow
-    import config
-
+    from config import Config, AppInfo
+    # 提前 import agent.tools，触发所有 @register_tool 装饰器
+    import agent.tools  # noqa: F401
+    # 触发 API key 从 QSettings 一次性迁移到 .api_keys.json
+    from agent.infra import api_keys  # noqa: F401
 except Exception:
-    # 确定日志路径
     if getattr(sys, 'frozen', False):
         base_dir = os.path.dirname(sys.executable)
     else:
@@ -22,72 +30,73 @@ except Exception:
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(f"\n--- {datetime.now()} ---\n")
         traceback.print_exc(file=f)
-    # 重新抛出，让系统处理（可选）
     raise
 
+
 def excepthook(exc_type, exc_value, exc_traceback):
-    # 确定日志文件存放位置（与 exe 同目录或当前目录）
+    """全局异常钩子：写 error.log，便于事后排查"""
     if getattr(sys, 'frozen', False):
         base_dir = os.path.dirname(sys.executable)
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(base_dir, 'error.log')
 
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(f"\n--- {datetime.now()} ---\n")
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-    # 也可以打印到控制台（如果有）
+    try:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n--- {datetime.now()} ---\n")
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    except OSError:
+        pass
+    # 同时打印到 stderr（PyCharm/终端可见）
     traceback.print_exception(exc_type, exc_value, exc_traceback)
 
 
 sys.excepthook = excepthook
 
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    # MarkdownView.preload_engine()
-
-    # 读取字体大小设置
-    settings = QSettings("CyberPardofelis", "LLM科研助手")
-    font_size_str = settings.value("font_size", "10px")  # 默认10px
-    try:
-        # 提取数字部分，例如 "14px" -> 14
-        font_size = int(font_size_str.replace('px', ''))
-    except:
-        font_size = 10
-
-    # 设置全局字体
+def _apply_user_settings(app: QApplication):
+    """从 QSettings 读用户设置（字体等）并应用到 app"""
+    font_size = Config.get_font_size()
     font = app.font()
     font.setPointSize(font_size)
     app.setFont(font)
 
-    settings = QSettings("CyberPardofelis", "LLM科研助手")
-    if settings.contains("OPENAI_API_KEY"):
-        config.OPENAI_API_KEY = settings.value("OPENAI_API_KEY")
-    if settings.contains("OPENAI_MODEL"):
-        config.OPENAI_MODEL = settings.value("OPENAI_MODEL")
-    if settings.contains("DEEPSEEK_API_KEY"):
-        config.DEEPSEEK_API_KEY = settings.value("DEEPSEEK_API_KEY")
-    if settings.contains("DEEPSEEK_MODEL"):
-        config.DEEPSEEK_MODEL = settings.value("DEEPSEEK_MODEL")
-    if settings.contains("DEEPSEEK_MODEL_CHAT"):
-        config.DEEPSEEK_MODEL_CHAT = settings.value("DEEPSEEK_MODEL_CHAT")
-    if settings.contains("EMBEDDING_ENABLED"):
-        val = settings.value("EMBEDDING_ENABLED")
-        config.EMBEDDING_ENABLED = val in [True, "true", "1"]
-    if settings.contains("EMBEDDER_TYPE"):
-        config.EMBEDDER_TYPE = settings.value("EMBEDDER_TYPE")
-    if settings.contains("OPENAI_EMBEDDING_MODEL"):
-        config.OPENAI_EMBEDDING_MODEL = settings.value("OPENAI_EMBEDDING_MODEL")
-    if settings.contains("LOCAL_EMBEDDER_NAME"):
-        config.LOCAL_EMBEDDER_NAME = settings.value("LOCAL_EMBEDDER_NAME")
-    if settings.contains("MODEL_PATH"):
-        config.MODEL_PATH = settings.value("MODEL_PATH")
-    if settings.contains("DATA_DIR"):
-        config.DATA_DIR = settings.value("DATA_DIR")
-    if settings.contains("VECTOR_DIR"):
-        config.VECTOR_DIR = settings.value("VECTOR_DIR")
 
+def _load_qsettings_into_config():
+    """
+    旧版 main.py 里的逻辑：把 QSettings 里的值同步到 config 模块全局变量。
+    现在 Config 类每次从 QSettings 读最新值，不再需要这样手动同步。
+    但为了兼容还在 `import config; config.X` 的代码，这里仍然把
+    QSettings 里的旧 key 写到 .api_keys.json（如果还没迁移过）。
+    """
+    # agent.infra.api_keys 第一次调用 get_api_key 时会自动迁移
+    # 这里只是触发一下
+    try:
+        # 读一下 deepseek key，触发迁移
+        _ = api_keys.get_api_key("deepseek")
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # 触发 API key 一次性迁移
+    _load_qsettings_into_config()
+
+    # 应用图标
+    if getattr(sys, 'frozen', False):
+        _base_dir = os.path.dirname(sys.executable)
+    else:
+        _base_dir = os.path.dirname(os.path.abspath(__file__))
+    _icon_path = os.path.join(_base_dir, "resources", "app_icon.ico")
+    if os.path.exists(_icon_path):
+        app.setWindowIcon(QIcon(_icon_path))
+
+    # 全局字体
+    _apply_user_settings(app)
+
+    # 主窗口
     window = ChatWindow()
     window.show()
     sys.exit(app.exec())

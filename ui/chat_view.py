@@ -44,15 +44,16 @@ class ChatView(QWidget):
             self.scroll_to_bottom()
 
     def add_chat_message(self, role, text, isAppend=False):
-        if not text:
+        # 空气泡（assistant 流式槽位）需要保留 → 单独放行
+        if not text and role != "assistant":
             return
-        if isAppend and role == "assistant":
+        if isAppend and role == "assistant" and text:
             last_bubble = self.find_last_assistant_bubble()
             if last_bubble:
                 last_bubble.update_content(text)
                 QTimer.singleShot(0, self.scroll_if_needed)
                 return
-        bubble = MessageBubble(role, text)
+        bubble = MessageBubble(role, text or "")
         alignment = {'user': Qt.AlignRight, 'assistant': Qt.AlignLeft, 'system': Qt.AlignCenter}
         self.scroll_layout.addWidget(bubble, 0, alignment.get(role, Qt.AlignLeft))
         bubble.updateMaxWidth()

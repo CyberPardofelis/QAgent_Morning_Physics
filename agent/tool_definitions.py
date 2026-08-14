@@ -1,11 +1,25 @@
-# agent/tool_definitions.py
 """
-工具定义（与具体实现解耦）
-"""
+工具 schema 集中管理（参考 WAgent 实现）。
 
-# 不依赖 embedding 的基础工具（始终可用）
-BASE_TOOLS = [
-    {
+所有 LLM 可调用的工具的 OpenAI function calling schema 在这里按 name 索引声明。
+实现分散在各工具文件，通过 @register_tool 装饰器按 name 自动绑定。
+
+新增工具流程：
+1. 在本文件 TOOL_SCHEMAS 添加新 key
+2. 在对应工具文件中用 @register_tool(name="your_tool_name") 装饰函数
+3. 完成。controller 无需改动。
+
+注意：TOOL_SCHEMAS 只是数据声明，不依赖任何工具实现，避免循环 import。
+"""
+from typing import Dict, Any
+
+
+# 所有 LLM 可调用的工具 schema 在这里声明
+TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    # ============================================================
+    # run_python: 执行任意 Python 代码（子进程运行）
+    # ============================================================
+    "run_python": {
         "type": "function",
         "function": {
             "name": "run_python",
@@ -19,7 +33,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # search_arxiv: 在 arXiv 上搜索论文
+    # ============================================================
+    "search_arxiv": {
         "type": "function",
         "function": {
             "name": "search_arxiv",
@@ -34,7 +52,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # download_arxiv_paper: 下载 arXiv 论文 PDF
+    # ============================================================
+    "download_arxiv_paper": {
         "type": "function",
         "function": {
             "name": "download_arxiv_paper",
@@ -48,7 +70,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # analyze_paper: 分析论文并保存到知识库
+    # ============================================================
+    "analyze_paper": {
         "type": "function",
         "function": {
             "name": "analyze_paper",
@@ -64,7 +90,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # update_paper_comment: 更新论文评论
+    # ============================================================
+    "update_paper_comment": {
         "type": "function",
         "function": {
             "name": "update_paper_comment",
@@ -79,7 +109,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # scan_local_papers: 增量扫描本地 PDF
+    # ============================================================
+    "scan_local_papers": {
         "type": "function",
         "function": {
             "name": "scan_local_papers",
@@ -87,7 +121,11 @@ BASE_TOOLS = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
-    {
+
+    # ============================================================
+    # generate_daily_summary_arxiv: arXiv 每日总结
+    # ============================================================
+    "generate_daily_summary_arxiv": {
         "type": "function",
         "function": {
             "name": "generate_daily_summary_arxiv",
@@ -95,7 +133,11 @@ BASE_TOOLS = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
-    {
+
+    # ============================================================
+    # analyze_today_topic_arxiv: arXiv 某主题详细分析
+    # ============================================================
+    "analyze_today_topic_arxiv": {
         "type": "function",
         "function": {
             "name": "analyze_today_topic_arxiv",
@@ -109,7 +151,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # generate_aps_daily_summary: APS 期刊每日总结
+    # ============================================================
+    "generate_aps_daily_summary": {
         "type": "function",
         "function": {
             "name": "generate_aps_daily_summary",
@@ -119,7 +165,7 @@ BASE_TOOLS = [
                 "properties": {
                     "journal": {
                         "type": "string",
-                        "enum": ["prl", "pra", "prb", "prc", "prd", "pre", "prx","prxquantum","rmp","prapplied"],
+                        "enum": ["prl", "pra", "prb", "prc", "prd", "pre", "prx", "prxquantum", "rmp", "prapplied"],
                         "description": "The APS journal code (e.g., 'prl' for Physical Review Letters, 'pra' for Physical Review A)."
                     }
                 },
@@ -127,7 +173,11 @@ BASE_TOOLS = [
             }
         }
     },
-    {
+
+    # ============================================================
+    # download_aps_paper: 下载 APS 论文 PDF
+    # ============================================================
+    "download_aps_paper": {
         "type": "function",
         "function": {
             "name": "download_aps_paper",
@@ -140,26 +190,12 @@ BASE_TOOLS = [
                 "required": ["doi"]
             }
         }
-    }
-]
-
-# 依赖 embedding 的工具（仅在 EMBEDDING_ENABLED = True 时启用）
-EMBEDDING_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_papers",
-            "description": "Search local research papers using vector index",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                },
-                "required": ["query"]
-            }
-        }
     },
-    {
+
+    # ============================================================
+    # query_knowledge: 知识库查询
+    # ============================================================
+    "query_knowledge": {
         "type": "function",
         "function": {
             "name": "query_knowledge",
@@ -174,6 +210,90 @@ EMBEDDING_TOOLS = [
             }
         }
     },
-]
 
-EMBEDDING_TOOL_NAMES = {tool["function"]["name"] for tool in EMBEDDING_TOOLS}
+    # ============================================================
+    # get_recent_papers: 获取最近分析的论文
+    # ============================================================
+    "get_recent_papers": {
+        "type": "function",
+        "function": {
+            "name": "get_recent_papers",
+            "description": "获取最近分析的论文列表（按时间倒序），用于回顾最近看过的文章",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 15, "description": "最多返回条数"}
+                }
+            }
+        }
+    },
+
+    # ============================================================
+    # web_search: 联网搜索（多 provider，移植自 WAgent）
+    # provider 链: bocha(中文主) -> tavily(海外) -> ddg(保底免 key)
+    # key 通过 .api_keys.json 管理 (key 名: bocha / tavily)
+    # ============================================================
+    "web_search": {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "联网搜索实时信息（新闻、百科、技术文档等），RAG 场景优化版本。"
+                "自动根据 query 中英文选择搜索源：中文优先博查，英文优先 Tavily，"
+                "两者都没配 key 时降级到 DuckDuckGo。返回网页标题、链接、摘要和正文，"
+                "可直接用于 chunking 和 embedding。"
+                "支持 auto/bocha/tavily/ddg 四种 provider 模式。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词，例如 '北京下周天气' 或 'Python asyncio best practices'"
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": "返回结果条数，默认 5，最多 10",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10
+                    },
+                    "fetch_content": {
+                        "type": "boolean",
+                        "description": "是否抓取网页正文。RAG 场景推荐开启（默认 true）；只想看标题链接时设 false 可加快速度",
+                        "default": True
+                    },
+                    "max_content_length": {
+                        "type": "integer",
+                        "description": "单条结果正文的最多字符数，默认 2000（RAG 友好）",
+                        "default": 2000,
+                        "minimum": 200,
+                        "maximum": 8000
+                    },
+                    "provider": {
+                        "type": "string",
+                        "enum": ["auto", "bocha", "tavily", "ddg"],
+                        "description": (
+                            "搜索源选择。auto=按 query 语言自动选（推荐）；"
+                            "bocha=博查（中文强，需 BOCHA_API_KEY）；"
+                            "tavily=Tavily（海外强，需 TAVILY_API_KEY）；"
+                            "ddg=DuckDuckGo（保底，免 key 但国内常超时）"
+                        ),
+                        "default": "auto"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+}
+
+
+def get_tool_schema(name: str):
+    """按名字取单个 schema（方便 controller / 测试用）"""
+    return TOOL_SCHEMAS.get(name)
+
+
+def get_all_tool_names():
+    """所有已注册工具的 LLM 端名字"""
+    return list(TOOL_SCHEMAS.keys())

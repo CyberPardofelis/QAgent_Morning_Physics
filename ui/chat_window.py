@@ -29,19 +29,25 @@ class ChatWindow(QMainWindow):
         self.setStyleSheet(GLOBAL_STYLESHEET)
 
         self.controller = ConversationController(self)
-        self._new_bubble_pending = False   # 标记需要创建新气泡
+        # 当前显示的对话 ID（所有 controller signal 进来时按这个过滤）
+        self.current_conv_id = None
+        # 兼容旧"先 chunk 再 new_bubble"机制的标记
+        self._new_bubble_pending = False
 
         self._setup_ui()
         self._connect_signals()
         self._load_settings()
         self.refresh_tree()
-        self.add_chat_message("system",
-                              "LLM科研助手已启动。请选择模式并开始对话。\n\n"
-                              "发送 早上好 arxiv/pra/prl等 以获取对应平台新文章摘要.\n\n"
-                              "发送 分析+文章DOI 以下载并分析对应文章，分析结果会保存至知识库。\n\n"
-                              "在分析文章之后可以发送 保存评论：评论内容 以将文章评论保存到知识库\n\n"
-                              "菜单栏中打开知识库，可以进行检索并打开相关文章的详情页面查看\n\n"
-                              "在详情页面可以查看和修改总结信息、引用信息、评论和LLM详细总结等")
+        # 系统消息
+        self.chat_view.add_chat_message("system",
+            "LLM科研助手已启动。请选择模式并开始对话。\n\n"
+            "发送 早上好 arxiv/pra/prl等 以获取对应平台新文章摘要.\n\n"
+            "发送 分析+文章DOI 以下载并分析对应文章，分析结果会保存至知识库。\n\n"
+            "在分析文章之后可以发送 保存评论：评论内容 以将文章评论保存到知识库\n\n"
+            "菜单栏中打开知识库，可以进行检索并打开相关文章的详情页面查看\n\n"
+            "在详情页面可以查看和修改总结信息、引用信息、评论和LLM详细总结等")
+        if self.controller.current_conversation:
+            self.current_conv_id = self.controller.current_conversation.conv_id
 
     def _setup_ui(self):
         central_widget = QWidget()
@@ -110,13 +116,14 @@ class ChatWindow(QMainWindow):
         self.setWindowIcon(QIcon(icon_path))
 
     def _connect_signals(self):
-        # Controller → UI
-        self.controller.new_message.connect(self.add_chat_message)
+        # Controller → UI（所有带 conv_id 的 signal 在处理时按 current_conv_id 过滤）
+        self.controller.new_message.connect(self._on_new_message)
         self.controller.stream_chunk.connect(self._on_stream_chunk_ui)
         self.controller.new_bubble.connect(self._on_new_bubble)
+        self.controller.bubble_finalize.connect(self._on_bubble_finalize)
         self.controller.comparison_chunk.connect(self._add_comparison_chunk)
-        self.controller.clear_chat.connect(self.chat_view.clear_chat)
-        self.controller.scroll_to_bottom.connect(self.chat_view.scroll_to_bottom)
+        self.controller.clear_chat.connect(self._on_clear_chat)
+        self.controller.scroll_to_bottom.connect(self._on_scroll_to_bottom)
         self.controller.update_regenerate_button.connect(
             self.input_panel.regenerate_btn.setEnabled
         )
@@ -146,24 +153,72 @@ class ChatWindow(QMainWindow):
                 self.controller.current_conversation.conv_id == conv_id):
             self.controller.current_conversation.group_id = target_group_id
 
-    def _on_new_bubble(self):
-        self._new_bubble_pending = True
-
-    def _on_stream_chunk_ui(self, role, chunk):
-        if role != "assistant" or not chunk:
+    def _on_new_message(self, conv_id, role, text):
+        """完整消息（非流式）：追加一条气泡"""
+        if conv_id and self.current_conv_id and conv_id != self.current_conv_id:
             return
-        if self._new_bubble_pending:
-            self.add_chat_message("assistant", chunk, isAppend=False)
-            self._new_bubble_pending = False
-        else:
-            last_bubble = self.chat_view.find_last_assistant_bubble()
-            if last_bubble:
-                last_bubble.update_content(chunk)
-                QTimer.singleShot(0, self.chat_view.scroll_if_needed)
-            else:
-                self.add_chat_message("assistant", chunk, isAppend=False)
+        if not text:
+            return
+        self.add_chat_message(role, text, isAppend=False)
 
-    def _add_comparison_chunk(self, chunk):
+    def _on_clear_chat(self):
+        """
+        清空聊天区（在 controller 切换对话前调用）。
+        关键：先把 current_conv_id 同步到 controller 的新 conv，
+        紧接着 controller 会发 new_message(conv_id, ...) 复读历史，
+        此时 current_conv_id 已就位，过滤才能匹配。
+        """
+        if self.controller.current_conversation:
+            self.current_conv_id = self.controller.current_conversation.conv_id
+        self.chat_view.clear_chat()
+
+    def _on_new_bubble(self, conv_id):
+        """
+        预留一个空 assistant 气泡（流式输出开始时 / 切气泡时）。
+        空气泡 → _is_streaming=True → 不触发 typeset（避免每 chunk 渲染），
+        等 finalize() 一次性 typeset。
+        """
+        if conv_id and self.current_conv_id and conv_id != self.current_conv_id:
+            return
+        # 空气泡（流式槽）
+        self.add_chat_message("assistant", "", isAppend=False)
+
+    def _on_stream_chunk_ui(self, conv_id, chunk):
+        """流式 chunk：追加到最后一个 assistant 气泡"""
+        if not chunk:
+            return
+        if conv_id and self.current_conv_id and conv_id != self.current_conv_id:
+            return
+        last_bubble = self.chat_view.find_last_assistant_bubble()
+        if last_bubble:
+            last_bubble.update_content(chunk)
+            QTimer.singleShot(0, self.chat_view.scroll_if_needed)
+        else:
+            # 没有气泡（极端情况）→ 创建一个
+            self.add_chat_message("assistant", chunk, isAppend=False)
+
+    def _on_bubble_finalize(self, conv_id):
+        """
+        流式结束：让所有"本轮流式"产生的 assistant 气泡触发 MathJax typeset + 收缩宽度。
+        兼容历史消息：is_final 标记会保证 finalize() 不会重复触发。
+        """
+        if conv_id and self.current_conv_id and conv_id != self.current_conv_id:
+            return
+        # 找到本轮产生的"未 finalize"的 assistant 气泡，全部 finalize
+        # 倒序：通常只有最后一个未 finalize（前面的已经经过新一轮 new_bubble + 后续 finalize），
+        # 但 DIRECT_OUTPUT 切多气泡时可能多个未 finalize，统一兜底
+        for i in range(self.chat_view.scroll_layout.count() - 1, -1, -1):
+            widget = self.chat_view.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, MessageBubble) and widget.role == "assistant":
+                if not widget.is_final:
+                    widget.finalize()
+                # 继续往前找（DIRECT_OUTPUT 切多气泡场景）
+
+    def _add_comparison_chunk(self, conv_id, chunk):
+        if not chunk:
+            return
+        if conv_id and self.current_conv_id and conv_id != self.current_conv_id:
+            return
         last_bubble = self.chat_view.find_last_assistant_bubble()
         if last_bubble and last_bubble.role == "assistant":
             last_bubble.update_content(chunk)
@@ -171,10 +226,14 @@ class ChatWindow(QMainWindow):
         else:
             self.add_chat_message("assistant", chunk, isAppend=False)
 
-    def _on_send(self, text):
+    def _on_scroll_to_bottom(self, conv_id):
+        if not self.current_conv_id or conv_id == self.current_conv_id:
+            self.chat_view.scroll_to_bottom()
+
+    def _on_send(self, text, attachments=None):
         mode = self.mode_combo.currentText()
         think = self.think_checkbox.isChecked()
-        self.controller.send_message(text, mode, think)
+        self.controller.send_message(text, mode, think, attachments=attachments or [])
 
     def _on_regenerate(self):
         mode = self.mode_combo.currentText()
@@ -195,9 +254,12 @@ class ChatWindow(QMainWindow):
     def on_conversation_switched(self):
         self.refresh_tree()
         if self.controller.current_conversation:
+            self.current_conv_id = self.controller.current_conversation.conv_id
             self.tree_panel._highlight_conversation_in_tree(
                 self.controller.current_conversation.conv_id
             )
+        else:
+            self.current_conv_id = None
 
     def create_new_group(self):
         self.tree_panel.create_new_group()

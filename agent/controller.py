@@ -1,380 +1,336 @@
-# agent/controller.py
+"""
+agent.controller — 流式对话与工具调用编排（v3 — 实时流式 + 工具结果切气泡）
+
+设计目标：
+- 实时 yield delta.content（保留 QAgent 流式感）
+- 工具调用循环：每个工具的结果在子回合里被 LLM 看到
+- DIRECT_OUTPUT 工具（generate_daily_summary_*）返回的完整内容按 ### 标题切气泡
+- 单一循环，无 if/elif 工具分发
+"""
 import json
 import re
-from openai import OpenAI
-from config import OPENAI_MODEL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY, EMBEDDING_ENABLED
-from agent.prompts import SYSTEM_PROMPT
-from agent.tools import (
-    scan_local_papers, run_python, update_paper_comment,
-    generate_daily_summary_arxiv, analyze_today_topic_arxiv,
-    generate_aps_daily_summary, download_aps_paper,
-    search_arxiv, download_arxiv_paper, analyze_paper
+import logging
+from typing import Iterator, Optional
+
+from agent.llm_clients import (
+    get_client as _get_client,
+    get_deepseek_client,
+    get_openai_client,
+    LLMClientError,
+    PROVIDERS,
 )
-from agent.llm_clients import get_openai_client, get_deepseek_client
-from agent.tool_definitions import BASE_TOOLS, EMBEDDING_TOOLS, EMBEDDING_TOOL_NAMES
+from agent.prompts import SYSTEM_PROMPT
+from agent.tools.registry import ToolRegistry
 from agent.stream_utils import split_markdown_bubbles
+from config import Config
 
-if EMBEDDING_ENABLED:
-    from agent.tools import (search_papers, query_knowledge)
+logger = logging.getLogger(__name__)
 
-# 直接输出工具：这些工具返回的内容就是最终答案，不需要再交给模型处理
+# 触发所有工具模块的 @register_tool 装饰器执行
+import agent.tools  # noqa: F401
+
+
+# 直接输出工具：这些工具返回的内容就是最终答案，需要按章节切气泡
 DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
 
-# =============================
-# 创建 DeepSeek client
-# =============================
-def get_deepseek_client():   # 保留原函数，避免外部依赖改动
-    return OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com"
-    )
+# mode -> (provider_name, default_model)
+MODE_TO_PROVIDER_MODEL = {
+    "openai":            ("openai",   None),
+    "deepseek-v4-flash": ("deepseek", "deepseek-v4-flash"),
+    "deepseek-v4-pro":   ("deepseek", "deepseek-v4-pro"),
+    # 旧 mode 兼容
+    "deepseek-flash":    ("deepseek", "deepseek-v4-flash"),
+    "deepseek-pro":      ("deepseek", "deepseek-v4-pro"),
+    "deepseek":          ("deepseek", "deepseek-v4-pro"),
+    # 自定义 mode（worker 用 extra_params 显式传 model）
+    "custom":            (None,       None),
+}
 
-# =============================
-# 内部辅助：将一段文本按 Markdown 标题分割为气泡并 yield
-# =============================
+# 旧 model 名 → (新 model, enable_thinking, reasoning_effort) 的兼容映射
+LEGACY_MODEL_MAP = {
+    "deepseek-reasoner": ("deepseek-v4-pro", True, "max"),
+    "deepseek-chat":     ("deepseek-v4-flash", False, "high"),
+}
+
+
+# bubble 分隔符（兼容旧 UI 代码）
 NEW_BUBBLE = "\x1cNEW_BUBBLE"
-NEW_BUBBLE_BATCH = "\x1cNEW_BUBBLE_BATCH"
 
-def _yield_bubbles(content: str):
-    """对任意文本内容，按 Markdown 三级+标题分割气泡并 yield"""
-    if not content:
-        return
-    bubbles = split_markdown_bubbles(content)
-    for bubble in bubbles:
-        yield bubble
-        yield NEW_BUBBLE
 
-# =============================
-# 流式输出函数（核心）
-# =============================
+def _resolve_client_and_model(mode: str) -> tuple:
+    if mode not in MODE_TO_PROVIDER_MODEL:
+        raise LLMClientError(
+            "unknown",
+            f"不支持的 mode: {mode!r}。支持: {list(MODE_TO_PROVIDER_MODEL.keys())}",
+        )
+    provider_name, default_model = MODE_TO_PROVIDER_MODEL[mode]
+    if provider_name is None:
+        return None, None, "custom"
+    client = _get_client(provider_name)
+    if default_model:
+        model = default_model
+    elif provider_name == "openai":
+        model = Config.get_openai_model() or PROVIDERS["openai"].default_model
+    elif provider_name == "deepseek":
+        model = Config.get_deepseek_model() or PROVIDERS["deepseek"].default_model
+    else:
+        model = PROVIDERS[provider_name].default_model
+    return client, model, provider_name
+
+
+def _resolve_legacy_model(model: str, enable_thinking: bool) -> tuple:
+    if model in LEGACY_MODEL_MAP:
+        new_model, want_thinking, effort = LEGACY_MODEL_MAP[model]
+        logger.info(
+            "[controller] 旧 model %r → %r (thinking=%s, effort=%s)",
+            model, new_model, want_thinking, effort,
+        )
+        return new_model, want_thinking, effort
+    return model, enable_thinking, "high"
+
+
+# ============================================================
+# 流式输出（核心）
+# ============================================================
 def run_agent_stream(
     messages: list,
     mode: str = "deepseek",
-    # 以下全部可配置
-    model: str = None,                     # 如果为 None，则使用 config.DEEPSEEK_MODEL
+    model: Optional[str] = None,
     temperature: float = 0.3,
     top_p: float = 0.9,
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
-    max_tokens: int = 40000,                # 根据 model 自动调整也行，但就给个默认值
+    max_tokens: int = 40000,
     timeout: int = 180,
-    enable_thinking: bool = True,          # 是否开启思考模式
-    reasoning_effort: str = "high"):
+    enable_thinking: bool = True,
+    reasoning_effort: str = "high",
+    **_unused,
+) -> Iterator[str]:
+    """
+    流式调用 LLM。
 
-    if mode == "openai":
-        client = get_openai_client()
-        model = OPENAI_MODEL
-        return _stream_openai(client, model, messages)
-    else:  # deepseek
-        client = get_deepseek_client()
-        model = DEEPSEEK_MODEL
+    yield 规则：
+    - delta.content → 实时 yield（流式感）
+    - NEW_BUBBLE   → UI 创建新气泡
+    - DIRECT_OUTPUT 工具（generate_daily_summary_*）返回后，按 ### 标题切气泡
+    - 工具执行完毕 → yield 一条 [工具 name 执行完毕] 提示
+    - LLM 错误 → yield 友好错误消息
+    """
+    client, default_model, provider_name = _resolve_client_and_model(mode)
+    actual_model = model or default_model
+    if actual_model is None:
+        raise LLMClientError("unknown", f"mode={mode!r} 需要显式传 model 参数")
 
-    if EMBEDDING_ENABLED:
-        TOOLS = BASE_TOOLS + EMBEDDING_TOOLS
-    else:
-        TOOLS = BASE_TOOLS
+    # 旧 model 名兼容
+    actual_model, enable_thinking, reasoning_effort = _resolve_legacy_model(
+        actual_model, enable_thinking
+    )
 
+    # 工具 schema 统一从 ToolRegistry 拿
+    tools = ToolRegistry.list_schemas()
+
+    # OpenAI 模式：不支持工具调用
+    if provider_name == "openai":
+        try:
+            yield from _stream_openai_simple(
+                client=client, model=actual_model, messages=messages,
+                temperature=temperature, max_tokens=min(max_tokens, 8192),
+            )
+        except Exception as e:
+            yield _format_openai_error(e)
+            yield NEW_BUBBLE
+        return
+
+    # DeepSeek 模式：思考 + 工具调用循环
     while True:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            stream=True,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body={"thinking": {"type": "enabled"}} if enable_thinking else {},
-            reasoning_effort=reasoning_effort if enable_thinking else None
-        )
-
-        # 用于累积当前子回合（sub-turn）的完整响应
-        current_sub_turn_message = {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "",
-            "tool_calls": []
+        request_params = {
+            "model": actual_model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": True,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
         }
-        tool_call_dict = {}
+        if enable_thinking:
+            request_params["extra_body"] = {"thinking": {"type": "enabled"}}
+            request_params["reasoning_effort"] = reasoning_effort
+
+        try:
+            stream = client.chat.completions.create(**request_params)
+        except Exception as e:
+            yield _format_deepseek_error(e)
+            yield NEW_BUBBLE
+            return
+
+        current_content = ""
+        current_reasoning = ""
+        tool_calls_dict: dict = {}
 
         for chunk in stream:
             delta = chunk.choices[0].delta
-
-            if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                current_sub_turn_message["reasoning_content"] += delta.reasoning_content
-
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                current_reasoning += delta.reasoning_content
             if delta.content:
-                current_sub_turn_message["content"] += delta.content
-                # ✅ 关键修改：不再在此处实时 yield，改为完整累积后再分割气泡
-
+                current_content += delta.content
+                # ✅ 实时 yield — 保留 QAgent 流式感
+                yield delta.content
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
-                    if idx not in tool_call_dict:
-                        tool_call_dict[idx] = {
+                    if idx not in tool_calls_dict:
+                        tool_calls_dict[idx] = {
                             "id": tc.id,
                             "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments or ""}
+                            "function": {"name": tc.function.name, "arguments": ""},
                         }
-                    else:
-                        if tc.function.arguments:
-                            tool_call_dict[idx]["function"]["arguments"] += tc.function.arguments
+                    if tc.function.arguments:
+                        tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
 
-        if tool_call_dict:
-            current_sub_turn_message["tool_calls"] = list(tool_call_dict.values())
-            for tc in current_sub_turn_message["tool_calls"]:
-                print(f"模型请求调用工具: {tc['function']['name']}")
-        else:
-            current_sub_turn_message.pop("tool_calls", None)
+        # 把当前 assistant 消息加入历史
+        assistant_msg: dict = {"role": "assistant", "content": current_content}
+        if current_reasoning:
+            assistant_msg["reasoning_content"] = current_reasoning
+        if tool_calls_dict:
+            assistant_msg["tool_calls"] = list(tool_calls_dict.values())
+        messages.append(assistant_msg)
 
-        # 将当前子回合的完整消息追加到历史
-        messages.append(current_sub_turn_message)
-
-        # ========== ✅ 对累积的文本内容进行气泡分割并输出 ==========
-        accumulated_text = current_sub_turn_message.get("content", "")
-        # has_tool_calls = bool(current_sub_turn_message.get("tool_calls"))
-
-        if accumulated_text:
-            for chunk_text in _yield_bubbles(accumulated_text):
-                yield chunk_text
-
-        # 如果没有工具调用，说明本轮已结束
-        if not current_sub_turn_message.get("tool_calls"):
+        # 没有工具调用：本轮结束
+        if not tool_calls_dict:
             break
 
-        # ========== 工具调用执行 ==========
-        tool_responses = []
-        for tool_call in current_sub_turn_message["tool_calls"]:
+        # ========== 工具调用（统一通过 ToolRegistry 分发） ==========
+        for tool_call in assistant_msg["tool_calls"]:
             fn_name = tool_call["function"]["name"]
-
-            if not EMBEDDING_ENABLED and fn_name in EMBEDDING_TOOL_NAMES:
-                content = f"工具 {fn_name} 需要 embedding 支持，但当前已在配置中禁用。"
-                tool_responses.append((tool_call["id"], content))
-                yield NEW_BUBBLE
-                yield content
-                yield NEW_BUBBLE
-                continue
-
             try:
                 args = json.loads(tool_call["function"]["arguments"])
             except json.JSONDecodeError as e:
-                content = f"工具 {fn_name} 参数解析失败: {e}"
-                tool_responses.append((tool_call["id"], content))
                 yield NEW_BUBBLE
-                yield content
+                yield f"[工具 {fn_name} 参数解析失败: {e}]"
                 yield NEW_BUBBLE
                 continue
 
-            result = None
-            if fn_name == "search_papers":
-                result = search_papers(args["query"])
-            elif fn_name == "run_python":
-                result = run_python(args["code"])
-            elif fn_name == "search_arxiv":
-                result = search_arxiv(args["query"], args.get("max_results", 10))
-            elif fn_name == "download_arxiv_paper":
-                result = download_arxiv_paper(args["arxiv_id"])
-            elif fn_name == "analyze_paper":
-                paper_id = args.get("paper_id")
-                pdf_path = args.get("pdf_path")
-                user_comment = args.get("user_comment", "")
-                if not paper_id:
-                    yield NEW_BUBBLE
-                    yield "❌ 缺少论文标识符（paper_id）"
-                    yield NEW_BUBBLE
-                    continue
-                try:
-                    result = analyze_paper(paper_id, pdf_path, user_comment)
-                    yield NEW_BUBBLE
-                    yield f"✅ 论文分析完成，标题：{result.get('title', 'N/A')}"
-                    yield NEW_BUBBLE
-                except Exception as e:
-                    yield NEW_BUBBLE
-                    yield f"❌ 分析失败：{e}"
-                    yield NEW_BUBBLE
-            elif fn_name == "update_paper_comment":
-                paper_id = args.get("paper_id")
-                user_comment = args.get("user_comment", "")
-                if not paper_id:
-                    yield NEW_BUBBLE
-                    yield "❌ 缺少论文标识符（paper_id）"
-                    yield NEW_BUBBLE
-                    continue
-                if not user_comment:
-                    yield NEW_BUBBLE
-                    yield "❌ 缺少评论内容（user_comment）"
-                    yield NEW_BUBBLE
-                    continue
-                try:
-                    result = update_paper_comment(paper_id, user_comment)
-                    yield NEW_BUBBLE
-                    yield f"✅ 评论已更新至论文 {paper_id}，现有评论：{result['user_comments']}"
-                    yield NEW_BUBBLE
-                except Exception as e:
-                    yield NEW_BUBBLE
-                    yield f"❌ 更新评论失败：{e}"
-                    yield NEW_BUBBLE
-            elif fn_name == "scan_local_papers":
-                result = scan_local_papers()
-            elif fn_name == "query_knowledge":
-                result = query_knowledge(
-                    args.get("keyword"),
-                    args.get("topic"),
-                    args.get("author")
-                )
-            elif fn_name == "generate_daily_summary_arxiv":
-                result = generate_daily_summary_arxiv()
-            elif fn_name == "analyze_today_topic_arxiv":
-                result = analyze_today_topic_arxiv(args["topic"])
-            elif fn_name == "generate_aps_daily_summary":
-                journal = args.get("journal")
-                try:
-                    result = generate_aps_daily_summary(journal)
-                except Exception as e:
-                    error_msg = f"❌ aps总结生成失败：{e}"
-                    yield NEW_BUBBLE
-                    yield error_msg
-                    yield NEW_BUBBLE
-                    result = error_msg
-            elif fn_name == "download_aps_paper":
-                result = download_aps_paper(args["doi"])
-            else:
-                result = f"未知工具: {fn_name}"
+            # 工具结果收集（同步或流式）
+            result_text = _dispatch_tool(fn_name, args)
 
-            # 将结果转换为字符串
-            if result is None:
-                content = f"工具 {fn_name} 执行无返回"
-            elif isinstance(result, str):
-                content = result
-            else:
-                content = json.dumps(result, ensure_ascii=False)
-            tool_responses.append((tool_call["id"], content))
-
-        # 将所有 tool 消息追加到 messages
-        for tool_call_id, content in tool_responses:
+            # 工具结果加入 LLM 历史
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content
+                "tool_call_id": tool_call["id"],
+                "content": result_text,
             })
 
-        # 检查本轮调用的工具是否属于直接输出类型
-        called_tool_names = {tc["function"]["name"] for tc in current_sub_turn_message["tool_calls"]}
-        if called_tool_names & DIRECT_OUTPUT_TOOLS:
-            for _, content in tool_responses:
-                bubbles = split_markdown_bubbles(content)
-                for bubble in bubbles:
-                    yield ('\n' + bubble).lstrip('\n')
-                    yield NEW_BUBBLE
-            break
+            # DIRECT_OUTPUT 工具：按 ### 标题切气泡，yield 完 break
+            if fn_name in DIRECT_OUTPUT_TOOLS:
+                yield NEW_BUBBLE
+                yield from _split_into_bubbles(result_text)
+                return
 
-def _stream_openai(client, model, user_input):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input}
-    ]
+            # 普通工具：yield 一条简短完成提示 + 切新气泡（让后续 LLM 输出在另一个气泡里）
+            yield NEW_BUBBLE
+            yield f"[工具 {fn_name} 执行完毕]"
+            yield NEW_BUBBLE
+
+
+def _dispatch_tool(fn_name: str, args: dict) -> str:
+    """调工具，收集完整结果（同步或流式），返回字符串"""
+    collected: list[str] = []
+    for chunk in ToolRegistry.dispatch(fn_name, args):
+        if chunk:
+            collected.append(chunk)
+    return "".join(collected)
+
+
+def _split_into_bubbles(content: str) -> Iterator[str]:
+    """
+    把 DIRECT_OUTPUT 工具返回的长 Markdown 内容按 ### 标题切气泡。
+    每段 yield 一次（用 NEW_BUBBLE 分隔）。
+    如果没有 ### 标题，整个内容一个气泡。
+    """
+    if not content or not content.strip():
+        return
+
+    bubbles = split_markdown_bubbles(content)
+    for bubble in bubbles:
+        if bubble.strip():
+            yield bubble
+            yield NEW_BUBBLE
+
+
+# ============================================================
+# 错误格式化
+# ============================================================
+def _format_openai_error(e: Exception) -> str:
+    err_name = type(e).__name__
+    err_str = str(e)[:300]
+    if "Authentication" in err_name or "401" in err_str or "Incorrect API key" in err_str or "governor" in err_str.lower():
+        return (
+            f"❌ OpenAI API 鉴权失败（{err_name}）\n\n"
+            f"可能原因：\n"
+            f"  1. API key 无效或已过期 — 在「首选项 → LLM API」里检查\n"
+            f"  2. 国内 IP 会被 OpenAI 风控（governor）拦截，**建议切到 deepseek-v4-flash**\n"
+            f"  3. 检查 OpenAI 账户余额\n\n"
+            f"原始错误：{err_str}"
+        )
+    if "Timeout" in err_name:
+        return f"❌ OpenAI 请求超时（{err_name}）：{err_str}"
+    if "RateLimit" in err_name or "429" in err_str:
+        return f"❌ OpenAI 触发限流，建议稍后重试。\n\n原始：{err_str}"
+    return f"❌ OpenAI 调用失败（{err_name}）：{err_str}"
+
+
+def _format_deepseek_error(e: Exception) -> str:
+    err_name = type(e).__name__
+    err_str = str(e)[:300]
+    if "Authentication" in err_name or "401" in err_str or "Incorrect API key" in err_str or "governor" in err_str.lower():
+        return (
+            f"❌ DeepSeek API 鉴权失败（{err_name}）\n\n"
+            f"可能原因：\n"
+            f"  1. API key 无效或已过期 — 在「首选项 → LLM API」或 .env 中检查\n"
+            f"  2. DeepSeek 账户余额不足\n"
+            f"  3. key 被 DeepSeek governor 拦截，需要重新生成 key\n\n"
+            f"原始错误：{err_str}"
+        )
+    if "Timeout" in err_name:
+        return f"❌ DeepSeek 请求超时（{err_name}）：{err_str}"
+    if "RateLimit" in err_name or "429" in err_str:
+        return f"❌ DeepSeek 触发限流，建议稍后重试。\n\n原始：{err_str}"
+    return f"❌ DeepSeek 调用失败（{err_name}）：{err_str}"
+
+
+# ============================================================
+# OpenAI 简单流式
+# ============================================================
+def _stream_openai_simple(client, model, messages, temperature, max_tokens) -> Iterator[str]:
     stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-        temperature=0.3,
-        max_tokens=8192
+        model=model, messages=messages, stream=True,
+        temperature=temperature, max_tokens=max_tokens,
     )
     for chunk in stream:
         if chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
-def call_model(client, model_name, user_input):
-    messages = [
+
+# ============================================================
+# 非流式（兼容旧调用）
+# ============================================================
+def call_model(client, model_name, user_input) -> str:
+    msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input}
+        {"role": "user", "content": user_input},
     ]
+    response = client.chat.completions.create(
+        model=model_name, messages=msgs, temperature=0.3, max_tokens=8192,
+    )
+    return response.choices[0].message.content
 
-    if EMBEDDING_ENABLED:
-        TOOLS = BASE_TOOLS + EMBEDDING_TOOLS
-    else:
-        TOOLS = BASE_TOOLS
 
-    while True:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto"
-        )
-
-        msg = response.choices[0].message
-
-        if not msg.tool_calls:
-            return msg.content
-
-        for tool_call in msg.tool_calls:
-            fn = tool_call.function.name
-            if not EMBEDDING_ENABLED and fn in EMBEDDING_TOOL_NAMES:
-                result = f"工具 {fn} 需要 embedding 支持，但当前已在配置中禁用。"
-                messages.append(msg)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result
-                })
-                continue
-            args = json.loads(tool_call.function.arguments)
-            result = None
-
-            if fn == "search_papers":
-                result = search_papers(args["query"])
-            elif fn == "run_python":
-                result = run_python(args["code"])
-            elif fn == "search_arxiv":
-                result = search_arxiv(args["query"], args.get("max_results", 10))
-            elif fn == "download_arxiv_paper":
-                result = download_arxiv_paper(args["arxiv_id"])
-            elif fn == "analyze_paper":
-                result = analyze_paper(
-                    args["paper_id"],
-                    args.get("pdf_path"),
-                    args.get("user_comment", "")
-                )
-            elif fn == "scan_local_papers":
-                result = scan_local_papers()
-            elif fn == "query_knowledge":
-                result = query_knowledge(
-                    args.get("keyword"),
-                    args.get("topic"),
-                    args.get("author")
-                )
-            elif fn == "generate_daily_summary_arxiv":
-                result = generate_daily_summary_arxiv()
-            elif fn == "analyze_today_topic_arxiv":
-                result = analyze_today_topic_arxiv(args["topic"])
-            elif fn == "generate_aps_daily_summary":
-                result = generate_aps_daily_summary(args["journal"])
-            elif fn == "download_aps_paper":
-                result = download_aps_paper(args["doi"])
-            else:
-                result = "Unknown tool"
-
-            messages.append(msg)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
-            })
-
-def run_agent(user_input, mode="deepseek"):
-    if mode == "openai":
-        client = get_openai_client()
-        return call_model(client, OPENAI_MODEL, user_input)
-    if mode == "deepseek":
-        client = get_deepseek_client()
-        return call_model(client, DEEPSEEK_MODEL, user_input)
-    if mode == "compare":
-        openai_client = get_openai_client()
-        deepseek_client = get_deepseek_client()
-        r1 = call_model(openai_client, OPENAI_MODEL, user_input)
-        r2 = call_model(deepseek_client, DEEPSEEK_MODEL, user_input)
-        return {"OpenAI": r1, "DeepSeek": r2}
+def run_agent(user_input: str, mode: str = "deepseek") -> str:
+    client, model, _ = _resolve_client_and_model(mode)
+    if client is None or model is None:
+        raise LLMClientError("unknown", f"mode={mode!r} 在非流式入口不支持")
+    return call_model(client, model, user_input)
