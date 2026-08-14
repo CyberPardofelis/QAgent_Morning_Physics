@@ -1,10 +1,11 @@
 import os
 import json
+import re
 import arxiv
 from datetime import datetime
 from pathlib import Path
 from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR
-from agent.tools.database import get_db_connection, get_paper_by_id
+from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
 from agent.tools.pdf_utils import extract_text_from_pdf
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
@@ -83,7 +84,6 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
     try:
         result = json.loads(result_str)
     except json.JSONDecodeError:
-        import re
         match = re.search(r'\{.*\}', result_str, re.DOTALL)
         if match:
             try:
@@ -102,57 +102,7 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
 
     # 存入数据库
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-
-        authors_json = json.dumps(result.get("authors", []), ensure_ascii=False)
-        keywords_json = json.dumps(result.get("keywords", []), ensure_ascii=False)
-        citations_json = json.dumps(result.get("citations", []), ensure_ascii=False)
-        intro_cites_json = json.dumps(result.get("intro_cites", []), ensure_ascii=False)
-        user_comments_json = json.dumps(result.get("user_comments", []), ensure_ascii=False)
-
-        c.execute('''
-            INSERT OR REPLACE INTO papers (
-                paper_id, title, authors, link, keywords, research_topic,
-                basic_method, main_conclusion, citations, intro_cites,
-                outlook, summary, local_path, user_comments, analyzed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            result["paper_id"],
-            result.get("title", ""),
-            authors_json,
-            result.get("link", ""),
-            keywords_json,
-            result.get("research_topic", ""),
-            result.get("basic_method", ""),
-            result.get("main_conclusion", ""),
-            citations_json,
-            intro_cites_json,
-            result.get("outlook", ""),
-            result.get("summary", ""),
-            result.get("local_path", ""),
-            user_comments_json,
-            result["analyzed_at"]
-        ))
-
-        keywords_str = ' '.join(result.get("keywords", []))
-        comments_str = ' '.join(result.get("user_comments", []))
-        c.execute('''
-            INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords, user_comments_text)
-            VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            result.get("title", ""),
-            result.get("research_topic", ""),
-            result.get("basic_method", ""),
-            result.get("main_conclusion", ""),
-            result.get("outlook", ""),
-            result.get("summary", ""),
-            keywords_str,
-            comments_str
-        ))
-
-        conn.commit()
-        conn.close()
+        save_paper_record(result)
     except Exception as e:
         return f"❌ 存入数据库失败: {e}"
 
@@ -203,21 +153,7 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     if not rows:
         return "未找到匹配的论文。"
 
-    results = []
-    for row in rows:
-        paper = dict(row)
-        for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
-            if paper.get(field):
-                try:
-                    parsed = json.loads(paper[field])
-                    while isinstance(parsed, str):
-                        parsed = json.loads(parsed)
-                    paper[field] = parsed
-                except Exception:
-                    paper[field] = []
-            else:
-                paper[field] = []
-        results.append(paper)
+    results = [deserialize_json_fields(dict(row)) for row in rows]
 
     lines = [f"找到 {len(results)} 篇匹配论文：\n"]
     for i, p in enumerate(results, 1):
@@ -281,61 +217,14 @@ def scan_local_papers() -> str:
 # ============================================================
 def migrate_json_to_db():
     """将 KNOWLEDGE_DIR 下所有 .json 文件（除了 index.json）导入数据库"""
-    conn = get_db_connection()
-    c = conn.cursor()
-
     for json_file in KNOWLEDGE_DIR.glob("*.json"):
         if json_file.name == "index.json":
             continue
         with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        paper_id = data.get("paper_id", json_file.stem)
-        authors_json = json.dumps(data.get("authors", []), ensure_ascii=False)
-        keywords_json = json.dumps(data.get("keywords", []), ensure_ascii=False)
-        citations_json = json.dumps(data.get("citations", []), ensure_ascii=False)
-        intro_cites_json = json.dumps(data.get("intro_cites", []), ensure_ascii=False)
-        user_comments_json = json.dumps(data.get("user_comments", []), ensure_ascii=False)
-
-        c.execute('''
-            INSERT OR REPLACE INTO papers (
-                paper_id, title, authors, link, keywords, research_topic,
-                basic_method, main_conclusion, citations, intro_cites,
-                outlook, summary, local_path, user_comments, analyzed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            paper_id,
-            data.get("title", ""),
-            authors_json,
-            data.get("link", ""),
-            keywords_json,
-            data.get("research_topic", ""),
-            data.get("basic_method", ""),
-            data.get("main_conclusion", ""),
-            citations_json,
-            intro_cites_json,
-            data.get("outlook", ""),
-            data.get("summary", ""),
-            data.get("local_path", ""),
-            user_comments_json,
-            data.get("analyzed_at", datetime.now().isoformat())
-        ))
-
-        keywords_str = ' '.join(data.get("keywords", []))
-        comments_str = ' '.join(data.get("user_comments", []))
-        c.execute('''
-            INSERT INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords, user_comments_text)
-            VALUES (last_insert_rowid(), ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            data.get("title", ""),
-            data.get("research_topic", ""),
-            data.get("basic_method", ""),
-            data.get("main_conclusion", ""),
-            data.get("outlook", ""),
-            data.get("summary", ""),
-            keywords_str,
-            comments_str
-        ))
-
-    conn.commit()
-    conn.close()
+        if "paper_id" not in data:
+            data["paper_id"] = json_file.stem
+        if "analyzed_at" not in data:
+            data["analyzed_at"] = datetime.now().isoformat()
+        save_paper_record(data)

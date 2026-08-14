@@ -1,10 +1,78 @@
 import json
+import re
 import arxiv
 import requests
 from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
+
+
+# ============================================================
+# 内部：抓取并解析 arXiv "今日新论文" 列表
+# ============================================================
+_ARXIV_LISTING_URL = "https://arxiv.org/list/quant-ph/new"
+
+
+def _fetch_arxiv_listing(include_authors: bool = True) -> list:
+    """
+    抓取 arXiv quant-ph "今日新论文" 列表并解析。
+
+    Returns:
+        list of dict: [{'id', 'title', 'abstract', 'link', 'authors'?}, ...]
+
+    Raises:
+        RuntimeError: 抓取或解析失败
+    """
+    response = requests.get(_ARXIV_LISTING_URL, timeout=30)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    papers = []
+    dts = soup.find_all('dt')
+    dds = soup.find_all('dd')
+    for dt, dd in zip(dts, dds):
+        arxiv_id_tag = dt.find('a', title='Abstract')
+        if arxiv_id_tag:
+            arxiv_id = arxiv_id_tag['href'].split('/')[-1]
+        else:
+            match = re.search(r'arXiv:(\d+\.\d+)', dt.get_text())
+            arxiv_id = match.group(1) if match else "unknown"
+
+        title_tag = dd.find('div', class_='list-title')
+        title = title_tag.get_text().replace('Title:', '').strip() if title_tag else ''
+
+        abstract_tag = dd.find('p', class_='mathjax')
+        abstract = abstract_tag.get_text().strip() if abstract_tag else ''
+
+        paper = {
+            'id': arxiv_id,
+            'title': title,
+            'abstract': abstract,
+            'link': f"https://arxiv.org/abs/{arxiv_id}",
+        }
+
+        if include_authors:
+            authors_tag = dd.find('div', class_='list-authors')
+            if authors_tag:
+                authors_text = authors_tag.get_text().replace('Authors:', '').strip()
+                author_list = [a.strip() for a in authors_text.split(',') if a.strip()]
+                if len(author_list) > 5:
+                    paper['authors'] = ', '.join(author_list[:3]) + ' 等'
+                else:
+                    paper['authors'] = ', '.join(author_list)
+            else:
+                paper['authors'] = "未知"
+
+        papers.append(paper)
+    return papers
+
+
+def _format_arxiv_links(text: str) -> str:
+    """把 LLM 总结里的 arXiv:NNNN.NNNNN / (NNNN.NNNNN) 转成 Markdown 超链接"""
+    text = re.sub(r'arXiv:\s*(\d{4}\.\d{4,5}(?:v\d+)?)', r'arXiv:[\1](https://arxiv.org/abs/\1)', text)
+    text = re.sub(r'\((\d{4}\.\d{4,5}(?:v\d+)?)\)', r'([\1](https://arxiv.org/abs/\1))', text)
+    return text
 
 
 # ============================================================
@@ -66,63 +134,20 @@ def generate_daily_summary_arxiv() -> str:
 
     返回完整 Markdown 总结。controller 会识别这是"直接输出"工具，单独分气泡渲染。
     """
-    url = "https://arxiv.org/list/quant-ph/new"
     try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        papers = []
-        dts = soup.find_all('dt')
-        dds = soup.find_all('dd')
-
-        for dt, dd in zip(dts, dds):
-            arxiv_id_tag = dt.find('a', title='Abstract')
-            if arxiv_id_tag:
-                arxiv_id = arxiv_id_tag['href'].split('/')[-1]
-            else:
-                text = dt.get_text()
-                import re
-                match = re.search(r'arXiv:(\d+\.\d+)', text)
-                arxiv_id = match.group(1) if match else "unknown"
-
-            title_tag = dd.find('div', class_='list-title')
-            title = title_tag.get_text().replace('Title:', '').strip() if title_tag else ''
-
-            abstract_tag = dd.find('p', class_='mathjax')
-            abstract = abstract_tag.get_text().strip() if abstract_tag else ''
-
-            authors_tag = dd.find('div', class_='list-authors')
-            if authors_tag:
-                authors_text = authors_tag.get_text().replace('Authors:', '').strip()
-                author_list = [a.strip() for a in authors_text.split(',') if a.strip()]
-                if len(author_list) > 5:
-                    authors = ', '.join(author_list[:3]) + ' 等'
-                else:
-                    authors = ', '.join(author_list)
-            else:
-                authors = "未知"
-
-            papers.append({
-                'id': arxiv_id,
-                'title': title,
-                'abstract': abstract,
-                'link': f"https://arxiv.org/abs/{arxiv_id}",
-                'authors': authors
-            })
-
-        if not papers:
-            return "未找到论文列表，请稍后重试。"
-
-        papers_text = ""
-        for i, p in enumerate(papers, 1):
-            papers_text += f"{i}. **{p['title']}**\n"
-            papers_text += f"   - 作者: {p.get('authors', '未知')}\n"
-            papers_text += f"   - ID: `{p['id']}` | [arXiv链接]({p['link']})\n"
-            papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
-
+        papers = _fetch_arxiv_listing(include_authors=True)
     except Exception as e:
-        return f"❌ 抓取或解析 arXiv 页面失败: {str(e)}"
+        return f"❌ 抓取或解析 arXiv 页面失败: {e}"
+
+    if not papers:
+        return "未找到论文列表，请稍后重试。"
+
+    papers_text = ""
+    for i, p in enumerate(papers, 1):
+        papers_text += f"{i}. **{p['title']}**\n"
+        papers_text += f"   - 作者: {p.get('authors', '未知')}\n"
+        papers_text += f"   - ID: `{p['id']}` | [arXiv链接]({p['link']})\n"
+        papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
 
     prompt = f"""
     你现在是一个科研助手。以下是从 arXiv.org 抓取的"量子物理（quant-ph）"类别最新论文列表（共 {len(papers)} 篇）。
@@ -145,15 +170,9 @@ def generate_daily_summary_arxiv() -> str:
     {papers_text}
     """
 
-    def _add_arxiv_links(text: str) -> str:
-        import re
-        text = re.sub(r'arXiv:\s*(\d{4}\.\d{4,5}(?:v\d+)?)', r'arXiv:[\1](https://arxiv.org/abs/\1)', text)
-        text = re.sub(r'\((\d{4}\.\d{4,5}(?:v\d+)?)\)', r'([\1](https://arxiv.org/abs/\1))', text)
-        return text
-
     try:
         summary = _call_llm(prompt)
-        return _add_arxiv_links(summary)
+        return _format_arxiv_links(summary)
     except Exception as e:
         return f"❌ 生成总结失败: {e}"
 
@@ -166,35 +185,10 @@ def analyze_today_topic_arxiv(topic: str) -> str:
     """
     针对当天 arXiv quant-ph 新论文中某个主题的论文进行详细分析。
     """
-    url = "https://arxiv.org/list/quant-ph/new"
     try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        papers = []
-        dts = soup.find_all('dt')
-        dds = soup.find_all('dd')
-        for dt, dd in zip(dts, dds):
-            arxiv_id_tag = dt.find('a', title='Abstract')
-            if arxiv_id_tag:
-                arxiv_id = arxiv_id_tag['href'].split('/')[-1]
-            else:
-                text = dt.get_text()
-                import re
-                match = re.search(r'arXiv:(\d+\.\d+)', text)
-                arxiv_id = match.group(1) if match else "unknown"
-            title_tag = dd.find('div', class_='list-title')
-            title = title_tag.get_text().replace('Title:', '').strip() if title_tag else ''
-            abstract_tag = dd.find('p', class_='mathjax')
-            abstract = abstract_tag.get_text().strip() if abstract_tag else ''
-            papers.append({
-                'id': arxiv_id,
-                'title': title,
-                'abstract': abstract,
-                'link': f"https://arxiv.org/abs/{arxiv_id}"
-            })
+        papers = _fetch_arxiv_listing(include_authors=False)
     except Exception as e:
-        return f"❌ 抓取或解析 arXiv 页面失败: {str(e)}"
+        return f"❌ 抓取或解析 arXiv 页面失败: {e}"
 
     if not papers:
         return "当天没有新论文。"

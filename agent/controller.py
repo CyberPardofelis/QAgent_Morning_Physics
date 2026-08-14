@@ -18,6 +18,8 @@ from agent.llm_clients import (
     get_openai_client,
     LLMClientError,
     PROVIDERS,
+    resolve_legacy_model,
+    classify_llm_error,
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools.registry import ToolRegistry
@@ -46,12 +48,6 @@ MODE_TO_PROVIDER_MODEL = {
     "custom":            (None,       None),
 }
 
-# 旧 model 名 → (新 model, enable_thinking, reasoning_effort) 的兼容映射
-LEGACY_MODEL_MAP = {
-    "deepseek-reasoner": ("deepseek-v4-pro", True, "max"),
-    "deepseek-chat":     ("deepseek-v4-flash", False, "high"),
-}
-
 
 # bubble 分隔符（兼容旧 UI 代码）
 NEW_BUBBLE = "\x1cNEW_BUBBLE"
@@ -78,15 +74,7 @@ def _resolve_client_and_model(mode: str) -> tuple:
     return client, model, provider_name
 
 
-def _resolve_legacy_model(model: str, enable_thinking: bool) -> tuple:
-    if model in LEGACY_MODEL_MAP:
-        new_model, want_thinking, effort = LEGACY_MODEL_MAP[model]
-        logger.info(
-            "[controller] 旧 model %r → %r (thinking=%s, effort=%s)",
-            model, new_model, want_thinking, effort,
-        )
-        return new_model, want_thinking, effort
-    return model, enable_thinking, "high"
+# resolve_legacy_model 已在 agent.llm_clients 中定义（统一来源）
 
 
 # ============================================================
@@ -122,7 +110,7 @@ def run_agent_stream(
         raise LLMClientError("unknown", f"mode={mode!r} 需要显式传 model 参数")
 
     # 旧 model 名兼容
-    actual_model, enable_thinking, reasoning_effort = _resolve_legacy_model(
+    actual_model, enable_thinking, reasoning_effort = resolve_legacy_model(
         actual_model, enable_thinking
     )
 
@@ -262,44 +250,14 @@ def _split_into_bubbles(content: str) -> Iterator[str]:
 
 
 # ============================================================
-# 错误格式化
+# 错误格式化（薄封装，逻辑统一在 agent.llm_clients.classify_llm_error）
 # ============================================================
 def _format_openai_error(e: Exception) -> str:
-    err_name = type(e).__name__
-    err_str = str(e)[:300]
-    if "Authentication" in err_name or "401" in err_str or "Incorrect API key" in err_str or "governor" in err_str.lower():
-        return (
-            f"❌ OpenAI API 鉴权失败（{err_name}）\n\n"
-            f"可能原因：\n"
-            f"  1. API key 无效或已过期 — 在「首选项 → LLM API」里检查\n"
-            f"  2. 国内 IP 会被 OpenAI 风控（governor）拦截，**建议切到 deepseek-v4-flash**\n"
-            f"  3. 检查 OpenAI 账户余额\n\n"
-            f"原始错误：{err_str}"
-        )
-    if "Timeout" in err_name:
-        return f"❌ OpenAI 请求超时（{err_name}）：{err_str}"
-    if "RateLimit" in err_name or "429" in err_str:
-        return f"❌ OpenAI 触发限流，建议稍后重试。\n\n原始：{err_str}"
-    return f"❌ OpenAI 调用失败（{err_name}）：{err_str}"
+    return classify_llm_error("OpenAI", e)
 
 
 def _format_deepseek_error(e: Exception) -> str:
-    err_name = type(e).__name__
-    err_str = str(e)[:300]
-    if "Authentication" in err_name or "401" in err_str or "Incorrect API key" in err_str or "governor" in err_str.lower():
-        return (
-            f"❌ DeepSeek API 鉴权失败（{err_name}）\n\n"
-            f"可能原因：\n"
-            f"  1. API key 无效或已过期 — 在「首选项 → LLM API」或 .env 中检查\n"
-            f"  2. DeepSeek 账户余额不足\n"
-            f"  3. key 被 DeepSeek governor 拦截，需要重新生成 key\n\n"
-            f"原始错误：{err_str}"
-        )
-    if "Timeout" in err_name:
-        return f"❌ DeepSeek 请求超时（{err_name}）：{err_str}"
-    if "RateLimit" in err_name or "429" in err_str:
-        return f"❌ DeepSeek 触发限流，建议稍后重试。\n\n原始：{err_str}"
-    return f"❌ DeepSeek 调用失败（{err_name}）：{err_str}"
+    return classify_llm_error("DeepSeek", e)
 
 
 # ============================================================

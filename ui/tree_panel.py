@@ -1,7 +1,8 @@
-# tree_panel.py
+﻿# tree_panel.py
 import json
 from datetime import datetime
 from PySide6.QtCore import Qt, QSettings
+from config.settings import get_settings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QTreeWidget,
@@ -182,7 +183,7 @@ class ConversationTreePanel(QWidget):
         )
         if reply == QMessageBox.Yes:
             self.history_manager.delete_group(group_id, move_to_group_id=None)
-            settings = QSettings("CyberPardofelis", "LLM科研助手")
+            settings = get_settings()
             settings.remove(f"group_system_prompt/{group_id}")
             self.refresh_tree()
 

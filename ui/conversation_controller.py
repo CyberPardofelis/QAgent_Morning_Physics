@@ -1,4 +1,4 @@
-"""
+﻿"""
 ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 
 变更点（相对旧版）：
@@ -11,6 +11,7 @@ ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 import json
 from datetime import datetime
 from PySide6.QtCore import QObject, Signal, QSettings
+from config.settings import get_settings
 from agent.history_manager import HistoryManager
 from ui.worker import Worker, NEW_BUBBLE
 from agent.tools import get_paper_by_id, update_paper_llm_summary
@@ -54,12 +55,12 @@ class ConversationController(QObject):
         self._comparison_target_conv = None
         self._comparison_last_bubble = None
 
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         self.default_system_prompt = settings.value("default_system_prompt", SYSTEM_PROMPT)
         self._load_comparison_config()
 
     def _load_comparison_config(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         try:
             self.compare_config_a = json.loads(settings.value("comparison/config_a",
                 '{"model":"deepseek-flash","thinking":true,"temperature":0.3,"top_p":0.9,"frequency_penalty":0.0,"presence_penalty":0.0}'))
@@ -77,7 +78,7 @@ class ConversationController(QObject):
     def _get_current_system_prompt(self):
         if self.current_conversation and self.current_conversation.group_id:
             group_id = self.current_conversation.group_id
-            settings = QSettings("CyberPardofelis", "LLM科研助手")
+            settings = get_settings()
             group_prompt = settings.value(f"group_system_prompt/{group_id}")
             if group_prompt:
                 return group_prompt

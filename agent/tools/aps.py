@@ -1,11 +1,11 @@
 import os
 import re
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.utils import JOURNAL_CONFIG
 from agent.tools.registry import register_tool
+from agent.tools.browser_pool import get_browser_pool
 
 
 def fetch_aps_page_via_browser(journal: str = 'prl'):
@@ -21,21 +21,18 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     url = config['url_template'].format(journal=journal, section=config['section'])
     link_selector = config['link_selector']
 
+    pool = get_browser_pool()
     try:
-        with sync_playwright() as p:
-            browser = p.firefox.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
+        with pool.acquire_page(
+            browser_type="firefox",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36",
+        ) as page:
             page.set_default_timeout(60000)
-
-            response = page.goto(url, wait_until="domcontentloaded")
-
+            page.goto(url, wait_until="domcontentloaded")
             page.wait_for_selector(link_selector, timeout=15000)
-            html = page.content()
-            browser.close()
-            return html
+            return page.content()
     except Exception as e:
         raise Exception(f"浏览器自动化抓取失败: {str(e)}")
 
@@ -137,19 +134,18 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
 
 
 def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
+    """
+    通过 chromium 下载 APS 论文 PDF。
+    使用 BrowserPool 复用浏览器进程，page/context 用完即关。
+    """
     os.makedirs(save_dir, exist_ok=True)
 
-    playwright = sync_playwright().start()
-    browser = None
-    try:
-        browser = playwright.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-        context = browser.new_context(
-            accept_downloads=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
-        )
-        page = context.new_page()
-
+    pool = get_browser_pool()
+    with pool.acquire_page(
+        browser_type="chromium",
+        accept_downloads=True,
+        viewport={'width': 1280, 'height': 800},
+    ) as page:
         page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=30000)
         final_url = page.url
 
@@ -180,11 +176,6 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         filepath = os.path.join(save_dir, filename)
         download.save_as(filepath)
         return filepath
-
-    finally:
-        if browser:
-            browser.close()
-        playwright.stop()
 
 
 @register_tool(name="download_aps_paper", is_streaming=False)

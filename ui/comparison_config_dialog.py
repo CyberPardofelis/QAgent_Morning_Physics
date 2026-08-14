@@ -1,6 +1,7 @@
-# ui/comparison_config_dialog.py
+﻿# ui/comparison_config_dialog.py
 import json
 from PySide6.QtCore import QSettings
+from config.settings import get_settings
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QCheckBox, QDoubleSpinBox, QSpinBox, QGroupBox, QPushButton, QMessageBox
@@ -11,7 +12,7 @@ class ComparisonConfigDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("对比模式设置")
         self.setMinimumWidth(600)
-        self.settings = QSettings("CyberPardofelis", "LLM科研助手")
+        self.settings = get_settings()
 
         layout = QVBoxLayout(self)
 

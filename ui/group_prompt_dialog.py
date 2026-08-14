@@ -1,4 +1,5 @@
-from PySide6.QtCore import QSettings
+﻿from PySide6.QtCore import QSettings
+from config.settings import get_settings
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QTextEdit, QHBoxLayout,
     QPushButton, QMessageBox
@@ -39,7 +40,7 @@ class GroupSystemPromptDialog(QDialog):
         self.load_prompt()
 
     def load_prompt(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         prompt = settings.value(f"group_system_prompt/{self.group_id}")
         if prompt:
             self.prompt_edit.setPlainText(prompt)
@@ -55,7 +56,7 @@ class GroupSystemPromptDialog(QDialog):
                 return
 
         new_prompt = self.prompt_edit.toPlainText().strip()
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         if new_prompt:
             settings.setValue(f"group_system_prompt/{self.group_id}", new_prompt)
         else:

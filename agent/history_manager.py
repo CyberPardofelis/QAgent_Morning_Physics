@@ -10,7 +10,9 @@ agent.history_manager — 对话历史持久化（参考 WAgent 重构版）
 """
 import json
 import logging
+import random
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -49,8 +51,6 @@ class Conversation:
 
     @staticmethod
     def _generate_id() -> str:
-        import time
-        import random
         timestamp = int(time.time() * 1000)
         rand = random.randint(1000, 9999)
         return f"{timestamp}-{rand}"
@@ -132,8 +132,6 @@ class Group:
 
     @staticmethod
     def _generate_id() -> str:
-        import time
-        import random
         timestamp = int(time.time() * 1000)
         rand = random.randint(1000, 9999)
         return f"group-{timestamp}-{rand}"

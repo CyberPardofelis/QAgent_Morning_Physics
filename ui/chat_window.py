@@ -1,7 +1,8 @@
-# chat_window.py
+﻿# chat_window.py
 import json
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QSettings, QEvent
+from config.settings import get_settings
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QMenu,
@@ -306,7 +307,7 @@ class ChatWindow(QMainWindow):
             self.think_checkbox.setToolTip("思考模式已开启")
 
     def on_daily_summary_clicked(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         selected = json.loads(settings.value("daily_summary_journals", '["arxiv"]'))
         if not selected:
             QMessageBox.information(self, "提示", "请先在设置中勾选需要每日总结的期刊")
@@ -333,7 +334,7 @@ class ChatWindow(QMainWindow):
         self.chat_view.refresh_bubble_widths()
 
     def _load_settings(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         self.controller.default_system_prompt = settings.value("default_system_prompt", SYSTEM_PROMPT)
         self.controller._load_comparison_config()
 

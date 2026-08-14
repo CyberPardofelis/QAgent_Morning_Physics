@@ -1,4 +1,4 @@
-"""
+﻿"""
 ui.settings_dialog — 设置对话框
 
 8 个标签页（按 WAgent 风格组织 + 保留 QAgent 专属）：
@@ -19,6 +19,7 @@ import json
 import yaml
 from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, Signal
+from config.settings import get_settings
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QCheckBox,
     QComboBox, QDialogButtonBox, QLabel, QTabWidget, QWidget,
@@ -424,13 +425,13 @@ class SettingsDialog(QDialog):
     # 加载 / 保存
     # ============================================================
     def _load_font_size(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
         font_size = settings.value("font_size", "14px")
         if isinstance(font_size, str) and font_size:
             self.font_size_combo.setCurrentText(font_size)
 
     def _load_config(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
 
         # API key：先看 .api_keys.json（agent.infra.api_keys 自动 fallback 到 QSettings）
         all_keys = get_all_api_keys()
@@ -472,7 +473,7 @@ class SettingsDialog(QDialog):
         self.prompt_edit.setPlainText(SYSTEM_PROMPT)
 
     def accept(self):
-        settings = QSettings("CyberPardofelis", "LLM科研助手")
+        settings = get_settings()
 
         # 字体
         settings.setValue("font_size", self.font_size_combo.currentText())

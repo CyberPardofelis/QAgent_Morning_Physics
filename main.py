@@ -5,7 +5,9 @@ main.py — 应用入口（重构版）
 - 用 config.Config + agent.infra.api_keys 统一配置来源
 - 配置加载顺序：QSettings 显式值 > .api_keys.json（自动迁移自 QSettings 旧 key）> .env 兜底
 - 全局异常钩子保留（写 error.log）
+- 退出时 atexit 关闭 BrowserPool（释放 playwright + browser 进程）
 """
+import atexit
 import sys
 import os
 import traceback
@@ -21,6 +23,9 @@ try:
     import agent.tools  # noqa: F401
     # 触发 API key 从 QSettings 一次性迁移到 .api_keys.json
     from agent.infra import api_keys  # noqa: F401
+    # 注册退出 hook：关闭共享的 Playwright 浏览器实例（懒创建的，shutdown 是幂等的）
+    from agent.tools.browser_pool import shutdown_browser_pool
+    atexit.register(shutdown_browser_pool)
 except Exception:
     if getattr(sys, 'frozen', False):
         base_dir = os.path.dirname(sys.executable)

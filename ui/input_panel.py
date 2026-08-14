@@ -1,4 +1,4 @@
-# input_panel.py — 移植 WAgent 附件系统 + 保留 QAgent 高度自适应
+﻿# input_panel.py — 移植 WAgent 附件系统 + 保留 QAgent 高度自适应
 #
 # 结构（外层垂直布局）：
 #   1. 附件 chip 横滚条（无附件时高度=0 完全隐藏）
@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QTimer, QEvent, QSettings
+from config.settings import get_settings
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPlainTextEdit,
     QPushButton, QSizePolicy, QToolButton, QScrollArea,
@@ -278,7 +279,7 @@ class InputPanel(QWidget):
 
     def _last_attach_dir(self) -> str:
         try:
-            s = QSettings("CyberPardofelis", "LLM科研助手")
+            s = get_settings()
             d = s.value("last_attach_dir", "", type=str)
             return d or ""
         except Exception:
@@ -286,7 +287,7 @@ class InputPanel(QWidget):
 
     def _save_last_attach_dir(self, d: str):
         try:
-            s = QSettings("CyberPardofelis", "LLM科研助手")
+            s = get_settings()
             s.setValue("last_attach_dir", d)
         except Exception:
             pass

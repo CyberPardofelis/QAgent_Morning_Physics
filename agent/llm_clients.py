@@ -183,6 +183,64 @@ def reset_client_cache(provider_name: Optional[str] = None) -> None:
 
 
 # ============================================================
+# 旧 model 名兼容（统一来源，controller 和 tools/llm 都从这 import）
+# ============================================================
+LEGACY_MODEL_MAP: Dict[str, tuple] = {
+    # 旧 model 名 -> (新 model, enable_thinking, reasoning_effort)
+    "deepseek-reasoner": ("deepseek-v4-pro", True, "max"),
+    "deepseek-chat":     ("deepseek-v4-flash", False, "high"),
+}
+
+
+def resolve_legacy_model(model: str, enable_thinking: bool) -> tuple:
+    """
+    旧 model 名 → 新 model 的兼容映射。
+    未命中时直接返回 (model, enable_thinking, "high")。
+    """
+    if model in LEGACY_MODEL_MAP:
+        new_model, want_thinking, effort = LEGACY_MODEL_MAP[model]
+        logger.info(
+            "[llm_clients] 旧 model %r → %r (thinking=%s, effort=%s)",
+            model, new_model, want_thinking, effort,
+        )
+        return new_model, want_thinking, effort
+    return model, enable_thinking, "high"
+
+
+# ============================================================
+# LLM 错误分类（401/Timeout/RateLimit/其他）→ 用户友好提示
+# ============================================================
+def classify_llm_error(provider_display: str, exc: Exception) -> str:
+    """
+    把 OpenAI 兼容 SDK 抛出的异常分类成用户友好的错误提示。
+    provider_display: 用于错误头部的可读 provider 名（如 "DeepSeek" / "OpenAI"）
+    返回 markdown 错误消息。
+    """
+    err_name = type(exc).__name__
+    err_str = str(exc)[:300]
+
+    if (
+        "Authentication" in err_name
+        or "401" in err_str
+        or "Incorrect API key" in err_str
+        or "governor" in err_str.lower()
+    ):
+        return (
+            f"❌ {provider_display} API 鉴权失败（{err_name}）\n\n"
+            f"可能原因：\n"
+            f"  1. API key 无效或已过期 — 在「首选项 → LLM API」或 .env 中检查\n"
+            f"  2. {provider_display} 账户余额不足\n"
+            f"  3. key 被风控系统拦截（governor），需要重新生成 key\n\n"
+            f"原始错误：{err_str}"
+        )
+    if "Timeout" in err_name:
+        return f"❌ {provider_display} 请求超时（{err_name}）：{err_str}"
+    if "RateLimit" in err_name or "429" in err_str:
+        return f"❌ {provider_display} 触发限流，建议稍后重试。\n\n原始：{err_str}"
+    return f"❌ {provider_display} 调用失败（{err_name}）：{err_str}"
+
+
+# ============================================================
 # 兼容旧接口（保留调用方不破坏）
 # ============================================================
 def get_deepseek_client() -> OpenAI:

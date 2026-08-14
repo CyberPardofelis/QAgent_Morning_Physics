@@ -71,18 +71,22 @@ def init_db():
 # ============================================================
 # KnowledgeBaseDialog 内部使用的查询函数（不是 LLM 工具，直接返回 dict/list）
 # ============================================================
-def get_paper_by_id(paper_id: str):
-    """根据 ID 获取论文完整信息（转换为字典），供 UI 直接使用"""
-    conn = get_db_connection()
-    row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
-    conn.close()
-    if not row:
-        return None
-    paper = dict(row)
-    for field in ['authors', 'keywords', 'citations', 'intro_cites', 'user_comments']:
+
+# 论文表中以 JSON 字符串存储的列表字段
+JSON_LIST_FIELDS = ('authors', 'keywords', 'citations', 'intro_cites', 'user_comments')
+
+
+def deserialize_json_fields(paper: dict) -> dict:
+    """
+    把 papers 表里以 JSON 字符串存的列表字段（authors / keywords / citations 等）
+    反序列化为 Python 对象。解析失败则置为空列表。
+    会就地修改 paper 并返回。
+    """
+    for field in JSON_LIST_FIELDS:
         if paper.get(field):
             try:
                 parsed = json.loads(paper[field])
+                # 兜底：有些旧数据会被双重编码
                 while isinstance(parsed, str):
                     parsed = json.loads(parsed)
                 paper[field] = parsed
@@ -91,6 +95,16 @@ def get_paper_by_id(paper_id: str):
         else:
             paper[field] = []
     return paper
+
+
+def get_paper_by_id(paper_id: str):
+    """根据 ID 获取论文完整信息（转换为字典），供 UI 直接使用"""
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return deserialize_json_fields(dict(row))
 
 
 # ============================================================
@@ -191,43 +205,87 @@ def update_paper_llm_summary(paper_id: str, summary: str):
     conn.close()
 
 
-def update_full_paper(updated_data):
-    """更新论文完整信息到数据库（UI 内部使用）"""
+def save_paper_record(data: dict) -> None:
+    """
+    把单篇论文的完整字段写入 papers + papers_fts（覆盖式）。
+
+    必填 key: paper_id
+    可选 key: title, authors(list), link, keywords(list), research_topic,
+             basic_method, main_conclusion, citations(list), intro_cites(list),
+             outlook, summary, local_path, user_comments(list), analyzed_at, llm_summary
+
+    行为：
+    - INSERT OR REPLACE 进 papers（按 paper_id 去重）
+    - 同时同步 papers_fts（FTS5 external content 表需手动同步）
+    - 如果 data 里没带 llm_summary，**保留已有值**（避免 analyze_paper 重复分析时
+      清空用户通过 update_paper_llm_summary 写入的对话总结）
+    """
     conn = get_db_connection()
     c = conn.cursor()
 
-    authors_json = json.dumps(updated_data["authors"], ensure_ascii=False)
-    keywords_json = json.dumps(updated_data["keywords"], ensure_ascii=False)
-    citations_json = json.dumps(updated_data["citations"], ensure_ascii=False)
-    intro_cites_json = json.dumps(updated_data["intro_cites"], ensure_ascii=False)
-    user_comments_json = json.dumps(updated_data["user_comments"], ensure_ascii=False)
+    # 保留已有 llm_summary（除非调用方显式覆盖）
+    if "llm_summary" not in data:
+        row = c.execute(
+            "SELECT llm_summary FROM papers WHERE paper_id = ?",
+            (data["paper_id"],),
+        ).fetchone()
+        data["llm_summary"] = row["llm_summary"] if row and row["llm_summary"] else ""
+
+    authors_json = json.dumps(data.get("authors", []) or [], ensure_ascii=False)
+    keywords_json = json.dumps(data.get("keywords", []) or [], ensure_ascii=False)
+    citations_json = json.dumps(data.get("citations", []) or [], ensure_ascii=False)
+    intro_cites_json = json.dumps(data.get("intro_cites", []) or [], ensure_ascii=False)
+    user_comments_json = json.dumps(data.get("user_comments", []) or [], ensure_ascii=False)
 
     c.execute('''
-        UPDATE papers SET
-            title=?, authors=?, link=?, keywords=?, research_topic=?,
-            basic_method=?, main_conclusion=?, citations=?, intro_cites=?,
-            outlook=?, summary=?, local_path=?, user_comments=?, analyzed_at=?, llm_summary=?
-        WHERE paper_id=?
+        INSERT OR REPLACE INTO papers (
+            paper_id, title, authors, link, keywords, research_topic,
+            basic_method, main_conclusion, citations, intro_cites,
+            outlook, summary, local_path, user_comments, analyzed_at, llm_summary
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        updated_data["title"], authors_json, updated_data["link"], keywords_json,
-        updated_data["research_topic"], updated_data["basic_method"],
-        updated_data["main_conclusion"], citations_json, intro_cites_json,
-        updated_data["outlook"], updated_data["summary"], updated_data["local_path"],
-        user_comments_json, updated_data["analyzed_at"], updated_data.get("llm_summary", ""),
-        updated_data["paper_id"]
+        data["paper_id"],
+        data.get("title", ""),
+        authors_json,
+        data.get("link", ""),
+        keywords_json,
+        data.get("research_topic", ""),
+        data.get("basic_method", ""),
+        data.get("main_conclusion", ""),
+        citations_json,
+        intro_cites_json,
+        data.get("outlook", ""),
+        data.get("summary", ""),
+        data.get("local_path", ""),
+        user_comments_json,
+        data.get("analyzed_at", ""),
+        data.get("llm_summary", ""),
     ))
 
-    keywords_str = ' '.join(updated_data["keywords"])
-    comments_str = ' '.join(updated_data["user_comments"])
+    # INSERT OR REPLACE 走 DELETE+INSERT 路径，rowid 会变，必须重新拿
+    rowid = c.lastrowid
+
+    keywords_str = " ".join(data.get("keywords") or [])
+    comments_str = " ".join(data.get("user_comments") or [])
     c.execute('''
-        UPDATE papers_fts SET
-            title=?, research_topic=?, basic_method=?, main_conclusion=?,
-            outlook=?, summary=?, keywords=?, user_comments_text=?
-        WHERE rowid = (SELECT rowid FROM papers WHERE paper_id=?)
+        INSERT OR REPLACE INTO papers_fts (rowid, title, research_topic, basic_method, main_conclusion, outlook, summary, keywords, user_comments_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        updated_data["title"], updated_data["research_topic"], updated_data["basic_method"],
-        updated_data["main_conclusion"], updated_data["outlook"], updated_data["summary"],
-        keywords_str, comments_str, updated_data["paper_id"]
+        rowid,
+        data.get("title", ""),
+        data.get("research_topic", ""),
+        data.get("basic_method", ""),
+        data.get("main_conclusion", ""),
+        data.get("outlook", ""),
+        data.get("summary", ""),
+        keywords_str,
+        comments_str,
     ))
+
     conn.commit()
     conn.close()
+
+
+def update_full_paper(updated_data):
+    """更新论文完整信息到数据库（UI 内部使用）— 现在是 save_paper_record 的薄封装"""
+    save_paper_record(updated_data)

@@ -1,6 +1,6 @@
 from .styles import GLOBAL_STYLESHEET
 from .worker import Worker
-from .message_bubble import MessageBubble
+from .message_bubble_1 import MessageBubble
 from .chat_window import ChatWindow
 from .settings_dialog import SettingsDialog
 from .knowledge_base_dialog import KnowledgeBaseDialog
