@@ -30,6 +30,7 @@ KEYS_FILE = DATA_DIR / ".api_keys.json"
 LEGACY_SETTINGS_KEYS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
 }
 
 

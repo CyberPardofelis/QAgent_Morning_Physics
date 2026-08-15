@@ -44,7 +44,7 @@ class ComparisonConfigDialog(QDialog):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("模型:"))
         model_combo = QComboBox()
-        model_combo.addItems(["openai", "deepseek-flash", "deepseek-pro"])
+        model_combo.addItems(["openai", "deepseek-flash", "deepseek-pro", "minimax-m3", "minimax-vl-01"])
         model_layout.addWidget(model_combo)
         layout.addLayout(model_layout)
 

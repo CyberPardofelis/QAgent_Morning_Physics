@@ -24,6 +24,7 @@ import re
 import markdown
 import os
 import html as html_module
+from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QEvent, QUrl, QSize
 from PySide6.QtGui import QTextOption, QDesktopServices
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy
@@ -31,95 +32,18 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
 # ============================================================
-# HTML 模板（MathJax typeset 用 setTimeout 合并）
+# HTML 模板（v4：放到外部文件，让 Chromium HTTP 缓存）
 # ============================================================
-BASE_HTML_TEMPLATE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style id="custom-style"></style>
-<style>
-html,body{
-    margin:0; padding:0; background:transparent; overflow:hidden;
-    height: 100%;  /* 让 body 撑满 viewport，flex 居中才有空间 */
-}
-/* body 用 flex，让 #content 垂直居中（短内容不再靠上） */
-body{
-    display: flex;
-    align-items: center;
-}
-/* 水平：默认靠左（assistant/user），system 由 text-align: center 居中 */
-#content{
-    background:transparent;
-    display: inline-block;
-    white-space: normal;
-    word-wrap: break-word;
-    box-sizing: border-box;
-    max-width: 100%;
-}
-/* 去掉 Markdown 元素默认的 1em margin（避免上下"看不见"的空白） */
-#content p,
-#content ul,
-#content ol,
-#content blockquote,
-#content pre,
-#content h1,
-#content h2,
-#content h3,
-#content h4,
-#content h5,
-#content h6,
-#content table {
-    margin: 0;
-    padding: 0;
-}
-#content ul, #content ol {
-    padding-left: 1.5em;
-}
-/* 相邻段落间留 0.3em（避免挤在一起），首末段不加 */
-#content p + p,
-#content p + ul,
-#content p + ol,
-#content p + blockquote,
-#content p + pre,
-#content ul + p,
-#content ol + p,
-#content pre + p,
-#content blockquote + p,
-#content h1 + p, #content h2 + p, #content h3 + p,
-#content h4 + p, #content h5 + p, #content h6 + p,
-#content p + h1, #content p + h2, #content p + h3,
-#content p + h4, #content p + h5, #content p + h6 {
-    margin-top: 0.3em;
-}
-</style>
-<script>
-window.MathJax = {
-    tex: {
-        inlineMath: [['$','$'], ['\\(','\\)']],
-        displayMath: [['$$','$$'], ['\\[','\\]']]
-    },
-    options: { renderActions: { addMenu: [] } },
-    svg: { fontCache: 'global' }
-};
-// 合并短时间内多次 typeset 请求（流式场景：每个 chunk 进来不要立即 typeset）
-window.__qgTypesetTimer = null;
-window.qgTypeset = function() {
-    if (window.__qgTypesetTimer) {
-        clearTimeout(window.__qgTypesetTimer);
-    }
-    window.__qgTypesetTimer = setTimeout(function() {
-        window.__qgTypesetTimer = null;
-        if (window.MathJax && MathJax.typesetPromise) {
-            MathJax.typesetPromise().then(function() {
-                var el = document.getElementById('content');
-                var h = el ? el.scrollHeight : document.body.scrollHeight;
-                if (window.__qgOnHeight) window.__qgOnHeight(h);
-            });
-        }
-    }, 300);
-};
-</script>
-<script type="text/javascript" async src="mathjax/tex-svg.js"></script>
-</head><body><div id="content"></div></body></html>"""
+# 模板文件路径（相对 message_bubble_1.py 同目录的 resources/）
+_BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+_BUBBLE_TEMPLATE_PATH = _BASE_DIR / "resources" / "bubble_template.html"
+_BUBBLE_TEMPLATE_URL = QUrl.fromLocalFile(str(_BUBBLE_TEMPLATE_PATH))
+
+
+# ============================================================
+# MarkdownView — 渲染 Markdown + MathJax（稳定版）
+# ============================================================
+
 
 
 # ============================================================
@@ -141,8 +65,14 @@ class MarkdownView(QWebEngineView):
         self._max_width = 0
         self._is_streaming = False  # 流式过程中不 typeset
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.setHtml(BASE_HTML_TEMPLATE, QUrl.fromLocalFile(base_dir + '/'))
+        # A2+C 流式增量渲染状态
+        self._stream_rendered_text = ""
+        self._stream_pending = ""
+
+        # v4：改用本地 file:// URL，让 Chromium HTTP 缓存复用 BASE 模板
+        # （之前 setHtml(..., data:URL) 每个 view 都要重新 parse + 重新加载 MathJax，
+        #  导致切对话时 5-10 个 view 串行启动 → 3 秒白屏）
+        self.load(_BUBBLE_TEMPLATE_URL)
         self.loadFinished.connect(self._on_base_loaded)
 
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -411,6 +341,96 @@ class MarkdownView(QWebEngineView):
             html = html.replace(f"\x00MATHHD{i}\x00", p, 1).replace(f"\x00MATHIN{i}\x00", p, 1)
         return html
 
+    # ============================================================
+    # B：生命周期冻结（不可见时释放 GPU/内存）
+    # ============================================================
+    def freeze(self) -> None:
+        """
+        冻结页面：释放 Chromium 端的 GPU 资源，DOM 状态保留。
+        滚回视野调 unfreeze() 恢复（无需重新渲染）。
+        """
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+            self.page().setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
+        except (ImportError, AttributeError):
+            # PySide6 < 6.2 没有 setLifecycleState
+            self.setVisible(False)
+            self.page().setUrl(QUrl("about:blank"))
+
+    def unfreeze(self) -> None:
+        """恢复冻结的页面。"""
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+            self.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        except (ImportError, AttributeError):
+            self.setVisible(True)
+
+    # ============================================================
+    # A2 + C：流式增量渲染
+    # ============================================================
+    def append_stream_chunk(self, full_text: str) -> None:
+        """
+        流式增量追加。每 chunk 调用一次。
+        - 切稳定段（\n\n），转 markdown → HTML（公式保留为原文）
+        - runJavaScript append 到 #content（不替换 innerHTML，不重排已存在节点）
+        - **不** typeset
+        """
+        if not self._base_loaded:
+            self._pending_markdown = full_text
+            return
+
+        if full_text.startswith(self._stream_rendered_text):
+            new_text = full_text[len(self._stream_rendered_text):]
+        else:
+            new_text = full_text
+            self._stream_pending = ""
+        if not new_text:
+            return
+        self._stream_rendered_text = full_text
+        self._stream_pending += new_text
+
+        stable, self._stream_pending = self._split_stable(self._stream_pending)
+        if not stable:
+            return
+
+        html = self._stream_markdown_to_html(stable)
+        if not html.strip():
+            return
+        self.page().runJavaScript(
+            f"window.qgStreamAppend && window.qgStreamAppend({json.dumps(html)});"
+        )
+
+    def end_streaming(self) -> None:
+        """流式结束：处理剩余 pending + 一次性 typeset。"""
+        if not self._base_loaded:
+            return
+        rest = self._stream_pending
+        self._stream_pending = ""
+        self._stream_rendered_text = ""
+        rest_html = self._markdown_to_html(rest) if rest.strip() else ""
+        self.page().runJavaScript(
+            f"window.qgStreamFinalize && window.qgStreamFinalize({json.dumps(rest_html)});"
+        )
+
+    def _split_stable(self, pending: str) -> tuple:
+        """按 \n\n 切稳定段；未闭合的代码块 / display 公式不切。"""
+        if pending.count('```') % 2 == 1:
+            return "", pending
+        if pending.count('$$') % 2 == 1:
+            return "", pending
+        idx = pending.rfind('\n\n')
+        if idx == -1:
+            return "", pending
+        return pending[:idx + 2], pending[idx + 2:]
+
+    def _stream_markdown_to_html(self, text: str) -> str:
+        """
+        流式阶段：转 markdown。公式 $...$ / $$...$$ 保留为原文
+        （markdown 不处理 $，MathJax typeset 时再处理）。
+        """
+        text = html_module.escape(text, quote=False)
+        return markdown.markdown(text, extensions=['fenced_code', 'tables'])
+
 
 # ============================================================
 # MessageBubble — 消息气泡
@@ -586,11 +606,11 @@ class MessageBubble(QWidget):
     # ---------- 流式更新 ----------
     def update_content(self, new_text: str):
         """
-        流式追加内容
-        - 第一次 update_content 时，beginStreaming 进入流式状态
-        - 追加到 self.full_text 并 setMarkdown（**不 typeset**）
+        流式追加内容（A2 + C 实现）：
+        - 第一次 update_content 时进入流式状态
+        - 追加到 self.full_text，调 view.append_stream_chunk（**增量追加**到 DOM，**不**重新替换 innerHTML）
         - 触发一次 reportHeight（200ms 防抖）
-        - 宽度保持 _max_view_width（容器 75%），不根据内容调整（避免流式中闪）
+        - 宽度保持 _max_view_width，不根据内容调整（避免流式中闪）
         """
         if self.is_final or not new_text:
             return
@@ -601,14 +621,15 @@ class MessageBubble(QWidget):
             self.view.beginStreaming()
 
         self.full_text = (self.full_text or "") + new_text
-        self.view.setMarkdown(self.full_text)
+        # ✨ A2 + C：增量追加到 DOM，不替换 innerHTML
+        self.view.append_stream_chunk(self.full_text)
         # 触发一次高度报告（防抖 200ms）
         self.view.reportHeight()
 
     def finalize(self):
         """
-        流式结束：
-        - 触发一次 typeset（让 MathJax 渲染公式）
+        流式结束（A2 + C 实现）：
+        - view.end_streaming()：把剩余 pending 一次性解析 + 追加 + 一次性 typeset
         - 报告最终高度
         - 测 view 的自然宽度（JS 测 offsetWidth），让 bubble 缩到紧凑尺寸
         """
@@ -616,10 +637,8 @@ class MessageBubble(QWidget):
             return
         self.is_final = True
         self._is_streaming = False
-        # 重渲一次确保内容完整
-        self.view.setMarkdown(self.full_text or "")
-        # 退出流式，触发 typeset
-        self.view.endStreaming()
+        # ✨ A2 + C：end_streaming 一次性处理剩余 + typeset
+        self.view.end_streaming()
         # 报告最终高度（typeset 前后各一次）
         QTimer.singleShot(100, self.view.reportHeight)
         QTimer.singleShot(800, self.view.reportHeight)

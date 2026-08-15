@@ -16,6 +16,7 @@ from agent.llm_clients import (
     get_client as _get_client,
     get_deepseek_client,
     get_openai_client,
+    get_minimax_client,
     LLMClientError,
     PROVIDERS,
     resolve_legacy_model,
@@ -40,6 +41,8 @@ MODE_TO_PROVIDER_MODEL = {
     "openai":            ("openai",   None),
     "deepseek-v4-flash": ("deepseek", "deepseek-v4-flash"),
     "deepseek-v4-pro":   ("deepseek", "deepseek-v4-pro"),
+    "minimax-m3":        ("minimax",  "MiniMax-M3"),
+    "minimax-vl-01":     ("minimax",  "MiniMax-VL-01"),
     # 旧 mode 兼容
     "deepseek-flash":    ("deepseek", "deepseek-v4-flash"),
     "deepseek-pro":      ("deepseek", "deepseek-v4-pro"),
@@ -69,6 +72,15 @@ def _resolve_client_and_model(mode: str) -> tuple:
         model = Config.get_openai_model() or PROVIDERS["openai"].default_model
     elif provider_name == "deepseek":
         model = Config.get_deepseek_model() or PROVIDERS["deepseek"].default_model
+    elif provider_name == "minimax":
+        # MiniMax 支持运行时切换 model（如 MiniMax-M3 / MiniMax-VL-01），
+        # 也允许用户在 QSettings 里配 MINIMAX_MODEL 覆盖
+        try:
+            from config.settings import get_settings
+            cfg_model = (get_settings().value("MINIMAX_MODEL", "") or "").strip()
+        except Exception:
+            cfg_model = ""
+        model = cfg_model or PROVIDERS["minimax"].default_model
     else:
         model = PROVIDERS[provider_name].default_model
     return client, model, provider_name
@@ -130,6 +142,7 @@ def run_agent_stream(
         return
 
     # DeepSeek 模式：思考 + 工具调用循环
+    # MiniMax 模式：走同一路径（MiniMax OpenAI 兼容接口支持工具调用 + thinking extra_body）
     while True:
         request_params = {
             "model": actual_model,
@@ -148,10 +161,19 @@ def run_agent_stream(
             request_params["extra_body"] = {"thinking": {"type": "enabled"}}
             request_params["reasoning_effort"] = reasoning_effort
 
+        # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限（部分模型会回 400），
+        # 这里只在非 MiniMax 时透传，避免不必要的失败。
+        if provider_name == "minimax":
+            request_params.pop("frequency_penalty", None)
+            request_params.pop("presence_penalty", None)
+
         try:
             stream = client.chat.completions.create(**request_params)
         except Exception as e:
-            yield _format_deepseek_error(e)
+            if provider_name == "minimax":
+                yield _format_minimax_error(e)
+            else:
+                yield _format_deepseek_error(e)
             yield NEW_BUBBLE
             return
 
@@ -258,6 +280,10 @@ def _format_openai_error(e: Exception) -> str:
 
 def _format_deepseek_error(e: Exception) -> str:
     return classify_llm_error("DeepSeek", e)
+
+
+def _format_minimax_error(e: Exception) -> str:
+    return classify_llm_error("MiniMax", e)
 
 
 # ============================================================

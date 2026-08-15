@@ -11,6 +11,7 @@ LLM 客户端管理（重构版，参考 WAgent 实现）。
 当前支持的 provider：
 - deepseek: DeepSeek 官方 API（OpenAI 兼容）
 - openai:   OpenAI 官方 API
+- minimax:  MiniMax（MiniMax）官方 API（OpenAI 兼容，国内稳定，支持工具调用 + 思考模式）
 """
 import hashlib
 import logging
@@ -54,6 +55,12 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         display_name="OpenAI",
         default_base_url="https://api.openai.com/v1",
         default_model="gpt-4o-mini",
+    ),
+    "minimax": ProviderConfig(
+        name="minimax",
+        display_name="MiniMax",
+        default_base_url="https://api.MiniMax.com/v1",
+        default_model="MiniMax-M3",
     ),
 }
 
@@ -251,3 +258,8 @@ def get_deepseek_client() -> OpenAI:
 def get_openai_client() -> OpenAI:
     """兼容旧调用：等价于 get_client("openai")"""
     return get_client("openai")
+
+
+def get_minimax_client() -> OpenAI:
+    """兼容旧调用：等价于 get_client("minimax")"""
+    return get_client("minimax")

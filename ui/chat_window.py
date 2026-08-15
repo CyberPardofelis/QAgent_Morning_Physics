@@ -72,7 +72,7 @@ class ChatWindow(QMainWindow):
         top_layout = QHBoxLayout()
         top_layout.addWidget(QLabel("模式："))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["openai", "deepseek-v4-flash", "deepseek-v4-pro", "compare"])
+        self.mode_combo.addItems(["openai", "deepseek-v4-flash", "deepseek-v4-pro", "minimax-m3", "minimax-vl-01", "compare"])
         self.mode_combo.setCurrentIndex(1)
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         top_layout.addWidget(self.mode_combo)

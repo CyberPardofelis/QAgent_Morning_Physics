@@ -194,6 +194,28 @@ class SettingsDialog(QDialog):
         oa_layout.addRow("默认 Model:", self.openai_model)
         layout.addWidget(oa_group)
 
+        # ---------- MiniMax（MiniMax） ----------
+        mm_group = QGroupBox("MiniMax（国内）")
+        mm_layout = QFormLayout(mm_group)
+        self.minimax_api_key = QLineEdit()
+        self.minimax_api_key.setEchoMode(QLineEdit.Password)
+        self.minimax_api_key.setPlaceholderText("eyJhbGciOi...")
+        mm_layout.addRow("API Key:", self.minimax_api_key)
+        self.minimax_model = QLineEdit()
+        self.minimax_model.setPlaceholderText("MiniMax-M3")
+        mm_layout.addRow("默认 Model:", self.minimax_model)
+        self.minimax_base_url = QLineEdit()
+        self.minimax_base_url.setPlaceholderText("https://api.MiniMax.com/v1  (留空用默认)")
+        mm_layout.addRow("Base URL:", self.minimax_base_url)
+        mm_hint = QLabel(
+            "国内 MiniMax 官方 API，OpenAI 兼容接口，支持工具调用 + 思考模式。"
+            "可换模型：MiniMax-M3、MiniMax-VL-01 等。"
+        )
+        mm_hint.setWordWrap(True)
+        mm_hint.setStyleSheet("color: #888; font-size: 11px;")
+        mm_layout.addRow("", mm_hint)
+        layout.addWidget(mm_group)
+
         # ---------- 兼容旧字段 ----------
         # 旧 controller1.py 还在读 DEEPSEEK_MODEL_CHAT，保留设置项但加说明
         ds_chat_group = QGroupBox("兼容设置（老 controller 用的字段，新代码忽略）")
@@ -437,6 +459,7 @@ class SettingsDialog(QDialog):
         all_keys = get_all_api_keys()
         self.deepseek_api_key.setText(all_keys.get("deepseek", ""))
         self.openai_api_key.setText(all_keys.get("openai", ""))
+        self.minimax_api_key.setText(all_keys.get("minimax", ""))
         self.bocha_api_key.setText(all_keys.get("bocha", ""))
         self.tavily_api_key.setText(all_keys.get("tavily", ""))
 
@@ -444,6 +467,8 @@ class SettingsDialog(QDialog):
         self.deepseek_model.setText(settings.value("DEEPSEEK_MODEL", "deepseek-v4-flash"))
         self.deepseek_chat_model.setText(settings.value("DEEPSEEK_MODEL_CHAT", "deepseek-v4-flash"))
         self.openai_model.setText(settings.value("OPENAI_MODEL", ""))
+        self.minimax_model.setText(settings.value("MINIMAX_MODEL", ""))
+        self.minimax_base_url.setText(settings.value("MINIMAX_BASE_URL", ""))
 
         # Embedding
         enabled = settings.value("EMBEDDING_ENABLED", False)
@@ -481,6 +506,7 @@ class SettingsDialog(QDialog):
         # API Key：写到 .api_keys.json（agent.infra.api_keys 统一管理）
         set_api_key("deepseek", self.deepseek_api_key.text().strip())
         set_api_key("openai", self.openai_api_key.text().strip())
+        set_api_key("minimax", self.minimax_api_key.text().strip())
         set_api_key("bocha", self.bocha_api_key.text().strip())
         set_api_key("tavily", self.tavily_api_key.text().strip())
 
@@ -488,6 +514,8 @@ class SettingsDialog(QDialog):
         settings.setValue("DEEPSEEK_MODEL", self.deepseek_model.text().strip())
         settings.setValue("DEEPSEEK_MODEL_CHAT", self.deepseek_chat_model.text().strip())
         settings.setValue("OPENAI_MODEL", self.openai_model.text().strip())
+        settings.setValue("MINIMAX_MODEL", self.minimax_model.text().strip())
+        settings.setValue("MINIMAX_BASE_URL", self.minimax_base_url.text().strip())
 
         # Embedding
         settings.setValue("EMBEDDING_ENABLED", self.embedding_enabled_embed.isChecked())
