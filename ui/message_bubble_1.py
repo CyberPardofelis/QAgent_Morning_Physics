@@ -1,16 +1,27 @@
 """
-MessageBubble + MarkdownView（v3 — 稳定渲染版）
+MessageBubble + MarkdownView（v5 — KaTeX 替换 MathJax + 懒加载）
 
-修复历史问题：
+v5 改动（替换 v3 — 稳定渲染版）：
+- B：MathJax → KaTeX（typeset 同步、不触发布局重排、bundle 小 4×）
+  - 565KB 离线 bundle 在 ui/resources/katex/（vs MathJax 2.1MB）
+  - bubble_template.html 引用 katex/katex.min.{js,css} + auto-render.min.js
+  - _update_content 不再依赖 window.MathJax.typesetPromise
+- C：view 懒加载（切对话只 load 视口内 1-2 个气泡）
+  - MarkdownView.__init__ 不立即 load _BUBBLE_TEMPLATE_URL
+  - 改由 ensure_loaded() 触发（idempotent）
+  - ChatView 滚动事件 + add_chat_message 后调 _ensure_loaded_if_in_view
+  - 视口外气泡 _pending_load 保持 True，不消耗 Chromium 启动开销
+
+v3 历史问题（保留文档）：
 1. 流式过程中反复调整宽度 → "闪来闪去最后才落到适合的大小"
-2. MathJax typeset 触发布局重排 → 又触发新一轮测量
+2. ~~MathJax typeset 触发布局重排~~ → 已迁 KaTeX,typeset 同步不触发重排
 3. showEvent / resizeEvent / 父窗口 resize 多个事件链重复触发 updateMaxWidth
 4. update_content 累积整段再 setMarkdown，O(n²) 性能
 
-设计目标（保留 QWebEngineView 以支持 MathJax 公式渲染）：
+设计目标（保留 QWebEngineView 以支持 KaTeX 公式渲染）：
 - 流式过程：宽度锁住（用容器宽度的 75% 一次设置，不重测自然宽度）
 - finalize 时：才 typeset 一次（避免流式过程多次 typeset 引起的重排）
-- MathJax typeset：自己写 setTimeout-based 合并，避免每 chunk 都触发
+- KaTeX typeset：自己写 setTimeout-based 合并，避免每 chunk 都触发
 - resize 事件：防抖 80ms，只调宽度不重排
 - showEvent：只触发一次
 
@@ -69,14 +80,29 @@ class MarkdownView(QWebEngineView):
         self._stream_rendered_text = ""
         self._stream_pending = ""
 
-        # v4：改用本地 file:// URL，让 Chromium HTTP 缓存复用 BASE 模板
-        # （之前 setHtml(..., data:URL) 每个 view 都要重新 parse + 重新加载 MathJax，
-        #  导致切对话时 5-10 个 view 串行启动 → 3 秒白屏）
+        # v3 行为恢复：构造时立即 load(原 v5 尝试懒加载导致黑色色块回归)
+        # 原因：view load 完成前 setBackgroundColor(Qt.transparent) 不会生效,
+        #  view 第一次显示时是 QWebEngineView 默认黑色背景 + 空 content → 黑色色块。
+        # 立即 load + _on_base_loaded 完成后,view 显示时背景已 transparent,无色块。
+        # C 方案的切对话优化已撤回(详见 v5 注释 + chat_view.py)。
         self.load(_BUBBLE_TEMPLATE_URL)
         self.loadFinished.connect(self._on_base_loaded)
 
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setStyleSheet("background: transparent;")
+        # v5 兜底:在 view 一创建就 setBackgroundColor(transparent),消除 about:blank 阶段
+        # 原因:v3 时代只在 _on_base_loaded 里 setBackgroundColor transparent,
+        #       view 构造到 _on_base_loaded 触发之间(~50-200ms)的 about:blank 阶段
+        #       page 默认背景是黑/白(取决于平台),文字色与之同色则看上去是"色块"。
+        # 修复:__init__ 立即 self.page().setBackgroundColor(transparent),
+        #       view 一创建就透,文字加载期间透出 MessageBubble 自身背景(白/蓝/灰)
+        #       — assistant 气泡 HTML 前后都是白底,user 气泡前后都是蓝底,无色块错觉。
+        # 注:不采用 setVisible(False) 兜底 — 会导致 Chromium GPU 初始化 context lost。
+        try:
+            self.page().setBackgroundColor(Qt.transparent)
+        except Exception:
+            # PySide6 < 6.2 或 page() 尚未就绪,_on_base_loaded 里会再设一次
+            pass
         # 关键：QWebEngineView 默认 sizeHint 在 PySide6 下不可靠（返回 0×0）
         # 用 Expanding 让 layout 给 view 完整空间（fill bubble 内容区）
         # 不依赖 sizeHint
@@ -99,6 +125,7 @@ class MarkdownView(QWebEngineView):
         if not ok:
             return
         self._base_loaded = True
+        # 双保险:__init__ 里设过一次,这里再设一次(覆盖 page 重建后的默认值)
         self.page().setBackgroundColor(Qt.transparent)
         if self._html_style:
             self._inject_style(self._html_style)
@@ -158,12 +185,13 @@ class MarkdownView(QWebEngineView):
         html_escaped = json.dumps(self._content_html)
         # setHtml 后 qgTypeset 由 endStreaming 统一触发
         # 但 base_loaded 第一次 setHtml 时需要立即 typeset
+        # v4: 改用 qgTypeset(KaTeX 同步 typeset)—— 不再依赖 window.MathJax.typesetPromise
         js = f"""
         document.getElementById('content').innerHTML = {html_escaped};
         if ({str(self._is_streaming).lower()}) {{
             // 流式中：等待 endStreaming 统一 typeset
-        }} else if (window.MathJax && MathJax.typesetPromise) {{
-            window.qgTypeset && window.qgTypeset();
+        }} else if (window.qgTypeset) {{
+            window.qgTypeset();
         }}
         """
         self.page().runJavaScript(js)
@@ -364,6 +392,8 @@ class MarkdownView(QWebEngineView):
             self.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
         except (ImportError, AttributeError):
             self.setVisible(True)
+        # 注:v5 尝试的 ensure_loaded() 懒加载方法已撤回,见 __init__ 注释
+        # 撤回原因:view load 完成前 setBackgroundColor 不生效,导致黑色色块回归
 
     # ============================================================
     # A2 + C：流式增量渲染

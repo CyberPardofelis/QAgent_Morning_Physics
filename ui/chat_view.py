@@ -155,6 +155,8 @@ class ChatView(QWidget):
         # 注意：这里**不**主动触发 freeze check。新气泡默认 visible，
         # 滚出视野的气泡由定时器（或滚动事件）自然处理。
         self._maybe_enable_freeze()
+        # 注:v5 尝试的 ensure_loaded 懒加载已撤回(见 message_bubble_1.py 注释)
+        # 撤回原因:view load 完前显示 → 黑色色块回归
 
     def find_last_assistant_bubble(self):
         for i in range(self.scroll_layout.count() - 1, -1, -1):
