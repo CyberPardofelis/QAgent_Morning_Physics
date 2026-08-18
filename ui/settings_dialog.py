@@ -159,8 +159,18 @@ class SettingsDialog(QDialog):
     # LLM API Tab
     # ============================================================
     def _build_llm_tab(self) -> QWidget:
+        # MiniMax 组的输入框被显式 setMinimumHeight(48) 撑高后,tab 整体高度
+        # 可能超过 dialog 的 620px 最小高度 → 用 QScrollArea 兜底,内容超长可滚。
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        outer_layout.addWidget(scroll)
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setSpacing(12)
 
         info = QLabel(
@@ -212,8 +222,17 @@ class SettingsDialog(QDialog):
             "可换模型：MiniMax-M3、MiniMax-VL-01 等。"
         )
         mm_hint.setWordWrap(True)
-        mm_hint.setStyleSheet("color: #888; font-size: 11px;")
+        mm_hint.setStyleSheet("color: #888;")
+        mm_hint.setMinimumHeight(43)  # 跟 QLineEdit 等高,避免 hint 行被压扁
         mm_layout.addRow("", mm_hint)
+        # 给 MiniMax 三个输入框强制更高的 min-height + 缩小圆角,
+        # 避免 global QSS 的 border-radius:20px + padding:12px 让 widget 看着"圆胖矮",
+        # 在某些 DPI/字号下视觉上比 DeepSeek/OpenAI 明显矮一截
+        for le in (self.minimax_api_key, self.minimax_model, self.minimax_base_url):
+            le.setMinimumHeight(48)
+            le.setStyleSheet(
+                "QLineEdit { padding: 10px 16px; border-radius: 10px; }"
+            )
         layout.addWidget(mm_group)
 
         # ---------- 兼容旧字段 ----------
