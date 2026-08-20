@@ -43,6 +43,7 @@ from .attachment_reader import (
     SUPPORTED_EXTS, FILE_DIALOG_FILTER, MAX_CHARS,
 )
 from .search import web_search
+from .memory import save_memory, recall_memories  # 通用记忆库工具
 
 # llm / pdf_utils 内部接口
 from .llm import _call_llm
@@ -78,6 +79,8 @@ __all__ = [
     "run_python",
     # 搜索
     "web_search",
+    # 记忆库
+    "save_memory", "recall_memories",
     # 附件（UI 侧用）
     "extract_text", "compose_llm_user_content", "is_supported",
     "SUPPORTED_EXTS", "FILE_DIALOG_FILTER", "MAX_CHARS",

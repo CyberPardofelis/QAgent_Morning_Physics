@@ -9,6 +9,7 @@
 QAgent 数据布局（保留现有文件位置以兼容旧数据）：
 - data/conversations/conversations.db  → 对话历史
 - data/knowledge/papers.db            → 论文知识库
+- data/memory/memories.db             → 通用记忆库（v1，2026-08-20 新增）
 """
 import sqlite3
 import logging
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 DB_FILES: Dict[str, str] = {
     "conversations": "conversations/conversations.db",   # 对话历史
     "papers":        "knowledge/papers.db",              # 论文知识库
+    "memory":        "memory/memories.db",               # 通用记忆库
 }
 
 

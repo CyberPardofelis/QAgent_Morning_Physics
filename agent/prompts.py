@@ -56,6 +56,40 @@ TOOL_GUIDE = """【可用工具指南】
 - **你必须原样输出工具返回的完整内容，不要以任何形式压缩、重写、或者转换成简洁表格。** 用户需要完整的详细信息。
 - 如果你觉得返回内容太长，不要自行截断或总结，原样输出即可。
 
+### 记忆库
+- `save_memory(content, memory_type, importance?, related_paper_id?, metadata_json?)` — 保存一条长期记忆
+- `recall_memories(query, limit?, memory_type?, related_paper_id?, min_importance?, method?)` — 检索相关记忆
+
+【重要：何时调 save_memory】
+当用户说以下词或表达了**对自己有长期价值**的信息时，**必须**调 `save_memory`：
+- 触发关键词：【记住】【记下】【别忘】【我的偏好】【我喜欢/讨厌/不喜欢】【我的决定/我决定】【约定/说好了】【关于这篇论文/这篇 paper】【我发现了/意识到/学到了】
+- 用户陈述长期偏好（例如「我更习惯看中文」「公式用块排版别用 inline」）
+- 用户做研究决策/约定（例如「我决定用 VQE 路线」「和导师约好每周交 5 篇笔记」）
+- 用户表达洞见/反思（例如「我发现 TEE 在 NISQ 上不实用」）
+- 用户说任务状态（例如「现在卡在 QAOA 电路优化那一步」）
+
+**content 必须是完整的自包含陈述**（含主语），不是简略词。
+- 错误: `content="是"`（未来无法检索）
+- 正确: `content="用户偏好 LaTeX 公式用 aligned 块排版而不是 inline"`
+
+**记忆类型选择**:
+- `user_preference` 偏好/格式习惯
+- `research_fact` 研究决策/约定/事实
+- `paper_note` 论文笔记（**必须填 related_paper_id**）
+- `reflection` 对话中的洞见/总结
+- `task_state` 任务状态
+- `general` 其他（兜底）
+
+**重要性建议**:
+- 0.7-0.9：长期不变的偏好/决策
+- 0.5：普通事实/临时笔记
+
+【重要：何时调 recall_memories】
+当用户引用过去时**应当**调 `recall_memories`：
+- 「我之前说过…」「上次我们讨论过…」「我对 XX 的偏好是…」
+- 延续某话题讨论，需要确认过去决策
+- 注意：`query_knowledge` 查的是论文，**`recall_memories` 查的是用户偏好/决策/笔记**
+
 【arXiv 论文列表返回处理】
 当你收到一个 JSON 数组（论文列表），每个元素包含 'arxiv_id', 'title', 'authors', 'subjects', 'abstract', 'url' 字段：
 1. **确认总数**：先说明找到了多少篇

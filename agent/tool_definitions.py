@@ -286,6 +286,111 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             }
         }
     },
+
+    # ============================================================
+    # save_memory: 保存一条长期记忆
+    # ============================================================
+    "save_memory": {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "保存一条长期记忆到记忆库，用于跨对话记住用户的偏好、决策、"
+                "对论文的笔记、洞见等。当用户说【记住】【记下】【我的偏好是】【我决定】【约定】等时必须调用。"
+                "content 必须是完整的自包含陈述（含主语），不能是【是】这种简略词。"
+                "用户对长期不变信息的偏好/决策，importance 建议 0.7-0.9；普通事实 0.5。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "记忆内容（完整自包含陈述，含主语，例如【用户偏好 LaTeX 公式用 aligned 块排版】）"
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["user_preference", "research_fact", "paper_note", "reflection", "task_state", "general"],
+                        "description": (
+                            "记忆类型: user_preference=用户偏好, research_fact=研究事实/决策, "
+                            "paper_note=论文笔记（必须填 related_paper_id）, "
+                            "reflection=洞见, task_state=任务状态, general=其他"
+                        ),
+                        "default": "general"
+                    },
+                    "importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.5,
+                        "description": "重要性 0-1。用户的明确偏好/决策建议 0.7-0.9；普通事实 0.5"
+                    },
+                    "related_paper_id": {
+                        "type": "string",
+                        "description": "关联论文 ID（paper_note 类型必填）"
+                    },
+                    "metadata_json": {
+                        "type": "string",
+                        "description": "额外元数据 JSON 字符串（可空），例如 '{\"topic\": \"QAOA\"}'"
+                    }
+                },
+                "required": ["content"]
+            }
+        }
+    },
+
+    # ============================================================
+    # recall_memories: 检索记忆
+    # ============================================================
+    "recall_memories": {
+        "type": "function",
+        "function": {
+            "name": "recall_memories",
+            "description": (
+                "从记忆库检索相关记忆。当用户引用过去决策（如【我之前说过…】）、"
+                "延续某话题讨论、需要确认用户偏好时调用。"
+                "和 query_knowledge 的区别：query_knowledge 查的是论文，recall_memories 查的是用户偏好/决策/笔记。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索文本（自然语言，问题/关键词均可）"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 5,
+                        "description": "最多返回条数（默认 5）"
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["user_preference", "research_fact", "paper_note", "reflection", "task_state"],
+                        "description": "限定记忆类型（可空）"
+                    },
+                    "related_paper_id": {
+                        "type": "string",
+                        "description": "限定关联论文（可空；填了就走精确匹配不走向量检索）"
+                    },
+                    "min_importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.0,
+                        "description": "最低重要性 0-1（默认 0）"
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["vector", "keyword", "hybrid"],
+                        "default": "vector",
+                        "description": "检索方法: vector(默认，语义) / keyword(关键词) / hybrid(混合)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
 }
 
 
