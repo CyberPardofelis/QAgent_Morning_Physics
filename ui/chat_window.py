@@ -109,6 +109,10 @@ class ChatWindow(QMainWindow):
         search_action.triggered.connect(self.open_knowledge_base)
         menubar.addAction(search_action)
 
+        memory_action = QAction("记忆库", self)
+        memory_action.triggered.connect(self.open_memory_viewer)
+        menubar.addAction(memory_action)
+
         compare_config_action = QAction("对比模式设置", self)
         compare_config_action.triggered.connect(self.show_comparison_config_dialog)
         menubar.addAction(compare_config_action)
@@ -274,6 +278,12 @@ class ChatWindow(QMainWindow):
     def open_knowledge_base(self):
         from ui.knowledge_base_dialog import KnowledgeBaseDialog
         dialog = KnowledgeBaseDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.show()
+
+    def open_memory_viewer(self):
+        from ui.memory_viewer_dialog import MemoryViewerDialog
+        dialog = MemoryViewerDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.show()
 

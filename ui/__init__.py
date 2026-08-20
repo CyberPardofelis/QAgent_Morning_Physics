@@ -4,5 +4,6 @@ from .message_bubble_1 import MessageBubble
 from .chat_window import ChatWindow
 from .settings_dialog import SettingsDialog
 from .knowledge_base_dialog import KnowledgeBaseDialog
+from .memory_viewer_dialog import MemoryViewerDialog
 from .paper_edit_dialog import PaperEditDialog
 from .group_prompt_dialog import GroupSystemPromptDialog

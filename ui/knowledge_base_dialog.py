@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QMessageBox, QLabel
 )
 from ui.styles import GLOBAL_STYLESHEET
-from agent.tools import query_knowledge, get_paper_by_id, get_recent_papers
+from agent.tools import query_knowledge, get_paper_by_id, get_recent_papers_raw
 from ui.paper_edit_dialog import PaperEditDialog
 
 
@@ -44,7 +44,7 @@ class KnowledgeBaseDialog(QDialog):
 
     def load_recent_papers(self):
         """加载最近的论文并显示在表格中"""
-        recent = get_recent_papers(15)  # 调用新函数
+        recent = get_recent_papers_raw(15)  # UI 内部函数，返回 list of dict
         self.display_papers(recent)
 
     def display_papers(self, papers):
