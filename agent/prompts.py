@@ -84,6 +84,37 @@ TOOL_GUIDE = """【可用工具指南】
 - 0.7-0.9：长期不变的偏好/决策
 - 0.5：普通事实/临时笔记
 
+【重要：save_memory 自动去重 + 看到提示要怎么处理】
+save_memory 在保存前会做**相似度去重检测**（基于 embedding 向量）：
+- **sim >= 0.95**（高度相似）→ save_memory 不会直接保存，会返回"已存在相似记忆 #xxx"信息，**你必须**：
+  1. 调 `update_memory(memory_id=xxx, new_content=新内容)` **合并**到旧条目（覆盖旧内容）
+  2. **或**调 `save_memory(..., force_save=True)` 强制新建（如果确实是新主题）
+  3. **或**告诉用户"这条已记过"
+- **sim 0.75-0.95**（类似）→ save_memory 会返回"发现类似记忆"提示，**你必须判断**：
+  - 合并 → `update_memory(...)`
+  - 真的新内容 → `save_memory(..., force_save=True)`
+- **sim < 0.75**（不重复）→ 直接保存成功
+
+【重要：update_memory 用法】
+当 save_memory 返回"已存在相似记忆"时，**优先用 update_memory 合并**而不是新建。update_memory 参数:
+- `memory_id` 必填（8 位 short id 即可）
+- `new_content` 新内容（覆盖旧 content；空字符串表示不改）
+- `new_importance` 新重要性 0-1；-1 表示不改
+
+**典型工作流**:
+- 用户: "记住，我偏好 LaTeX 块排版"
+- 你: save_memory("用户偏好 LaTeX 块排版", memory_type="user_preference", importance=0.85)
+  → 假设返回 "✅ 记忆已保存"
+- 用户: "再补充一下，是用 aligned 块，不是 array 块"
+- 你: update_memory(memory_id=那个 short id, new_content="用户偏好 LaTeX 用 aligned 块（不是 array 块）排版")
+  → 合并，避免重复
+
+【重要：recall_memories 的多样性】
+recall_memories 默认用 **MMR (Maximal Marginal Relevance)** 重排，λ=0.7（偏向相关）：
+- 同主题重复时，给出多样性结果（避免被重复条目淹没其他重要记忆）
+- 如果你**确认想要更广覆盖**，传 `mmr_lambda=0.5` + `limit=10`（更多样但松散相关）
+- 默认参数（λ=0.7, limit=5）适合绝大多数场景
+
 【重要：何时调 recall_memories】
 当用户引用过去时**应当**调 `recall_memories`：
 - 「我之前说过…」「上次我们讨论过…」「我对 XX 的偏好是…」

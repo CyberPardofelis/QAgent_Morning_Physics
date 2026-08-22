@@ -46,6 +46,210 @@ class MemoryProcessor:
     # ============================================================
     # 写
     # ============================================================
+    # ============================================================
+    # 去重检测（save 前调用）
+    # ============================================================
+    def check_duplicate(
+        self,
+        content: str,
+        sim_merge: float = 0.95,
+        sim_similar: float = 0.75,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        检查要保存的内容是否与库内已有记忆重复。
+
+        返回:
+            {
+                "verdict": "unique" | "similar" | "duplicate",
+                "top_match": {memory_dict, similarity} | None,
+                "all_matches": [{memory_dict, similarity}, ...] (top_k)
+            }
+
+        判定:
+            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
+            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
+            - max_sim <  sim_similar → verdict="unique"   (不重复)
+        """
+        try:
+            vec = self.embedder.encode(content)
+        except RuntimeError as e:
+            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        try:
+            hits = self.vs.search(vec, top_k=top_k)
+        except Exception as e:
+            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        if not hits:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        # 拿完整信息
+        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
+        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
+        memories = self.db.list_by_ids([mid for mid in ids if mid])
+
+        all_matches = []
+        for m in memories:
+            mid = m["id"]
+            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
+        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        if not all_matches:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        top_sim = all_matches[0]["similarity"]
+        if top_sim >= sim_merge:
+            verdict = "duplicate"
+        elif top_sim >= sim_similar:
+            verdict = "similar"
+        else:
+            verdict = "unique"
+
+        return {
+            "verdict": verdict,
+            "top_match": all_matches[0],
+            "all_matches": all_matches,
+        }
+
+    # ============================================================
+    # 去重检测（save 前调用）
+    # ============================================================
+    def check_duplicate(
+        self,
+        content: str,
+        sim_merge: float = 0.95,
+        sim_similar: float = 0.75,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        检查要保存的内容是否与库内已有记忆重复。
+
+        返回:
+            {
+                "verdict": "unique" | "similar" | "duplicate",
+                "top_match": {memory_dict, similarity} | None,
+                "all_matches": [{memory_dict, similarity}, ...] (top_k)
+            }
+
+        判定:
+            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
+            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
+            - max_sim <  sim_similar → verdict="unique"   (不重复)
+        """
+        try:
+            vec = self.embedder.encode(content)
+        except RuntimeError as e:
+            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        try:
+            hits = self.vs.search(vec, top_k=top_k)
+        except Exception as e:
+            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        if not hits:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        # 拿完整信息
+        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
+        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
+        memories = self.db.list_by_ids([mid for mid in ids if mid])
+
+        all_matches = []
+        for m in memories:
+            mid = m["id"]
+            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
+        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        if not all_matches:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        top_sim = all_matches[0]["similarity"]
+        if top_sim >= sim_merge:
+            verdict = "duplicate"
+        elif top_sim >= sim_similar:
+            verdict = "similar"
+        else:
+            verdict = "unique"
+
+        return {
+            "verdict": verdict,
+            "top_match": all_matches[0],
+            "all_matches": all_matches,
+        }
+
+    # ============================================================
+    # 去重检测（save 前调用）
+    # ============================================================
+    def check_duplicate(
+        self,
+        content: str,
+        sim_merge: float = 0.95,
+        sim_similar: float = 0.75,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        检查要保存的内容是否与库内已有记忆重复。
+
+        返回:
+            {
+                "verdict": "unique" | "similar" | "duplicate",
+                "top_match": {memory_dict, similarity} | None,
+                "all_matches": [{memory_dict, similarity}, ...] (top_k)
+            }
+
+        判定:
+            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
+            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
+            - max_sim <  sim_similar → verdict="unique"   (不重复)
+        """
+        try:
+            vec = self.embedder.encode(content)
+        except RuntimeError as e:
+            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        try:
+            hits = self.vs.search(vec, top_k=top_k)
+        except Exception as e:
+            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
+            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
+
+        if not hits:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        # 拿完整信息
+        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
+        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
+        memories = self.db.list_by_ids([mid for mid in ids if mid])
+
+        all_matches = []
+        for m in memories:
+            mid = m["id"]
+            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
+        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        if not all_matches:
+            return {"verdict": "unique", "top_match": None, "all_matches": []}
+
+        top_sim = all_matches[0]["similarity"]
+        if top_sim >= sim_merge:
+            verdict = "duplicate"
+        elif top_sim >= sim_similar:
+            verdict = "similar"
+        else:
+            verdict = "unique"
+
+        return {
+            "verdict": verdict,
+            "top_match": all_matches[0],
+            "all_matches": all_matches,
+        }
+
     def save(
         self,
         content: str,

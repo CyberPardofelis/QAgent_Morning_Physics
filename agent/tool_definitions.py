@@ -341,6 +341,39 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # ============================================================
     # recall_memories: 检索记忆
     # ============================================================
+    "update_memory": {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": (
+                "更新一条已有记忆。用于去重时合并（覆盖旧内容）或调整重要性。"
+                "何时调用：save_memory 返回【已存在相似记忆】时；用户说【刚才记错了，应该是 XX】更正时；"
+                "用户说【那条更重要了/没那么重要了】调整重要性时。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "已有记忆的 ID（save_memory 返回的 8 位 short id 即可，函数会自动补全完整 id）"
+                    },
+                    "new_content": {
+                        "type": "string",
+                        "description": "新内容（覆盖原 content；空字符串表示不改）"
+                    },
+                    "new_importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": -1.0,
+                        "description": "新重要性 0-1；-1 表示不改"
+                    }
+                },
+                "required": ["memory_id"]
+            }
+        }
+    },
+
     "recall_memories": {
         "type": "function",
         "function": {

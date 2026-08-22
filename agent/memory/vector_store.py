@@ -229,6 +229,20 @@ class MemoryVectorStore:
             return dict(self._meta[row_idx])
         return None
 
+    def get_vector(self, row_idx: int) -> Optional[np.ndarray]:
+        """
+        拿单条向量的副本（用于 MMR 等需要候选向量的场景）。
+        返回 1D ndarray 或 None（row_idx 越界 / 已被 tombstone）。
+        """
+        if row_idx < 0 or row_idx >= self.index.ntotal:
+            return None
+        try:
+            v = self.index.reconstruct(int(row_idx))
+            return np.asarray(v, dtype=np.float32).copy()
+        except Exception as e:
+            logger.warning("[MemoryVectorStore] reconstruct %d 失败: %s", row_idx, e)
+            return None
+
     def get_row_idx(self, memory_id: str) -> Optional[int]:
         """按 memory_id 拿 faiss row idx。"""
         return self._id_to_idx.get(memory_id)

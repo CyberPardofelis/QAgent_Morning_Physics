@@ -18,6 +18,8 @@ import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
+import numpy as np
+
 from .db_manager import MemoryDBManager
 from .vector_store import MemoryVectorStore
 from .embedder import MemoryEmbedder
@@ -64,6 +66,7 @@ class MemoryRetriever:
         method: str = "vector",
         importance_weight: float = 0.3,
         decay_rate: float = 0.0,  # 默认不衰减（v1 简化，未来按需开）
+        mmr_lambda: float = 0.7,  # MMR：1.0=纯相关，0.0=纯多样，0.7=偏向相关
     ) -> List[Dict[str, Any]]:
         """
         检索记忆。
@@ -77,6 +80,9 @@ class MemoryRetriever:
             method          "vector" / "keyword" / "hybrid"
             importance_weight  最终分数 = sim * (w*importance + (1-w)*1)
             decay_rate      时间衰减率（每日 e^(-rate) 倍衰减）
+            mmr_lambda      MMR 重排系数（仅 method=vector/hybrid 有效）
+                            1.0=纯相关性, 0.0=纯多样性, 默认 0.7=偏相关
+                            调成 0.5 + 调大 limit 可同时获得相关和多样的结果
 
         返回：
             记忆列表（带 _score 字段），按分数降序
@@ -131,6 +137,7 @@ class MemoryRetriever:
         min_similarity: float,
         importance_weight: float,
         decay_rate: float,
+        mmr_lambda: float = 0.7,
     ) -> List[Dict[str, Any]]:
         # 1) 编码查询
         try:
@@ -143,8 +150,8 @@ class MemoryRetriever:
             )
 
         # 2) 向量搜索
-        # 多取一些（后面要按 importance / SQL 过滤再截断）
-        k_search = min(max(limit * 3, 30), self.vs.total() or 1)
+        # 多取一些（后面要按 importance / SQL 过滤 + MMR 再截断）
+        k_search = min(max(limit * 5, 50), self.vs.total() or 1)
         hits = self.vs.search(q_vec, top_k=k_search)
 
         if not hits:
@@ -154,8 +161,10 @@ class MemoryRetriever:
             )
 
         # 3) 拿 metadata + 查 SQLite 拿完整信息
+        # 同时 reconstruct 向量（MMR 需要）
         candidate_ids = []
-        candidate_sim = {}  # row_idx -> sim
+        candidate_sim: Dict[str, float] = {}
+        candidate_vector: Dict[str, np.ndarray] = {}
         for row_idx, sim in hits:
             meta = self.vs.get_metadata(row_idx)
             if not meta:
@@ -165,6 +174,10 @@ class MemoryRetriever:
                 continue
             candidate_ids.append(mid)
             candidate_sim[mid] = sim
+            # reconstruct 向量（用于 MMR 多样性计算）
+            vec = self.vs.get_vector(row_idx)
+            if vec is not None:
+                candidate_vector[mid] = vec
 
         if not candidate_ids:
             return []
@@ -199,9 +212,20 @@ class MemoryRetriever:
             mem["_method"] = "vector"
             scored.append((score, mem))
 
-        # 5) 按分数排序截断
+        # 5) 按分数排序 + MMR 重排（多样性）
         scored.sort(key=lambda x: x[0], reverse=True)
-        results = [m for _, m in scored[:limit]]
+        candidates = [m for _, m in scored]
+        if mmr_lambda < 1.0 and len(candidates) > limit:
+            # MMR 重排
+            for m in candidates:
+                mid = m["id"]
+                m["_vector"] = candidate_vector.get(mid)
+            results = self._mmr_rerank(candidates, top_k=limit, lambda_param=mmr_lambda)
+            # 清理 _vector 临时字段
+            for m in results:
+                m.pop("_vector", None)
+        else:
+            results = candidates[:limit]
 
         # 6) 更新访问记录
         for mem in results:
@@ -211,6 +235,80 @@ class MemoryRetriever:
                 logger.debug("[MemoryRetriever] touch 失败: %s", e)
 
         return results
+
+    # ============================================================
+    # MMR 重排（Maximal Marginal Relevance）
+    # ============================================================
+    def _mmr_rerank(
+        self,
+        candidates: List[Dict[str, Any]],
+        top_k: int,
+        lambda_param: float = 0.7,
+    ) -> List[Dict[str, Any]]:
+        """
+        MMR 重排：在"相关"和"多样"间平衡。
+
+        公式：MMR(d) = λ * relevance(d) - (1-λ) * max_sim_to_selected(d)
+
+        参数：
+            candidates     候选 list[dict]，每条需有 _vector 和 _score
+            top_k          最终返回条数
+            lambda_param   1.0=纯相关, 0.0=纯多样, 默认 0.7=偏相关
+
+        实现：贪心选择，每次选 MMR 分数最高的，未选里移除。
+        """
+        if not candidates:
+            return []
+        if top_k <= 0:
+            return []
+        if top_k >= len(candidates):
+            return candidates
+
+        # relevance 用 _score（已经结合了 sim + importance + decay）
+        # 多样性用 _vector 的余弦相似度
+        selected: List[Dict[str, Any]] = []
+        pool = list(candidates)
+
+        # 第一条：直接选 relevance 最高的
+        pool.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        selected.append(pool.pop(0))
+
+        while len(selected) < top_k and pool:
+            best_idx = 0
+            best_mmr = -float("inf")
+            for i, cand in enumerate(pool):
+                # 相关性
+                relevance = cand.get("_score", 0)
+                # 多样性惩罚：与已选中最相似的
+                cand_vec = cand.get("_vector")
+                if cand_vec is None or not selected:
+                    max_sim_to_selected = 0.0
+                else:
+                    sims = []
+                    for s in selected:
+                        s_vec = s.get("_vector")
+                        if s_vec is not None:
+                            sim = self._cosine_sim(cand_vec, s_vec)
+                            sims.append(sim)
+                    max_sim_to_selected = max(sims) if sims else 0.0
+                mmr = lambda_param * relevance - (1.0 - lambda_param) * max_sim_to_selected
+                if mmr > best_mmr:
+                    best_mmr = mmr
+                    best_idx = i
+            selected.append(pool.pop(best_idx))
+        return selected
+
+    @staticmethod
+    def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+        """余弦相似度（向量已归一化时可直接点积）。"""
+        try:
+            na = np.linalg.norm(a)
+            nb = np.linalg.norm(b)
+            if na < 1e-9 or nb < 1e-9:
+                return 0.0
+            return float(np.dot(a, b) / (na * nb))
+        except Exception:
+            return 0.0
 
     # ============================================================
     # 关键词检索
@@ -260,11 +358,13 @@ class MemoryRetriever:
         min_importance: Optional[float],
         importance_weight: float,
         decay_rate: float,
+        mmr_lambda: float = 0.7,
     ) -> List[Dict[str, Any]]:
         # 多取一些
         vec_results = self._vector_retrieve(
             query, limit * 2, scope, memory_type, min_importance,
             min_similarity=0.0, importance_weight=importance_weight, decay_rate=decay_rate,
+            mmr_lambda=mmr_lambda,
         )
         kw_results = self._keyword_retrieve(
             query, limit * 2, scope, memory_type, min_importance,
