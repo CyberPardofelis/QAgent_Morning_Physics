@@ -15,12 +15,14 @@ agent.memory.retriever — 混合检索（向量 + 关键词 + 衰减）
 import logging
 import math
 import re
+import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
 import numpy as np
 
 from .db_manager import MemoryDBManager
+from .extractor import extract as _extractor_extract
 from .vector_store import MemoryVectorStore
 from .embedder import MemoryEmbedder
 
@@ -65,8 +67,10 @@ class MemoryRetriever:
         min_similarity: float = 0.0,
         method: str = "vector",
         importance_weight: float = 0.3,
-        decay_rate: float = 0.0,  # 默认不衰减（v1 简化，未来按需开）
-        mmr_lambda: float = 0.7,  # MMR：1.0=纯相关，0.0=纯多样，0.7=偏向相关
+        decay_rate: float = 0.0,
+        mmr_lambda: float = 0.7,
+        concept_aware: bool = True,  # 启用概念召回 (query 中的 concept 优先召回)
+        concept_bonus: float = 0.2,  # concept 召回的分数加成 (× (1+bonus))
     ) -> List[Dict[str, Any]]:
         """
         检索记忆。
@@ -83,6 +87,11 @@ class MemoryRetriever:
             mmr_lambda      MMR 重排系数（仅 method=vector/hybrid 有效）
                             1.0=纯相关性, 0.0=纯多样性, 默认 0.7=偏相关
                             调成 0.5 + 调大 limit 可同时获得相关和多样的结果
+            concept_aware   是否启用概念召回（v3 新增，默认 True）
+                            True  → 用 query 抽 concept，SQL LIKE 拿相关 id，
+                                    这些 id 在算分时叠 × (1+concept_bonus) 的加成
+                            False → 纯向量检索 (回退 v2 行为)
+            concept_bonus   概念召回的分数加成，默认 0.2（即 ×1.2）
 
         返回：
             记忆列表（带 _score 字段），按分数降序
@@ -110,19 +119,92 @@ class MemoryRetriever:
             return results
 
         if method == "keyword":
+            # keyword 也走 concept_recall 加成
+            concept_bonus_ids_kw: Set[str] = set()
+            if concept_aware:
+                try:
+                    cr = self._concept_recall(query, scope=scope, limit=50)
+                    concept_bonus_ids_kw = {m["id"] for m in cr}
+                except Exception as e:
+                    logger.debug("[MemoryRetriever] keyword concept_recall 失败: %s", e)
             return self._keyword_retrieve(
                 query, limit, scope, memory_type, min_importance,
+                concept_bonus_ids=concept_bonus_ids_kw, concept_bonus=concept_bonus,
             )
         if method == "hybrid":
+            # hybrid 也走 concept_recall 加成
+            concept_bonus_ids_h: Set[str] = set()
+            if concept_aware:
+                try:
+                    cr = self._concept_recall(query, scope=scope, limit=50)
+                    concept_bonus_ids_h = {m["id"] for m in cr}
+                except Exception as e:
+                    logger.debug("[MemoryRetriever] hybrid concept_recall 失败: %s", e)
             return self._hybrid_retrieve(
                 query, limit, scope, memory_type, min_importance,
-                importance_weight, decay_rate,
+                importance_weight, decay_rate, mmr_lambda,
+                concept_bonus_ids=concept_bonus_ids_h, concept_bonus=concept_bonus,
             )
-        # 默认 vector
+        # 默认 vector（v3: 先做 concept_recall 拿 id set, 算分时给这些 id 加 bonus）
+        concept_bonus_ids: Set[str] = set()
+        if concept_aware:
+            try:
+                concept_recalls = self._concept_recall(query, scope=scope, limit=50)
+                concept_bonus_ids = {m["id"] for m in concept_recalls}
+                logger.debug("[MemoryRetriever] concept_recall 命中 %d 个 id", len(concept_bonus_ids))
+            except Exception as e:
+                logger.debug("[MemoryRetriever] concept_recall 失败: %s", e)
         return self._vector_retrieve(
             query, limit, scope, memory_type, min_importance,
-            min_similarity, importance_weight, decay_rate,
+            min_similarity, importance_weight, decay_rate, mmr_lambda,
+            concept_bonus_ids=concept_bonus_ids, concept_bonus=concept_bonus,
         )
+
+    def _concept_recall(
+        self,
+        query: str,
+        scope: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        概念召回: 查该 query 中的 core_concepts 所有记忆.
+        依赖 extractor 抽取并检索 metadata.extract.core_concepts.canonical.
+        """
+        try:
+            ext = _extractor_extract(query)
+        except Exception as e:
+            logger.debug("[MemoryRetriever] extract 失败: %s", e)
+            return []
+        concepts = ext.get("core_concepts", []) if ext else []
+        if not concepts:
+            return []
+        canonicals = list({c.get("canonical") for c in concepts if c.get("canonical")})
+        if not canonicals:
+            return []
+        # SQL 查询: metadata 中包含这些 canonical 的记忆
+        # 由于 metadata 是 JSON 字箍, 用 LIKE 匹配
+        try:
+            from agent.infra.db import connect
+            import json
+            conditions = []
+            params = []
+            for c in canonicals:
+                conditions.append("metadata LIKE ?")
+                # 用 chr(34) \u8d70\u8f6c\u53cc\u5f15\u53f7
+                params.append("%" + chr(34) + "canonical" + chr(34) + ": " + chr(34) + c + chr(34) + "%")
+            where = " OR ".join(conditions) if conditions else "1=1"
+            if scope is not None:
+                where = f"({where}) AND scope = ?"
+                params.append(scope)
+            sql = f"SELECT * FROM memories WHERE {where} ORDER BY importance DESC, created_at DESC LIMIT ?"
+            params.append(limit)
+            with connect("memory") as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(sql, params).fetchall()
+            return [self.db._row_to_dict(r) for r in rows]
+        except Exception as e:
+            logger.warning("[MemoryRetriever] _concept_recall SQL 失败: %s", e)
+            return []
 
     # ============================================================
     # 向量检索
@@ -138,15 +220,18 @@ class MemoryRetriever:
         importance_weight: float,
         decay_rate: float,
         mmr_lambda: float = 0.7,
+        concept_bonus_ids: Optional[Set[str]] = None,
+        concept_bonus: float = 0.2,
     ) -> List[Dict[str, Any]]:
         # 1) 编码查询
         try:
             q_vec = self.embedder.encode(query)
         except RuntimeError as e:
             logger.warning("[MemoryRetriever] embedding 失败: %s", e)
-            # fallback 到关键词
+            # fallback 到关键词（带 concept_bonus, 不丢加成）
             return self._keyword_retrieve(
                 query, limit, scope, memory_type, min_importance,
+                concept_bonus_ids=concept_bonus_ids, concept_bonus=concept_bonus,
             )
 
         # 2) 向量搜索
@@ -155,9 +240,10 @@ class MemoryRetriever:
         hits = self.vs.search(q_vec, top_k=k_search)
 
         if not hits:
-            # fallback 关键词
+            # fallback 关键词（带 concept_bonus）
             return self._keyword_retrieve(
                 query, limit, scope, memory_type, min_importance,
+                concept_bonus_ids=concept_bonus_ids, concept_bonus=concept_bonus,
             )
 
         # 3) 拿 metadata + 查 SQLite 拿完整信息
@@ -205,6 +291,15 @@ class MemoryRetriever:
 
             if decay_rate > 0:
                 score = self._apply_decay(score, mem.get("created_at", ""), decay_rate)
+
+            # v3: concept_recall 加成 — query 中的 concept 命中的记忆, 分数 × (1+bonus)
+            # 用乘法而非加法: 避免 sim=0.05 的噪声记忆靠 concept 加成混进 top
+            in_concept = concept_bonus_ids is not None and mid in concept_bonus_ids
+            if in_concept and concept_bonus > 0:
+                score = score * (1.0 + concept_bonus)
+                mem["_concept_match"] = True
+            else:
+                mem["_concept_match"] = False
 
             mem["_score"] = score
             mem["_similarity"] = sim
@@ -320,6 +415,8 @@ class MemoryRetriever:
         scope: Optional[str],
         memory_type: Optional[str],
         min_importance: Optional[float],
+        concept_bonus_ids: Optional[Set[str]] = None,
+        concept_bonus: float = 0.2,
     ) -> List[Dict[str, Any]]:
         keywords = self._extract_keywords(query)
         if not keywords:
@@ -341,7 +438,16 @@ class MemoryRetriever:
         sorted_ids = sorted(id_to_score.keys(), key=lambda x: id_to_score[x], reverse=True)[:limit]
         memories = self.db.list_by_ids(sorted_ids)
         for mem in memories:
-            mem["_score"] = id_to_score[mem["id"]]
+            score = id_to_score[mem["id"]]
+            # v3: keyword 路径也叠 concept_bonus (vector fallback 时不能丢)
+            mid = mem["id"]
+            in_concept = concept_bonus_ids is not None and mid in concept_bonus_ids
+            if in_concept and concept_bonus > 0:
+                score = score * (1.0 + concept_bonus)
+                mem["_concept_match"] = True
+            else:
+                mem["_concept_match"] = False
+            mem["_score"] = score
             mem["_similarity"] = 0.0
             mem["_method"] = "keyword"
         return memories
@@ -359,12 +465,15 @@ class MemoryRetriever:
         importance_weight: float,
         decay_rate: float,
         mmr_lambda: float = 0.7,
+        concept_bonus_ids: Optional[Set[str]] = None,
+        concept_bonus: float = 0.2,
     ) -> List[Dict[str, Any]]:
         # 多取一些
         vec_results = self._vector_retrieve(
             query, limit * 2, scope, memory_type, min_importance,
             min_similarity=0.0, importance_weight=importance_weight, decay_rate=decay_rate,
             mmr_lambda=mmr_lambda,
+            concept_bonus_ids=concept_bonus_ids, concept_bonus=concept_bonus,
         )
         kw_results = self._keyword_retrieve(
             query, limit * 2, scope, memory_type, min_importance,

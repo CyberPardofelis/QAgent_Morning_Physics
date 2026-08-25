@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 重复检测阈值（可调）
 # ============================================================
-SIM_MERGE_THRESHOLD = 0.95    # >= 0.95 判定为"重复"，建议合并
+SIM_MERGE_THRESHOLD = 0.99    # 临时紧缩到0.99防对立观点被误合并 (2026-08-24 用户报 BGE 不能区分对立/同一事实)
 SIM_SIMILAR_THRESHOLD = 0.75  # 0.75-0.95 判定为"类似"，提示用户判断
 
 
@@ -121,6 +121,20 @@ def save_memory(
                     f"1. 如果新内容覆盖了旧条目 → 调用 update_memory(existing_id, new_content) 合并" + chr(10) +
                     f"2. 如果确实是新主题（虽然相似）→ 再次调用 save_memory(..., force_save=True) 强制新建" + chr(10) +
                     f"3. 如果旧条目不再重要 → 用 viewer 删除它后重试"
+                )
+            if verdict == "opposite" and top_match:
+                # 三元组识别出对立观点, 不要合并
+                existing = top_match["memory"]
+                judge_reason = top_match.get("judge_reason", "")
+                return (
+                    f"⚠️ **检测到对立观点（三元组判断）**" + chr(10) + chr(10) +
+                    f"**已存在条目（与新内容矛盾）**:" + chr(10) +
+                    f"- ID: `{existing['id'][:8]}`" + chr(10) +
+                    f"- 类型: `{existing.get('memory_type', 'general')}`" + chr(10) +
+                    f"- 内容: {existing.get('content', '')[:200]}{'...' if len(existing.get('content', '')) > 200 else ''}" + chr(10) + chr(10) +
+                    f"**判断依据**: {judge_reason}" + chr(10) + chr(10) +
+                    f"**不要合并** — 两条都是有效观点, 需要同时保留以跟踪演化." + chr(10) +
+                    f"如果确认要覆盖旧观点，调用 update_memory 合并即可."
                 )
             elif verdict == "similar" and all_matches:
                 lines_list = [f"⚠️ **发现类似记忆（sim 0.75-0.95）**:" + chr(10)]

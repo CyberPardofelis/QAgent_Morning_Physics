@@ -22,6 +22,8 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+from .extractor import extract as _llm_extract
+from .judger import judge as _judge_triples, can_merge as _can_merge
 
 
 class MemoryProcessor:
@@ -52,54 +54,105 @@ class MemoryProcessor:
     def check_duplicate(
         self,
         content: str,
-        sim_merge: float = 0.95,
+        sim_merge: float = 0.99,  # 临时紧羁以防对立观点被误合并
         sim_similar: float = 0.75,
         top_k: int = 3,
     ) -> Dict[str, Any]:
         """
         检查要保存的内容是否与库内已有记忆重复。
 
+        判定策略 (三层):
+          1. LLM 抽取三元组 -> judger 判断 (same_fact / opposite / related / unrelated)
+          2. embedding similarity (合并的叨门, 防 LLM 抽不出来)
+          3. keyword overlap (兑底)
+
         返回:
             {
-                "verdict": "unique" | "similar" | "duplicate",
+                "verdict": "duplicate" | "similar" | "unique",
                 "top_match": {memory_dict, similarity} | None,
-                "all_matches": [{memory_dict, similarity}, ...] (top_k)
+                "all_matches": [{memory_dict, similarity}, ...] (top_k),
+                "judge_verdict": "...",  # 三元组判断结果
+                "judge_reason": "..."
             }
 
         判定:
-            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
-            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
-            - max_sim <  sim_similar → verdict="unique"   (不重复)
+            - same_fact → verdict="duplicate" (合并)
+            - opposite → verdict="opposite" (不要合并, 保留对立)
+            - related_* → verdict="similar" (提示用户)
+            - unrelated → verdict="unique"
         """
+        # Step 1: LLM 抽取
+        new_extract = None
+        try:
+            new_extract = _llm_extract(content)
+        except Exception as e:
+            logger.debug("[MemoryProcessor] extract 异常: %s", e)
+
+        # Step 2: embedding 召回候选
         try:
             vec = self.embedder.encode(content)
         except RuntimeError as e:
             logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        try:
-            hits = self.vs.search(vec, top_k=top_k)
-        except Exception as e:
-            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        if not hits:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
-        # 拿完整信息
-        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
-        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
-        memories = self.db.list_by_ids([mid for mid in ids if mid])
+            vec = None
 
         all_matches = []
-        for m in memories:
-            mid = m["id"]
-            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
-        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+        if vec is not None:
+            try:
+                hits = self.vs.search(vec, top_k=top_k)
+                if hits:
+                    ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
+                    sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
+                    memories = self.db.list_by_ids([mid for mid in ids if mid])
+                    for m in memories:
+                        mid = m["id"]
+                        all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
+                    all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+            except Exception as e:
+                logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
 
+        # Step 3: 用 judger 逐个判断候选
+        judge_verdict = "unrelated"
+        judge_reason = ""
+        for match in all_matches:
+            existing_extract = (match["memory"].get("metadata") or {}).get("extract") or {}
+            if not existing_extract:
+                continue  # 老数据没有 extract, 跳过
+            verdict, reason = _judge_triples(new_extract or {"core_concepts": [], "relations": [], "negation": False},
+                                              existing_extract)
+            match["judge_verdict"] = verdict
+            match["judge_reason"] = reason
+            if verdict in ("same_fact", "opposite"):
+                judge_verdict = verdict
+                judge_reason = reason
+                break  # 最优先级判断, 出来就退
+
+        # 三元组判断优先
+        if judge_verdict == "same_fact":
+            return {
+                "verdict": "duplicate",
+                "top_match": all_matches[0] if all_matches else None,
+                "all_matches": all_matches,
+                "judge_verdict": judge_verdict,
+                "judge_reason": judge_reason,
+            }
+        if judge_verdict == "opposite":
+            return {
+                "verdict": "opposite",  # 专门用于提示 LLM 不要合并
+                "top_match": all_matches[0] if all_matches else None,
+                "all_matches": all_matches,
+                "judge_verdict": judge_verdict,
+                "judge_reason": judge_reason,
+            }
+
+        # 回落到 embedding 判断
         if not all_matches:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
+            return {
+                "verdict": "unique",
+                "top_match": None,
+                "all_matches": [],
+                "judge_verdict": judge_verdict,
+                "judge_reason": judge_reason,
+            }
         top_sim = all_matches[0]["similarity"]
         if top_sim >= sim_merge:
             verdict = "duplicate"
@@ -107,11 +160,12 @@ class MemoryProcessor:
             verdict = "similar"
         else:
             verdict = "unique"
-
         return {
             "verdict": verdict,
             "top_match": all_matches[0],
             "all_matches": all_matches,
+            "judge_verdict": judge_verdict,
+            "judge_reason": judge_reason,
         }
 
     # ============================================================
@@ -288,22 +342,30 @@ class MemoryProcessor:
         except RuntimeError as e:
             logger.error("[MemoryProcessor] embedding 失败（仅 SQLite 写入成功）: %s", e)
             # 不抛：SQLite 已经有这条数据，向量检索拿不到而已
-            return memory_id
+            # 注意：不能 return, enrich 还要跑（enrich 跟 embedding 独立）
+            vec = None
 
+        if vec is not None:
+            try:
+                self.vs.add(
+                    memory_id=memory_id,
+                    vector=vec,
+                    metadata={
+                        "memory_type": memory_type,
+                        "importance": importance,
+                        "related_paper_id": related_paper_id,
+                        "created_at": datetime.now().isoformat(),
+                    },
+                )
+            except Exception as e:
+                logger.exception("[MemoryProcessor] faiss add 失败: %s", e)
+                # 不抛：SQLite 数据完整，向量索引缺这条（标记 _vector_missing）
+
+        # 调 LLM 抽取元数据 (后台, 不报错)
         try:
-            self.vs.add(
-                memory_id=memory_id,
-                vector=vec,
-                metadata={
-                    "memory_type": memory_type,
-                    "importance": importance,
-                    "related_paper_id": related_paper_id,
-                    "created_at": datetime.now().isoformat(),
-                },
-            )
+            self._enrich_with_extract(memory_id, content)
         except Exception as e:
-            logger.exception("[MemoryProcessor] faiss add 失败: %s", e)
-            # 不抛：SQLite 数据完整，向量索引缺这条（标记 _vector_missing）
+            logger.debug("[MemoryProcessor] enrich 错误: %s", e)
 
         logger.info(
             "[MemoryProcessor] saved: id=%s type=%s importance=%.2f content='%s...'",
@@ -321,6 +383,40 @@ class MemoryProcessor:
             mid = self.save(**it)
             ids.append(mid)
         return ids
+
+    def _enrich_with_extract(self, memory_id: str, content: str) -> None:
+        """
+        使用 LLM 抽取元数据 (核心概念 / 三元组 / 否定) 追加到 metadata 字段.
+        仅在抽取成功时更新, 不覆盖现有 metadata.
+        """
+        if not content:
+            return
+        try:
+            ext = _llm_extract(content)
+        except Exception as e:
+            logger.debug("[MemoryProcessor] extract 调用异常: %s", e)
+            return
+        if not ext:
+            return
+        if not ext.get("core_concepts") and not ext.get("relations"):
+            return
+        # 读现有 metadata, 合并
+        existing = self.db.get(memory_id)
+        if not existing:
+            return
+        meta = existing.get("metadata") or {}
+        meta["extract"] = ext
+        meta["extracted_at"] = __import__("datetime").datetime.now().isoformat()
+        # 写回 SQLite
+        try:
+            from agent.infra.db import connect
+            with connect("memory") as conn:
+                conn.execute(
+                    "UPDATE memories SET metadata = ? WHERE id = ?",
+                    (__import__("json").dumps(meta, ensure_ascii=False), memory_id),
+                )
+        except Exception as e:
+            logger.warning("[MemoryProcessor] update metadata 失败: %s", e)
 
     def delete(self, memory_id: str) -> bool:
         """删除（同时从 faiss 和 SQLite）。"""
