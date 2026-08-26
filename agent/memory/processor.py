@@ -54,24 +54,28 @@ class MemoryProcessor:
     def check_duplicate(
         self,
         content: str,
-        sim_merge: float = 0.99,  # 临时紧羁以防对立观点被误合并
+        sim_merge: float = 0.99,
         sim_similar: float = 0.75,
         top_k: int = 3,
     ) -> Dict[str, Any]:
         """
         检查要保存的内容是否与库内已有记忆重复。
 
-        判定策略 (三层):
-          1. LLM 抽取三元组 -> judger 判断 (same_fact / opposite / related / unrelated)
-          2. embedding similarity (合并的叨门, 防 LLM 抽不出来)
-          3. keyword overlap (兑底)
+        判定策略 (v3.2 三路召回 + judger):
+          1. LLM 抽取三元组 → judger 判定 (same_fact / opposite / related_* / unrelated)
+          2. 三路召回候选 (每路都去重合并):
+             - 路 0: 整体 embedding sim top-3 (embedding 不可用时跳过)
+             - 路 1: 主+宾相同 + 谓语语义 sim>0.9 (embedding 不可用时跳过, 最多 5)
+             - 路 2: 仅谓语语义 sim>0.9 (embedding 不可用时跳过, 最多 5)
+             - 路 3: concept_recall 降级 (SQL LIKE 按 canonical, 不依赖 embedding, 最多 top_k*3)
+          3. embedding similarity 兜底
 
         返回:
             {
-                "verdict": "duplicate" | "similar" | "unique",
+                "verdict": "duplicate" | "opposite" | "similar" | "unique",
                 "top_match": {memory_dict, similarity} | None,
-                "all_matches": [{memory_dict, similarity}, ...] (top_k),
-                "judge_verdict": "...",  # 三元组判断结果
+                "all_matches": [{memory_dict, similarity, _via}, ...] (deduped),
+                "judge_verdict": "...",
                 "judge_reason": "..."
             }
 
@@ -79,7 +83,7 @@ class MemoryProcessor:
             - same_fact → verdict="duplicate" (合并)
             - opposite → verdict="opposite" (不要合并, 保留对立)
             - related_* → verdict="similar" (提示用户)
-            - unrelated → verdict="unique"
+            - unrelated → verdict 由 embedding/concept_recall 决定
         """
         # Step 1: LLM 抽取
         new_extract = None
@@ -88,14 +92,16 @@ class MemoryProcessor:
         except Exception as e:
             logger.debug("[MemoryProcessor] extract 异常: %s", e)
 
-        # Step 2: embedding 召回候选
+        # Step 2: 多路召回
+        all_matches: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+
+        # ---- 路 0: 整体 embedding 召回 ----
         try:
             vec = self.embedder.encode(content)
         except RuntimeError as e:
-            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
+            logger.debug("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
             vec = None
-
-        all_matches = []
         if vec is not None:
             try:
                 hits = self.vs.search(vec, top_k=top_k)
@@ -105,28 +111,126 @@ class MemoryProcessor:
                     memories = self.db.list_by_ids([mid for mid in ids if mid])
                     for m in memories:
                         mid = m["id"]
-                        all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
-                    all_matches.sort(key=lambda x: x["similarity"], reverse=True)
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0), "_via": "embedding"})
+                    logger.debug("[MemoryProcessor] check_duplicate 路 0 (embedding) 命中 %d", len(hits))
             except Exception as e:
                 logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
 
-        # Step 3: 用 judger 逐个判断候选
+        # ---- 路 1 + 路 2: 按 entry 召回 (谓语向量) ----
+        # 跟路 0 共享 embedder 状态: 如果路 0 失败, 这里也跳过
+        relations_for_recall: List[Dict[str, Any]] = []
+        if new_extract:
+            relations_for_recall = new_extract.get("relations", []) or []
+        if vec is not None and relations_for_recall:
+            try:
+                from .relation_vector_store import get_relation_vector_store
+                rvs = get_relation_vector_store()
+                entry_candidates: Dict[str, Dict[str, Any]] = {}  # memory_id -> {memory, similarity, _via}
+                for rel in relations_for_recall:
+                    subj = rel.get("subj_canonical", "")
+                    pred = rel.get("pred", "")
+                    obj = rel.get("obj_canonical", "")
+                    if not pred:
+                        continue
+                    # 编码谓语
+                    try:
+                        pred_vec = self.embedder.encode(pred)
+                    except RuntimeError:
+                        continue
+
+                    # 路 1: 主+宾相同 + 谓语相似
+                    if subj and obj:
+                        l1_hits = rvs.search_by_subj_pred_obj(
+                            subj_canonical=subj,
+                            query_pred_vector=pred_vec,
+                            obj_canonical=obj,
+                            top_k=5,
+                            sim_threshold=0.9,
+                        )
+                        for h in l1_hits:
+                            mid = h.get("memory_id")
+                            if not mid or mid in seen_ids:
+                                continue
+                            # 拿完整 memory
+                            mem = self.db.get(mid)
+                            if not mem:
+                                continue
+                            seen_ids.add(mid)
+                            entry_candidates[mid] = {
+                                "memory": mem,
+                                "similarity": h["similarity"],
+                                "_via": "subj_pred_obj",
+                            }
+                            if len(entry_candidates) >= 5:
+                                break
+                    if len(entry_candidates) >= 5:
+                        break
+
+                    # 路 2: 仅谓语语义
+                    l2_hits = rvs.search_by_pred_semantic(
+                        query_pred_vector=pred_vec,
+                        top_k=5,
+                        sim_threshold=0.9,
+                    )
+                    for h in l2_hits:
+                        mid = h.get("memory_id")
+                        if not mid or mid in seen_ids:
+                            continue
+                        mem = self.db.get(mid)
+                        if not mem:
+                            continue
+                        seen_ids.add(mid)
+                        entry_candidates[mid] = {
+                            "memory": mem,
+                            "similarity": h["similarity"],
+                            "_via": "pred_semantic",
+                        }
+                        if len(entry_candidates) >= 5:
+                            break
+                all_matches.extend(entry_candidates.values())
+                logger.debug("[MemoryProcessor] check_duplicate 路 1+2 (entry) 命中 %d", len(entry_candidates))
+            except Exception as e:
+                logger.debug("[MemoryProcessor] check_duplicate entry 召回失败: %s", e)
+
+        # ---- 路 3: concept_recall 降级 (SQL LIKE 按 canonical, 不依赖 embedding) ----
+        # 当路 0/1/2 没召回时 (embedding 不可用) 自动生效
+        if not all_matches and new_extract:
+            try:
+                from .retriever import MemoryRetriever
+                retriever = MemoryRetriever()
+                concept_recalls = retriever._concept_recall(content, scope=None, limit=top_k * 3)
+                for m in concept_recalls:
+                    mid = m["id"]
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    all_matches.append({"memory": m, "similarity": 0.0, "_via": "concept_recall"})
+                logger.debug("[MemoryProcessor] check_duplicate 路 3 (concept_recall) 命中 %d", len(concept_recalls))
+            except Exception as e:
+                logger.warning("[MemoryProcessor] check_duplicate concept_recall 失败: %s", e)
+
+        # Step 3: judger 逐个判断
         judge_verdict = "unrelated"
         judge_reason = ""
         for match in all_matches:
             existing_extract = (match["memory"].get("metadata") or {}).get("extract") or {}
             if not existing_extract:
-                continue  # 老数据没有 extract, 跳过
-            verdict, reason = _judge_triples(new_extract or {"core_concepts": [], "relations": [], "negation": False},
-                                              existing_extract)
+                continue
+            verdict, reason = _judge_triples(
+                new_extract or {"core_concepts": [], "relations": [], "negation": False},
+                existing_extract,
+            )
             match["judge_verdict"] = verdict
             match["judge_reason"] = reason
             if verdict in ("same_fact", "opposite"):
                 judge_verdict = verdict
                 judge_reason = reason
-                break  # 最优先级判断, 出来就退
+                break
 
-        # 三元组判断优先
+        # Step 4: 综合 verdict
         if judge_verdict == "same_fact":
             return {
                 "verdict": "duplicate",
@@ -137,14 +241,14 @@ class MemoryProcessor:
             }
         if judge_verdict == "opposite":
             return {
-                "verdict": "opposite",  # 专门用于提示 LLM 不要合并
+                "verdict": "opposite",
                 "top_match": all_matches[0] if all_matches else None,
                 "all_matches": all_matches,
                 "judge_verdict": judge_verdict,
                 "judge_reason": judge_reason,
             }
 
-        # 回落到 embedding 判断
+        # 回落到 similarity 判断
         if not all_matches:
             return {
                 "verdict": "unique",
@@ -166,142 +270,6 @@ class MemoryProcessor:
             "all_matches": all_matches,
             "judge_verdict": judge_verdict,
             "judge_reason": judge_reason,
-        }
-
-    # ============================================================
-    # 去重检测（save 前调用）
-    # ============================================================
-    def check_duplicate(
-        self,
-        content: str,
-        sim_merge: float = 0.95,
-        sim_similar: float = 0.75,
-        top_k: int = 3,
-    ) -> Dict[str, Any]:
-        """
-        检查要保存的内容是否与库内已有记忆重复。
-
-        返回:
-            {
-                "verdict": "unique" | "similar" | "duplicate",
-                "top_match": {memory_dict, similarity} | None,
-                "all_matches": [{memory_dict, similarity}, ...] (top_k)
-            }
-
-        判定:
-            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
-            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
-            - max_sim <  sim_similar → verdict="unique"   (不重复)
-        """
-        try:
-            vec = self.embedder.encode(content)
-        except RuntimeError as e:
-            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        try:
-            hits = self.vs.search(vec, top_k=top_k)
-        except Exception as e:
-            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        if not hits:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
-        # 拿完整信息
-        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
-        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
-        memories = self.db.list_by_ids([mid for mid in ids if mid])
-
-        all_matches = []
-        for m in memories:
-            mid = m["id"]
-            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
-        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
-
-        if not all_matches:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
-        top_sim = all_matches[0]["similarity"]
-        if top_sim >= sim_merge:
-            verdict = "duplicate"
-        elif top_sim >= sim_similar:
-            verdict = "similar"
-        else:
-            verdict = "unique"
-
-        return {
-            "verdict": verdict,
-            "top_match": all_matches[0],
-            "all_matches": all_matches,
-        }
-
-    # ============================================================
-    # 去重检测（save 前调用）
-    # ============================================================
-    def check_duplicate(
-        self,
-        content: str,
-        sim_merge: float = 0.95,
-        sim_similar: float = 0.75,
-        top_k: int = 3,
-    ) -> Dict[str, Any]:
-        """
-        检查要保存的内容是否与库内已有记忆重复。
-
-        返回:
-            {
-                "verdict": "unique" | "similar" | "duplicate",
-                "top_match": {memory_dict, similarity} | None,
-                "all_matches": [{memory_dict, similarity}, ...] (top_k)
-            }
-
-        判定:
-            - max_sim >= sim_merge   → verdict="duplicate" (建议合并)
-            - max_sim >= sim_similar → verdict="similar"   (类似但需判断)
-            - max_sim <  sim_similar → verdict="unique"   (不重复)
-        """
-        try:
-            vec = self.embedder.encode(content)
-        except RuntimeError as e:
-            logger.warning("[MemoryProcessor] check_duplicate embedding 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        try:
-            hits = self.vs.search(vec, top_k=top_k)
-        except Exception as e:
-            logger.warning("[MemoryProcessor] check_duplicate faiss 失败: %s", e)
-            return {"verdict": "unique", "top_match": None, "all_matches": [], "error": str(e)}
-
-        if not hits:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
-        # 拿完整信息
-        ids = [self.vs.get_metadata(ri).get("id") for ri, _ in hits if self.vs.get_metadata(ri)]
-        sim_map = {self.vs.get_metadata(ri).get("id"): sim for ri, sim in hits if self.vs.get_metadata(ri)}
-        memories = self.db.list_by_ids([mid for mid in ids if mid])
-
-        all_matches = []
-        for m in memories:
-            mid = m["id"]
-            all_matches.append({"memory": m, "similarity": sim_map.get(mid, 0.0)})
-        all_matches.sort(key=lambda x: x["similarity"], reverse=True)
-
-        if not all_matches:
-            return {"verdict": "unique", "top_match": None, "all_matches": []}
-
-        top_sim = all_matches[0]["similarity"]
-        if top_sim >= sim_merge:
-            verdict = "duplicate"
-        elif top_sim >= sim_similar:
-            verdict = "similar"
-        else:
-            verdict = "unique"
-
-        return {
-            "verdict": verdict,
-            "top_match": all_matches[0],
-            "all_matches": all_matches,
         }
 
     def save(
@@ -417,6 +385,29 @@ class MemoryProcessor:
                 )
         except Exception as e:
             logger.warning("[MemoryProcessor] update metadata 失败: %s", e)
+
+        # [v3.2] 把每条 relation 的 pred 向量存进 relation 索引, 供 _recall_by_pred 召回
+        # 注意: embedding 不可用时跳过 (跟主向量库一致, 不报错)
+        relations = ext.get("relations", []) or []
+        if relations:
+            try:
+                from .relation_vector_store import get_relation_vector_store
+                rvs = get_relation_vector_store()
+                pred_vectors = []
+                for r in relations:
+                    pred = r.get("pred", "")
+                    if not pred:
+                        pred_vectors.append(None)
+                        continue
+                    try:
+                        vec = self.embedder.encode(pred)
+                        pred_vectors.append(vec)
+                    except RuntimeError:
+                        pred_vectors.append(None)
+                # 只 add 不为 None 的 (add_relations_batch 内部会过滤)
+                rvs.add_relations_batch(memory_id, relations, pred_vectors)
+            except Exception as e:
+                logger.debug("[MemoryProcessor] 存 relation 向量失败: %s", e)
 
     def delete(self, memory_id: str) -> bool:
         """删除（同时从 faiss 和 SQLite）。"""

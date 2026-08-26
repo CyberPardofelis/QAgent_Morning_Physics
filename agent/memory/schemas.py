@@ -19,6 +19,12 @@ VECTOR_DIR.mkdir(parents=True, exist_ok=True)
 MEMORY_FAISS_PATH = VECTOR_DIR / "memories.faiss"
 MEMORY_META_PATH = VECTOR_DIR / "memories_meta.pkl"
 
+# v3.2: relation 级向量索引 (按 (subj_canonical, pred, obj_canonical) entry 召回)
+# 每条 relation 单独存一个谓语 embedding, 用于 _recall_by_pred_semantic
+# 独立路径, 跟主记忆向量库互不影响
+RELATION_FAISS_PATH = VECTOR_DIR / "relations.faiss"
+RELATION_META_PATH = VECTOR_DIR / "relations_meta.pkl"
+
 # ============================================================
 # 记忆类型（QAgent 任务场景定制，对照 WAgent 的 emotion/imagery/plot）
 # ============================================================
