@@ -157,9 +157,31 @@ def run_agent_stream(
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
-        if enable_thinking:
-            request_params["extra_body"] = {"thinking": {"type": "enabled"}}
-            request_params["reasoning_effort"] = reasoning_effort
+        # 2026-08-31 修(从 SAgent 照搬):用 provider 显式分支代替通用 enable_thinking
+        # 之前 `if enable_thinking:` 一刀切,对 minimax/local_qwen 都不准确。
+        # SAgent 2026-08-24 修复的 3 路分支:
+        #   - deepseek  + enable=True  → extra_body.thinking.enabled + reasoning_effort
+        #   - minimax   + enable=False → extra_body.thinking.disabled (防 adaptive thinking 默认开)
+        #   - 其他 provider           → 不动 extra_body
+        # 2026-08-31 新增:deepseek 切到非思考时,清洗历史里所有 assistant 消息的 reasoning_content。
+        # 否则 DeepSeek 报 400:
+        #   "The reasoning_content in the thinking mode must be passed back to the API."
+        # (历史里带 reasoning_content 字段 → 当前请求必须开 thinking,否则 API 端校验失败)
+        if provider_name == "deepseek":
+            if enable_thinking:
+                request_params["extra_body"] = {"thinking": {"type": "enabled"}}
+                request_params["reasoning_effort"] = reasoning_effort
+            else:
+                # 剥掉历史里所有 assistant 消息的 reasoning_content,避免 400
+                for _m in messages:
+                    if _m.get("role") == "assistant" and "reasoning_content" in _m:
+                        _m.pop("reasoning_content", None)
+        elif provider_name == "minimax":
+            if not enable_thinking:
+                # MiniMax M3 默认 adaptive thinking,enable=False 时必须显式关
+                # 否则用户取消"思考模式"对 MiniMax 完全无效,LLM 仍输出 reasoning_content,
+                # 第二轮报 "must be passed back" 错
+                request_params["extra_body"] = {"thinking": {"type": "disabled"}}
 
         # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限（部分模型会回 400），
         # 这里只在非 MiniMax 时透传，避免不必要的失败。
@@ -203,7 +225,12 @@ def run_agent_stream(
 
         # 把当前 assistant 消息加入历史
         assistant_msg: dict = {"role": "assistant", "content": current_content}
-        if current_reasoning:
+        # 2026-08-31 修(从 SAgent 照搬):加 provider 判断,只在 deepseek 模式
+        # 才把 reasoning_content 加到 assistant_msg。
+        # 其他 provider(minimax/openai)即使输出了 reasoning_content,也不存到历史,
+        # 避免下次切到非 deepseek 模式时残留在 messages 里触发 400。
+        if current_reasoning and provider_name == "deepseek":
+            # DeepSeek thinking 模式要求多轮/工具循环时把 reasoning_content 原样传回
             assistant_msg["reasoning_content"] = current_reasoning
         if tool_calls_dict:
             assistant_msg["tool_calls"] = list(tool_calls_dict.values())

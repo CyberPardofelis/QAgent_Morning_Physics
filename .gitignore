@@ -1,0 +1,22 @@
+.env
+# 临时诊断/冒烟脚本（一次性，写完确认无问题后应该移走或删除）
+data/_*.py
+data/_*.txt
+data/_*.log
+data/
+
+test_stream_render.py
+
+test_v4.py
+tests/
+
+*.spec
+
+ui/resources/
+
+.idea/
+docs/
+*.log
+
+mathjax/
+ui/mathjax/
