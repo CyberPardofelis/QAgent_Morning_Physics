@@ -24,7 +24,11 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     Raises:
         RuntimeError: 抓取或解析失败
     """
+    import time as _t
+    _t0 = _t.time()
+    print(f"[arxiv] _fetch_arxiv_listing start: url={_ARXIV_LISTING_URL} include_authors={include_authors}", flush=True)
     response = requests.get(_ARXIV_LISTING_URL, timeout=30)
+    print(f"[arxiv]   requests.get 状态码={response.status_code} 耗时 {_t.time()-_t0:.1f}s, 解析 HTML ({len(response.text)} 字符)", flush=True)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
 
@@ -65,6 +69,7 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
                 paper['authors'] = "未知"
 
         papers.append(paper)
+    print(f"[arxiv] 解析到 {len(papers)} 篇 papers  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
     return papers
 
 

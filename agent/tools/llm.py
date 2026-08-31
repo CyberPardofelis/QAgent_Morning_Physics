@@ -102,6 +102,12 @@ def _call_llm(
         kwargs.pop("presence_penalty", None)
 
     try:
-        return client.chat.completions.create(**kwargs).choices[0].message.content
+        import time as _t
+        _t0 = _t.time()
+        print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符", flush=True)
+        out = client.chat.completions.create(**kwargs).choices[0].message.content
+        print(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符", flush=True)
+        return out
     except Exception as e:
+        print(f"[llm] _call_llm 失败: {e}", flush=True)
         return classify_llm_error(display_name, e)

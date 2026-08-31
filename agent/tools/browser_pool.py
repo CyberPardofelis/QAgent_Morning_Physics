@@ -7,13 +7,20 @@ BrowserPool — Playwright 浏览器实例池（懒启动、复用、page 用完
 - sync_playwright 绑定启动线程，跨线程调用会抛错。
 
 设计：
-- 全局单例；第一次 acquire_page() 才启动 playwright + browser。
+- 【v2 2026-08-31】按线程懒创建 BrowserPool,每个 QThread worker 在自己的线程里持有独立 pool。
+  之前是全局单例 + owner_thread 校验,但 QAgent 的工具在 QThread worker 子线程里跑,
+  单例 + 校验导致跨线程被 playwright 拒绝。改成 threading.local 后,每个 thread 第一次
+  调 get_browser_pool() 时创建自己的 pool(同线程,playwright 校验通过),代价是多 worker
+  时每个 thread 一份 firefox 进程(内存翻倍),但 QAgent 现在只有 1 个 worker thread,
+  实际只多一份。
 - 每次调用开独立 context + page，with 退出时 page/context 立即关掉，browser 保留。
-- 同一线程内复用：threading.Lock 保护懒初始化，owner thread 校验防止跨线程用。
 - 退出时（atexit 或显式 shutdown）关 browser + playwright，释放内存。
+  worker thread 的 pool 在 thread GC 时由 weakref.finalize 兜底关 playwright。
 """
+import atexit
 import logging
 import threading
+import weakref
 from contextlib import contextmanager
 from typing import Optional
 
@@ -36,6 +43,21 @@ class BrowserPool:
         self._browser = None
         self._owner_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        # GC 兜底:worker thread 退出时,如果 BrowserPool 没显式 shutdown,
+        # 至少把 playwright stop 掉,避免 firefox 进程残留。
+        # 注意:finalize callback 必须在 self 创建时的线程里 stop(playwright 硬约束),
+        # 但 weakref.finalize 会在 GC 触发线程里调,通常还是原线程(线程结束后 GC 该 thread
+        # 局部变量时,通常仍在该线程 context 里,安全);跨线程 stop 可能抛错,已被 _finalize 内部 try 吞掉。
+        weakref.finalize(self, BrowserPool._finalize, self)
+
+    @staticmethod
+    def _finalize(pool: "BrowserPool") -> None:
+        """GC 兜底:清理 playwright 资源(可能跨线程,失败就吞)。"""
+        try:
+            if pool._playwright is not None:
+                pool._playwright.stop()
+        except Exception as e:
+            logger.debug("[BrowserPool] GC 兜底 stop playwright 失败(忽略): %s", e)
 
     # ---------- 内部 ----------
     def _ensure_started(self, browser_type: str) -> None:
@@ -135,27 +157,50 @@ class BrowserPool:
 
 
 # ============================================================
-# 全局单例（懒创建）
+# 按线程懒创建（v2:threading.local,支持 QThread worker）
 # ============================================================
-_pool: Optional[BrowserPool] = None
-_pool_lock = threading.Lock()
+_local = threading.local()
+_init_lock = threading.Lock()
+_main_pool: Optional[BrowserPool] = None  # 主线程的 pool 引用,atexit 时关
 
 
 def get_browser_pool() -> BrowserPool:
-    """获取全局 BrowserPool 单例。"""
-    global _pool
-    if _pool is not None:
-        return _pool
-    with _pool_lock:
-        if _pool is None:
-            _pool = BrowserPool()
-        return _pool
+    """按线程懒创建 BrowserPool。
+
+    - 主线程第一次调:创建主线程 pool(走 atexit 关闭)。
+    - QThread worker 子线程第一次调:创建该 thread 自己的 pool(GC 兜底)。
+    - 同线程后续调用:直接返回旧 pool(复用 firefox,避免 10-30s 启动开销)。
+    """
+    pool = getattr(_local, "pool", None)
+    if pool is not None:
+        return pool
+    with _init_lock:
+        # 双重检查:可能在锁等待期间已被其他协程创建
+        pool = getattr(_local, "pool", None)
+        if pool is not None:
+            return pool
+        pool = BrowserPool()
+        _local.pool = pool
+        # 主线程的 pool 单独记录,atexit 显式 shutdown
+        global _main_pool
+        if threading.current_thread() is threading.main_thread():
+            _main_pool = pool
+        logger.info(
+            "[BrowserPool] 新建 pool for thread=%s  (后续同线程复用)",
+            threading.current_thread().name,
+        )
+        return pool
 
 
 def shutdown_browser_pool() -> None:
-    """进程退出时调；幂等。"""
-    global _pool
-    if _pool is None:
-        return
-    _pool.shutdown()
-    _pool = None
+    """进程退出时调；幂等。仅关闭主线程 pool(worker thread 的 pool 由 GC finalize 兜底)。"""
+    global _main_pool
+    if _main_pool is not None:
+        try:
+            _main_pool.shutdown()
+        except Exception as e:
+            logger.debug("[BrowserPool] shutdown 失败(忽略): %s", e)
+        _main_pool = None
+
+
+atexit.register(shutdown_browser_pool)

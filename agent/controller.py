@@ -169,7 +169,11 @@ def run_agent_stream(
 
     # DeepSeek 模式：思考 + 工具调用循环
     # MiniMax 模式：走同一路径（MiniMax OpenAI 兼容接口支持工具调用 + thinking extra_body）
+    import time as _t
+    _round = 0
     while True:
+        _round += 1
+        print(f"[controller] LLM round {_round} start  mode={provider_name} model={actual_model} messages={len(messages)}", flush=True)
         request_params = {
             "model": actual_model,
             "messages": messages,
@@ -289,8 +293,13 @@ def run_agent_stream(
                 yield NEW_BUBBLE
                 continue
 
+            _t0 = _t.time()
+            print(f"[controller] 调工具 {fn_name} args={args}  (round {_round})", flush=True)
+
             # 工具结果收集（同步或流式）
             result_text = _dispatch_tool(fn_name, args)
+
+            print(f"[controller] 工具 {fn_name} 返回 ({len(result_text)} 字符) 耗时 {_t.time()-_t0:.1f}s  (round {_round})", flush=True)
 
             # 工具结果加入 LLM 历史
             messages.append({

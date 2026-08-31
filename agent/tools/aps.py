@@ -14,14 +14,21 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     Args:
         journal: 期刊标识，如 'prl', 'pra'，对应配置文件中的键。
     """
+    import time as _t
+    _t0 = _t.time()
+    print(f"[aps] fetch_aps_page_via_browser start: journal={journal}", flush=True)
+
     config = JOURNAL_CONFIG.get(journal)
     if not config:
+        print(f"[aps] ! 不支持的期刊: {journal} 耗时 {_t.time()-_t0:.1f}s", flush=True)
         raise ValueError(f"不支持的期刊: {journal}")
 
     url = config['url_template'].format(journal=journal, section=config['section'])
     link_selector = config['link_selector']
+    print(f"[aps]   url={url}  selector={link_selector}", flush=True)
 
     pool = get_browser_pool()
+    print(f"[aps]   拿 browser_pool, 准备 acquire_page (firefox)...", flush=True)
     try:
         with pool.acquire_page(
             browser_type="firefox",
@@ -29,11 +36,17 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/120.0.0.0 Safari/537.36",
         ) as page:
+            print(f"[aps]   acquire_page ok 耗时 {_t.time()-_t0:.1f}s, 开始 goto", flush=True)
             page.set_default_timeout(60000)
             page.goto(url, wait_until="domcontentloaded")
+            print(f"[aps]   goto ok 耗时 {_t.time()-_t0:.1f}s, 准备 wait_for_selector({link_selector}, 15s)", flush=True)
             page.wait_for_selector(link_selector, timeout=15000)
-            return page.content()
+            print(f"[aps]   wait_for_selector ok 耗时 {_t.time()-_t0:.1f}s, 拿 page.content()", flush=True)
+            html = page.content()
+            print(f"[aps]   page.content() 完成 ({len(html)} 字符)  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
+            return html
     except Exception as e:
+        print(f"[aps] ! 浏览器抓取失败: {e}  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
         raise Exception(f"浏览器自动化抓取失败: {str(e)}")
 
 
@@ -98,6 +111,7 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
     try:
         html = fetch_aps_page_via_browser(journal)
         papers = parse_aps_papers_from_html(html)
+        print(f"[aps] 解析到 {len(papers)} 篇 papers", flush=True)
         if not papers:
             return f"未找到 {config['name']} 论文列表，请稍后重试。"
 
