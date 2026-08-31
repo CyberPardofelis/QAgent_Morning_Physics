@@ -129,6 +129,32 @@ def run_agent_stream(
     # 工具 schema 统一从 ToolRegistry 拿
     tools = ToolRegistry.list_schemas()
 
+    # 2026-08-31 v3 加(根因修复):当 deepseek 模式 + thinking 模式 + 带 tools 时,
+    # DeepSeek 强制要求 messages 里**所有** assistant 消息都有 `reasoning_content` 字段
+    # (空字符串 "" 也算有,不能缺)。
+    # 否则报 400:
+    #   "The reasoning_content in the thinking mode must be passed back to the API."
+    # 这是 QAgent 一直 400 的真正根因(测试 2026-08-31 验证):
+    # - Test 1: thinking on + tools + 空 assistant (没 reasoning_content) → 400
+    # - Test 2: thinking on + tools + assistant 加 reasoning_content="" → OK
+    # - Test 3: 不带 extra_body + tools + 空 assistant → 400
+    # 之前 v1/v2 修复只在"切到非思考"或"切到非 deepseek 模式"时剥历史,治标不治本。
+    # 空气泡(预分配的 content="" assistant)是从 conversation_controller 来的,
+    # 它没 reasoning_content 字段 → DeepSeek 校验失败。
+    # 修法:deepseek + thinking 模式下,给所有 assistant 消息补 reasoning_content=""(如果缺)
+    if provider_name == "deepseek" and enable_thinking:
+        for _m in messages:
+            if _m.get("role") == "assistant" and "reasoning_content" not in _m:
+                _m["reasoning_content"] = ""
+
+    # 2026-08-31 v2 加:openai 模式早 return, 跳过下面的 while 循环。
+    # 但 openai 模式也不该带 reasoning_content(openai 不会用,且会污染历史)。
+    # 在早 return 前统一剥掉历史里的 reasoning_content,跟 while 循环里的逻辑保持一致。
+    if provider_name == "openai":
+        for _m in messages:
+            if _m.get("role") == "assistant" and "reasoning_content" in _m:
+                _m.pop("reasoning_content", None)
+
     # OpenAI 模式：不支持工具调用
     if provider_name == "openai":
         try:
@@ -167,6 +193,8 @@ def run_agent_stream(
         # 否则 DeepSeek 报 400:
         #   "The reasoning_content in the thinking mode must be passed back to the API."
         # (历史里带 reasoning_content 字段 → 当前请求必须开 thinking,否则 API 端校验失败)
+        # 2026-08-31 v2 修:跨模式切换场景(用户从 deepseek-thinking 切到 minimax/openai/compare),
+        # 也需要剥 reasoning_content,因为非 deepseek 模式用不上、留着会触发校验失败。
         if provider_name == "deepseek":
             if enable_thinking:
                 request_params["extra_body"] = {"thinking": {"type": "enabled"}}
@@ -182,6 +210,16 @@ def run_agent_stream(
                 # 否则用户取消"思考模式"对 MiniMax 完全无效,LLM 仍输出 reasoning_content,
                 # 第二轮报 "must be passed back" 错
                 request_params["extra_body"] = {"thinking": {"type": "disabled"}}
+            # 2026-08-31 v2 加:minimax 模式一律剥 reasoning_content(其他 provider 用不上,留着会污染历史)
+            for _m in messages:
+                if _m.get("role") == "assistant" and "reasoning_content" in _m:
+                    _m.pop("reasoning_content", None)
+        else:
+            # 2026-08-31 v2 加:openai / compare / custom 等其他 provider 一律剥 reasoning_content
+            # 避免历史里的 deepseek thinking 残留触发 400
+            for _m in messages:
+                if _m.get("role") == "assistant" and "reasoning_content" in _m:
+                    _m.pop("reasoning_content", None)
 
         # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限（部分模型会回 400），
         # 这里只在非 MiniMax 时透传，避免不必要的失败。
