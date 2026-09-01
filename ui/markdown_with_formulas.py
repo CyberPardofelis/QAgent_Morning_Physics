@@ -69,30 +69,38 @@ def _render_formula_html(latex: str, is_display: bool) -> str:
     # Windows 路径转 file:// URL(正斜杠)
     file_url = 'file:///' + str(path).replace('\\', '/').lstrip('/')
 
-    # v13:img 标签不带 width/height,按 PNG 物理像素 / 屏幕 DPR 显示
-    # FormulaRenderer PIL LANCZOS resize 后 PNG 物理已固定(高 45,宽按比例)
-    # 不强制 width/height → 浏览器按物理比例显示,宽度不被压缩
-    _size_attr = ''
+    # v17:img 标签加 HTML 属性 width/height = PNG 物理像素
+    # 强制 QTextBrowser 的 QTextImageFormat 按 HTML 属性显示(不被容器/DPR 调整)
+    # "渲染多少像素就显示多少像素" — user 要求
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as _pi:
+            _pw, _ph = _pi.size
+        _size_attr = f' width="{_pw}" height="{_ph}"'
+    except Exception:
+        _size_attr = ''
 
     if is_display:
-        # display 公式:<figure> 居中,v11 去掉 caption,只显示图片
+        # v18.1:display 公式 — 不用外层 div,直接放 img 进 <p>(之前用 div 包裹导致 QTextBrowser 把它当块,布局错乱)
+        # img HTML width/height 强制 = PNG 物理像素
+        # ★ 加 max-width:none / max-height:none 压制 .formula-block 容器自身的
+        #   max-width:100% 行为(避免 QTextBrowser 把 img 缩到容器宽)
         return (
-            f'<figure class="formula-block" '
-            f'style="display:block; text-align:center; margin:8px 0; '
-            f'padding:0;">'
+            f'<p class="formula-block" '
+            f'style="text-align:center; margin:8px 0; max-width:none;">'
             f'<img src="{file_url}" alt="{safe_latex}"{_size_attr} '
-            f'style="vertical-align:middle; max-width:100%;"/>'
-            f'</figure>'
+            f'style="vertical-align:middle; max-width:none; max-height:none;"/>'
+            f'</p>'
         )
     else:
-        # inline 公式:v11 去掉 caption,只显示图片
+        # v18.1:inline 公式 — 不用 inline-block span 包裹!
+        # 之前用 <span class="formula-inline" style="display:inline-block"> 包裹,
+        # 导致 QTextBrowser 渲染时 image 被压成 1 像素(inline-block span 在 QTextBrowser 中行为异常)。
+        # 直接放 img 进 p,QTextBrowser 正确按 PNG 物理显示。
         return (
-            f'<span class="formula-inline" '
-            f'style="display:inline-block; vertical-align:middle; '
-            f'margin:0 1px; line-height:1;">'
-            f'<img src="{file_url}" alt="{safe_latex}"{_size_attr} '
-            f'style="vertical-align:middle;"/>'
-            f'</span>'
+            f'<img class="formula-inline" '
+            f'src="{file_url}" alt="{safe_latex}"{_size_attr} '
+            f'style="vertical-align:middle; max-width:none; max-height:none;"/>'
         )
 
 
@@ -195,11 +203,12 @@ table { border-collapse: collapse; margin: 0.5em 0; }
 th, td { border: 1px solid #ddd; padding: 4px 8px; }
 th { background: #f8f8f8; }
 hr { border: 0; border-top: 1px solid #ddd; margin: 0.8em 0; }
-.formula-block { margin: 8px 0; padding: 0; }
-.formula-inline { display: inline-block; vertical-align: middle; }
+.formula-block { margin: 8px 0; padding: 0; max-width: none; }
+.formula-inline { display: inline-block; vertical-align: middle; max-width: none; }
 .formula-source { user-select: text; }
 .formula-error { user-select: text; }
-img { max-width: 100%; }
+/* v18: 删 img { max-width: 100% } — 全局限制会把公式图片水平压缩
+   公式图片走自己 HTML width/height + inline max-width:none,按 PNG 物理像素显示 */
 """
 
 

@@ -517,8 +517,11 @@ class ConversationController(QObject):
         if conv:
             self.current_conversation = conv
             self.clear_chat.emit()
+            # v18:切对话不复读历史里的 system 消息 — user 要求
+            # "切对话 = system 消息都消失"(无论是启动欢迎气泡还是历史的错误/对比提示)
+            # 仍然复读 user + assistant
             for msg in conv.messages:
-                if msg["role"] in ("user", "assistant", "system") and msg.get("content", "").strip():
+                if msg["role"] in ("user", "assistant") and msg.get("content", "").strip():
                     self.new_message.emit(conv_id, msg["role"], msg["content"])
             self.conversation_switched.emit()
             busy = conv_id in self._busy_conversation_ids
@@ -533,7 +536,10 @@ class ConversationController(QObject):
         conv = self.history_manager.create_conversation(title="新对话", group_id=group_id)
         self.current_conversation = conv
         self.clear_chat.emit()
-        self.new_message.emit(conv.conv_id, "system", "新对话已创建。")
+        # v16:删掉"新对话已创建。"system 消息 emit — 切新对话不应有 system 气泡显示
+        # (user 要求 system 欢迎气泡"切对话就消失",所以 create_new_conversation 不能新建 system 消息)
+        # 注意:错误 system 消息(self.new_message.emit(..., "system", f"错误:{error}"))
+        #       仍然保留 — 错误提示 user 需要看到
         self.conversation_switched.emit()
         self.update_regenerate_button.emit(False)
         self.update_send_input.emit(True)

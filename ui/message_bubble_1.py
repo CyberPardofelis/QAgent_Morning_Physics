@@ -87,6 +87,73 @@ class MarkdownView(QTextBrowser):
         """直接 setHtml (QAgent 扩展)"""
         super().setHtml(html)
         self._apply_document_margins()
+        # v18.1: 强制公式图片按 PNG 物理像素显示
+        # 关键: 必须用 QTextImageFormat 重新构造(用 toImageFormat 副本 setWidth 写回不算,
+        # 副本被 setCharFormat 时会丢失 image 类型标志)
+        self._force_formula_image_size()
+
+    def _force_formula_image_size(self):
+        """
+        v18 公式图片强制按 PNG 物理像素显示 — 三重保险之一
+        - 关键: QTextImageFormat 是按值传递的!改 fragment.charFormat() 返回的
+          fmt 副本,doc 内部 layout 用的 fmt 不变。
+          必须用 QTextCursor.setCharFormat 写回 doc 才会生效。
+        - 单位: setWidth 接受 1:1 像素(实测,不是 pt)
+        - v18.1: 用 setProperty(ImageWidth/ImageHeight) 直接设 QTextLength property
+          (不用 img_fmt.setWidth/setHeight — 那可能被 toImageFormat 转换丢失)
+        """
+        import os as _os
+        from PIL import Image as _PILImage
+        from PySide6.QtGui import QTextCursor, QTextCharFormat, QTextLength, QTextFormat, QTextImageFormat
+        try:
+            doc = self.document()
+            cursor = QTextCursor(doc)
+            block = doc.begin()
+            while block.isValid():
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid():
+                        char_fmt = frag.charFormat()
+                        if char_fmt.isImageFormat():
+                            raw = char_fmt.toImageFormat().name()
+                            if raw:
+                                if raw.startswith('file:///'):
+                                    local = raw[len('file:///'):]
+                                elif raw.startswith('file://'):
+                                    local = raw[len('file://'):]
+                                else:
+                                    local = raw
+                                local = local.replace('/', _os.sep)
+                                try:
+                                    with _PILImage.open(local) as p:
+                                        w_px, h_px = p.size
+                                except Exception:
+                                    w_px, h_px = 0, 0
+                                if w_px > 0 and h_px > 0:
+                                    # v18.2: 按 PNG 物理的 2/3 显示
+                                    # 原因: 125-150% 系统缩放下,PNG 物理 121 logical px
+                                    # 渲染 121 * 1.25-1.5 = 151-181 物理像素,显得过大。
+                                    # user 期望 ≈ 80 logical px(PNG 物理 × 2/3)
+                                    # 让公式看起来跟 14px 文字协调。
+                                    scale = 2.0 / 3.0
+                                    new_fmt = QTextImageFormat()
+                                    new_fmt.setName(raw)
+                                    new_fmt.setWidth(w_px * scale)
+                                    new_fmt.setHeight(h_px * scale)
+                                    cursor.setPosition(frag.position())
+                                    cursor.setPosition(
+                                        frag.position() + frag.length(),
+                                        QTextCursor.KeepAnchor
+                                    )
+                                    cursor.setCharFormat(new_fmt)
+                    it += 1
+                block = block.next()
+            # v18.1: 强制 doc 重新算 idealWidth
+            self.document().setTextWidth(-1)
+        except Exception as e:
+            import sys
+            print(f"[MarkdownView] _force_formula_image_size 失败: {e}", file=sys.stderr)
 
     def _render_html(self, md_text: str) -> str:
         """markdown → 完整 HTML 文档(含公式图片)"""
@@ -246,10 +313,14 @@ class MessageBubble(QWidget):
 
     # ---------- 核心:动态更新最大宽度 ----------
     def _update_max_width(self):
+        # v18.1: 找 QAbstractScrollArea 类型的 parent(或更上层)的 viewport
+        # 之前用 hasattr(parent, 'viewport') 不靠谱 — QWidget 也可能有 viewport 属性
+        # 改用 isinstance(parent, QAbstractScrollArea)
+        from PySide6.QtWidgets import QAbstractScrollArea
         parent = self.parent()
         available_width = 800
         while parent:
-            if hasattr(parent, 'viewport') and hasattr(parent.viewport(), 'width'):
+            if isinstance(parent, QAbstractScrollArea):
                 available_width = parent.viewport().width()
                 break
             parent = parent.parent()

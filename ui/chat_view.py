@@ -27,19 +27,36 @@ class ChatView(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QScrollArea.NoFrame)
+        # v18: 整个滚动区背景 transparent — 避免 QWidget/QAbstractScrollArea 默认浅灰
+        self.scroll_area.setStyleSheet("background: transparent; border: none;")
+        # viewport 默认 autoFillBackground=True,显示 Palette.Window 浅灰
+        # 必须显式 transparent + setAutoFillBackground(False) 才能完全透明
+        self.scroll_area.viewport().setStyleSheet("background: transparent;")
+        self.scroll_area.viewport().setAutoFillBackground(False)
+        # v18: scroll_content 显式 transparent
         self.scroll_content = QWidget()
         self.scroll_content.setObjectName("chatScrollContent")
+        self.scroll_content.setStyleSheet("background-color: transparent;")
+        self.scroll_content.setAutoFillBackground(False)
         self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll_layout.setAlignment(Qt.AlignTop)
         self.scroll_layout.setSpacing(10)
         self.scroll_area.setWidget(self.scroll_content)
         layout.addWidget(self.scroll_area)
 
     def clear_chat(self):
+        # v18 修复: takeAt + deleteLater 是异步删除,期间 widget 仍在 widget tree
+        # (parent 还是 scroll_content)→ 仍然显示在旧位置,新加的 widget 跟它叠加。
+        # 修法: 先 hide() + setParent(None) 立即从 widget tree 移除 + 显示,
+        #       再 deleteLater() 释放内存。
         while self.scroll_layout.count():
             child = self.scroll_layout.takeAt(0)
             if child.widget():
-                child.widget().deleteLater()
+                w = child.widget()
+                w.hide()  # ★ 立即隐藏,不让它继续显示
+                w.setParent(None)  # ★ 立即从 widget tree 移除
+                w.deleteLater()  # 然后异步释放内存
 
     def scroll_to_bottom(self):
         QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(
@@ -52,12 +69,11 @@ class ChatView(QWidget):
             self.scroll_to_bottom()
 
     def add_chat_message(self, role, text, isAppend=False, attachments=None):
-        # v14:加非 system 角色气泡时(用户发消息 / 切新对话 → 新 user/assistant 气泡),
-        # 自动删除启动时的 system 欢迎气泡(欢迎提示已阅)
-        # 关键:必须放在 isAppend 分支**之前**!否则流式 chunk 的 isAppend=True 早退
-        # return 走不到这里,welcome 气泡不消失
-        if role != "system":
-            self._remove_welcome_bubbles()
+        # v15:任何 role 都先 remove system 气泡(防堆叠)
+        # 原因:create_new_conversation 会 emit new_message("system", "新对话已创建。"),
+        # 这条 system 消息也走 add_chat_message。如果不先 remove,旧的 system 气泡
+        # (欢迎提示)不会被清,新的 system 消息又叠加上去 → 切换对话后"不消失"
+        self._remove_welcome_bubbles()
 
         if isAppend and role == "assistant":
             last_bubble = self.find_last_assistant_bubble()
