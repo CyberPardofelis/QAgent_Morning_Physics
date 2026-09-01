@@ -151,24 +151,31 @@ def _cleanup_on_quit():
     _kill_chromium_residual()
 
 
-def _kill_chromium_residual():
-    """
-    兜底清理:扫描所有以当前进程为祖先的 Chromium / python.exe 子进程并强杀。
-    解决 PyCharm run tab 关掉时(主进程被 SIGKILL,aboutToQuit 来不及跑)
-    Chromium 子进程残留的问题。
-
-    用 wmic 查所有 ProcessId + ParentProcessId,递归找所有 descendant,
-    然后 taskkill /F /T 强杀。
-    """
-    my_pid = os.getpid()
-
-    def _find_children(parent_pid):
-        """返回所有 parent_pid 的子进程 pid 列表"""
-        children = []
+def _find_children(parent_pid):
+    """返回所有 parent_pid 的子进程 pid 列表(wmic → PowerShell CIM fallback)"""
+    children = []
+    try:
+        result = subprocess.run(
+            ['wmic', 'process', 'where', f'ParentProcessId={parent_pid}',
+             'get', 'ProcessId'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                children.append(int(line))
+    except Exception:
+        pass
+    if not children:
+        # fallback:PowerShell + CIM(Win11 22H2+ 兼容)
         try:
+            ps_cmd = (
+                f'Get-CimInstance Win32_Process '
+                f'| Where-Object {{ $_.ParentProcessId -eq {parent_pid} }} '
+                f'| Select-Object -ExpandProperty ProcessId'
+            )
             result = subprocess.run(
-                ['wmic', 'process', 'where', f'ParentProcessId={parent_pid}',
-                 'get', 'ProcessId'],
+                ['powershell', '-NoProfile', '-Command', ps_cmd],
                 capture_output=True, text=True, timeout=5
             )
             for line in result.stdout.splitlines():
@@ -177,37 +184,25 @@ def _kill_chromium_residual():
                     children.append(int(line))
         except Exception:
             pass
-        if not children:
-            # fallback:PowerShell + CIM(Win11 22H2+ 兼容)
-            try:
-                ps_cmd = (
-                    f'Get-CimInstance Win32_Process '
-                    f'| Where-Object {{ $_.ParentProcessId -eq {parent_pid} }} '
-                    f'| Select-Object -ExpandProperty ProcessId'
-                )
-                result = subprocess.run(
-                    ['powershell', '-NoProfile', '-Command', ps_cmd],
-                    capture_output=True, text=True, timeout=5
-                )
-                for line in result.stdout.splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        children.append(int(line))
-            except Exception:
-                pass
-        return children
+    return children
 
-    # 递归找所有 descendant
+
+def _find_descendants(root_pid):
+    """BFS 找所有以 root_pid 为祖先的进程 PID(不含 root 本身)"""
     all_pids = set()
-    queue = [my_pid]
+    queue = [root_pid]
     while queue:
         parent = queue.pop(0)
         for child in _find_children(parent):
-            if child not in all_pids:
+            if child not in all_pids and child != root_pid:
                 all_pids.add(child)
                 queue.append(child)
+    return all_pids
 
-    for pid in all_pids:
+
+def _kill_pids(pids):
+    """taskkill /F /T 杀一组 PID(silent,失败不抛)"""
+    for pid in pids:
         try:
             subprocess.run(
                 ['taskkill', '/F', '/T', '/PID', str(pid)],
@@ -215,6 +210,166 @@ def _kill_chromium_residual():
             )
         except Exception:
             pass
+
+
+def _is_pid_alive(pid):
+    """检查 pid 是否还活着(tasklist)"""
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+            capture_output=True, text=True, timeout=3
+        )
+        return str(pid) in result.stdout
+    except Exception:
+        return False
+
+
+def _kill_chromium_residual():
+    """
+    兜底清理(退出时跑):扫描所有以当前进程为祖先的 Chromium 子进程并强杀。
+    注册到 app.aboutToQuit + atexit。
+
+    用 wmic 查所有 ProcessId + ParentProcessId,递归找所有 descendant,
+    然后 taskkill /F /T 强杀。
+    """
+    my_pid = os.getpid()
+    all_pids = _find_descendants(my_pid)
+    if all_pids:
+        print(f"[main] aboutToQuit 清理 {len(all_pids)} 个子进程", flush=True)
+    _kill_pids(all_pids)
+
+
+# ============================================================
+# 启动时清理残留(终极兜底) — 以下函数都不依赖 PySide6,可以独立测试
+# ============================================================
+
+
+# ============================================================
+# 启动时清理残留(终极兜底)
+# ============================================================
+# 即使 Job Object / atexit / signal handler 全失效(PyCharm Stop = TerminateProcess,
+# Python 层 hook 全部来不及跑),用户下次启动 QAgent 时,这个函数会:
+# 1. 读 PID file(记录上次的 main pid)
+# 2. 检查上次进程是否还活着
+# 3. 死了就 taskkill 它所有 descendants
+# 这样无论怎么退,下一次启动都会自动干净,用户永远不需要手动 taskkill。
+# ============================================================
+
+def _get_pid_file_path():
+    """PID file 放在 base_dir/.qagent_last_pid(隐藏文件,避免跟用户数据混)"""
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, '.qagent_last_pid')
+
+
+def _write_pid_file():
+    """写当前 PID 到文件,下次启动时用来找残留"""
+    try:
+        pid_file = _get_pid_file_path()
+        with open(pid_file, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"[main] 写 PID file 失败: {e}", flush=True)
+
+
+def _cleanup_chromium_residual_at_startup():
+    """
+    启动时清理上次的残留。
+
+    核心难题:上次 QAgent 进程被强杀时,Windows 会 reparent 它的 Chromium 子进程
+    到 System (PID 1),子进程的 PPID 不再是 QAgent,所以 _find_descendants(last_qagent_pid)
+    找不到它们。
+
+    解法:Qt 嵌入的 Chromium 进程名固定叫 **QtWebEngineProcess.exe**(不是 chrome.exe),
+    绝对不会误杀用户的 Chrome 浏览器。直接按名字杀所有 QtWebEngineProcess.exe 残留即可,
+    排除本次 QAgent 自己启的子进程。
+
+    安全检查:
+    - 如果上次 QAgent 进程还活着(用户开了多个 QAgent),不动(保护另一个实例的子进程)
+    - 否则扫所有 QtWebEngineProcess.exe 进程,排除属于本次 QAgent 的(在 my descendants 里)
+    """
+    # 1. 写本次 PID(防止下次启动又清自己)
+    _write_pid_file()
+
+    # 2. 读上次 PID
+    pid_file = _get_pid_file_path()
+    if not os.path.exists(pid_file):
+        return
+    try:
+        last_pid = int(open(pid_file, 'r', encoding='utf-8').read().strip())
+    except Exception:
+        return
+
+    if last_pid == os.getpid():
+        # 第一次启动,刚写完 PID,没残留
+        return
+
+    if _is_pid_alive(last_pid):
+        print(f"[main] 上次 QAgent (PID {last_pid}) 还在跑,跳过启动清理"
+              f"(如果开多个 QAgent 不会互相干扰)", flush=True)
+        return
+
+    # 3. 上次 QAgent 死了 — 优先走精确路径:找 last_pid 的 descendants
+    #    如果能找到(说明 reparent 没发生),直接杀
+    #    如果找不到(reparent 发生了),走暴力路径:按进程名杀 QtWebEngineProcess.exe
+    descendants = _find_descendants(last_pid)
+    if descendants:
+        print(f"[main] 启动清理: 杀 {len(descendants)} 个上次 QAgent 残留子进程", flush=True)
+        _kill_pids(descendants)
+        return
+
+    # 4. 精确路径失败(reparent 了),走暴力路径
+    # 找当前所有 QtWebEngineProcess.exe,排除本次 QAgent 启的
+    qt_pids = _find_qtwebengine_pids()
+    if not qt_pids:
+        print(f"[main] 启动清理: 上次 QAgent 已死,无残留", flush=True)
+        return
+
+    my_kids = _find_descendants(os.getpid())
+    residual_pids = [pid for pid in qt_pids if pid not in my_kids]
+    if not residual_pids:
+        print(f"[main] 启动清理: QtWebEngineProcess 都是本次启的,无残留", flush=True)
+        return
+
+    print(f"[main] 启动清理: 杀 {len(residual_pids)} 个 QtWebEngineProcess 残留"
+          f"(上次 QAgent 强死后 reparent 了的子进程)", flush=True)
+    _kill_pids(residual_pids)
+
+
+def _find_qtwebengine_pids():
+    """返回当前所有 QtWebEngineProcess.exe 进程 PID 列表(wmic → PowerShell fallback)"""
+    pids = []
+    # wmic 尝试
+    try:
+        r = subprocess.run(
+            ['wmic', 'process', 'where', 'Name="QtWebEngineProcess.exe"', 'get', 'ProcessId'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception:
+        pass
+    if pids:
+        return pids
+    # PowerShell fallback
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             'Get-CimInstance Win32_Process -Filter \'Name="QtWebEngineProcess.exe"\' '
+             '| Select-Object -ExpandProperty ProcessId'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception:
+        pass
+    return pids
 
 
 # ============================================================
@@ -424,10 +579,57 @@ def _start_job_watchdog(app: QApplication):
 
 
 if __name__ == "__main__":
+    # === --check-residual CLI 模式 ===
+    # 用户可以 `python main.py --check-residual` 单独跑一次清理诊断(不开 GUI)
+    # 检查上次 QAgent 的残留 + 扫所有 QtWebEngineProcess.exe + 杀,然后退出
+    if '--check-residual' in sys.argv:
+        print("=" * 60)
+        print("QAgent 残留进程诊断模式")
+        print("=" * 60)
+        # 1. 看 PID file
+        pid_file = _get_pid_file_path()
+        print(f"\nPID file: {pid_file}")
+        if os.path.exists(pid_file):
+            try:
+                last_pid = int(open(pid_file, 'r', encoding='utf-8').read().strip())
+                alive = _is_pid_alive(last_pid)
+                print(f"  上次 QAgent PID: {last_pid} ({'还活着' if alive else '已死'})")
+                if not alive:
+                    desc = _find_descendants(last_pid)
+                    print(f"  上次 QAgent descendants(还能找到的): {sorted(desc)}")
+            except Exception as e:
+                print(f"  读 PID file 失败: {e}")
+        else:
+            print(f"  PID file 不存在(第一次启动?)")
+        # 2. 扫所有 QtWebEngineProcess.exe
+        qt_pids = _find_qtwebengine_pids()
+        print(f"\n当前 QtWebEngineProcess.exe 进程: {sorted(qt_pids) if qt_pids else '(无)'}")
+        # 3. 跑清理
+        print(f"\n跑 _cleanup_chromium_residual_at_startup() ...")
+        _cleanup_chromium_residual_at_startup()
+        # 4. 再扫一遍
+        qt_pids2 = _find_qtwebengine_pids()
+        print(f"\n清理后 QtWebEngineProcess.exe 进程: {sorted(qt_pids2) if qt_pids2 else '(无)'}")
+        print("=" * 60)
+        sys.exit(0)
+
+    # === 第一件事:启动时清理上次残留 ===
+    # 这是终极兜底 — 即使 Job Object 在 PyCharm run 下失效(主进程在 PyCharm Job 里,
+    # 我们的 AssignProcessToJobObject 会 err=145),而且 atexit/signal handler 也没跑,
+    # 下次启动时这个函数会清干净上次的 Chromium 残留。用户永远不需要手动 taskkill。
+    _cleanup_chromium_residual_at_startup()
+
     # === 必须最早:QApplication 创建之前就 setup Job Object ===
     # 这样 QApplication 启动后所有子进程(QWebEngineView Chromium 链)都自动 inherit Job,
     # 主进程一旦被强杀(PyCharm Stop),Windows 内核自动 kill 整个进程树。
-    _setup_windows_job()
+    job_ok = _setup_windows_job()
+    if not job_ok:
+        # Job setup 失败(很可能在 PyCharm run 下,主进程已在 PyCharm Job 里,err=145)
+        # 启动清理 + aboutToQuit + atexit + signal handler 仍然生效,只是没有内核级强制
+        print(f"[main] ⚠️ Windows Job Object 未生效(PyCharm run 常见),"
+              f"改靠 启动时清理 + 退出 hook 兜底", flush=True)
+    else:
+        print(f"[main] ✅ Windows Job Object 生效(独立运行时内核级清理)", flush=True)
 
     app = QApplication(sys.argv)
 

@@ -131,27 +131,22 @@ class MarkdownView(QTextBrowser):
                                 except Exception:
                                     w_px, h_px = 0, 0
                                 if w_px > 0 and h_px > 0:
-                                    # v18.8: 不再 hardcode setWidth=80 — 按 PNG 物理 1/4 缩放
-                                    # 原因: setWidth=80 fixed 同时造成两个对立问题 —
-                                    #       简单公式 PNG 349×86 → display 80×19.7(宽 80,字符 visual 19.7 OK)
-                                    #       长公式 PNG 1238×121 → display 80×7.8(字符 visual 7.8 几乎看不见)
-                                    #       任何一个 hardcode 值都无法同时满足"简单公式别太宽"+"长公式别被压扁"
-                                    # 修法: 统一缩放系数 SCALE = 1/4(字号 60 渲染,4x 降采样保持锐度)
-                                    #       所有公式 display 尺寸 = PNG 物理像素 / 4
-                                    #       字符 visual = 字号 / 4 = 60/4 = 15 logical(简单公式)→
-                                    #                但长公式字符 visual = PNG 高 / 4 = 121/4 = 30 logical
-                                    #                因为字符本身在 PNG 里被垂直占满,所以字符 visual
-                                    #                取决于 PNG 高,不取决于宽 — 长公式不会被水平压扁
-                                    # 效果(实测 17 个 PNG):
-                                    #       简单公式 349×86  → 87×21.5  (字符 visual 21.5 ≈ v18.4 19.7)
-                                    #       简单公式 357×101 → 89×25.25
-                                    #       长公式 737×95   → 184×23.75 (从 v18.7 字符 visual 10.3 提升到 23.75)
-                                    #       长公式 1238×121 → 309×30.25 (从 7.8 提升到 30.25,清晰可读)
-                                    #       多行 frac 88×123 → 22×30.75 (不被水平压扁)
-                                    #       矩阵 296×224    → 74×56    (按比例,字符 visual 一致 56)
-                                    # 字符 visual 一致性: 所有公式字符都从 60 字号缩下来,降采样率一样 →
-                                    #                     锐度一致(简单 vs 长公式字符内部细节同样锐利)
-                                    # 不接受多行公式 display 高(多行公式天然高,user 接受"复杂公式天然高大")
+                                    # v18.9 撤回 (2026-09-01 17:31) → 恢复 v18.8 状态
+                                    # 原因: v18.9 (PIL Lanczos 4x 预降采样 + 1:1 物理显示) 实测 user 反馈"更模糊了"
+                                    #   - PIL Lanczos 对 4x 激进 downsample + 稀疏字符 组合产生 ringing 伪影
+                                    #   - 1:1 物理显示 + DPI 缩放链上 Qt 再做一次缩放,叠加反而更差
+                                    #   - v18.8 (Qt bilinear 4x 实时缩放) 是当前最稳状态
+                                    # 恢复: SCALE = 1/4 + setWidth(80 fixed) + setHeight 按 PNG 宽高比算
+                                    #   - 字符 visual 跟 v18.4 接近(简单公式 19.7, 多行公式 111.8)
+                                    #   - 长公式字符 visual 从 v18.7 之前的 7.8 提升到 23-30
+                                    #   - 多行公式不被压(按 PNG 物理宽高比)
+                                    # 历史参考:
+                                    #   v18.4: setWidth=80 fixed + setHeight 按比例 → user 接受 "scale 没问题"
+                                    #   v18.5/v18.6: 标准化 PNG 高 100 + setWidth=w*0.5 → user 报"又太大/又压扁"否决
+                                    #   v18.7: 强制 inline + setWidth=80 fixed + setHeight 按比例 → user 接受
+                                    #   v18.8: SCALE 1/4 去掉 hardcode 80 → 解决"宽度统一"问题 (v18.7 setWidth=80 fixed 已被回退,见 v18.8 注释)
+                                    #   v18.9: PIL Lanczos + 1:1 → 失败撤回
+                                    # 当前状态(回退 v18.8): SCALE 1/4 + 按比例 (user 接受过的 v18.7 状态)
                                     SCALE = 1.0 / 4.0
                                     new_fmt = QTextImageFormat()
                                     new_fmt.setName(raw)

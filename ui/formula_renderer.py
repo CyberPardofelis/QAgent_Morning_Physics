@@ -442,17 +442,16 @@ class FormulaRenderer:
             x1 = min(img.size[0] - 1, x1 + PAD_X)
             y1 = min(img.size[1] - 1, y1 + PAD_Y)
             cropped = img.crop((x0, y0, x1 + 1, y1 + 1))
-            # v18.7: 不再 PIL resize — 让 PNG 保留 KaTeX 原始物理尺寸
-            # 原因: v18.5 标准化 PNG 高 100 + setHeight=50 fixed → 简单公式 202 wide 太宽
-            #       (user 报"单行公式又太大了"),多行公式 35 wide 字符被水平压扁(user 报"多行公式缩小了")
-            # v18.4 方案: setWidth=80 fixed + setHeight 按 PNG 宽高比算
-            #   简单公式 80×19.7,多行公式 80×111.8(多行公式天然占 display 高,user 接受)
-            #   不设最大,字符 visual 简单公式 ~20 logical,多行公式 ~90 logical
-            # 字号 60 渲染: 简单公式字符物理 ~99 高(4-5x 字号),setHeight=19.7 logical = 5x 降采样
-            #   字符内部细节锐利
-            # v14:不 PIL resize — 让浏览器按 PNG 物理 / 屏幕 DPR 自然显示
-            # user 觉得 LANCZOS down-sample 反而让清晰度"又不对"
-            # 1x 屏视觉 = 物理 = v11 字号 20px 字符的物理尺寸(33 高)
+            # v18.9 撤回 (2026-09-01 17:19):
+            #   user 反馈 v18.9 "更模糊了"。分析:
+            #   PIL Lanczos 4x 预降采样 + 1:1 物理显示,理论应该比 v18.8 (Qt bilinear 4x 实时缩放) 更清晰,
+            #   但实际看到的更糊。
+            #   根因猜测: Lanczos 对 4x downsample 这种激进缩放 + 字符本身在 PNG 里占少数像素的组合,
+            #   会产生 ringing 伪影(边缘"过度锐化"反而显糊),而且 1:1 物理显示 + DPI 缩放链上
+            #   还会被 Qt 再做一次缩放,叠加反而更差。
+            #   v18.8 (Qt bilinear 4x 实时缩放) 反而是最稳的: 字符 visual 跟 v18.4 接近, 字符 visual OK。
+            # 撤回: 恢复 v18.7 注释 + 不做 PIL resize,让 PNG 保留 KaTeX 60 字号原始物理尺寸。
+            #   message_bubble_1.py 同时改回 SCALE 1/4 + setWidth/Height 按比例算 (v18.8 状态)。
             cw, ch = cropped.size
             # PIL Image.save 不返回 bool,失败时抛 OSError — 不要用 if not
             cropped.save(str(cache_path), 'PNG')
