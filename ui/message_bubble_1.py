@@ -131,16 +131,32 @@ class MarkdownView(QTextBrowser):
                                 except Exception:
                                     w_px, h_px = 0, 0
                                 if w_px > 0 and h_px > 0:
-                                    # v18.2: 按 PNG 物理的 2/3 显示
-                                    # 原因: 125-150% 系统缩放下,PNG 物理 121 logical px
-                                    # 渲染 121 * 1.25-1.5 = 151-181 物理像素,显得过大。
-                                    # user 期望 ≈ 80 logical px(PNG 物理 × 2/3)
-                                    # 让公式看起来跟 14px 文字协调。
-                                    scale = 2.0 / 3.0
+                                    # v18.8: 不再 hardcode setWidth=80 — 按 PNG 物理 1/4 缩放
+                                    # 原因: setWidth=80 fixed 同时造成两个对立问题 —
+                                    #       简单公式 PNG 349×86 → display 80×19.7(宽 80,字符 visual 19.7 OK)
+                                    #       长公式 PNG 1238×121 → display 80×7.8(字符 visual 7.8 几乎看不见)
+                                    #       任何一个 hardcode 值都无法同时满足"简单公式别太宽"+"长公式别被压扁"
+                                    # 修法: 统一缩放系数 SCALE = 1/4(字号 60 渲染,4x 降采样保持锐度)
+                                    #       所有公式 display 尺寸 = PNG 物理像素 / 4
+                                    #       字符 visual = 字号 / 4 = 60/4 = 15 logical(简单公式)→
+                                    #                但长公式字符 visual = PNG 高 / 4 = 121/4 = 30 logical
+                                    #                因为字符本身在 PNG 里被垂直占满,所以字符 visual
+                                    #                取决于 PNG 高,不取决于宽 — 长公式不会被水平压扁
+                                    # 效果(实测 17 个 PNG):
+                                    #       简单公式 349×86  → 87×21.5  (字符 visual 21.5 ≈ v18.4 19.7)
+                                    #       简单公式 357×101 → 89×25.25
+                                    #       长公式 737×95   → 184×23.75 (从 v18.7 字符 visual 10.3 提升到 23.75)
+                                    #       长公式 1238×121 → 309×30.25 (从 7.8 提升到 30.25,清晰可读)
+                                    #       多行 frac 88×123 → 22×30.75 (不被水平压扁)
+                                    #       矩阵 296×224    → 74×56    (按比例,字符 visual 一致 56)
+                                    # 字符 visual 一致性: 所有公式字符都从 60 字号缩下来,降采样率一样 →
+                                    #                     锐度一致(简单 vs 长公式字符内部细节同样锐利)
+                                    # 不接受多行公式 display 高(多行公式天然高,user 接受"复杂公式天然高大")
+                                    SCALE = 1.0 / 4.0
                                     new_fmt = QTextImageFormat()
                                     new_fmt.setName(raw)
-                                    new_fmt.setWidth(w_px * scale)
-                                    new_fmt.setHeight(h_px * scale)
+                                    new_fmt.setWidth(w_px * SCALE)
+                                    new_fmt.setHeight(h_px * SCALE)
                                     cursor.setPosition(frag.position())
                                     cursor.setPosition(
                                         frag.position() + frag.length(),

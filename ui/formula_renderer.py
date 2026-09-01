@@ -44,7 +44,12 @@ _FORMULA_HTML_TEMPLATE = """<!DOCTYPE html>
 html, body {{
     margin: 0; padding: 0; background: transparent;
     display: inline-block;
-    font-size: 20px;  /* v11: 16 → 24 → 20 (1.5x→1.25x,user 觉得 24 太大,20 是"两次之间") */
+    font-size: 60px;  /* v18.4: 20 → 60 (3x 高分辨率渲染)
+                        原因: 字号 20 渲染的 PNG 物理 121x33,直接给 QTextBrowser 显示
+                              按 setWidth=80 fixed 缩,字符内部细节被 LANCZOS 一次性降到 1x,
+                              user 觉得"模糊/大小不稳定"。
+                              现在字号 60 渲染物理 363x99,缩到 80 logical 时 3x 降采样,
+                              字符内部细节锐利,跟 14px 文字协调 */
 }}
 .katex {{ color: #000; }}
 </style>
@@ -198,13 +203,19 @@ class FormulaRenderer:
     def render(self, formula: str, display_mode: bool = False) -> Optional[Path]:
         """
         同步渲染公式为 PNG,返回路径;失败返回 None。
-        - 缓存命中立即返回(0ms)
-        - 缓存未命中:首次需要 KaTeX 渲染(200-500ms)
+        - 缓存命中立即返回(0ms) + console 标 "cache hit"(便于排查"console 重复 log")
+        - 缓存未命中:首次需要 KaTeX 渲染(200-500ms) + console 标实际渲染
         """
         # 1. 检查缓存
         cache_path = self._cache_path(formula, display_mode)
         if self._is_valid_png(cache_path):
             self.stats['cache_hits'] += 1
+            # v18.7: console 显式标 cache hit — user 之前报"控制台对已有公式重复渲染"
+            # 实测 console 没重复 log(只有 _do_render 渲染时打 log),但 user 看错以为重复
+            # 加 hit 日志让 cache 复用情况透明,看 chat 时能区分 hit vs miss
+            # 阈值: hit 超过 cache_hits_logged_threshold 才 log(避免每条公式都打)
+            if self.stats['cache_hits'] <= 5 or self.stats['cache_hits'] % 50 == 0:
+                print(f'[FormulaRenderer] cache hit #{self.stats["cache_hits"]}: {formula[:50]!r}')
             return cache_path
 
         # 2. 渲染
@@ -233,12 +244,16 @@ class FormulaRenderer:
         formula_text = formula.strip()
         # 公式参数可能带 $...$ / $$...$$ 包裹(strip 掉,KaTeX 自己处理 math mode)
         # 因为 cache key 来自调用者传入的 formula,所以调用者传什么都行
+        # v18.6: 强制 displayMode=False(忽略 $$ 强制 inline)
+        # 原因: user 截图显示 $$...$$ 公式 vs $...$ 公式字符 visual 大小不一致
+        #       display 模式 KaTeX 字符更大 + 上下留白多,即使 v18.5 setHeight=50 fixed
+        #       字符实际 visual 大小仍比 inline 大 25%+ → user 反馈"大小不统一"
+        # 修法: 全部按 inline 渲染 → 字符物理一致 → v18.5 标准化后 visual 一致
         if formula_text.startswith('$$') and formula_text.endswith('$$'):
             formula_text = formula_text[2:-2].strip()
-            display_mode = True
         elif formula_text.startswith('$') and formula_text.endswith('$') and not formula_text.startswith('$$'):
             formula_text = formula_text[1:-1].strip()
-            display_mode = False
+        # 始终 inline 模式(忽略 $$ 强制 inline,见上面 v18.6 注释)
         # 公式字符串 escape:写到 HTML <span> 文本节点,浏览器 textContent 原样保留
         # 反斜杠 \\ 不需要 escape(HTML 文本节点不解析 \)
         # 只 escape </ 避免提前结束 <script>(KHTML/HTML parser 安全)
@@ -427,6 +442,14 @@ class FormulaRenderer:
             x1 = min(img.size[0] - 1, x1 + PAD_X)
             y1 = min(img.size[1] - 1, y1 + PAD_Y)
             cropped = img.crop((x0, y0, x1 + 1, y1 + 1))
+            # v18.7: 不再 PIL resize — 让 PNG 保留 KaTeX 原始物理尺寸
+            # 原因: v18.5 标准化 PNG 高 100 + setHeight=50 fixed → 简单公式 202 wide 太宽
+            #       (user 报"单行公式又太大了"),多行公式 35 wide 字符被水平压扁(user 报"多行公式缩小了")
+            # v18.4 方案: setWidth=80 fixed + setHeight 按 PNG 宽高比算
+            #   简单公式 80×19.7,多行公式 80×111.8(多行公式天然占 display 高,user 接受)
+            #   不设最大,字符 visual 简单公式 ~20 logical,多行公式 ~90 logical
+            # 字号 60 渲染: 简单公式字符物理 ~99 高(4-5x 字号),setHeight=19.7 logical = 5x 降采样
+            #   字符内部细节锐利
             # v14:不 PIL resize — 让浏览器按 PNG 物理 / 屏幕 DPR 自然显示
             # user 觉得 LANCZOS down-sample 反而让清晰度"又不对"
             # 1x 屏视觉 = 物理 = v11 字号 20px 字符的物理尺寸(33 高)
