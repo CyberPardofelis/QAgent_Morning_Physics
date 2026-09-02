@@ -79,6 +79,14 @@ class SettingsDialog(QDialog):
         tab_bar.setExpanding(False)            # tabs 不强制填满宽度(放不下时不要滚动)
         main_layout.addWidget(self.tab_widget)
 
+        # 2026-09-02 v5 加:保存所有"可能被隐藏"的 tab widget 引用,防 GC 释放 C++
+        # 之前用 QWidget(self) 让这些 tab 变成 dialog 直接子 widget (浮在 (0,0)),
+        # addTab 不 re-parent 那些被 filter 排除的 tab → 它们带着内嵌的 QScrollArea 浮在
+        # 标题栏下方 → 用户报"首选项左上角横滚条"反复 5 轮的真正根因
+        # 现在改 QWidget() (无 parent) + 这个 dict 持有 Python 引用 → addTab 被调时
+        # Qt 自动 re-parent 进 QStackedWidget,不被调时也不会浮在外面
+        self._hidden_tabs = {}
+
         # ----- 1. 首选项（仅字体） -----
         pref_tab = QWidget()
         pref_layout = QVBoxLayout(pref_tab)
@@ -132,23 +140,31 @@ class SettingsDialog(QDialog):
         # 只在 addTab 时按 tab_filter 过滤
         if self._should_show("首选项"):
             self.tab_widget.addTab(pref_tab, "首选项")
+        else:
+            self._hidden_tabs["首选项"] = pref_tab  # 2026-09-02 v5:防 GC 释放
 
         # ----- 2. LLM API -----
         llm_tab = self._build_llm_tab()  # 始终构造,因 _load_config 读 self.deepseek_api_key 等
         if self._should_show("LLM API"):
             self.tab_widget.addTab(llm_tab, "LLM API")
+        else:
+            self._hidden_tabs["LLM API"] = llm_tab
 
         # ----- 3. 搜索服务 -----
         search_tab = self._build_search_tab()  # 始终构造,_load_config 读 self.bocha_api_key 等
         if self._should_show("搜索服务"):
             self.tab_widget.addTab(search_tab, "搜索服务")
+        else:
+            self._hidden_tabs["搜索服务"] = search_tab
 
         # ----- 4. 系统提示词 -----
         # 2026-09-02 改:给所有可能被隐藏的 tab widget 加 self 作 parent,
-        # 防止 tab_filter 不包含时,本地变量 embed_tab 出 __init__ 作用域被 GC,
-        # 连带其下 QCheckBox/QLineEdit 等 C++ 一起被释放(就是 accept() 撞
-        # "QCheckBox already deleted" 的根因)。
-        prompt_tab = QWidget(self)
+        # 2026-09-02 v5 改:不再用 QWidget(self) — 那会变成 dialog 直接子 widget
+        #   (addTab 不会 re-parent 那些被 filter 排除的 tab),浮在 (0,0) 位置显示
+        #   内含的 QScrollArea → 标题栏下方出现 1-2px 横滚条(用户报 N 次的 bug)
+        # 改用: QWidget() 创建 + self._hidden_tabs[tab_name] = tab 保存引用防 GC
+        # addTab() 在被 filter 包含时会 re-parent 进去 QStackedWidget,不会被浮在外面
+        prompt_tab = QWidget()
         prompt_layout = QVBoxLayout(prompt_tab)
         info_label = QLabel("设置默认系统提示词（将作为所有新对话的初始系统提示，分组可单独覆盖）")
         info_label.setWordWrap(True)
@@ -162,14 +178,18 @@ class SettingsDialog(QDialog):
         prompt_layout.addStretch()
         if self._should_show("系统提示词"):
             self.tab_widget.addTab(prompt_tab, "系统提示词")
+        else:
+            self._hidden_tabs["系统提示词"] = prompt_tab
 
         # ----- 5. 数据状态 -----
         db_tab = self._build_db_tab()  # 始终构造(用 self.db_status_text)
         if self._should_show("数据状态"):
             self.tab_widget.addTab(db_tab, "数据状态")
+        else:
+            self._hidden_tabs["数据状态"] = db_tab
 
         # ----- 6. 期刊设置（QAgent 专属） -----
-        journal_tab = QWidget(self)
+        journal_tab = QWidget()
         journal_layout = QVBoxLayout(journal_tab)
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -184,9 +204,11 @@ class SettingsDialog(QDialog):
         journal_layout.addStretch()
         if self._should_show("期刊设置"):
             self.tab_widget.addTab(journal_tab, "期刊设置")
+        else:
+            self._hidden_tabs["期刊设置"] = journal_tab  # 2026-09-02 v5:防 GC 释放
 
         # ----- 7. Embedding 设置（QAgent 专属） -----
-        embed_tab = QWidget(self)
+        embed_tab = QWidget()
         embed_layout = QVBoxLayout(embed_tab)
         embed_form = QFormLayout()
         embed_form.setSpacing(10)
@@ -209,9 +231,11 @@ class SettingsDialog(QDialog):
         embed_layout.addStretch()
         if self._should_show("Embedding 设置"):
             self.tab_widget.addTab(embed_tab, "Embedding 设置")
+        else:
+            self._hidden_tabs["Embedding 设置"] = embed_tab  # 2026-09-02 v5:防 GC 释放
 
         # ----- 8. 每日总结范围（QAgent 专属） -----
-        daily_scope_tab = QWidget(self)
+        daily_scope_tab = QWidget()
         daily_scope_layout = QVBoxLayout(daily_scope_tab)
         daily_scroll = QScrollArea()
         daily_scroll.setWidgetResizable(True)
@@ -224,6 +248,8 @@ class SettingsDialog(QDialog):
         daily_scope_layout.addStretch()
         if self._should_show("每日总结范围"):
             self.tab_widget.addTab(daily_scope_tab, "每日总结范围")
+        else:
+            self._hidden_tabs["每日总结范围"] = daily_scope_tab  # 2026-09-02 v5:防 GC 释放
 
         # 底部按钮
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
