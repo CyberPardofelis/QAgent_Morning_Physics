@@ -75,12 +75,23 @@ class ChatWindow(QMainWindow):
         top_layout.addWidget(QLabel("模式："))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["openai", "deepseek-v4-flash", "deepseek-v4-pro", "minimax-m3", "minimax-vl-01", "compare"])
-        self.mode_combo.setCurrentIndex(1)
+        # 2026-09-02 加:从 QSettings 读上次保存的模式(用户报"选择模型没有退出保存")
+        # 找不到就用 index 1 (deepseek-v4-flash) 作为默认
+        _saved_mode = get_settings().value("chat_mode", "deepseek-v4-flash", type=str)
+        _saved_idx = self.mode_combo.findText(_saved_mode)
+        if _saved_idx >= 0:
+            self.mode_combo.setCurrentIndex(_saved_idx)
+        else:
+            self.mode_combo.setCurrentIndex(1)
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         top_layout.addWidget(self.mode_combo)
 
         self.think_checkbox = QCheckBox("思考模式")
-        self.think_checkbox.setChecked(True)
+        # 2026-09-02 加:从 QSettings 读上次是否勾选思考模式(默认 True)
+        _saved_think = get_settings().value("chat_think_mode", "true", type=str)
+        self.think_checkbox.setChecked(_saved_think == "true")
+        # 2026-09-02 加:用户切换时立即保存到 QSettings
+        self.think_checkbox.toggled.connect(self._on_think_toggled)
         top_layout.addWidget(self.think_checkbox)
         top_layout.addSpacing(20)
 
@@ -352,12 +363,18 @@ class ChatWindow(QMainWindow):
             self.controller._load_comparison_config()
 
     def on_mode_changed(self, mode):
+        # 2026-09-02 加:模式切换时保存到 QSettings(退出后下次启动恢复)
+        get_settings().setValue("chat_mode", mode)
         if mode == "compare":
             self.think_checkbox.setEnabled(False)
             self.think_checkbox.setToolTip("对比模式下，请使用「对比模式设置」分别配置各模型的思考开关")
         else:
             self.think_checkbox.setEnabled(True)
             self.think_checkbox.setToolTip("思考模式已开启")
+
+    def _on_think_toggled(self, checked: bool):
+        # 2026-09-02 加:思考模式勾选状态保存到 QSettings
+        get_settings().setValue("chat_think_mode", "true" if checked else "false")
 
     def on_daily_summary_clicked(self):
         settings = get_settings()

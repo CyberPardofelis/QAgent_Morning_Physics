@@ -70,6 +70,13 @@ class SettingsDialog(QDialog):
         main_layout = QVBoxLayout(self)
         self.tab_widget = QTabWidget()
         self.tab_widget.setDocumentMode(True)
+        # 2026-09-02 修:用户报"首选项左上角横滚条还在"
+        # 三重处理:禁用 scroll buttons + 禁 drawBase + 设固定高度
+        tab_bar = self.tab_widget.tabBar()
+        tab_bar.setUsesScrollButtons(False)   # 禁撕角(QToolButton)
+        tab_bar.setDrawBase(False)             # 禁 tab bar 底部基线
+        tab_bar.setFixedHeight(34)             # 固定高度(防 1-2px 横条 bug)
+        tab_bar.setExpanding(False)            # tabs 不强制填满宽度(放不下时不要滚动)
         main_layout.addWidget(self.tab_widget)
 
         # ----- 1. 首选项（仅字体） -----

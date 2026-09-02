@@ -338,6 +338,8 @@ QListWidget::item:selected {{
     color: {accent};
 }}
 /* 通用 QComboBox 样式 */
+/* 2026-09-02 改:加 font-size: {font_size_pt}pt,设置下拉/主题下拉等跟全局字号同步
+   之前没设 → Win 退回 system font 9pt,跟 settings 里 14/16 错位 */
 QComboBox {{
     background-color: {bg_input};
     border: 1px solid {border};
@@ -345,6 +347,7 @@ QComboBox {{
     padding: 6px 16px;
     min-width: 120px;
     color: {text_primary};
+    font-size: {font_size_pt}pt;
 }}
 QComboBox::drop-down {{
     border: none;
@@ -369,6 +372,8 @@ QComboBox QAbstractItemView {{
     outline: none;
     selection-background-color: {bg_hover};
     selection-color: {accent};
+    /* 2026-09-02 加:下拉打开的项也跟全局字号 */
+    font-size: {font_size_pt}pt;
 }}
 QComboBox QAbstractItemView::item {{
     padding: 8px 12px;
@@ -376,6 +381,7 @@ QComboBox QAbstractItemView::item {{
     color: {text_primary};
 }}
 /* 通用 QLineEdit 样式(用于搜索框等) */
+/* 2026-09-02 改:加 font-size: {font_size_pt}pt,跟全局字号同步 */
 QLineEdit {{
     background-color: {bg_input};
     border: 1px solid {border};
@@ -383,6 +389,7 @@ QLineEdit {{
     padding: 12px 16px;
     selection-background-color: {accent_soft};
     color: {text_primary};
+    font-size: {font_size_pt}pt;
 }}
 QLineEdit:focus {{
     border-color: {accent};
@@ -396,6 +403,7 @@ QTextEdit {{
     padding: 8px 12px;
     selection-background-color: {accent_soft};
     color: {text_primary};
+    font-size: {font_size_pt}pt;
 }}
 QTextEdit:focus {{
     border-color: {accent};
@@ -409,6 +417,7 @@ QPlainTextEdit {{
     padding: 8px 18px;
     selection-background-color: {accent_soft};
     color: {text_primary};
+    font-size: {font_size_pt}pt;
 }}
 /* 通用按钮样式 */
 QPushButton {{
@@ -430,9 +439,27 @@ QPushButton:disabled {{
     color: {text_disabled};
 }}
 /* 特殊按钮颜色覆盖 */
-/* 2026-09-02 改:显式设 color: {text_on_accent} — 不然深色 / 纸感主题下按钮文字是黑
-   (之前只设 background,文字色从 #stopBtn specificity 漏到上层规则,在某些
-   主题/parent 下会被 text_primary 覆盖成黑) */
+/* 2026-09-02 v2 改:用 [state="stop"] dynamic property 替代 objectName="stopBtn"
+   原因: 之前 objectName="stopBtn" 永远让按钮走 danger 红色,无法切回 idle 的 accent 蓝色
+   现在 input_panel 根据状态 setProperty("state", "stop"/"send"),QSS 接管样式
+   - state="stop"  → 红色 (streaming)
+   - 无 state / state="send" → 走默认 QPushButton 规则 (accent 蓝, idle) */
+QPushButton[state="stop"] {{
+    background-color: {danger};
+    color: {text_on_accent};
+    border: none;
+    padding: 6px 14px;
+    font-weight: 500;
+}}
+QPushButton[state="stop"]:hover {{
+    background-color: {danger_hover};
+    color: {text_on_accent};
+}}
+QPushButton[state="stop"]:disabled {{
+    background-color: {bg_disabled};
+    color: {text_disabled};
+}}
+/* 兼容旧 #stopBtn objectName (如果其他地方还在用),跟 [state="stop"] 同效 */
 QPushButton#stopBtn {{
     background-color: {danger};
     color: {text_on_accent};
@@ -443,10 +470,6 @@ QPushButton#stopBtn {{
 QPushButton#stopBtn:hover {{
     background-color: {danger_hover};
     color: {text_on_accent};
-}}
-QPushButton#stopBtn:disabled {{
-    background-color: {bg_disabled};
-    color: {text_disabled};
 }}
 QPushButton#regenerateBtn {{
     background-color: {neutral_gray};
@@ -668,6 +691,8 @@ QMenuBar::item {{
     padding: 8px 12px;
     background: transparent;
     border-radius: 6px;
+    /* 2026-09-02 加:菜单项(主界面"设置"下拉里那两个选项)也跟全局字号 */
+    font-size: {font_size_pt}pt;
 }}
 QMenuBar::item:selected {{
     background-color: {bg_hover};
@@ -682,6 +707,8 @@ QMenu {{
 QMenu::item {{
     padding: 6px 24px 6px 12px;
     border-radius: 6px;
+    /* 2026-09-02 加:下拉菜单项("设置"下拉里"首选项" / "期刊与论文")也跟全局字号 */
+    font-size: {font_size_pt}pt;
 }}
 QMenu::item:selected {{
     background-color: {bg_hover};
@@ -690,16 +717,68 @@ QMenu::item:selected {{
 /* ---------- 扁平化标签页 ---------- */
 /* 2026-09-02 改:QTabBar 自己设 {bg_main} 背景
    之前没设 → tab 之间空白处退到 system 颜色,Win 浅色主题下显示白块(用户报"左上角白色奇怪东西")
-   现在 tab 之间空白处跟 dialog 背景一致 */
+   现在 tab 之间空白处跟 dialog 背景一致
+   + 固定高度,防止 tab 放不下时出现 1-2px 横滚条(用户第二轮反馈) */
 QTabBar {{
     background-color: {bg_main};
+    border: none;
+    /* 2026-09-02 加:防止 tab 放不下时出现滚动条 */
+    qproperty-usesScrollButtons: false;
+    qproperty-drawBase: false;
+    min-height: 0;
+}}
+/* 2026-09-02 加:兜底隐藏 QTabBar 任何可能出现的滚动元素 */
+QTabBar QScrollBar:horizontal,
+QTabBar QScrollBar:vertical {{
+    height: 0px;
+    width: 0px;
+    background: transparent;
+    border: none;
+    margin: 0px;
+}}
+QTabBar QScrollBar::handle:horizontal,
+QTabBar QScrollBar::handle:vertical {{
+    background: transparent;
+    min-width: 0;
+    min-height: 0;
+    height: 0;
+    width: 0;
+}}
+QTabBar QScrollBar::add-line:horizontal,
+QTabBar QScrollBar::sub-line:horizontal,
+QTabBar QScrollBar::add-line:vertical,
+QTabBar QScrollBar::sub-line:vertical,
+QTabBar QScrollBar::add-page:horizontal,
+QTabBar QScrollBar::sub-page:horizontal,
+QTabBar QScrollBar::add-page:vertical,
+QTabBar QScrollBar::sub-page:vertical {{
+    background: none;
+    border: none;
+    width: 0;
+    height: 0;
+}}
+QTabBar::scroller,
+QTabBar::tear-left,
+QTabBar::tear-right {{
+    width: 0;
+    height: 0;
+    border: none;
+    background: transparent;
+}}
+QTabBar QToolButton {{
+    width: 0;
+    height: 0;
+    padding: 0;
     border: none;
 }}
 QTabWidget::pane {{
     border: 1px solid {border};
+    border-top: none;             /* 2026-09-02 改:去 top border — 之前 top: -1px 配合 border
+                                       在某些主题下会画出 1px 横条(用户报"首选项左上角横滚条")
+                                       现在 top 无 border,1-2px 横条不再出现 */
     border-radius: 12px;
-    background: {bg_card};          /* tab 内容区用次级背景(跟 main 形成层次) */
-    top: -1px;
+    background: {bg_card};
+    top: 0;                       /* 2026-09-02 改:不再 -1px,跟 tab bar 齐平 */
 }}
 
 QTabBar::tab {{

@@ -229,13 +229,12 @@ class InputPanel(QWidget):
         self.input_edit.textChanged.connect(self._on_input_text_changed)
 
         # === 2026-09-02 改(抄 WAgent): 合并"发送"和"停止"为一个 send_stop_btn ===
-        # 状态由 set_streaming_state() 切换:idle="发送" / streaming="停止"
-        # 初始禁用,等第一次 set_streaming_state(False) 才启用
-        # 2026-09-02 v2 改:objectName 改 "stopBtn" — styles.py 已有 #stopBtn 规则
-        #   (走 {danger}/{danger_hover} token),切主题时按钮红/深红跟主题走,
-        #   不再 inline 写死 #dc3545
+        # 状态由 set_streaming_state() 切换:idle="发送" 蓝色 / streaming="停止" 红色
+        # 2026-09-02 v3 改:不用 objectName="stopBtn"(会让按钮永远红),
+        #   改用 setProperty("state", "stop") 在 streaming 时切红色
+        #   idle 时清掉 state,走默认 QPushButton 规则 = {accent} 蓝
         self.send_stop_btn = QPushButton("发送")
-        self.send_stop_btn.setObjectName("stopBtn")
+        # 不设 objectName,避免 [state="stop"] 之外的样式规则把它永久变红
         self.send_stop_btn.setEnabled(False)
 
         self.regenerate_btn = QPushButton("重新生成")
@@ -459,15 +458,22 @@ class InputPanel(QWidget):
     def _update_send_stop_btn(self):
         """
         2026-09-02 加(抄 WAgent):根据 _is_streaming / _input_enabled / 输入框内容刷新 send_stop_btn。
-        streaming 状态: 走全局 QSS 里 #stopBtn 规则 → {danger}/{danger_hover} 红色,文字"停止",强制 enabled
-        idle 状态: 默认 QPushButton 规则 → {accent} 蓝色,文字"发送",enabled = input_enabled AND (有文字 OR 有附件)
+        - streaming: setProperty("state", "stop") → 走 [state="stop"] QSS 规则 → {danger} 红色,文字"停止"
+        - idle: clearProperty("state") / "send" → 走默认 QPushButton 规则 → {accent} 蓝色,文字"发送"
         """
         if self._is_streaming:
             self.send_stop_btn.setText("停止")
             self.send_stop_btn.setEnabled(True)
-            # objectName "stopBtn" 已设 → 全局 QSS 接管,颜色跟 {danger} 主题 token 走
+            # dynamic property 让 QSS [state="stop"] 接管 → 红色 + 白字
+            self.send_stop_btn.setProperty("state", "stop")
+            self.send_stop_btn.style().unpolish(self.send_stop_btn)
+            self.send_stop_btn.style().polish(self.send_stop_btn)
         else:
             self.send_stop_btn.setText("发送")
+            # 清掉 state,回到默认 QPushButton 规则 → 蓝色 (accent) + 白字
+            self.send_stop_btn.setProperty("state", "send")
+            self.send_stop_btn.style().unpolish(self.send_stop_btn)
+            self.send_stop_btn.style().polish(self.send_stop_btn)
             has_text = bool(self.input_edit.toPlainText().strip())
             has_attach = bool(self._attachments)
             self.send_stop_btn.setEnabled(

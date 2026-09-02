@@ -59,6 +59,10 @@ class SettingsKeys:
     # 聊天模式
     CHAT_MODEL_PARAMS = "chat_model_params"
     DAILY_SUMMARY_JOURNALS = "daily_summary_journals"
+    # 2026-09-02 加:主界面"模式"下拉 + "思考模式"勾选 的持久化
+    # (用户报"选择模型没有退出保存,每次打开要重新选")
+    CHAT_MODE = "chat_mode"               # mode_combo.currentText() (e.g. "deepseek-v4-flash")
+    CHAT_THINK_MODE = "chat_think_mode"   # think_checkbox.isChecked() (bool)
 
     # 系统提示词
     DEFAULT_SYSTEM_PROMPT = "default_system_prompt"
