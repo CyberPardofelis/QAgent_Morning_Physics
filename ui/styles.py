@@ -555,39 +555,39 @@ QWidget[state="error"] {{
     background-color: {danger};
     border-radius: 5px;
 }}
-/* ---------- 消息气泡 (kind="bubble-user|assistant|system") ---------- */
-QWidget[kind="bubble-user"] {{
+/* ---------- 消息气泡 (objectName="bubble_user/assistant/system") ---------- */
+/* 2026-09-02 v6 改:用 #objectName 替代 [kind=...] attribute selector
+   原因: PySide6 6.10 下 setProperty("kind", ...) 在 chat_view 嵌套上下文里 QSS 不匹配
+         (debug 看到 palette bg = #000000, 气泡背景是黑色)
+   改用 setObjectName + #objectName 选择器, 这是 Qt 5/6 最稳的 dynamic styling */
+QWidget#bubble_user {{
     background-color: {bubble_user_bg};
     border-radius: 10px;
     border: none;
 }}
-QWidget[kind="bubble-user"] QTextBrowser {{
+QWidget#bubble_user QTextBrowser {{
     color: {bubble_user_fg};
     background: transparent;
-    /* 2026-08-19:清掉 QTextBrowser viewport 默认 1px 灰色内边框
-       (QSS selector specificity 高于内联 setStyleSheet,MarkdownView 自己的 border:none 被这条压住) */
     border: 0;
     outline: 0;
-    /* 注意:不要清 padding — QTextBrowser 默认有内部 padding 让文字不贴边,
-       之前我加了 padding: 0 导致文字贴边(2026-08-19 反馈) */
 }}
-QWidget[kind="bubble-assistant"] {{
+QWidget#bubble_assistant {{
     background-color: {bubble_assistant_bg};
     border-radius: 10px;
     border: none;
 }}
-QWidget[kind="bubble-assistant"] QTextBrowser {{
+QWidget#bubble_assistant QTextBrowser {{
     color: {bubble_assistant_fg};
     background: transparent;
     border: 0;
     outline: 0;
 }}
-QWidget[kind="bubble-system"] {{
+QWidget#bubble_system {{
     background-color: {bubble_system_bg};
     border-radius: 10px;
     border: none;
 }}
-QWidget[kind="bubble-system"] QTextBrowser {{
+QWidget#bubble_system QTextBrowser {{
     color: {bubble_system_fg};
     background: transparent;
     border: 0;

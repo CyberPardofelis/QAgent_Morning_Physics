@@ -1,15 +1,26 @@
 import os
 import re
+import logging
 from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.utils import JOURNAL_CONFIG
 from agent.tools.registry import register_tool
 from agent.tools.browser_pool import get_browser_pool
-# 2026-09-02 P0.6 加:抓文后异步落库
-from agent.tools.summary import save_summary_item_async
-# 2026-09-02 协同 fix:抓文后 LLM 提关键词 + update summary_item + 重嵌
-from agent.tools.extract_keywords import update_keywords_for_paper_async
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 2026-09-02 P0.9 彻底回退(用户拍板):
+# 完全回退 P0.6 加的协同逻辑(save_summary_item_async / update_keywords_for_paper_async):
+#   - 之前 30 篇 paper → 60 个并发后台线程(LLM 关键词 + bge-large 嵌入 + chromadb 写)
+#   - Windows 句柄/内存耗尽 → 用户连续 2 次蓝屏(memory manage)
+# 现在 daily summary 只做两件事:抓文 + LLM 总结,完全同步、零后台线程。
+# 关键词由 LLM 在总结时**一次性输出**(prompt 里加要求行),不再单独 LLM 调用。
+#
+# 落库/SQLite/chromadb 嵌入:全部不做,回到"老版本"最简行为。
+# 恢复协同:必须先加 Semaphore 限流 + bge-large 单例 + chromadb 加锁,见 README/memory。
+# ============================================================
 
 
 def fetch_aps_page_via_browser(journal: str = 'prl'):
@@ -119,22 +130,10 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         if not papers:
             return f"未找到 {config['name']} 论文列表，请稍后重试。"
 
-        # 2026-09-02 P0.6:异步落库
-        for p in papers:
-            save_summary_item_async(
-                paper_id=p["id"],
-                source="aps_daily",
-                title=p["title"],
-                authors=p.get("authors"),
-                abstract=p.get("abstract"),
-            )
-            # 2026-09-02 协同:后台线程 LLM 提关键词 + update + 重嵌
-            update_keywords_for_paper_async(
-                paper_id=p["id"],
-                source="aps_daily",
-                title=p["title"],
-                abstract=p.get("abstract", ""),
-            )
+        # 2026-09-02 P0.9 彻底回退:不做任何后台落库/关键词提取,只走 LLM 总结(同步、单线程)。
+        # 关键词由 prompt 要求 LLM 在每篇论文里输出"**关键词**:"行,主流程不解析,直接显示给用户看。
+        # 之前的 P0.6 协同(save_summary_item_async + update_keywords_for_paper_async)
+        # 30 篇 paper → 60 个并发线程 → Windows 蓝屏,见模块顶部注释。
 
         papers_text = ""
         for i, p in enumerate(papers, 1):
@@ -154,6 +153,7 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         - **核心贡献**：用 2-3 句话概括论文的主要创新点
         - **方法**：简述使用的方法或技术路线（100字左右）
         - **意义与展望**：该工作的潜在影响或后续研究方向（80字左右）
+        - **关键词**：5-8 个英文关键词，逗号分隔（用于后续检索/分类；不要翻译，保持英文原词）
 
         注意事项：
         - 使用清晰的 Markdown 标题分级。

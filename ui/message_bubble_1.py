@@ -249,19 +249,21 @@ class MessageBubble(QWidget):
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self._flush_complete_lines)
 
-        # 2026-09-02 改(抄 WAgent 主题系统):不再 hardcode 气泡颜色,
-        # 用 setProperty("kind", "bubble-xxx") 让 styles.py 里的 [kind="bubble-xxx"] QSS 规则接管
-        # (走 {bubble_user_bg}/{bubble_assistant_bg}/{bubble_system_bg} token,切主题时气泡跟主题走)
+        # 2026-09-02 v6 改:用 setObjectName("bubble_user/assistant/system") 替代 setProperty("kind", ...)
+        # 原因: 之前用 dynamic property + [kind=...] QSS attribute selector 在 chat_view
+        # 上下文中不生效 (debug 看到 palette bg = #000000 而不是 #77aaff, QSS 规则没被匹配)
+        # 改用 objectName + #objectName 选择器 — 这是 Qt 5/6 最稳的 dynamic styling 方式
+        # 对应 QSS: QWidget#bubble_user { background-color: {bubble_user_bg}; ... }
         if role == 'user':
+            self.setObjectName("bubble_user")
             text_color = "white"
         elif role == 'assistant':
+            self.setObjectName("bubble_assistant")
             text_color = "black"
         else:
+            self.setObjectName("bubble_system")
             text_color = "#495057"
-        # kind property 让全局 QSS 接管背景色
-        self.setProperty("kind", f"bubble-{role}")
-        # bubble QSS 已经设了 border-radius: 10px; border: none
-        # 但没设 WA_StyledBackground,需要显式开
+        # objectName 已设, #objectName QSS 规则会接管, 不需要 WA_StyledBackground
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         self.view = MarkdownView(self)

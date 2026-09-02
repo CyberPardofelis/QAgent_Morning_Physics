@@ -27,16 +27,15 @@ class ChatView(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QScrollArea.NoFrame)
-        # v18: 整个滚动区背景 transparent — 避免 QWidget/QAbstractScrollArea 默认浅灰
-        self.scroll_area.setStyleSheet("background: transparent; border: none;")
-        # viewport 默认 autoFillBackground=True,显示 Palette.Window 浅灰
-        # 必须显式 transparent + setAutoFillBackground(False) 才能完全透明
-        self.scroll_area.viewport().setStyleSheet("background: transparent;")
+        # 2026-09-02 v6 改:不调用 setStyleSheet() — 那会创建 widget 级 QSS,
+        # 覆盖 app 的 QSS,导致气泡的 #bubble_user/assistant/system QSS 规则不生效
+        # (用户报"对话气泡背景去掉了"的真根因 — debug 看到 bubble 实际渲染是纯黑)
+        # 改靠 setAutoFillBackground(False) + QSS QScrollArea, QScrollArea > QWidget 规则
+        self.scroll_area.setAutoFillBackground(False)
         self.scroll_area.viewport().setAutoFillBackground(False)
-        # v18: scroll_content 显式 transparent
+        # v18: scroll_content 显式 transparent — 也只用 setAutoFillBackground(False)
         self.scroll_content = QWidget()
         self.scroll_content.setObjectName("chatScrollContent")
-        self.scroll_content.setStyleSheet("background-color: transparent;")
         self.scroll_content.setAutoFillBackground(False)
         self.scroll_layout = QVBoxLayout(self.scroll_content)
         self.scroll_layout.setContentsMargins(0, 0, 0, 0)

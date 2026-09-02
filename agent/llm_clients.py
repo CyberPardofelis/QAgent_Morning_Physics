@@ -59,9 +59,54 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     "minimax": ProviderConfig(
         name="minimax",
         display_name="MiniMax",
-        default_base_url="https://api.MiniMax.com/v1",
+        # 2026-09-02 修(抄 SAgent):默认走国内端点 api.minimaxi.com/v1。
+        # 用户是国内账号(同 SAgent 2026-08-18 排查:同 key 配 minimaxi.com/v1 → 200,
+        # 配 minimax.io/v1 → 401 2049)。官方原话: "Match Global keys to
+        # minimax.io and Mainland China keys to minimimaxi.com."
+        # 跨 region 走 MiniMax 服务端会判 key 失效,返回 2049 invalid api key。
+        # 如果用户未来切到国际账号,在 SettingsDialog → LLM API → MiniMax →
+        # base_url 改 https://api.minimax.io/v1 即可。
+        # 注意:必须保留 /v1 路径前缀,OpenAI SDK 会自动拼 /chat/completions。
+        default_base_url="https://api.minimaxi.com/v1",
         default_model="MiniMax-M3",
     ),
+}
+
+
+# ============================================================
+# MiniMax 真实支持的 model 列表(2026-09-02 抄 SAgent)
+# 用于校验/防御 user 在 QSettings / SettingsDialog 里配 model。
+# 注意:没有"Reasoning"命名的 model — thinking/reasoning 是 extra_body.thinking 启用。
+# 未来 minimax 加 model 时,这里和 settings_dialog 的 dropdown 都要同步更新。
+# ============================================================
+MINIMAX_VALID_MODELS = (
+    "MiniMax-M2",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M3",
+)
+
+
+# 已知失效的 base_url 历史值(用于自动清理 QSettings 残留)
+# ⚠️ 重要:这里只放"全球范围都失效"的 URL。区域端点不能加进来!
+#   - 国内端点 api.minimaxi.com/v1 对国内账号是有效的
+#   - 国际端点 api.minimax.io/v1 对国际账号是有效的
+#   - 跨 region 走 MiniMax 服务端会判 key 失效(2049),不是 URL 失效
+# 添加新条目时,附上注释说明何时/为何失效
+_DEPRECATED_BASE_URLS = {
+    # 2026-09-02: QAgent 历史错误值(全 region 不可用,会回 401)
+    # 用户最初配的 "https://api.MiniMax.com/v1" 是无效的占位域名
+    # → 自动回退到 minimaxi.com/v1
+    "https://api.MiniMax.com/v1",
+    # 2026-08: 旧 anthropic 端点(全 region 不可用,404)
+    # https://api.minimaxi.com/anthropic 在 MiniMax 域名迁移后已全局失效
+    "https://api.minimaxi.com/anthropic",
+    # 故意不放 minimaxi.com/v1 — 它对国内账号是有效 URL
+    # 误加这条会导致国内用户被强制回退到国际端点,key 跨 region 报 2049
 }
 
 
@@ -97,11 +142,21 @@ def _get_user_base_url(provider_name: str) -> str:
     """
     从 QSettings 读用户配置的 base_url（覆盖默认值）。
     找不到返回空字符串，由 caller 决定回退到默认值。
+
+    2026-09-02 加(抄 SAgent):如果用户配置的值在 _DEPRECATED_BASE_URLS 里
+    (旧版失效的 URL 残留),自动忽略,等同于没配置(返回空串 → caller 回退到新默认值)。
+    这样用户不需要手动去 SettingsDialog 清掉旧值。
     """
     try:
         from config.settings import get_settings
         settings = get_settings()
         raw = (settings.value(f"{provider_name}_base_url", "") or "").strip()
+        if raw and raw in _DEPRECATED_BASE_URLS:
+            logger.warning(
+                "[LLM] 忽略 %s provider 的失效 base_url=%s,自动使用新默认值",
+                provider_name, raw,
+            )
+            return ""
         return raw
     except Exception:
         # QSettings 不可用（无 Qt 环境）时直接返回空
@@ -224,20 +279,35 @@ def classify_llm_error(provider_display: str, exc: Exception) -> str:
     返回 markdown 错误消息。
     """
     err_name = type(exc).__name__
-    err_str = str(exc)[:300]
+    err_str = str(exc)[:500]  # 2026-09-02 加长:让 402/403 错误体的 JSON 能完整显示
+
+    # 2026-09-02 加:MiniMax 402 insufficient_balance_error (1008)
+    # 用户经常以为是"key 错了",其实是账户余额不足 → 给明确指引
+    if "402" in err_str or "insufficient_balance" in err_str.lower() or "1008" in err_str:
+        return (
+            f"💰 {provider_display} 账户余额不足（{err_name}）\n\n"
+            f"**这不是 key 错误,是账户没钱了。**\n\n"
+            f"处理方法：\n"
+            f"  1. 登录 {provider_display} 官方充值页面（国内：platform.minimaxi.com / 国际：platform.minimax.io）\n"
+            f"  2. 充值或购买套餐后,几分钟内自动恢复\n"
+            f"  3. 充值后**直接重试**即可,不用重置 key\n\n"
+            f"原始错误：{err_str}"
+        )
 
     if (
         "Authentication" in err_name
         or "401" in err_str
         or "Incorrect API key" in err_str
         or "governor" in err_str.lower()
+        or "2049" in err_str  # 2026-09-02 加:MiniMax region mismatch (跨 region 鉴权失败)
     ):
         return (
             f"❌ {provider_display} API 鉴权失败（{err_name}）\n\n"
             f"可能原因：\n"
             f"  1. API key 无效或已过期 — 在「首选项 → LLM API」或 .env 中检查\n"
             f"  2. {provider_display} 账户余额不足\n"
-            f"  3. key 被风控系统拦截（governor），需要重新生成 key\n\n"
+            f"  3. key 被风控系统拦截（governor），需要重新生成 key\n"
+            f"  4. 跨 region 鉴权失败(2049):key 是国内账号但 base_url 走了国际,或反之\n\n"
             f"原始错误：{err_str}"
         )
     if "Timeout" in err_name:

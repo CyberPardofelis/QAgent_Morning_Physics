@@ -6,10 +6,13 @@ agent.controller — 流式对话与工具调用编排（v3 — 实时流式 + �
 - 工具调用循环：每个工具的结果在子回合里被 LLM 看到
 - DIRECT_OUTPUT 工具（generate_daily_summary_*）返回的完整内容按 ### 标题切气泡
 - 单一循环，无 if/elif 工具分发
+- 2026-09-02 改(抄 SAgent):加 <think>...</think> 标签流式剥离状态机,
+  处理 MiniMax M3 把 thinking 直接拼在 content 字段的情况
 """
 import json
 import re
 import logging
+import time
 from typing import Iterator, Optional
 
 from agent.llm_clients import (
@@ -36,6 +39,133 @@ import agent.tools  # noqa: F401
 
 # 直接输出工具：这些工具返回的内容就是最终答案，需要按章节切气泡
 DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
+
+
+# ============================================================
+# 工具调用日志(2026-09-02 抄 SAgent)
+# UI 不显示工具原始输出,但控制台/日志要能看到:工具名 + 关键参数 +
+# 结果长度 + 结果头尾片段,方便排查 silent failure。
+# ============================================================
+_LOG_PREVIEW_BYTES = 200
+
+
+def _brief_args_for_log(fn_name: str, args: dict) -> str:
+    """工具参数格式化(控制台用)。长字符串截断,大字典缩到 200 字内。"""
+    try:
+        s = json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:
+        s = repr(args)
+    if len(s) > _LOG_PREVIEW_BYTES:
+        s = s[:_LOG_PREVIEW_BYTES] + f"... <truncated total={len(s)}>"
+    return s
+
+
+def _brief_result_for_log(result: str) -> str:
+    """工具结果格式化(控制台用)。头尾各 100 字,中间省略。
+    空结果 → '<empty>' 标记,方便排查 silent failure。"""
+    if not result:
+        return "<empty>"
+    if len(result) <= _LOG_PREVIEW_BYTES:
+        return repr(result)
+    head = result[:_LOG_PREVIEW_BYTES // 2]
+    tail = result[-_LOG_PREVIEW_BYTES // 2:]
+    return f"{head!r} ... <truncated total={len(result)}> ... {tail!r}"
+
+
+# ============================================================
+# 思考过程过滤(2026-09-02 抄 SAgent)
+# MiniMax M3 把 thinking 用 <think>...</think> 标签直接拼在 delta.content 字段里
+# (不是用 reasoning_content 字段),用一段轻量级状态机在流式输出时实时剥离。
+# 这是 2026-09-02 用户报的"minimax 模式下两个空气泡" 根因。
+# ============================================================
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _is_prefix_of_tag(prefix: str, tag: str) -> bool:
+    """检查 prefix 是不是 tag 的前缀(用于跨 chunk 标签边界检测)"""
+    return len(prefix) < len(tag) and tag.startswith(prefix)
+
+
+def _strip_think_tags(chunk_content: str, state: list):
+    """
+    流式剥离 <think>...</think> 标签。
+
+    参数:
+        chunk_content: 当前 chunk 的 content(可能只含部分标签)
+        state: 2 元素 list,作为 mutable 状态盒子: [in_thinking, pending_buf]
+               调用方在循环外初始化 [False, ""],跨 chunk 保持状态。
+
+    返回:
+        list[str]: 应当 yield 给 UI 的内容片段(可能 0/1/多个)
+
+    设计:
+      - 把 chunk_content 累积到 state[1] (pending_buf),状态机对 pending_buf 操作
+      - NORMAL 状态:yield 非 thinking 标签内容;如果 pending 是 open 标签的前缀,等待
+      - THINKING 状态:丢弃 thinking 内容;如果 pending 是 close 标签的前缀,等待
+      - 状态机跨 chunk 保持(state 参数),close 后继续找下一个 open(支持连续 thinking 块)
+    """
+    out = []
+    # 累积新 chunk 到 pending
+    state[1] += chunk_content
+    pending = state[1]
+    in_thinking = state[0]
+
+    while pending:
+        if in_thinking:
+            if _THINK_CLOSE_TAG in pending:
+                idx = pending.find(_THINK_CLOSE_TAG)
+                pending = pending[idx + len(_THINK_CLOSE_TAG):]
+                in_thinking = False
+                # 循环,处理 close 后的 pending
+            else:
+                # 看 pending 中任何 < 位置是否可能是 close 标签前缀
+                cut = len(pending)
+                for i, ch in enumerate(pending):
+                    if ch == '<':
+                        candidate = pending[i:]
+                        if _THINK_CLOSE_TAG.startswith(candidate) and len(candidate) < len(_THINK_CLOSE_TAG):
+                            cut = i
+                            break
+                if cut < len(pending):
+                    # 丢弃 cut 之前的 thinking,保留 cut 之后(可能是 close 前缀)
+                    pending = pending[cut:]
+                    break
+                else:
+                    # 整段都不是 close 前缀的开始,丢弃
+                    pending = ""
+        else:
+            # NORMAL
+            if _THINK_OPEN_TAG in pending:
+                idx = pending.find(_THINK_OPEN_TAG)
+                before = pending[:idx]
+                if before:
+                    out.append(before)
+                pending = pending[idx + len(_THINK_OPEN_TAG):]
+                in_thinking = True
+            else:
+                # 看 pending 中任何 < 位置是否可能是 open 标签前缀
+                cut = len(pending)
+                for i, ch in enumerate(pending):
+                    if ch == '<':
+                        candidate = pending[i:]
+                        if _THINK_OPEN_TAG.startswith(candidate) and len(candidate) < len(_THINK_OPEN_TAG):
+                            cut = i
+                            break
+                if cut < len(pending):
+                    # yield cut 之前(确定非标签),保留 cut 之后(等更多)
+                    if cut > 0:
+                        out.append(pending[:cut])
+                    pending = pending[cut:]
+                    break
+                else:
+                    # 整段都不是 open 前缀的开始,整段 yield
+                    out.append(pending)
+                    pending = ""
+
+    state[0] = in_thinking
+    state[1] = pending
+    return out
 
 # mode -> (provider_name, default_model)
 MODE_TO_PROVIDER_MODEL = {
@@ -198,8 +328,9 @@ def run_agent_stream(
 
     # DeepSeek 模式：思考 + 工具调用循环
     # MiniMax 模式：走同一路径（MiniMax OpenAI 兼容接口支持工具调用 + thinking extra_body）
-    import time as _t
     _round = 0
+    # 2026-09-02 加(抄 SAgent):跨 chunk 持续的状态盒,用于剥离 <think> 标签
+    _think_state = [False, ""]
     while True:
         _round += 1
         print(f"[controller] LLM round {_round} start  mode={provider_name} model={actual_model} messages={len(messages)}", flush=True)
@@ -276,12 +407,27 @@ def run_agent_stream(
 
         for chunk in stream:
             delta = chunk.choices[0].delta
-            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                current_reasoning += delta.reasoning_content
+            # 2026-09-02 改(抄 SAgent):把 reasoning_content 字段的累加 + content 字段的
+            # <think> 标签剥离严格分开
+            # - deepseek: extra_body.thinking 开启时 reasoning 走独立字段 → 这里累加
+            # - MiniMax M3: 把 thinking 直接拼在 content 字段(用 <think> 标签) → 走 _strip_think_tags 状态机
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                # 静默收集 reasoning — 不进 current_content、不 yield 给 UI
+                current_reasoning += rc or ""
+                continue
             if delta.content:
-                current_content += delta.content
-                # ✅ 实时 yield — 保留 QAgent 流式感
-                yield delta.content
+                # 2026-09-02 改(抄 SAgent):过滤 MiniMax 把 thinking 直接拼在 content 字段里用
+                # <think>...</think> 标签包着的部分(不是用 reasoning_content 字段)。
+                # 用轻量级状态机: tracking 是否在 thinking 块内 + buffer 累积跨 chunk 的标签边界。
+                # 这就是用户报的"minimax 模式两个空气泡" 的真正根因 ——
+                # 之前 QAgent controller 直接 yield delta.content,让 <think>...</think> 标签
+                # 污染 UI 之外,有时因为标签跨 chunk 还会让 content 看起来"几乎为空"。
+                for fc in _strip_think_tags(delta.content, _think_state):
+                    if fc:
+                        current_content += fc
+                        # ✅ 实时 yield — 保留 QAgent 流式感
+                        yield fc
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -322,13 +468,33 @@ def run_agent_stream(
                 yield NEW_BUBBLE
                 continue
 
-            _t0 = _t.time()
-            print(f"[controller] 调工具 {fn_name} args={args}  (round {_round})", flush=True)
+            # 2026-09-02 改(抄 SAgent):控制台日志(不影响 UI,方便排查 silent failure)
+            args_brief = _brief_args_for_log(fn_name, args)
+            logger.info(
+                "[controller] [tool-call] ▶ %s id=%s args=%s  (round %d)",
+                fn_name, tool_call.get("id", "?"), args_brief, _round,
+            )
+            t0 = time.monotonic()
 
             # 工具结果收集（同步或流式）
-            result_text = _dispatch_tool(fn_name, args)
-
-            print(f"[controller] 工具 {fn_name} 返回 ({len(result_text)} 字符) 耗时 {_t.time()-_t0:.1f}s  (round {_round})", flush=True)
+            collected_chunks: list[str] = []
+            dispatch_failed = False
+            try:
+                for chunk in ToolRegistry.dispatch(fn_name, args):
+                    if chunk:
+                        collected_chunks.append(chunk)
+            except Exception as e:
+                dispatch_failed = True
+                logger.exception("[controller] [tool-call] ✗ %s dispatch 异常: %s", fn_name, e)
+            result_text = "".join(collected_chunks)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            logger.info(
+                "[controller] [tool-call] %s %s id=%s len=%d elapsed=%dms preview=%s  (round %d)",
+                "✗" if dispatch_failed or not result_text else "✓",
+                fn_name, tool_call.get("id", "?"),
+                len(result_text), elapsed_ms,
+                _brief_result_for_log(result_text), _round,
+            )
 
             # 工具结果加入 LLM 历史
             messages.append({

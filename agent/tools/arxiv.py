@@ -1,15 +1,22 @@
 import json
 import re
+import logging
 import arxiv
 import requests
 from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
-# 2026-09-02 P0.6 加:抓文后异步落库
-from agent.tools.summary import save_summary_item_async
-# 2026-09-02 协同 fix:抓文后 LLM 提关键词 + update summary_item + 重嵌 paper_keywords
-from agent.tools.extract_keywords import update_keywords_for_paper_async
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 2026-09-02 P0.9 彻底回退(跟 agent/tools/aps.py 同步):
+# 完全回退 P0.6 加的协同逻辑,见 aps.py 顶部注释。
+# arxiv 跟 aps 同模式 — 30 篇 → 60 线程 → 蓝屏,所以一并回退。
+# 现在只做两件事:抓文 + LLM 总结(同步、零后台线程)。
+# 关键词由 LLM 在 prompt 里一次性输出,主流程不解析。
+# ============================================================
 
 
 # ============================================================
@@ -151,22 +158,10 @@ def generate_daily_summary_arxiv() -> str:
     if not papers:
         return "未找到论文列表，请稍后重试。"
 
-    # 2026-09-02 P0.6:异步落库(不阻塞 LLM 总结,失败不抛)
-    for p in papers:
-        save_summary_item_async(
-            paper_id=p["id"],
-            source="arxiv_daily",
-            title=p["title"],
-            authors=p.get("authors"),
-            abstract=p.get("abstract"),
-        )
-        # 2026-09-02 协同:后台线程 LLM 提关键词 + update + 重嵌(独立线程,跟 save 并行)
-        update_keywords_for_paper_async(
-            paper_id=p["id"],
-            source="arxiv_daily",
-            title=p["title"],
-            abstract=p.get("abstract", ""),
-        )
+    # 2026-09-02 P0.9 彻底回退:不做任何后台落库/关键词提取,只走 LLM 总结(同步、单线程)。
+    # 关键词由 prompt 要求 LLM 在每篇亮点论文里输出"**关键词**:"行,主流程不解析。
+    # 之前 P0.6 协同:每篇 paper 独立后台线程 → 30 篇 60 线程 → Windows 蓝屏。
+    # 见模块顶部注释 + aps.py 同名函数。
 
     papers_text = ""
     for i, p in enumerate(papers, 1):
@@ -190,6 +185,7 @@ def generate_daily_summary_arxiv() -> str:
         - **核心贡献**：用 2-3 句话概括论文的主要创新点
         - **方法**：简述使用的方法或技术路线（50字左右）
         - **意义与展望**：该工作的潜在影响或后续研究方向（40字左右）
+        - **关键词**：5-8 个英文关键词，逗号分隔（用于后续检索/分类；不要翻译，保持英文原词）
     4. **输出格式**：使用清晰 Markdown 格式（### 小标题、- 列表等）。总字数在50000字符以内。
 
     论文列表：
