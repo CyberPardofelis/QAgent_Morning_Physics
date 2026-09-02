@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QWidget, QHBoxLayout, QPushButton, QMessageBox
 )
 from PySide6.QtGui import QFont
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import get_stylesheet
 from agent.tools import update_full_paper, update_paper_comment
 
 
@@ -16,7 +16,7 @@ class PaperEditDialog(QDialog):
         self.paper_id = article.get("paper_id")
         self.setWindowTitle(f"论文详情 - {self.paper_id}")
         self.setMinimumSize(850, 750)
-        self.setStyleSheet(GLOBAL_STYLESHEET)  # 应用全局样式
+        self.setStyleSheet(get_stylesheet())  # 2026-09-02 改:用 get_stylesheet() 跟主题
 
         # 主布局
         main_layout = QVBoxLayout(self)

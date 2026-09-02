@@ -72,3 +72,36 @@ class Config:
     @staticmethod
     def set_embedding_enabled(value: bool) -> None:
         Config._settings().setValue("EMBEDDING_ENABLED", bool(value))
+
+    # ---------- chroma 向量库（P0，2026-09-02 起） ----------
+    @staticmethod
+    def get_chroma_path() -> str:
+        """chroma 持久化目录。默认 data/chroma_db"""
+        v = Config._settings().value("chroma_path", "")
+        return v if v else "data/chroma_db"
+
+    @staticmethod
+    def set_chroma_path(value: str) -> None:
+        Config._settings().setValue("chroma_path", value)
+
+    @staticmethod
+    def get_chroma_collection() -> str:
+        """默认 papers collection。后续 P2.5/P6 会加 paper_keywords / survey_sections"""
+        v = Config._settings().value("chroma_collection", "")
+        return v if v else "papers"
+
+    @staticmethod
+    def set_chroma_collection(value: str) -> None:
+        Config._settings().setValue("chroma_collection", value)
+
+    @staticmethod
+    def get_chroma_embedding_model_path() -> str:
+        """chroma 用的 embedding function 本地路径。默认 D:\\pythonProject\\BGE_Large_en_v1.5
+        （已下好的 bge-large-en-v1.5，避免 chroma 默认 80MB onnx 下载）
+        改这个值会触发重新建索引（dim 不一样），需要清空 data/chroma_db。"""
+        v = Config._settings().value("chroma_embedding_model_path", "")
+        return v if v else r"D:\pythonProject\BGE_Large_en_v1.5"
+
+    @staticmethod
+    def set_chroma_embedding_model_path(value: str) -> None:
+        Config._settings().setValue("chroma_embedding_model_path", value)

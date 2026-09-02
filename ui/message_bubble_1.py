@@ -249,25 +249,34 @@ class MessageBubble(QWidget):
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self._flush_complete_lines)
 
-        # v9 补:hardcode 气泡颜色(QAgent 原本特色,user 蓝/assistant 白/system 灰)
-        # SAgent 的 setProperty("kind") 主题在 QAgent 不生效(styles.py 没对应 QSS),
-        # 直接 hardcode setStyleSheet 给气泡上色
+        # 2026-09-02 改(抄 WAgent 主题系统):不再 hardcode 气泡颜色,
+        # 用 setProperty("kind", "bubble-xxx") 让 styles.py 里的 [kind="bubble-xxx"] QSS 规则接管
+        # (走 {bubble_user_bg}/{bubble_assistant_bg}/{bubble_system_bg} token,切主题时气泡跟主题走)
         if role == 'user':
-            self.setStyleSheet("background-color: #77aaff; border-radius: 10px; border: none;")
             text_color = "white"
         elif role == 'assistant':
-            self.setStyleSheet("background-color: white; border-radius: 10px; border: none;")
             text_color = "black"
         else:
-            self.setStyleSheet("background-color: #e9ecef; border-radius: 10px; border: none;")
             text_color = "#495057"
-        # 保留 setProperty 给未来主题切换用
+        # kind property 让全局 QSS 接管背景色
         self.setProperty("kind", f"bubble-{role}")
+        # bubble QSS 已经设了 border-radius: 10px; border: none
+        # 但没设 WA_StyledBackground,需要显式开
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
         self.view = MarkdownView(self)
         self.view.setStyleSheet("background: transparent;")
         if markdown_text:
             self.view.setMarkdown(markdown_text)
+        # 2026-09-02 修:系统消息(欢迎/启动提示)文字不居中 —
+        # body { text-align: center } CSS 在 QTextBrowser 不稳;
+        # widget 级 setAlignment 会被后续 setMarkdown 重置,
+        # 所以**必须在 setMarkdown 之后**再设。同时加文档级 setDefaultTextOption 兜底
+        # (后者对 QTextDocument 走 HTML setHtml 路径更稳,前者对 setMarkdown 路径稳)。
+        if role == 'system':
+            self.view.setAlignment(Qt.AlignCenter)
+            from PySide6.QtGui import QTextOption as _QTextOption
+            self.view.document().setDefaultTextOption(_QTextOption(Qt.AlignCenter))
         # v9 补:setHtmlStyle 给 view 文字色(QAgent 原本特色)
         if role == 'system':
             text_css = f"body {{ color: {text_color}; text-align: center; }} h1,h2,h3,h4,h5,h6 {{ color: {text_color} !important; }}"
@@ -386,6 +395,7 @@ class MessageBubble(QWidget):
     def replace_content(self, new_text: str):
         self.full_text = new_text
         self.view.setMarkdown(new_text)
+        self._apply_alignment_if_system()  # 2026-09-02 加:setMarkdown 会重置 alignment
         self.is_final = True
         self._line_buffer = ""
         self._complete_lines = []
@@ -394,6 +404,7 @@ class MessageBubble(QWidget):
     def set_content(self, new_text: str):
         self.full_text = new_text
         self.view.setMarkdown(new_text)
+        self._apply_alignment_if_system()  # 2026-09-02 加:setMarkdown 会重置 alignment
         self.update_timer.stop()
 
     def _flush_complete_lines(self):
@@ -409,7 +420,13 @@ class MessageBubble(QWidget):
         safe_chunk = self._preprocess(chunk)
         self.full_text += safe_chunk
         self.view.setMarkdown(self.full_text)
+        self._apply_alignment_if_system()  # 2026-09-02 加:setMarkdown 会重置 alignment
         self.update_timer.stop()
+
+    def _apply_alignment_if_system(self):
+        """2026-09-02 加:setMarkdown 会重置 QTextBrowser 的 alignment,system 气泡需每帧重设"""
+        if self.role == 'system':
+            self.view.setAlignment(Qt.AlignCenter)
 
     def _preprocess(self, text: str) -> str:
         lines = text.split('\n')
@@ -448,4 +465,5 @@ class MessageBubble(QWidget):
         if self._complete_lines:
             self._flush_complete_lines()
         self.view.setMarkdown(self.full_text)
+        self._apply_alignment_if_system()  # 2026-09-02 加:setMarkdown 会重置 alignment
         QTimer.singleShot(100, self._update_max_width)

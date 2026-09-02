@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QStatusBar, QTabWidget, QWidget, QSplitter, QTreeWidget, QTreeWidgetItem,
 )
 
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import get_stylesheet
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,8 @@ class MemoryViewerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("记忆库")
         self.setMinimumSize(1100, 750)
-        self.setStyleSheet(GLOBAL_STYLESHEET)
+        # 2026-09-02 改:用 get_stylesheet() 跟主题(切主题时刷新)
+        self.setStyleSheet(get_stylesheet())
         self._processor = None  # lazy
 
         # ============================================================
@@ -153,7 +154,8 @@ class MemoryViewerDialog(QDialog):
             "只有通过 LLM 抽取的记忆才会出现在这里。"
         )
         tip.setWordWrap(True)
-        tip.setStyleSheet("color: gray; padding: 4px;")
+        # 2026-09-02 改:用 role="muted" 走主题 token,不再硬编码 gray
+        tip.setProperty("role", "muted")
         v.addWidget(tip)
 
         # 刷新按钮

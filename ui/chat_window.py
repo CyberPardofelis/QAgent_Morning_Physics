@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QMessageBox, QScrollArea, QSizePolicy, QCheckBox
 )
 from agent.history_manager import Conversation
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import get_stylesheet
 from ui.message_bubble_1 import MessageBubble
 from ui.settings_dialog import SettingsDialog
 from ui.group_prompt_dialog import GroupSystemPromptDialog
@@ -27,7 +27,9 @@ class ChatWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("LLM科研助手: 早上好，物理学")
         self.setMinimumSize(1200, 800)
-        self.setStyleSheet(GLOBAL_STYLESHEET)
+        # 2026-09-02 改:用 get_stylesheet() 而非 GLOBAL_STYLESHEET,让首启动就用用户保存的主题
+        # (main.py 的 apply_current_theme 在 ChatWindow 创建前调用,无法影响 ChatWindow 自己)
+        self.setStyleSheet(get_stylesheet())
 
         self.controller = ConversationController(self)
         # 当前显示的对话 ID（所有 controller signal 进来时按这个过滤）
@@ -101,9 +103,18 @@ class ChatWindow(QMainWindow):
 
         # 菜单栏
         menubar = self.menuBar()
-        settings_action = QAction("首选项", self)
-        settings_action.triggered.connect(self.open_settings_dialog)
-        menubar.addAction(settings_action)
+        # 2026-09-02 改:原"首选项" 单 action(8 个 tab 全塞一个 dialog,太繁杂)
+        # 拆成"设置"下拉菜单,2 项:
+        #   - 首选项:    字体 / LLM API / 搜索服务 / 系统提示词 / 数据状态
+        #   - 期刊与论文: 期刊设置 / Embedding / 每日总结范围
+        # 模板参考 SAgent ui/chat_window.py L257-267 的 system_menu 模式
+        settings_menu = menubar.addMenu("设置")
+        pref_action = QAction("首选项", self)
+        pref_action.triggered.connect(self.open_preferences_dialog)
+        settings_menu.addAction(pref_action)
+        journal_paper_action = QAction("期刊与论文", self)
+        journal_paper_action.triggered.connect(self.open_journal_paper_dialog)
+        settings_menu.addAction(journal_paper_action)
 
         search_action = QAction("知识库", self)
         search_action.triggered.connect(self.open_knowledge_base)
@@ -132,8 +143,10 @@ class ChatWindow(QMainWindow):
         self.controller.update_regenerate_button.connect(
             self.input_panel.regenerate_btn.setEnabled
         )
+        # 2026-09-02 改(抄 WAgent):update_stop_button 直接切 send_stop_btn 的 streaming 态
+        # 旧版本: input_panel.stop_btn.setEnabled(独立"中止"按钮)
         self.controller.update_stop_button.connect(
-            self.input_panel.stop_btn.setEnabled
+            self.input_panel.set_streaming_state
         )
         self.controller.update_send_input.connect(
             self.input_panel.set_input_enabled
@@ -279,18 +292,48 @@ class ChatWindow(QMainWindow):
         from ui.knowledge_base_dialog import KnowledgeBaseDialog
         dialog = KnowledgeBaseDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        # 2026-09-02 修:必须保存到 self 上,否则 show() 后函数返回,Python GC 立即把
+        # dialog 引用清掉 → C++ widget 全释放 → 后续任何访问都 RuntimeError
+        # (抄 WAgent/SAgent 模式)
+        self._knowledge_base_dialog = dialog
         dialog.show()
 
     def open_memory_viewer(self):
         from ui.memory_viewer_dialog import MemoryViewerDialog
         dialog = MemoryViewerDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._memory_viewer_dialog = dialog
         dialog.show()
 
     def open_settings_dialog(self):
+        """2026-09-02 旧入口,保留兼容(group_prompt_dialog / 其他模块可能还在用)
+        新入口:open_preferences_dialog / open_journal_paper_dialog"""
         dialog = SettingsDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.default_prompt_changed.connect(self.on_default_prompt_changed)
+        self._settings_dialog = dialog
+        dialog.show()
+
+    def open_preferences_dialog(self):
+        """2026-09-02 加:打开"首选项"子 dialog(通用类:LLM API / 搜索 / 提示词 / 数据状态)"""
+        # tab_filter 顺序就是 tab 顺序
+        dialog = SettingsDialog(
+            self,
+            tab_filter=["首选项", "LLM API", "搜索服务", "系统提示词", "数据状态"],
+        )
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.default_prompt_changed.connect(self.on_default_prompt_changed)
+        self._settings_dialog = dialog
+        dialog.show()
+
+    def open_journal_paper_dialog(self):
+        """2026-09-02 加:打开"期刊与论文"子 dialog(QAgent 专属 3 个 tab)"""
+        dialog = SettingsDialog(
+            self,
+            tab_filter=["期刊设置", "Embedding 设置", "每日总结范围"],
+        )
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._settings_dialog = dialog
         dialog.show()
 
     def on_default_prompt_changed(self, new_prompt):

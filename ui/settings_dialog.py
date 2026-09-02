@@ -31,7 +31,10 @@ from agent.infra.api_keys import (
 )
 from agent.infra.db import health_check
 from agent.llm_clients import reset_client_cache
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import (
+    get_stylesheet, list_themes, set_theme,
+    get_current_theme_name, load_user_themes, get_theme,
+)
 
 # 数据根目录（与 agent.infra.db._data_root() 一致）
 _DATA_ROOT = Path("data").resolve()
@@ -40,16 +43,34 @@ _DATA_ROOT = Path("data").resolve()
 class SettingsDialog(QDialog):
     default_prompt_changed = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, tab_filter=None):
+        """
+        2026-09-02 加 tab_filter 参数:让同一个 dialog 类支持 2 个子 dialog
+        (主菜单"设置"下拉里的"首选项" / "期刊与论文")。
+
+        用法:
+            SettingsDialog()                              # 显示全部 8 个 tab(旧行为,保留兼容)
+            SettingsDialog(tab_filter=["首选项", "LLM API", "搜索服务", "系统提示词", "数据状态"])
+            SettingsDialog(tab_filter=["期刊设置", "Embedding 设置", "每日总结范围"])
+
+        tab_filter 里 tab 名跟 self._TAB_ORDER 里的 key 一一对应。
+        """
         super().__init__(parent)
+        self._tab_filter = tab_filter  # None = 显示全部
+        # 2026-09-02 加:tab 名 → (widget 构造 callable) 映射,顺序就是显示顺序
+        # 集中管理,加新 tab 只改这一处 + 写 builder
+        self._TAB_BUILDERS: list = []  # 后面组装
         self.setWindowTitle("设置")
         self.setMinimumSize(720, 620)
-        self.setStyleSheet(GLOBAL_STYLESHEET)
+        # 2026-09-02 改:用 get_stylesheet() 跟主题
+        self.setStyleSheet(get_stylesheet())
+        # 2026-09-02 改(抄 WAgent):解除与主窗口的父子关系 → Z 序独立,避免父对象 close 时自动 delete
+        self.setParent(None)
 
         main_layout = QVBoxLayout(self)
-        tab_widget = QTabWidget()
-        tab_widget.setDocumentMode(True)
-        main_layout.addWidget(tab_widget)
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setDocumentMode(True)
+        main_layout.addWidget(self.tab_widget)
 
         # ----- 1. 首选项（仅字体） -----
         pref_tab = QWidget()
@@ -57,22 +78,70 @@ class SettingsDialog(QDialog):
         form_layout = QFormLayout()
         form_layout.setSpacing(10)
 
+        # tab_filter 为 None 时显示全部,否则只显示 filter 里的 tab
+        if tab_filter is not None:
+            # 调整窗口标题 + 尺寸提示(子 dialog 比全集小)
+            # 2026-09-02 v2 改:标题用菜单项同名("首选项" / "期刊与论文"),比"设置 - 首选项"直观
+            # v3 修:用 == 严格匹配(不能用 issubset,否则部分 filter 会被错判为全集子集)
+            if tab_filter == ["首选项", "LLM API", "搜索服务", "系统提示词", "数据状态"]:
+                self.setWindowTitle("首选项")
+            elif tab_filter == ["期刊设置", "Embedding 设置", "每日总结范围"]:
+                self.setWindowTitle("期刊与论文")
+            else:
+                self.setWindowTitle(f"设置({','.join(tab_filter)})")
+            self.setMinimumSize(640, 520)
+
+        # 主题下拉(实时切换) — 2026-09-02 加(抄 WAgent 主题系统)
+        theme_row = QHBoxLayout()
+        self.theme_combo = QComboBox()
+        self._populate_theme_combo()
+        self.theme_combo.setCurrentIndex(
+            max(0, self.theme_combo.findData(get_current_theme_name()))
+        )
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        theme_row.addWidget(self.theme_combo, stretch=1)
+
+        # ➕ 自定义主题按钮
+        self.new_theme_btn = QPushButton("➕ 自定义…")
+        self.new_theme_btn.setToolTip("新建/管理自定义主题 (从 8 个核心色派生整套配色)")
+        self.new_theme_btn.clicked.connect(self._on_new_theme)
+        theme_row.addWidget(self.new_theme_btn)
+
+        # ⚙ 编辑当前主题 (只对 user: 主题显示)
+        if get_current_theme_name().startswith("user:"):
+            edit_btn = QPushButton("⚙ 编辑")
+            edit_btn.clicked.connect(self._on_edit_current)
+            theme_row.addWidget(edit_btn)
+
+        form_layout.addRow("主题:", theme_row)
+
         self.font_size_combo = QComboBox()
         self.font_size_combo.addItems(["10px", "11px", "12px", "13px", "14px", "15px", "16px"])
         self.font_size_combo.setCurrentText("14px")
         form_layout.addRow("全局字体大小:", self.font_size_combo)
         pref_layout.addLayout(form_layout)
         pref_layout.addStretch()
-        tab_widget.addTab(pref_tab, "首选项")
+        # 2026-09-02 改:widget 始终构造(因 _load_config 等会读 self.xxx 属性),
+        # 只在 addTab 时按 tab_filter 过滤
+        if self._should_show("首选项"):
+            self.tab_widget.addTab(pref_tab, "首选项")
 
         # ----- 2. LLM API -----
-        tab_widget.addTab(self._build_llm_tab(), "LLM API")
+        llm_tab = self._build_llm_tab()  # 始终构造,因 _load_config 读 self.deepseek_api_key 等
+        if self._should_show("LLM API"):
+            self.tab_widget.addTab(llm_tab, "LLM API")
 
         # ----- 3. 搜索服务 -----
-        tab_widget.addTab(self._build_search_tab(), "搜索服务")
+        search_tab = self._build_search_tab()  # 始终构造,_load_config 读 self.bocha_api_key 等
+        if self._should_show("搜索服务"):
+            self.tab_widget.addTab(search_tab, "搜索服务")
 
         # ----- 4. 系统提示词 -----
-        prompt_tab = QWidget()
+        # 2026-09-02 改:给所有可能被隐藏的 tab widget 加 self 作 parent,
+        # 防止 tab_filter 不包含时,本地变量 embed_tab 出 __init__ 作用域被 GC,
+        # 连带其下 QCheckBox/QLineEdit 等 C++ 一起被释放(就是 accept() 撞
+        # "QCheckBox already deleted" 的根因)。
+        prompt_tab = QWidget(self)
         prompt_layout = QVBoxLayout(prompt_tab)
         info_label = QLabel("设置默认系统提示词（将作为所有新对话的初始系统提示，分组可单独覆盖）")
         info_label.setWordWrap(True)
@@ -84,13 +153,16 @@ class SettingsDialog(QDialog):
         reset_btn.clicked.connect(self.reset_default_prompt)
         prompt_layout.addWidget(reset_btn)
         prompt_layout.addStretch()
-        tab_widget.addTab(prompt_tab, "系统提示词")
+        if self._should_show("系统提示词"):
+            self.tab_widget.addTab(prompt_tab, "系统提示词")
 
         # ----- 5. 数据状态 -----
-        tab_widget.addTab(self._build_db_tab(), "数据状态")
+        db_tab = self._build_db_tab()  # 始终构造(用 self.db_status_text)
+        if self._should_show("数据状态"):
+            self.tab_widget.addTab(db_tab, "数据状态")
 
         # ----- 6. 期刊设置（QAgent 专属） -----
-        journal_tab = QWidget()
+        journal_tab = QWidget(self)
         journal_layout = QVBoxLayout(journal_tab)
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -103,10 +175,11 @@ class SettingsDialog(QDialog):
         self.journal_section_inputs = {}
         self._create_journal_inputs()
         journal_layout.addStretch()
-        tab_widget.addTab(journal_tab, "期刊设置")
+        if self._should_show("期刊设置"):
+            self.tab_widget.addTab(journal_tab, "期刊设置")
 
         # ----- 7. Embedding 设置（QAgent 专属） -----
-        embed_tab = QWidget()
+        embed_tab = QWidget(self)
         embed_layout = QVBoxLayout(embed_tab)
         embed_form = QFormLayout()
         embed_form.setSpacing(10)
@@ -127,10 +200,11 @@ class SettingsDialog(QDialog):
         embed_form.addRow("向量存储目录:", self.vector_dir)
         embed_layout.addLayout(embed_form)
         embed_layout.addStretch()
-        tab_widget.addTab(embed_tab, "Embedding 设置")
+        if self._should_show("Embedding 设置"):
+            self.tab_widget.addTab(embed_tab, "Embedding 设置")
 
         # ----- 8. 每日总结范围（QAgent 专属） -----
-        daily_scope_tab = QWidget()
+        daily_scope_tab = QWidget(self)
         daily_scope_layout = QVBoxLayout(daily_scope_tab)
         daily_scroll = QScrollArea()
         daily_scroll.setWidgetResizable(True)
@@ -141,7 +215,8 @@ class SettingsDialog(QDialog):
         self.daily_checkboxes = {}
         self._populate_daily_checkboxes(daily_content_layout)
         daily_scope_layout.addStretch()
-        tab_widget.addTab(daily_scope_tab, "每日总结范围")
+        if self._should_show("每日总结范围"):
+            self.tab_widget.addTab(daily_scope_tab, "每日总结范围")
 
         # 底部按钮
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -150,10 +225,21 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(button_box)
 
         # 加载所有配置
+        # 2026-09-02 加:WAgent 主题系统 — 启动时从 data/themes.json 加载用户自定义主题
+        load_user_themes()
         self._load_config()
         self._load_journals_config()
         self._load_font_size()
         self._refresh_db_status()
+
+    # ============================================================
+    # 2026-09-02 加:tab_filter helper
+    # ============================================================
+    def _should_show(self, tab_name: str) -> bool:
+        """tab_filter 为 None 时全部显示;否则只在 list 里才显示。"""
+        if self._tab_filter is None:
+            return True
+        return tab_name in self._tab_filter
 
     # ============================================================
     # LLM API Tab
@@ -222,7 +308,8 @@ class SettingsDialog(QDialog):
             "可换模型：MiniMax-M3、MiniMax-VL-01 等。"
         )
         mm_hint.setWordWrap(True)
-        mm_hint.setStyleSheet("color: #888;")
+        # 2026-09-02 改:用 role="muted" 走全局 QSS 里的 text_muted token,跟主题走
+        mm_hint.setProperty("role", "muted")
         mm_hint.setMinimumHeight(43)  # 跟 QLineEdit 等高,避免 hint 行被压扁
         mm_layout.addRow("", mm_hint)
         # 给 MiniMax 三个输入框强制更高的 min-height + 缩小圆角,
@@ -292,7 +379,8 @@ class SettingsDialog(QDialog):
         ddg_note = QLabel(
             "<b>DuckDuckGo</b>：无需配置 key，国内访问可能超时，仅作保底。"
         )
-        ddg_note.setStyleSheet("color: gray; font-size: 11px;")
+        # 2026-09-02 改:走主题 token
+        ddg_note.setProperty("role", "muted")
         ddg_note.setWordWrap(True)
         layout.addWidget(ddg_note)
 
@@ -350,11 +438,13 @@ class SettingsDialog(QDialog):
         layout.setSpacing(8)
 
         title = QLabel("数据库状态")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        # 2026-09-02 改:用 role="title" 走主题 — font-weight 走 QSS,font-size 跟随全局
+        title.setProperty("role", "title")
         layout.addWidget(title)
 
         path_label = QLabel(f"数据目录: {_DATA_ROOT}")
-        path_label.setStyleSheet("color: gray; font-size: 11px;")
+        # 2026-09-02 改:走主题 muted token
+        path_label.setProperty("role", "muted")
         layout.addWidget(path_label)
 
         check_btn = QPushButton("立即检查")
@@ -381,6 +471,21 @@ class SettingsDialog(QDialog):
                         f"✅ {name}: {info['size_bytes'] / 1024:.1f} KB, "
                         f"{info['table_count']} 张表"
                     )
+            # chroma 向量库状态（2026-09-02 P0 新增）
+            try:
+                from agent.vector_db import health_check as chroma_health_check
+                cinfo = chroma_health_check()
+                lines.append("")
+                lines.append("—— 向量库（chroma，P0）——")
+                if not cinfo.get("exists"):
+                    lines.append("⚪ chroma: 目录未创建（首次检索时自动建）")
+                else:
+                    lines.append(f"✅ chroma path: {cinfo['path']}")
+                    lines.append(f"   collection: {cinfo['collection']}")
+                    lines.append(f"   sqlite: {cinfo.get('sqlite_size_kb', 0):.1f} KB")
+                    lines.append(f"   embedding: {Path(cinfo['embedding_model']).name}")
+            except Exception as ce:
+                lines.append(f"❌ chroma 检查失败: {ce}")
             self.db_status_text.setPlainText("\n".join(lines))
         except Exception as e:
             self.db_status_text.setPlainText(f"检查失败: {e}")
@@ -470,6 +575,51 @@ class SettingsDialog(QDialog):
         font_size = settings.value("font_size", "14px")
         if isinstance(font_size, str) and font_size:
             self.font_size_combo.setCurrentText(font_size)
+
+    # ============================================================
+    # 主题(2026-09-02 加,抄 WAgent 主题系统)
+    # ============================================================
+    def _populate_theme_combo(self):
+        """填主题下拉: builtin 优先, 然后 user 自定义"""
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        for theme in list_themes():
+            marker = " ✦" if not theme.builtin else ""
+            self.theme_combo.addItem(theme.display_name + marker, theme.name)
+        self.theme_combo.blockSignals(False)
+
+    def _on_theme_changed(self, _index: int):
+        """主题下拉变化:实时切换 + 持久化。"""
+        name = self.theme_combo.currentData()
+        if not name:
+            return
+        set_theme(name, persist=True)
+
+    def _on_new_theme(self):
+        """打开主题编辑器(新建模式)"""
+        from ui.theme_editor import ThemeEditorDialog
+        dlg = ThemeEditorDialog(self)
+        dlg.theme_saved.connect(self._on_theme_editor_saved)
+        dlg.exec()
+
+    def _on_edit_current(self):
+        """编辑当前正在用的主题(只对 user: 主题有效)"""
+        current = get_current_theme_name()
+        if not current.startswith("user:"):
+            return
+        from ui.theme_editor import ThemeEditorDialog
+        dlg = ThemeEditorDialog(self, edit_theme_name=current)
+        dlg.theme_saved.connect(self._on_theme_editor_saved)
+        dlg.exec()
+
+    def _on_theme_editor_saved(self):
+        """主题编辑器保存/删除后: 刷新下拉 + 当前选择"""
+        self._populate_theme_combo()
+        idx = self.theme_combo.findData(get_current_theme_name())
+        if idx >= 0:
+            self.theme_combo.blockSignals(True)
+            self.theme_combo.setCurrentIndex(idx)
+            self.theme_combo.blockSignals(False)
 
     def _load_config(self):
         settings = get_settings()

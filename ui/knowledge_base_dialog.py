@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QMessageBox, QLabel
 )
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import get_stylesheet
 from agent.tools import query_knowledge, get_paper_by_id, get_recent_papers_raw
 from ui.paper_edit_dialog import PaperEditDialog
 
@@ -13,7 +13,8 @@ class KnowledgeBaseDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("论文知识库")
         self.setMinimumSize(1000, 700)
-        self.setStyleSheet(GLOBAL_STYLESHEET)
+        # 2026-09-02 改:用 get_stylesheet() 跟主题
+        self.setStyleSheet(get_stylesheet())
         # 主布局
         layout = QVBoxLayout(self)
 

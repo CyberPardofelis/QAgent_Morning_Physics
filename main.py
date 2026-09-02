@@ -212,6 +212,15 @@ if __name__ == "__main__":
     # 全局字体
     _apply_user_settings(app)
 
+    # 2026-09-02 加:WAgent 主题系统 — 启动时加载用户自定义主题 + 应用上次保存的主题
+    # (必须在 ChatWindow 之前,否则 ChatWindow 会用默认 light 覆盖)
+    try:
+        from ui.styles import load_user_themes, apply_current_theme
+        load_user_themes()
+        apply_current_theme(app)
+    except Exception as e:
+        print(f"[main] 主题系统初始化失败(非致命,已忽略): {e}", flush=True)
+
     # === Qt 标准退出钩子 ===
     app.aboutToQuit.connect(_cleanup_on_quit)
 

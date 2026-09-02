@@ -2,13 +2,17 @@
 #
 # 结构（外层垂直布局）：
 #   1. 附件 chip 横滚条（无附件时高度=0 完全隐藏）
-#   2. + 按钮 | 输入框 | 发送按钮 / (中止 + 重新生成)  水平行
+#   2. + 按钮 | 输入框 | 发送/停止(合并) | 重新生成  水平行
 #
 # 行为：
 #   - Enter 发送 / Shift+Enter 换行（保留 QAgent 行为）
 #   - 输入框高度随行数自动撑高（2~8 行，保留 QAgent 行为）
 #   - 附件文本懒加载：on_send_clicked 时才 extract_text（读 PDF/Word/文本）
 #   - 附件元数据（name/size/path）存历史；content 仅临时给 LLM
+#   - 2026-09-02 改(抄 WAgent 模式):
+#     * 发送 + 停止合并为 send_stop_btn(WAgent 二态按钮, idle="发送" / streaming="停止")
+#     * + 按钮改用 _AttachButton 自绘 QPainter 几何居中
+#     * 语音输入按钮未加入(用户拍板"暂时不加入这个功能")
 from __future__ import annotations
 
 import os
@@ -17,6 +21,7 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt, QTimer, QEvent, QSettings
 from config.settings import get_settings
+from PySide6.QtGui import QPainter, QPen, QPalette
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPlainTextEdit,
     QPushButton, QSizePolicy, QToolButton, QScrollArea,
@@ -56,6 +61,41 @@ class AttachmentItem:
         return f"{b / 1024 / 1024:.1f} MB"
 
 
+class _AttachButton(QToolButton):
+    """附件 + 按钮:用 QPainter 自绘一个完美居中的 + 号。
+
+    2026-09-02 抄自 WAgent — 之前 QAgent 直接 setText("+") 在 36x36 按钮里
+    因为字符 baseline 偏下导致视觉中心下沉。QPainter 画两条直线可以从几何上保证中心对齐。
+    颜色跟着 QSS 的 QPalette.ButtonText 走(hover/pressed/disabled 都自动适配)。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 不画文字(QSS 里也不再有 font-size/weight)
+        self.setText("")
+
+    def paintEvent(self, event):
+        # super 画背景、边框、圆角、hover 高亮(QSS 驱动)
+        super().paintEvent(event)
+        # 自绘 + 号
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # PySide6 访问方式:QPalette.ColorRole.ButtonText
+        color = self.palette().color(QPalette.ColorRole.ButtonText)
+        pen = QPen(color)
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        r = self.rect()
+        cx, cy = r.width() / 2, r.height() / 2
+        # 离边框留 9px,画一个对称的 +
+        margin = 9
+        L = min(r.width(), r.height()) / 2 - margin
+        painter.drawLine(int(cx - L), int(cy), int(cx + L), int(cy))
+        painter.drawLine(int(cx), int(cy - L), int(cx), int(cy + L))
+        painter.end()
+
+
 class _AttachmentChip(QWidget):
     """单个附件 chip：图标 + 文件名 + 关闭 ×"""
     closed = None  # 回调：fn(self) -> None
@@ -84,13 +124,10 @@ class _AttachmentChip(QWidget):
         layout.addWidget(self.name_label)
         layout.addWidget(self.close_btn)
 
-        self.setStyleSheet(
-            "QWidget {"
-            "  background-color: #f1f5f9;"
-            "  border: 1px solid #e2e8f0;"
-            "  border-radius: 14px;"
-            "}"
-        )
+        # 2026-09-02 改:用 objectName 让 styles.py 里 #attachmentChip 规则接管
+        # (走 {bg_chip}/{border} token,跟主题走,不再 hardcode 灰)
+        self.setObjectName("attachmentChip")
+
         if item.error:
             self.name_label.setProperty("state", "error")
             self.setToolTip(item.error)
@@ -139,6 +176,14 @@ class InputPanel(QWidget):
         # 附件列表
         self._attachments: List[AttachmentItem] = []
 
+        # === 2026-09-02 加(抄 WAgent):send_stop_btn 二态状态 ===
+        self._is_streaming = False         # LLM 是否在 streaming
+        self._input_enabled = True         # 输入框是否允许编辑(attach_btn/输入框联动)
+        # 旧字段兼容: send_btn/stop_btn 是 send_stop_btn 的别名,避免外部代码 break
+        # (chat_window.py 已经切到新方法,这些 alias 仅供旧代码兜底)
+        self.send_btn = self.send_stop_btn
+        self.stop_btn = self.send_stop_btn
+
     # ---------------- UI ----------------
     def _setup_ui(self):
         # 外层垂直布局：上面 chip 区，中间 +按钮 / 输入框 / 按钮 的水平行
@@ -168,9 +213,8 @@ class InputPanel(QWidget):
         input_layout = QHBoxLayout()
         input_layout.setSpacing(8)
 
-        # + 按钮
-        self.attach_btn = QToolButton()
-        self.attach_btn.setText("+")
+        # + 按钮(自绘,几何居中 — 2026-09-02 抄 WAgent)
+        self.attach_btn = _AttachButton()
         self.attach_btn.setObjectName("attachBtn")
         self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.setToolTip("添加附件（支持 .docx / .pdf / .txt / .md）")
@@ -182,35 +226,46 @@ class InputPanel(QWidget):
         self.input_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.input_edit.setFixedHeight(self._INPUT_MIN_HEIGHT)
         self.input_edit.installEventFilter(self)
+        self.input_edit.textChanged.connect(self._on_input_text_changed)
 
-        self.send_btn = QPushButton("发送")
-        self.send_btn.setObjectName("sendBtn")
-
-        self.stop_btn = QPushButton("中止")
-        self.stop_btn.setObjectName("stopBtn")
-        self.stop_btn.setEnabled(False)
+        # === 2026-09-02 改(抄 WAgent): 合并"发送"和"停止"为一个 send_stop_btn ===
+        # 状态由 set_streaming_state() 切换:idle="发送" / streaming="停止"
+        # 初始禁用,等第一次 set_streaming_state(False) 才启用
+        # 2026-09-02 v2 改:objectName 改 "stopBtn" — styles.py 已有 #stopBtn 规则
+        #   (走 {danger}/{danger_hover} token),切主题时按钮红/深红跟主题走,
+        #   不再 inline 写死 #dc3545
+        self.send_stop_btn = QPushButton("发送")
+        self.send_stop_btn.setObjectName("stopBtn")
+        self.send_stop_btn.setEnabled(False)
 
         self.regenerate_btn = QPushButton("重新生成")
         self.regenerate_btn.setObjectName("regenerateBtn")
         self.regenerate_btn.setEnabled(False)
 
         button_layout = QVBoxLayout()
-        button_layout.addWidget(self.stop_btn)
+        button_layout.addWidget(self.send_stop_btn)
         button_layout.addWidget(self.regenerate_btn)
 
         input_layout.addWidget(self.attach_btn)
         input_layout.addWidget(self.input_edit)
-        input_layout.addWidget(self.send_btn)
         input_layout.addLayout(button_layout)
         outer.addLayout(input_layout)
 
     def _connect_signals(self):
         self.input_edit.textChanged.connect(self.adjust_input_height)
-        self.send_btn.clicked.connect(self.on_send_clicked)
-        self.stop_btn.clicked.connect(lambda: self.stop_clicked and self.stop_clicked())
+        # 2026-09-02 改:send_stop_btn 单按钮 — 根据 _is_streaming 切行为
+        self.send_stop_btn.clicked.connect(self._on_send_stop_clicked)
         self.regenerate_btn.clicked.connect(
             lambda: self.regenerate_clicked and self.regenerate_clicked()
         )
+
+    def _on_send_stop_clicked(self):
+        """2026-09-02 加:send_stop_btn 合并点击 — 根据 _is_streaming 派发"""
+        if self._is_streaming:
+            if self.stop_clicked:
+                self.stop_clicked()
+        else:
+            self.on_send_clicked()
 
     # ==================== 辅助 ====================
     def line_height(self):
@@ -382,6 +437,43 @@ class InputPanel(QWidget):
             self.send_clicked(text, attachments_meta)
 
     def set_input_enabled(self, enabled):
-        self.send_btn.setEnabled(enabled)
+        """
+        2026-09-02 改(抄 WAgent):只控制 input_edit + attach_btn 的 enable。
+        send_stop_btn 的 enable 由 set_streaming_state() + 内容有无共同决定。
+        """
+        self._input_enabled = enabled
         self.input_edit.setEnabled(enabled)
         self.attach_btn.setEnabled(enabled)
+        self._update_send_stop_btn()
+
+    def set_streaming_state(self, streaming: bool):
+        """
+        2026-09-02 加(抄 WAgent):切换 send_stop_btn 的二态。
+
+        - streaming=True  → 按钮变 "停止"(红色), enabled=True, 点击触发 stop_clicked
+        - streaming=False → 按钮变 "发送"(默认色), enabled 由 (input_enabled + 内容) 决定, 点击触发 send
+        """
+        self._is_streaming = streaming
+        self._update_send_stop_btn()
+
+    def _update_send_stop_btn(self):
+        """
+        2026-09-02 加(抄 WAgent):根据 _is_streaming / _input_enabled / 输入框内容刷新 send_stop_btn。
+        streaming 状态: 走全局 QSS 里 #stopBtn 规则 → {danger}/{danger_hover} 红色,文字"停止",强制 enabled
+        idle 状态: 默认 QPushButton 规则 → {accent} 蓝色,文字"发送",enabled = input_enabled AND (有文字 OR 有附件)
+        """
+        if self._is_streaming:
+            self.send_stop_btn.setText("停止")
+            self.send_stop_btn.setEnabled(True)
+            # objectName "stopBtn" 已设 → 全局 QSS 接管,颜色跟 {danger} 主题 token 走
+        else:
+            self.send_stop_btn.setText("发送")
+            has_text = bool(self.input_edit.toPlainText().strip())
+            has_attach = bool(self._attachments)
+            self.send_stop_btn.setEnabled(
+                self._input_enabled and (has_text or has_attach)
+            )
+
+    def _on_input_text_changed(self):
+        """2026-09-02 加:输入框文字变化 → 刷新 send_stop_btn enable 状态"""
+        self._update_send_stop_btn()

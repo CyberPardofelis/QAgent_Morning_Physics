@@ -53,6 +53,9 @@ class SettingsKeys:
     # 字体
     FONT_SIZE = "font_size"
 
+    # UI 主题(WAgent 主题系统: light / dark / paper / user:xxx)
+    UI_THEME = "ui_theme"
+
     # 聊天模式
     CHAT_MODEL_PARAMS = "chat_model_params"
     DAILY_SUMMARY_JOURNALS = "daily_summary_journals"
@@ -72,6 +75,11 @@ class SettingsKeys:
     MODEL_PATH = "MODEL_PATH"
     DATA_DIR = "DATA_DIR"
     VECTOR_DIR = "VECTOR_DIR"
+
+    # chroma 向量库（P0，2026-09-02 起）
+    CHROMA_PATH = "chroma_path"
+    CHROMA_COLLECTION = "chroma_collection"
+    CHROMA_EMBEDDING_MODEL_PATH = "chroma_embedding_model_path"
 
     # 分组设置（带 group_id 后缀）
     @staticmethod

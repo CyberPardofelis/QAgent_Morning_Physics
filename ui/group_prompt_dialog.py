@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QTextEdit, QHBoxLayout,
     QPushButton, QMessageBox
 )
-from ui.styles import GLOBAL_STYLESHEET
+from ui.styles import get_stylesheet
 
 class GroupSystemPromptDialog(QDialog):
     def __init__(self, group_id, group_name, parent=None):
@@ -13,7 +13,7 @@ class GroupSystemPromptDialog(QDialog):
         self.group_name = group_name
         self.setWindowTitle(f"设置系统提示词 - {group_name}")
         self.setMinimumSize(600, 400)
-        self.setStyleSheet(GLOBAL_STYLESHEET)  # 复用全局样式
+        self.setStyleSheet(get_stylesheet())  # 2026-09-02 改:用 get_stylesheet() 跟主题
 
         layout = QVBoxLayout(self)
 
