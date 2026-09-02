@@ -127,9 +127,21 @@ class ChatWindow(QMainWindow):
         journal_paper_action.triggered.connect(self.open_journal_paper_dialog)
         settings_menu.addAction(journal_paper_action)
 
-        search_action = QAction("知识库", self)
-        search_action.triggered.connect(self.open_knowledge_base)
-        menubar.addAction(search_action)
+        # 2026-09-02 改:原"知识库" 单 action → "知识库" 下拉菜单, 3 项:
+        #   - 论文摘要知识库: summary_items.db(粒度细, 抓文级 + LLM 关键词)
+        #   - 论文分析知识库: papers.db(粒度粗, 已精细分析的论文)
+        #   - 论文综述库:     surveys.db(主题 + 章节, 综述生成待 P6)
+        # 模板参考"设置"下拉菜单 L122-128 模式
+        knowledge_menu = menubar.addMenu("知识库")
+        summary_kb_action = QAction("论文摘要知识库", self)
+        summary_kb_action.triggered.connect(self.open_summary_kb)
+        knowledge_menu.addAction(summary_kb_action)
+        paper_kb_action = QAction("论文分析知识库", self)
+        paper_kb_action.triggered.connect(self.open_knowledge_base)
+        knowledge_menu.addAction(paper_kb_action)
+        survey_workspace_action = QAction("论文综述库", self)
+        survey_workspace_action.triggered.connect(self.open_survey_workspace)
+        knowledge_menu.addAction(survey_workspace_action)
 
         memory_action = QAction("记忆库", self)
         memory_action.triggered.connect(self.open_memory_viewer)
@@ -309,6 +321,22 @@ class ChatWindow(QMainWindow):
         self._knowledge_base_dialog = dialog
         dialog.show()
 
+    def open_summary_kb(self):
+        """论文摘要知识库(2026-09-02 加): summary_items.db, 抓文级 + LLM 关键词"""
+        from ui.summary_kb_dialog import SummaryKBDialog
+        dialog = SummaryKBDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._summary_kb_dialog = dialog
+        dialog.show()
+
+    def open_survey_workspace(self):
+        """论文综述库(2026-09-02 加): 主题/章节树 + 写作工作台"""
+        from ui.survey_workspace_dialog import SurveyWorkspaceDialog
+        dialog = SurveyWorkspaceDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._survey_workspace_dialog = dialog
+        dialog.show()
+
     def open_memory_viewer(self):
         from ui.memory_viewer_dialog import MemoryViewerDialog
         dialog = MemoryViewerDialog(self)
@@ -338,10 +366,12 @@ class ChatWindow(QMainWindow):
         dialog.show()
 
     def open_journal_paper_dialog(self):
-        """2026-09-02 加:打开"期刊与论文"子 dialog(QAgent 专属 3 个 tab)"""
+        """2026-09-02 加:打开"期刊与论文"子 dialog(QAgent 专属 4 个 tab)
+        v2 加"综述总结" tab(P0.7 成本控制 + 预留 P6 综述生成位置)
+        """
         dialog = SettingsDialog(
             self,
-            tab_filter=["期刊设置", "Embedding 设置", "每日总结范围"],
+            tab_filter=["期刊设置", "Embedding 设置", "每日总结范围", "综述总结"],
         )
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         self._settings_dialog = dialog

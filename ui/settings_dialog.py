@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QCheckBox,
     QComboBox, QDialogButtonBox, QLabel, QTabWidget, QWidget,
     QScrollArea, QTextEdit, QPushButton, QMessageBox, QGroupBox,
-    QHBoxLayout,
+    QHBoxLayout, QSpinBox,
 )
 from agent.infra.api_keys import (
     get_all_api_keys, set_api_key, has_api_key,
@@ -98,10 +98,13 @@ class SettingsDialog(QDialog):
             # 调整窗口标题 + 尺寸提示(子 dialog 比全集小)
             # 2026-09-02 v2 改:标题用菜单项同名("首选项" / "期刊与论文"),比"设置 - 首选项"直观
             # v3 修:用 == 严格匹配(不能用 issubset,否则部分 filter 会被错判为全集子集)
+            # v4 加:"期刊与论文" 支持 4 tab(含 2026-09-02 加的"综述总结")
             if tab_filter == ["首选项", "LLM API", "搜索服务", "系统提示词", "数据状态"]:
                 self.setWindowTitle("首选项")
-            elif tab_filter == ["期刊设置", "Embedding 设置", "每日总结范围"]:
+            elif tab_filter == ["期刊设置", "Embedding 设置", "每日总结范围", "综述总结"]:
                 self.setWindowTitle("期刊与论文")
+            elif tab_filter == ["期刊设置", "Embedding 设置", "每日总结范围"]:
+                self.setWindowTitle("期刊与论文")  # 兼容 3 tab 旧 filter
             else:
                 self.setWindowTitle(f"设置({','.join(tab_filter)})")
             self.setMinimumSize(640, 520)
@@ -250,6 +253,99 @@ class SettingsDialog(QDialog):
             self.tab_widget.addTab(daily_scope_tab, "每日总结范围")
         else:
             self._hidden_tabs["每日总结范围"] = daily_scope_tab  # 2026-09-02 v5:防 GC 释放
+
+        # ----- 9. 综述总结（2026-09-02 P0.7 加:成本控制 3 档 + ceiling）
+        # 综述生成功能(P6)待 ReAct 内核(P4)完成后再实现。
+        # 现在这里只放成本控制 3 档 UI:防止给课题组用时 token 爆钱。
+        survey_tab = QWidget()
+        survey_layout = QVBoxLayout(survey_tab)
+        survey_layout.setSpacing(12)
+
+        # ---- 顶部说明 ----
+        info = QLabel(
+            "<b>综述总结</b><br>"
+            "本 tab 当前承载 <b>成本控制 3 档</b>(P0.7, 2026-09-02):<br>"
+            "• <b>L0 静默</b>: 只本地检索/SQL/下载, 0 次 LLM 调用 — 适合查本地知识库<br>"
+            "• <b>L1 轻量</b>: + 单次 LLM 工具 (analyze_paper / save_memory 等) — 默认档<br>"
+            "• <b>L2 重型</b>: + ReAct 多轮 + 综述生成 (P4 / P6 阶段实现后才有) — 给个人用时<br><br>"
+            "切档位立即生效, 不需重启。下次 LLM 调用时按档位过滤可用工具。"
+        )
+        info.setWordWrap(True)
+        info.setProperty("role", "muted")
+        survey_layout.addWidget(info)
+
+        # ---- 成本档位 segmented ----
+        tier_group = QGroupBox("当前成本档位")
+        tier_layout = QVBoxLayout(tier_group)
+        self.cost_tier_combo = QComboBox()
+        self.cost_tier_combo.addItems([
+            "L0 (纯本地, 0 次 LLM)",
+            "L1 (单次 LLM, 默认)",
+            "L2 (重型多轮, 给个人用)",
+        ])
+        # QComboBox 数据用 "L0" / "L1" / "L2",UI 显示长描述
+        self.cost_tier_combo.setItemData(0, "L0")
+        self.cost_tier_combo.setItemData(1, "L1")
+        self.cost_tier_combo.setItemData(2, "L2")
+        tier_layout.addWidget(self.cost_tier_combo)
+        tier_hint = QLabel(
+            "注意: L2 默认开是给个人用户测方便。给课题组用时建议调到 L1。"
+        )
+        tier_hint.setWordWrap(True)
+        tier_hint.setProperty("role", "muted")
+        tier_layout.addWidget(tier_hint)
+        survey_layout.addWidget(tier_group)
+
+        # ---- 每日 ceiling ----
+        ceiling_group = QGroupBox("每日 LLM 调用上限")
+        ceiling_layout = QFormLayout(ceiling_group)
+        self.cost_ceiling_spin = QSpinBox()
+        self.cost_ceiling_spin.setRange(1, 9999)
+        self.cost_ceiling_spin.setSuffix(" 次/天")
+        ceiling_layout.addRow("上限:", self.cost_ceiling_spin)
+        ceiling_hint = QLabel(
+            "达到上限的 80% 时弹窗提醒, 100% 时硬阻断。明天 0 点自动重置。"
+        )
+        ceiling_hint.setWordWrap(True)
+        ceiling_hint.setProperty("role", "muted")
+        ceiling_layout.addRow("", ceiling_hint)
+        survey_layout.addWidget(ceiling_group)
+
+        # ---- 今日用量 + 重置 ----
+        usage_group = QGroupBox("今日用量")
+        usage_layout = QHBoxLayout(usage_group)
+        self.cost_usage_label = QLabel("今日已用: 0 / 0 次")
+        self.cost_usage_label.setProperty("role", "title")
+        usage_layout.addWidget(self.cost_usage_label)
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self._refresh_cost_usage)
+        usage_layout.addWidget(refresh_btn)
+        reset_btn = QPushButton("重置今日计数")
+        reset_btn.clicked.connect(self._reset_cost_usage)
+        usage_layout.addWidget(reset_btn)
+        usage_layout.addStretch()
+        survey_layout.addWidget(usage_group)
+
+        # ---- 综述生成 placeholder ----
+        # 等 P6 阶段填候选池 / claim-source pairing / surveys.db 等
+        # 现在只放一行说明,告诉用户这个 tab 的另一半用途
+        placeholder_group = QGroupBox("综述生成 (P6, 待实现)")
+        placeholder_layout = QVBoxLayout(placeholder_group)
+        placeholder_label = QLabel(
+            "综述生成功能等 P4 (ReAct 调研内核) 完成后, 2026-09-02 之后排期。<br>"
+            "届时会新增: 候选池构建 / claim-source pairing / surveys.db 章节落库 / 行内 markdown 链接等。<br>"
+            "ROADMAP_NEXT §7 综述生成 (L2, 3-4 天) 已规划。"
+        )
+        placeholder_label.setWordWrap(True)
+        placeholder_label.setProperty("role", "muted")
+        placeholder_layout.addWidget(placeholder_label)
+        survey_layout.addWidget(placeholder_group)
+
+        survey_layout.addStretch()
+        if self._should_show("综述总结"):
+            self.tab_widget.addTab(survey_tab, "综述总结")
+        else:
+            self._hidden_tabs["综述总结"] = survey_tab  # 防 GC 释放
 
         # 底部按钮
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -695,6 +791,38 @@ class SettingsDialog(QDialog):
         for journal_key, cb in self.daily_checkboxes.items():
             cb.setChecked(journal_key in daily_journals)
 
+        # 2026-09-02 P0.7 加:成本控制 3 档 + ceiling
+        from config import Config
+        tier = Config.get_cost_tier()
+        tier_idx = {"L0": 0, "L1": 1, "L2": 2}.get(tier, 2)
+        if hasattr(self, "cost_tier_combo"):
+            self.cost_tier_combo.setCurrentIndex(tier_idx)
+        if hasattr(self, "cost_ceiling_spin"):
+            self.cost_ceiling_spin.setValue(Config.get_cost_ceiling_daily())
+        # 刷新今日用量显示
+        self._refresh_cost_usage()
+
+    def _refresh_cost_usage(self):
+        """2026-09-02 P0.7 加:刷新"今日已用 X/Y" 标签"""
+        if not hasattr(self, "cost_usage_label"):
+            return
+        try:
+            from agent.cost_guard import get_cost_guard
+            from config import Config
+            used = get_cost_guard().current_count()
+            ceiling = Config.get_cost_ceiling_daily()
+            pct = int(used / ceiling * 100) if ceiling else 0
+            self.cost_usage_label.setText(f"今日已用: {used} / {ceiling} 次 ({pct}%)")
+        except Exception as e:
+            self.cost_usage_label.setText(f"今日用量读取失败: {e}")
+
+    def _reset_cost_usage(self):
+        """2026-09-02 P0.7 加:重置今日计数(给用户手动清零)"""
+        from agent.cost_guard import get_cost_guard
+        get_cost_guard().reset()
+        self._refresh_cost_usage()
+        QMessageBox.information(self, "已重置", "今日 LLM 计数已清零, 明天 0 点也会自动重置。")
+
     def reset_default_prompt(self):
         from agent.prompts import SYSTEM_PROMPT
         self.prompt_edit.setPlainText(SYSTEM_PROMPT)
@@ -739,6 +867,16 @@ class SettingsDialog(QDialog):
         # 每日总结范围
         selected = [key for key, cb in self.daily_checkboxes.items() if cb.isChecked()]
         settings.setValue("daily_summary_journals", json.dumps(selected))
+
+        # 2026-09-02 P0.7 加:成本控制 3 档 + ceiling
+        if hasattr(self, "cost_tier_combo"):
+            tier_idx = self.cost_tier_combo.currentIndex()
+            tier = ["L0", "L1", "L2"][tier_idx] if 0 <= tier_idx <= 2 else "L2"
+            from config import Config
+            Config.set_cost_tier(tier)
+        if hasattr(self, "cost_ceiling_spin"):
+            from config import Config
+            Config.set_cost_ceiling_daily(self.cost_ceiling_spin.value())
 
         # API key 改了 → 清掉 client 缓存
         reset_client_cache()

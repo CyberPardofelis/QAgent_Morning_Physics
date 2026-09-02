@@ -171,7 +171,7 @@ def save_memory(
     )
 
 
-@register_tool(name="recall_memories", is_streaming=False)
+@register_tool(name="recall_memories", is_streaming=False, cost_tier="L0")
 def recall_memories(
     query: str,
     limit: int = 5,

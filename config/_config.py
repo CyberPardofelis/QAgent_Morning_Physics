@@ -105,3 +105,41 @@ class Config:
     @staticmethod
     def set_chroma_embedding_model_path(value: str) -> None:
         Config._settings().setValue("chroma_embedding_model_path", value)
+
+    # ---------- 成本控制（P0.7，2026-09-02 起） ----------
+    @staticmethod
+    def get_cost_tier() -> str:
+        """当前允许的最高档 L0/L1/L2, 默认 L2 (个人用方便, 课题组用时调低)
+        - L0: 只本地检索/SQL/下载, 0 次 LLM 调用
+        - L1: + 单次 LLM 工具 (analyze_paper, save_memory 等)
+        - L2: + 重型多轮 (ReAct 调研 / 综述生成, 等 P4 / P6 实现)
+        """
+        v = Config._settings().value("cost_tier", "")
+        if v in ("L0", "L1", "L2"):
+            return v
+        return "L2"  # 默认 L2 开, 给个人用方便
+
+    @staticmethod
+    def set_cost_tier(value: str) -> None:
+        if value not in ("L0", "L1", "L2"):
+            raise ValueError(f"cost_tier 必须是 L0/L1/L2, 收到 {value!r}")
+        Config._settings().setValue("cost_tier", value)
+
+    @staticmethod
+    def get_cost_ceiling_daily() -> int:
+        """每日 LLM 调用上限, 默认 50 (P0.7 ROADMAP_NEXT §2 给课题组用时建议 50)"""
+        v = Config._settings().value("cost_ceiling_daily", 50)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 50
+
+    @staticmethod
+    def set_cost_ceiling_daily(value: int) -> None:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            v = 50
+        if v < 1:
+            v = 1
+        Config._settings().setValue("cost_ceiling_daily", v)

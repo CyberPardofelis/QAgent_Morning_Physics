@@ -24,6 +24,7 @@ from agent.llm_clients import (
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools.registry import ToolRegistry
+from agent.cost_guard import get_cost_guard
 from agent.stream_utils import split_markdown_bubbles
 from config import Config
 
@@ -104,6 +105,7 @@ def run_agent_stream(
     timeout: int = 180,
     enable_thinking: bool = True,
     reasoning_effort: str = "high",
+    cost_tier: Optional[str] = None,  # 2026-09-02 P0.7 加:None = 从 Config 读
     **_unused,
 ) -> Iterator[str]:
     """
@@ -115,6 +117,13 @@ def run_agent_stream(
     - DIRECT_OUTPUT 工具（generate_daily_summary_*）返回后，按 ### 标题切气泡
     - 工具执行完毕 → yield 一条 [工具 name 执行完毕] 提示
     - LLM 错误 → yield 友好错误消息
+    - CostGuard 阻断（100%）→ yield 阻断消息 + 直接 return
+
+    2026-09-02 P0.7 加 cost_tier 参数:
+    - "L0": 只本地检索工具, 0 次 LLM
+    - "L1": + 单次 LLM 工具
+    - "L2": + 重型多轮（P4 / P6 实现后才有）
+    留空 = 从 Config.get_cost_tier() 读, 默认 L2
     """
     client, default_model, provider_name = _resolve_client_and_model(mode)
     actual_model = model or default_model
@@ -126,8 +135,28 @@ def run_agent_stream(
         actual_model, enable_thinking
     )
 
-    # 工具 schema 统一从 ToolRegistry 拿
-    tools = ToolRegistry.list_schemas()
+    # 2026-09-02 P0.7:cost_tier 过滤工具 + CostGuard 计数
+    if cost_tier is None:
+        cost_tier = Config.get_cost_tier()
+    if cost_tier not in ("L0", "L1", "L2"):
+        cost_tier = "L2"
+    # 工具 schema 按档位过滤
+    tools = ToolRegistry.list_schemas_filtered(cost_tier)
+    logger.info(
+        "[controller] 成本控制档位=%s, 工具数 %d (全部 %d)",
+        cost_tier, len(tools), len(ToolRegistry.list_schemas()),
+    )
+
+    # CostGuard: 进入 LLM 前 check + increment,100% 阻断
+    cost_guard = get_cost_guard()
+    is_ok, guard_msg = cost_guard.check_and_increment()
+    if not is_ok:
+        yield guard_msg
+        yield NEW_BUBBLE
+        return
+    if guard_msg:
+        # 80% 警告: 插到 LLM 输出前面,让用户看到
+        yield guard_msg
 
     # 2026-08-31 v3 加(根因修复):当 deepseek 模式 + thinking 模式 + 带 tools 时,
     # DeepSeek 强制要求 messages 里**所有** assistant 消息都有 `reasoning_content` 字段

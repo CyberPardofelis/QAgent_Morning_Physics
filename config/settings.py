@@ -85,6 +85,11 @@ class SettingsKeys:
     CHROMA_COLLECTION = "chroma_collection"
     CHROMA_EMBEDDING_MODEL_PATH = "chroma_embedding_model_path"
 
+    # 成本控制 P0.7（2026-09-02 起）
+    # 默认 L2 开, 给个人用方便; 给课题组用时调成 L1 或 L0
+    COST_TIER = "cost_tier"  # "L0" | "L1" | "L2"
+    COST_CEILING_DAILY = "cost_ceiling_daily"  # int, 默认 50
+
     # 分组设置（带 group_id 后缀）
     @staticmethod
     def group_system_prompt(group_id: str) -> str:

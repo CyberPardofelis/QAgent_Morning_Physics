@@ -6,6 +6,10 @@ from agent.tools.llm import _call_llm
 from agent.tools.utils import JOURNAL_CONFIG
 from agent.tools.registry import register_tool
 from agent.tools.browser_pool import get_browser_pool
+# 2026-09-02 P0.6 加:抓文后异步落库
+from agent.tools.summary import save_summary_item_async
+# 2026-09-02 协同 fix:抓文后 LLM 提关键词 + update summary_item + 重嵌
+from agent.tools.extract_keywords import update_keywords_for_paper_async
 
 
 def fetch_aps_page_via_browser(journal: str = 'prl'):
@@ -115,6 +119,23 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         if not papers:
             return f"未找到 {config['name']} 论文列表，请稍后重试。"
 
+        # 2026-09-02 P0.6:异步落库
+        for p in papers:
+            save_summary_item_async(
+                paper_id=p["id"],
+                source="aps_daily",
+                title=p["title"],
+                authors=p.get("authors"),
+                abstract=p.get("abstract"),
+            )
+            # 2026-09-02 协同:后台线程 LLM 提关键词 + update + 重嵌
+            update_keywords_for_paper_async(
+                paper_id=p["id"],
+                source="aps_daily",
+                title=p["title"],
+                abstract=p.get("abstract", ""),
+            )
+
         papers_text = ""
         for i, p in enumerate(papers, 1):
             papers_text += f"{i}. **{p['title']}**\n"
@@ -192,7 +213,7 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         return filepath
 
 
-@register_tool(name="download_aps_paper", is_streaming=False)
+@register_tool(name="download_aps_paper", is_streaming=False, cost_tier="L0")
 def download_aps_paper(doi: str) -> str:
     """下载 APS 期刊论文 PDF 到 PAPER_DIR，返回本地路径"""
     save_dir = str(PAPER_DIR)

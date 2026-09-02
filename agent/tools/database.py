@@ -150,7 +150,7 @@ def update_paper_comment(paper_id: str, user_comment: str) -> str:
 # ============================================================
 # LLM 工具：get_recent_papers
 # ============================================================
-@register_tool(name="get_recent_papers", is_streaming=False)
+@register_tool(name="get_recent_papers", is_streaming=False, cost_tier="L0")
 def get_recent_papers(limit: int = 15) -> str:
     """
     获取最近分析的论文列表（按时间倒序），用于回顾最近看过的文章。

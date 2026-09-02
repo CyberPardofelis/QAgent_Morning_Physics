@@ -199,7 +199,7 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "query_knowledge",
-            "description": "Search the knowledge base by keyword/topic/author",
+            "description": "Search the knowledge base by keyword/topic/author (FTS5 全文索引, 精确匹配)",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -207,6 +207,246 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                     "topic": {"type": "string"},
                     "author": {"type": "string"}
                 }
+            }
+        }
+    },
+
+    # ============================================================
+    # semantic_search: 语义检索（P1 新增 2026-09-02）
+    # 走 P0.5 section-aware chunk + P0 chroma 向量库
+    # 跟 query_knowledge 区别:query_knowledge 是关键词精确匹配,这个是语义相似
+    # ============================================================
+    "semantic_search": {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": (
+                "基于语义相似度检索知识库(走 chroma + bge-large-en-v1.5 embedding,本地免费)。"
+                "支持 metadata 过滤(year / journal / section / topic_keyword)。"
+                "返回按论文分组的 chunk 列表,每条带 section / 相似度 / 摘要片段。"
+                "适用场景: '找和 X 论文的 method 部分类似的内容' / '搜量子纠错码阈值'。"
+                "跟 query_knowledge 的区别:query_knowledge 是关键词精确匹配,这个是语义近似。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言查询, e.g. 'quantum error correction threshold'"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "返回多少篇论文(每篇可能命中多个 chunk)"
+                    },
+                    "year": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "按发表年份过滤(0=不过滤)"
+                    },
+                    "journal": {
+                        "type": "string",
+                        "default": "",
+                        "description": "按期刊过滤(arXiv / PRL / PRA / PRB 等,空=不过滤)"
+                    },
+                    "section": {
+                        "type": "string",
+                        "default": "",
+                        "description": "按章节类别过滤(introduction / method / result / discussion 等,空=不过滤)"
+                    },
+                    "topic_keyword": {
+                        "type": "string",
+                        "default": "",
+                        "description": "按关键词模糊过滤(在 keywords 字段里 contains 匹配,空=不过滤)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ============================================================
+    # P2.2: index_paper_to_chroma（纯本地, L0）
+    # 把单篇论文从 papers.db + PDF 切分后索引到 chroma
+    # ============================================================
+    "index_paper_to_chroma": {
+        "type": "function",
+        "function": {
+            "name": "index_paper_to_chroma",
+            "description": (
+                "把单篇论文切分后索引到 chroma papers collection(纯本地,无 LLM 调用)。"
+                "数据源:papers.db 元数据 + data/papers/{paper_id}.pdf。"
+                "幂等:同 paper_id 先删后插。"
+                "适用:论文已 analyze 但没入 chroma, 或者快速补索引。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "论文 ID(arXiv id 或 DOI 等)"
+                    }
+                },
+                "required": ["paper_id"]
+            }
+        }
+    },
+
+    # ============================================================
+    # P2.3: reindex_all（纯本地, L0）
+    # 全量重建 chroma papers collection
+    # ============================================================
+    "reindex_all": {
+        "type": "function",
+        "function": {
+            "name": "reindex_all",
+            "description": (
+                "全量重建 chroma papers collection(走 P0.5 chunker 切 + chroma 写入)。"
+                "适用:切分策略升级 / embedding model 切换 / 需要全量刷新。"
+                "不调 LLM,纯本地;每 10 篇 sleep 0.5s 防 CPU 100%。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "最多重建多少篇(0=全部,给测试用)"
+                    }
+                }
+            }
+        }
+    },
+
+    # ============================================================
+    # P2.4: sync_recent_to_chroma（纯本地, L0）
+    # 兜底:扫最近 summary_items,对未入 chroma 的 paper 切 + 入
+    # ============================================================
+    "sync_recent_to_chroma": {
+        "type": "function",
+        "function": {
+            "name": "sync_recent_to_chroma",
+            "description": (
+                "兜底:扫最近 N 天的 summary_items(P0.6 抓文时落库),对尚未入 chroma 的 paper "
+                "走 P0.5 chunker 切 + 入库(纯本地,无 LLM)。"
+                "适用:抓文后 analyze 失败 / summary_items 落库但 chroma 没数据。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "default": 7,
+                        "description": "查最近 N 天的 summary_item"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "最多处理多少条(防单次调用太慢)"
+                    }
+                }
+            }
+        }
+    },
+
+    # ============================================================
+    # P2.5: semantic_search_keywords — 关键词/摘要级语义检索(纯本地, L0)
+    # 走 chroma paper_keywords collection(独立于 papers chunks)
+    # 跟 semantic_search 区别: 这个粒度 = 1 篇 1 条 record(summary_item 粒度)
+    # ============================================================
+    "semantic_search_keywords": {
+        "type": "function",
+        "function": {
+            "name": "semantic_search_keywords",
+            "description": (
+                "基于语义相似度检索 summary_items 库(走 chroma paper_keywords collection,本地免费)。"
+                "支持 metadata 过滤(source / since_date / in_papers_db_only)。"
+                "返回按相似度排序的 summary_item 列表, 每条带 paper_id / title / source / date / distance。"
+                "跟 `semantic_search` 区别: `semantic_search` 走 papers chunks(已精细分析的论文,粒度=section级);"
+                "这个走 summary_items(抓文级,粒度=论文级,适用于召回没分析过的最新抓文)。"
+                "适用: '找和拓扑码贡献最像的论文' / '召回最近抓的 X 主题论文'。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言查询, e.g. 'topological code fault tolerance'"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 30,
+                        "description": "返回多少条 record(每条 = 1 篇 summary_item)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "default": "",
+                        "description": "按 source 过滤(arxiv_daily / aps_daily / reindex 等, 空=不过滤)"
+                    },
+                    "since_date": {
+                        "type": "string",
+                        "default": "",
+                        "description": "按 summary_date >= since_date 过滤(ISO date 如 '2026-09-01', 空=不过滤)"
+                    },
+                    "in_papers_db_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "只返回已精细分析过的 summary_item"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ============================================================
+    # P3: similar_papers — 找相似论文(字段匹配优先 + chroma 召回补充, 纯本地 L0)
+    # 设计: 字段匹配(同 keywords / authors / research_topic 打分) + chroma 关键词近邻
+    # ============================================================
+    "similar_papers": {
+        "type": "function",
+        "function": {
+            "name": "similar_papers",
+            "description": (
+                "找相似论文: 字段匹配(同 keywords / authors / research_topic 打分)优先, "
+                "再加 3-5 个 chroma 关键词语义近邻作多样性补充。走 papers.db 字段计算 + chroma paper_keywords 检索,纯本地无 LLM。"
+                "返回 Markdown 列表,每条带 paper_id / 命中字段 / 字段匹配分或语义相似度。"
+                "适用: '找和 X 论文方向类似的论文' / '推荐相关工作'。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "源论文 ID(arXiv id 或 DOI 等,必须在 papers.db 里)"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "返回多少条"
+                    },
+                    "n_field": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 0,
+                        "maximum": 15,
+                        "description": "字段匹配拿多少条(0 = 全用语义)"
+                    },
+                    "n_semantic": {
+                        "type": "integer",
+                        "default": 4,
+                        "minimum": 0,
+                        "maximum": 10,
+                        "description": "chroma 召回多少条语义近邻(0 = 全用字段)"
+                    }
+                },
+                "required": ["paper_id"]
             }
         }
     },

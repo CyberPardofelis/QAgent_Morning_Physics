@@ -10,6 +10,8 @@ QAgent 数据布局（保留现有文件位置以兼容旧数据）：
 - data/conversations/conversations.db  → 对话历史
 - data/knowledge/papers.db            → 论文知识库
 - data/memory/memories.db             → 通用记忆库（v1，2026-08-20 新增）
+- data/knowledge/summary_items.db     → 论文摘要库（2026-09-02 P0.6）
+- data/knowledge/surveys.db           → 综述库（2026-09-02 P6 准备，UI 先上线）
 """
 import sqlite3
 import logging
@@ -28,6 +30,12 @@ DB_FILES: Dict[str, str] = {
     "conversations": "conversations/conversations.db",   # 对话历史
     "papers":        "knowledge/papers.db",              # 论文知识库
     "memory":        "memory/memories.db",               # 通用记忆库
+    # 2026-09-02 P0.6 加:summary_items 独立库(粒度比 papers 细,只存"扫过"的论文摘要)
+    # ROADMAP_NEXT §ADR-N2:避免和 papers.db 混用,语义不同
+    "summary_items": "knowledge/summary_items.db",       # 论文摘要(抓文后落)
+    # 2026-09-02 加:surveys 综述库(主题 + 章节树状结构 + 内容 markdown)
+    # ROADMAP_NEXT §9.2 schema 简化版(暂不接 ReAct,UI 先建空库,等 P6 自动填)
+    "surveys":       "knowledge/surveys.db",             # 综述库(主题/章节/正文)
 }
 
 

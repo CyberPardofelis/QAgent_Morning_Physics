@@ -6,6 +6,10 @@ from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
+# 2026-09-02 P0.6 加:抓文后异步落库
+from agent.tools.summary import save_summary_item_async
+# 2026-09-02 协同 fix:抓文后 LLM 提关键词 + update summary_item + 重嵌 paper_keywords
+from agent.tools.extract_keywords import update_keywords_for_paper_async
 
 
 # ============================================================
@@ -115,7 +119,7 @@ def search_arxiv(query: str, max_results: int = 10) -> str:
 # ============================================================
 # download_arxiv_paper: 下载 arXiv 论文 PDF
 # ============================================================
-@register_tool(name="download_arxiv_paper", is_streaming=False)
+@register_tool(name="download_arxiv_paper", is_streaming=False, cost_tier="L0")
 def download_arxiv_paper(arxiv_id: str) -> str:
     """根据 arXiv ID 下载论文到 PAPER_DIR，返回本地路径"""
     try:
@@ -146,6 +150,23 @@ def generate_daily_summary_arxiv() -> str:
 
     if not papers:
         return "未找到论文列表，请稍后重试。"
+
+    # 2026-09-02 P0.6:异步落库(不阻塞 LLM 总结,失败不抛)
+    for p in papers:
+        save_summary_item_async(
+            paper_id=p["id"],
+            source="arxiv_daily",
+            title=p["title"],
+            authors=p.get("authors"),
+            abstract=p.get("abstract"),
+        )
+        # 2026-09-02 协同:后台线程 LLM 提关键词 + update + 重嵌(独立线程,跟 save 并行)
+        update_keywords_for_paper_async(
+            paper_id=p["id"],
+            source="arxiv_daily",
+            title=p["title"],
+            abstract=p.get("abstract", ""),
+        )
 
     papers_text = ""
     for i, p in enumerate(papers, 1):

@@ -16,7 +16,7 @@ def load_journal_config():
 JOURNAL_CONFIG = load_journal_config()
 
 
-@register_tool(name="run_python", is_streaming=False)
+@register_tool(name="run_python", is_streaming=False, cost_tier="L0")
 def run_python(code: str) -> str:
     """执行 Python 代码（子进程隔离），返回 stdout + stderr 合并输出"""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
