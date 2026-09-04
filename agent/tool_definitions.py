@@ -129,7 +129,18 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "generate_daily_summary_arxiv",
-            "description": "Generate a detailed daily summary of new quantum physics papers from arXiv (triggered by 'good morning, arxiv')",
+            "description": (
+                "Generate a detailed daily summary of new arXiv quant-ph papers. "
+                "抓 https://arxiv.org/list/quant-ph/new,只取 'New submissions' 块(跳过 cross-list 和 replacement),"
+                "LLM 生成结构化总结(每篇 paper 的核心贡献/方法/意义/关键词),返回完整 markdown。\n"
+                "**触发场景**:\n"
+                "  - 用户说'早上好'/'今日 arxiv'/'arxiv 每日总结'/'今天有什么新论文'\n"
+                "  - 用户说'fetch arxiv daily summary' / '今天 quant-ph'\n"
+                "**重要约束**:\n"
+                "  - 这是 DIRECT_OUTPUT 工具 — 调用时**不要**写'我帮你抓了 N 篇' / '日期范围' / 'arXiv ID 列表' 之类的 prose\n"
+                "  - 你**没有任何 fetch 能力**,在调工具前编出来的 paper 数/日期/arXiv ID 一定是幻觉(用户点开链接找不到)\n"
+                "  - 调完工具后,直接输出工具返回的完整 markdown 即可"
+            ),
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -159,7 +170,19 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "generate_aps_daily_summary",
-            "description": "Generate a detailed daily summary of new quantum information papers from an APS journal. Use this when the user says 'good morning' followed by a journal name like 'PRL' or 'PRA'.",
+            "description": (
+                "Generate a detailed daily summary of new quantum information papers from an APS journal. "
+                "调用后会通过 Playwright 抓取对应期刊的 recent 页面,提取真实 paper 列表(标题/作者/abstract/真 DOI),"
+                "然后 LLM 生成结构化总结(核心贡献/方法/意义/关键词),最后以 markdown 形式完整返回。\n"
+                "**触发场景**:\n"
+                "  - 用户说'早上好'/'每日总结'/'今天有什么新论文' + 期刊名(PRL/PRA/PRB/...)\n"
+                "  - 用户说'抓一下 PRA 今天的论文' / '帮我看下 PRL 最新'\n"
+                "  - 用户说'fetch PRA daily summary' / 'summarize PRL recent'\n"
+                "**重要约束**:\n"
+                "  - 这是 DIRECT_OUTPUT 工具 — 调用时**不要**在你的回复里写'我帮你抓了 N 篇' / '日期范围' / 'DOI 列表' 之类的 prose\n"
+                "  - 你**没有任何 fetch 能力**,在调工具前编出来的 paper 数/日期/DOI 一定是幻觉(用户点开全是 404)\n"
+                "  - 调完工具后,直接输出工具返回的完整 markdown 即可,不要压缩/总结/转表格"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

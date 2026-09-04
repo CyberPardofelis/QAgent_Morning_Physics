@@ -156,7 +156,9 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
             papers_text += f"{i}. **{p['title']}**\n"
             papers_text += f"   - ID: `{p['id']}` | [PRL链接]({p['link']})\n"
             papers_text += f"   - 作者: {p.get('authors', 'N/A')[:150]}...\n"
-            papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
+                # 2026-09-04:abstract 从 300 缩到 180(20 篇 × 180 = 3.6k chars,
+            # 之前 300 → 6k chars,MiniMax-M3 跑 12k prompt 撞 180s timeout)
+            papers_text += f"   - 摘要: {p.get('abstract', 'N/A')[:180]}...\n\n"
 
         prompt = f"""
         你现在是一个科研助手。以下是从 {config['name']} 期刊抓取的"量子信息科学与技术"类别最新论文列表（共 {len(papers)} 篇）。
@@ -182,12 +184,16 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         # 2026-09-04 用户拍板:daily summary 类任务(批量格式化 + 轻度摘要)强制不开思考
         # 原因:60+ 篇 × 思考 token = 2-5x 延迟 + 2-3x 成本,质量提升有限
         # analyze_paper 那种单篇深读场景保留"跟 chat 走",需要时再显式开思考
-        summary_md = _call_llm(prompt, enable_thinking=False)
+        # 2026-09-04 加:timeout 提到 600s(20 篇 × 180 字 = 3.6k prompt,有些慢模型
+        # 跑完整总结需要 > 180s,MiniMax-M3 12k prompt 实测撞过 180s timeout)
+        summary_md = _call_llm(prompt, enable_thinking=False, timeout=600)
 
         # 2026-09-03: 同步解析 LLM 输出 → 补 核心贡献/方法/意义/关键词
         # 主流程同步 save,不创建后台线程(防 P0.6 蓝屏)
+        # 2026-09-04 加:把已抓取的 papers 传进去,parser 在 LLM 漏掉 DOI 时
+        # 用 title 回退匹配(用户实测 20 条 APS 缺字段的根因)
         _persist_parsed_summary_fields(
-            parsed=parse_summary_markdown(summary_md),
+            parsed=parse_summary_markdown(summary_md, fetched_papers=papers),
             source='aps_daily',
             summary_date=today,
         )

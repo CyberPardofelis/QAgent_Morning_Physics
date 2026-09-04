@@ -60,6 +60,38 @@ def _brief_args_for_log(fn_name: str, args: dict) -> str:
     return s
 
 
+def _harmonize_assistant_reasoning(messages: list, provider_name: str, enable_thinking: bool) -> None:
+    """
+    2026-09-04 P0 fix:每轮 LLM 调用前,**就地**统一所有 assistant 消息的 `reasoning_content` 字段。
+
+    背景:
+    - DeepSeek API 在 thinking 模式下,**强制要求**所有 assistant 消息都有 `reasoning_content` 字段
+      (空字符串也算有,不能缺),否则报 400:
+      "The reasoning_content in the thinking mode must be passed back to the API."
+    - 之前的 v3 修法只在 `run_agent_stream` 开头跑一次 pre-loop(给所有 assistant 补 `""`),
+      但 while loop 里**新加的** assistant 消息(没 reasoning_content)会在下一轮触发 400
+    - 修法:把"补 reasoning_content"逻辑抽成 helper,每轮调 LLM 前跑一次(in-place 修改)
+
+    行为矩阵:
+    - deepseek + enable_thinking=True  → 给所有 assistant 补 `reasoning_content=""`
+    - deepseek + enable_thinking=False → 剥掉所有 assistant 的 `reasoning_content`
+    - minimax (无论 thinking 怎么设)   → 剥掉所有 assistant 的 `reasoning_content`(minimax 不用)
+    - openai / compare / custom       → 剥掉所有 assistant 的 `reasoning_content`
+
+    注意:in-place 修改 messages(跟原 pre-loop 一致,不返新 list)。
+    """
+    if provider_name == "deepseek" and enable_thinking:
+        # 补 reasoning_content=""(缺的 assistant)
+        for _m in messages:
+            if _m.get("role") == "assistant" and "reasoning_content" not in _m:
+                _m["reasoning_content"] = ""
+    else:
+        # 其它场景:剥掉所有 reasoning_content
+        for _m in messages:
+            if _m.get("role") == "assistant" and "reasoning_content" in _m:
+                _m.pop("reasoning_content", None)
+
+
 def _brief_result_for_log(result: str) -> str:
     """工具结果格式化(控制台用)。头尾各 100 字,中间省略。
     空结果 → '<empty>' 标记,方便排查 silent failure。"""
@@ -238,7 +270,11 @@ def run_agent_stream(
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     max_tokens: int = 40000,
-    timeout: int = 180,
+    # 2026-09-04 改:180s → 600s
+    # 之前默认 180s,慢模型(MiniMax-M3 等)跑长 prompt 容易撞 timeout,
+    # 用户报"控制台只看到 LLM round 1 start,然后什么也没了"就是撞了
+    # 600s 跟 _call_llm 里的 daily summary 默认一致(防 daily summary 工具也撞)
+    timeout: int = 600,
     enable_thinking: bool = True,
     reasoning_effort: str = "high",
     cost_tier: Optional[str] = None,  # 2026-09-02 P0.7 加:None = 从 Config 读
@@ -294,23 +330,12 @@ def run_agent_stream(
         # 80% 警告: 插到 LLM 输出前面,让用户看到
         yield guard_msg
 
-    # 2026-08-31 v3 加(根因修复):当 deepseek 模式 + thinking 模式 + 带 tools 时,
-    # DeepSeek 强制要求 messages 里**所有** assistant 消息都有 `reasoning_content` 字段
-    # (空字符串 "" 也算有,不能缺)。
-    # 否则报 400:
-    #   "The reasoning_content in the thinking mode must be passed back to the API."
-    # 这是 QAgent 一直 400 的真正根因(测试 2026-08-31 验证):
-    # - Test 1: thinking on + tools + 空 assistant (没 reasoning_content) → 400
-    # - Test 2: thinking on + tools + assistant 加 reasoning_content="" → OK
-    # - Test 3: 不带 extra_body + tools + 空 assistant → 400
-    # 之前 v1/v2 修复只在"切到非思考"或"切到非 deepseek 模式"时剥历史,治标不治本。
-    # 空气泡(预分配的 content="" assistant)是从 conversation_controller 来的,
-    # 它没 reasoning_content 字段 → DeepSeek 校验失败。
-    # 修法:deepseek + thinking 模式下,给所有 assistant 消息补 reasoning_content=""(如果缺)
-    if provider_name == "deepseek" and enable_thinking:
-        for _m in messages:
-            if _m.get("role") == "assistant" and "reasoning_content" not in _m:
-                _m["reasoning_content"] = ""
+    # 2026-09-04 P0 fix:DeepSeek thinking 模式下 messages 里所有 assistant 必须有
+    # reasoning_content 字段。之前的 v3 修法在 run_agent_stream 开头跑一次,
+    # 但 while loop 里新加的 assistant 消息没被覆盖 → 第 2 轮 400。
+    # 修法:_harmonize_assistant_reasoning() 在 while loop 每轮开头调一次
+    # (见下面 while True 块),这里只在 run_agent_stream 开头也跑一次做兜底。
+    _harmonize_assistant_reasoning(messages, provider_name, enable_thinking)
 
     # 2026-08-31 v2 加:openai 模式早 return, 跳过下面的 while 循环。
     # 但 openai 模式也不该带 reasoning_content(openai 不会用,且会污染历史)。
@@ -352,10 +377,19 @@ def run_agent_stream(
                 f"  - LLM 持续调同一工具(死循环)\n"
                 f"  - 工具持续返回空结果\n"
                 f"  - 工具持续返回错误\n\n"
-                f"已自动终止,避免内存/费用爆。如需继续,请重新提问。\n"
+                f"已自动终止,避免内存/费用爆。如需继续,请重新提问。"
             )
             yield NEW_BUBBLE
             return
+
+        # 2026-09-04 P0 fix:每轮都补 reasoning_content
+        # 之前只在 run_agent_stream 开头跑一次 pre-loop,但 while loop 里新加的
+        # assistant 消息(可能没 reasoning_content)会触发 DeepSeek 400:
+        #   "The reasoning_content in the thinking mode must be passed back to the API."
+        # 修法:每轮调 LLM 前再跑一次,确保 messages 里所有 assistant 都有 reasoning_content
+        # (deepseek + thinking) 或 都没有(其它 provider)
+        _harmonize_assistant_reasoning(messages, provider_name, enable_thinking)
+
         print(f"[controller] LLM round {_round} start  mode={provider_name} model={actual_model} messages={len(messages)}", flush=True)
         request_params = {
             "model": actual_model,
@@ -376,37 +410,18 @@ def run_agent_stream(
         #   - deepseek  + enable=True  → extra_body.thinking.enabled + reasoning_effort
         #   - minimax   + enable=False → extra_body.thinking.disabled (防 adaptive thinking 默认开)
         #   - 其他 provider           → 不动 extra_body
-        # 2026-08-31 新增:deepseek 切到非思考时,清洗历史里所有 assistant 消息的 reasoning_content。
-        # 否则 DeepSeek 报 400:
-        #   "The reasoning_content in the thinking mode must be passed back to the API."
-        # (历史里带 reasoning_content 字段 → 当前请求必须开 thinking,否则 API 端校验失败)
-        # 2026-08-31 v2 修:跨模式切换场景(用户从 deepseek-thinking 切到 minimax/openai/compare),
-        # 也需要剥 reasoning_content,因为非 deepseek 模式用不上、留着会触发校验失败。
+        # 2026-09-04 注:历史消息的 reasoning_content 清洗已在 _harmonize_assistant_reasoning 里统一处理,
+        # 这里只负责 per-request 的 extra_body 设置。
         if provider_name == "deepseek":
             if enable_thinking:
                 request_params["extra_body"] = {"thinking": {"type": "enabled"}}
                 request_params["reasoning_effort"] = reasoning_effort
-            else:
-                # 剥掉历史里所有 assistant 消息的 reasoning_content,避免 400
-                for _m in messages:
-                    if _m.get("role") == "assistant" and "reasoning_content" in _m:
-                        _m.pop("reasoning_content", None)
         elif provider_name == "minimax":
             if not enable_thinking:
                 # MiniMax M3 默认 adaptive thinking,enable=False 时必须显式关
                 # 否则用户取消"思考模式"对 MiniMax 完全无效,LLM 仍输出 reasoning_content,
                 # 第二轮报 "must be passed back" 错
                 request_params["extra_body"] = {"thinking": {"type": "disabled"}}
-            # 2026-08-31 v2 加:minimax 模式一律剥 reasoning_content(其他 provider 用不上,留着会污染历史)
-            for _m in messages:
-                if _m.get("role") == "assistant" and "reasoning_content" in _m:
-                    _m.pop("reasoning_content", None)
-        else:
-            # 2026-08-31 v2 加:openai / compare / custom 等其他 provider 一律剥 reasoning_content
-            # 避免历史里的 deepseek thinking 残留触发 400
-            for _m in messages:
-                if _m.get("role") == "assistant" and "reasoning_content" in _m:
-                    _m.pop("reasoning_content", None)
 
         # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限（部分模型会回 400），
         # 这里只在非 MiniMax 时透传，避免不必要的失败。
@@ -427,41 +442,82 @@ def run_agent_stream(
         current_content = ""
         current_reasoning = ""
         tool_calls_dict: dict = {}
+        # 2026-09-04 加:检测到 LLM 在调用 DIRECT_OUTPUT 工具前输出 prose,
+        # 后续 content 都不 yield(避免幻觉污染 UI)。系统 prompt + tool description
+        # 已经明确告诉 LLM 不要 pre-call prose,这里是兜底。
+        _discard_prose_for_direct_output = False
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            # 2026-09-02 改(抄 SAgent):把 reasoning_content 字段的累加 + content 字段的
-            # <think> 标签剥离严格分开
-            # - deepseek: extra_body.thinking 开启时 reasoning 走独立字段 → 这里累加
-            # - MiniMax M3: 把 thinking 直接拼在 content 字段(用 <think> 标签) → 走 _strip_think_tags 状态机
-            rc = getattr(delta, "reasoning_content", None)
-            if rc:
-                # 静默收集 reasoning — 不进 current_content、不 yield 给 UI
-                current_reasoning += rc or ""
-                continue
-            if delta.content:
-                # 2026-09-02 改(抄 SAgent):过滤 MiniMax 把 thinking 直接拼在 content 字段里用
-                # <think>...</think> 标签包着的部分(不是用 reasoning_content 字段)。
-                # 用轻量级状态机: tracking 是否在 thinking 块内 + buffer 累积跨 chunk 的标签边界。
-                # 这就是用户报的"minimax 模式两个空气泡" 的真正根因 ——
-                # 之前 QAgent controller 直接 yield delta.content,让 <think>...</think> 标签
-                # 污染 UI 之外,有时因为标签跨 chunk 还会让 content 看起来"几乎为空"。
-                for fc in _strip_think_tags(delta.content, _think_state):
-                    if fc:
-                        current_content += fc
-                        # ✅ 实时 yield — 保留 QAgent 流式感
-                        yield fc
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_dict:
-                        tool_calls_dict[idx] = {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": ""},
-                        }
-                    if tc.function.arguments:
-                        tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+        # 2026-09-04 加:心跳日志(每 5s 一次),让用户知道 LLM 还在跑(没卡死)
+        # 之前 MiniMax-M3 跑 9.7k prompt + 30k output 可能要 60-200s,
+        # 用户看到控制台"LLM round 1 start"然后什么都没了 → 误以为卡死
+        import time as _t
+        import threading as _th
+        _heartbeat_state = {"last_print": _t.time(), "stop": False}
+
+        def _heartbeat():
+            while not _heartbeat_state["stop"]:
+                _t.sleep(5.0)
+                if _heartbeat_state["stop"]:
+                    break
+                _elapsed = int(_t.time() - _heartbeat_state["last_print"])
+                print(f"[controller] ⏳ LLM 还在流式响应... 累计 {_elapsed}s  (round {_round})", flush=True)
+
+        _hb_thread = _th.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
+
+        try:
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                # 2026-09-02 改(抄 SAgent):把 reasoning_content 字段的累加 + content 字段的
+                # <think> 标签剥离严格分开
+                # - deepseek: extra_body.thinking 开启时 reasoning 走独立字段 → 这里累加
+                # - MiniMax M3: 把 thinking 直接拼在 content 字段(用 <think> 标签) → 走 _strip_think_tags 状态机
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    # 静默收集 reasoning — 不进 current_content、不 yield 给 UI
+                    current_reasoning += rc or ""
+                    continue
+                if delta.content:
+                    # 2026-09-02 改(抄 SAgent):过滤 MiniMax 把 thinking 直接拼在 content 字段里用
+                    # <think>...</think> 标签包着的部分(不是用 reasoning_content 字段)。
+                    # 用轻量级状态机: tracking 是否在 thinking 块内 + buffer 累积跨 chunk 的标签边界。
+                    # 这就是用户报的"minimax 模式两个空气泡" 的真正根因 ——
+                    # 之前 QAgent controller 直接 yield delta.content,让 <think>...</think> 标签
+                    # 污染 UI 之外,有时因为标签跨 chunk 还会让 content 看起来"几乎为空"。
+                    if _discard_prose_for_direct_output:
+                        # 2026-09-04:已检测到 DIRECT_OUTPUT 工具调用,后续 prose 都是幻觉,
+                        # 静默吞掉,不进 current_content、不 yield
+                        continue
+                    for fc in _strip_think_tags(delta.content, _think_state):
+                        if fc:
+                            current_content += fc
+                            # ✅ 实时 yield — 保留 QAgent 流式感
+                            yield fc
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": ""},
+                            }
+                        if tc.function.arguments:
+                            tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+                        # 2026-09-04:一旦看到 DIRECT_OUTPUT 工具调用,标记"丢弃后续 prose"
+                        if tc.function.name in DIRECT_OUTPUT_TOOLS:
+                            _discard_prose_for_direct_output = True
+                            # 同时把已 yield 的 current_content 也从 history 抹掉
+                            if current_content:
+                                logger.warning(
+                                    "[controller] LLM 在 DIRECT_OUTPUT 工具 %s 前已 yield %d 字符 prose,"
+                                    "疑似幻觉,history 中已抹掉(但 UI 气泡里已经看到——这是 QTextBrowser 没法 rewind 的代价)。",
+                                    tc.function.name, len(current_content),
+                                )
+                                current_content = ""
+        finally:
+            # 心跳线程停
+            _heartbeat_state["stop"] = True
 
         # 把当前 assistant 消息加入历史
         assistant_msg: dict = {"role": "assistant", "content": current_content}
@@ -526,10 +582,16 @@ def run_agent_stream(
                 "content": result_text,
             })
 
-            # DIRECT_OUTPUT 工具：按 ### 标题切气泡，yield 完 break
+            # DIRECT_OUTPUT 工具:2026-09-04 用户拍板,取消 ### 切气泡。
+            # 之前把 LLM 的总结按 `### 标题` 切到多个 bubble,理由是早期 chat 系统
+            # 单个 bubble 高度有限(超出会被截断/不滚)。现在 QTextBrowser 接管气泡渲染,
+            # 自带滚动条,单 bubble 也能放几万字 markdown → 不再需要切。
+            # 行为:整个 LLM 输出 yield 进同一个 bubble(用户滚动阅读)。
+            # 数据库层不受影响:parse_summary_markdown 解析完整 markdown 入库,
+            # 跟气泡怎么切没关系。
             if fn_name in DIRECT_OUTPUT_TOOLS:
                 yield NEW_BUBBLE
-                yield from _split_into_bubbles(result_text)
+                yield result_text
                 return
 
             # 普通工具：yield 一条简短完成提示 + 切新气泡（让后续 LLM 输出在另一个气泡里）

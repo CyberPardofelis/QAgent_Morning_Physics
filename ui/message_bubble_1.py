@@ -34,6 +34,12 @@ class MarkdownView(QTextBrowser):
         self.setLineWrapMode(QTextBrowser.WidgetWidth)
         self.setStyleSheet("background: transparent; border: none; margin: 0px; padding: 0px;")
         self.document().setDocumentMargin(0)
+        # 2026-09-04 修:关掉 QTextBrowser 的 setOpenLinks(默认 True)
+        # 默认行为:点链接 → 触发 anchorClicked(我们用 QDesktopServices 开外部浏览器)
+        #   **同时** QTextBrowser 内部 navigate 到那个 URL,导致气泡内容被替换成
+        #   abstract 页/404 页面文本。
+        # 修法:setOpenLinks(False) 后,只走 anchorClicked 信号,内部不 navigate。
+        self.setOpenLinks(False)
         self.anchorClicked.connect(lambda url: QDesktopServices.openUrl(url))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 

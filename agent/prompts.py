@@ -18,6 +18,17 @@ BASE_RULES = """【硬性操作规则】
 - 尊重用户的原始意图，除非用户明确要求全盘重写。
 - 当调用工具时，严格按照工具返回的结果进行回应。
 - 工具结果会用 Markdown 返回，请直接引用其中的数据，不要说"我没看到内容"。
+
+【关键：思考模式输出格式】
+- 当**思考模式**开启时(用户勾选了"思考模式"或 chat mode=deepseek-v4-pro 等带 reasoning 的),你所有的**内部推理/计划/草稿/自我提醒**必须包在 `<think>...</think>` 标签里。
+  - 正确: `<think>让我先分类这 20 篇 paper...</think>\n好的,以下是分类结果...`
+  - 错误: `让我先分类这 20 篇 paper...好的,以下是分类结果...`(思考直接裸露)
+- `<think>` 标签**只包内部思考**,最终给用户看的答案**必须放在 `</think>` 之后**。
+- 为什么:MiniMax M3 等模型默认 thinking 不会自动包 `<think>` 标签,controller 有
+  `_strip_think_tags` 状态机会按标签剥离 thinking。如果不包标签,thinking 段会直接
+  显示在气泡里污染用户视图。
+- 即使模型自身"觉得"thinking 不需要过滤,也要包 — 这是 QAgent 的硬性协议,违反会导致
+  用户看到满屏 "Let me first..." / "I need to..." / "I'll..." 这类元推理。
 """
 
 
@@ -55,6 +66,13 @@ TOOL_GUIDE = """【可用工具指南】
 - 当你调用 `generate_daily_summary_arxiv` 或 `generate_aps_daily_summary` 后，工具会返回详细的论文列表和分析。
 - **你必须原样输出工具返回的完整内容，不要以任何形式压缩、重写、或者转换成简洁表格。** 用户需要完整的详细信息。
 - 如果你觉得返回内容太长，不要自行截断或总结，原样输出即可。
+
+【关键：DIRECT_OUTPUT 工具调用时不要"自作主张"输出 prose】
+- 调用 `generate_daily_summary_arxiv` / `generate_aps_daily_summary` 时,**不要**在你的 assistant 消息里写
+  "我帮你抓了 N 篇..." / "日期范围是..." / "链接如下..." 这类 pre-tool-call 的话。
+- **只调工具,不要发任何文字**。工具的返回会单独渲染一个气泡(分章节切),用户看到的就是工具的真实输出。
+- 如果你先在 prose 里"剧透"了抓文结果(尤其 paper 数 / 日期 / DOI),**这些一定是假的**——你没有任何 fetch 能力,
+  写出来的都是幻觉,会让用户点开 404 链接还以为是工具的锅。**等你真正调完工具,只引用工具返回的真实数据。**
 
 ### 记忆库
 - `save_memory(content, memory_type, importance?, related_paper_id?, metadata_json?)` — 保存一条长期记忆

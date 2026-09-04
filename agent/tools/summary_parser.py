@@ -153,7 +153,7 @@ def _clean_title(raw: str) -> str:
     return t.strip()
 
 
-def parse_summary_markdown(md_text: str) -> List[PaperSummary]:
+def parse_summary_markdown(md_text: str, fetched_papers: List[dict] = None) -> List[PaperSummary]:
     """
     主入口:解析 LLM 输出的整篇 markdown 总结。
 
@@ -163,6 +163,13 @@ def parse_summary_markdown(md_text: str) -> List[PaperSummary]:
     不解析:
       - `## 整体概览` / `### 研究方向` 这种非 paper header
         (它们要么没有数字开头,要么不以 `N.` 数字开头)
+
+    2026-09-04 加 `fetched_papers` 参数:title-based 回退匹配
+    - 之前:LLM 输出里漏掉 DOI/URL 时,paper_id 空 → 整个 block 跳过(用户报"20 条 APS 缺字段")
+    - 现在:传已抓取的 paper 列表进来(每条有 paper_id + title),parser 在 paper_id 空时
+      拿 header 里的 title 跟 fetched_papers 比对,找到最匹配的填上 paper_id
+    - 匹配规则:normalize 后子串匹配(去掉 markdown/标点/大小写)
+    - 极小开销:只在 paper_id 缺失时启用,正常 LLM 输出不受影响
     """
     if not md_text or not md_text.strip():
         return []
@@ -199,6 +206,18 @@ def parse_summary_markdown(md_text: str) -> List[PaperSummary]:
                     if arxiv_match:
                         paper_id = arxiv_match.group(0)
 
+        # 2026-09-04 加:title-based 回退匹配
+        # LLM 偶尔漏掉 DOI/URL(实测),paper_id 空 → block 跳过 → UPDATE 落空
+        # 用已抓取的 paper 列表,按 title 匹配回 paper_id
+        if not paper_id and fetched_papers:
+            title_for_match = _clean_title(header_text)
+            paper_id = _match_paper_by_title(title_for_match, fetched_papers)
+            if paper_id:
+                logger.debug(
+                    "[summary_parser] title 匹配: header='%s' → paper_id='%s'",
+                    header_text[:60], paper_id,
+                )
+
         # 解析 title
         title = _clean_title(header_text)
 
@@ -230,3 +249,77 @@ def parse_summary_markdown(md_text: str) -> List[PaperSummary]:
                 header_text[:80], paper_id,
             )
     return results
+
+
+def _normalize_title_for_match(title: str) -> str:
+    """title 归一化:去 markdown/标点/空格/大小写,方便模糊匹配
+
+    - '**Paper A**' → 'papera'
+    - '[Paper A](https://...)' → 'papera'  (link 部分去掉了)
+    - 'Paper A: B' → 'papera b'
+    """
+    t = title.lower()
+    # 去 markdown 强调
+    t = re.sub(r'\*+', '', t)
+    # 去 markdown 链接(只保留文本部分)
+    t = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', t)
+    # 去标点
+    t = re.sub(r'[\[\]()（）【】""''「」、,。:;!?]', ' ', t)
+    # 多空白 → 单空格
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _match_paper_by_title(header_title: str, fetched_papers: List[dict]) -> str:
+    """根据 header 里的 title,在已抓取的 papers 里找最匹配的,返回 paper_id
+
+    匹配规则(从严到松):
+    1. 完全相等(normalize 后)
+    2. 子串匹配(header 是 fetched title 的子串,或反过来)
+    3. 共同 token 累计长度 >= 20(防误匹配)
+
+    用途:LLM 偶尔漏掉 DOI/URL 字段,header 里没 paper_id,fallback 用 title 找回
+    """
+    if not fetched_papers or not header_title:
+        return ""
+
+    h_norm = _normalize_title_for_match(header_title)
+    if not h_norm or len(h_norm) < 5:
+        return ""
+
+    # 预 normalize 候选 titles
+    candidates = []
+    for p in fetched_papers:
+        pid = p.get("id", "")
+        ptitle = p.get("title", "")
+        if not pid or not ptitle:
+            continue
+        p_norm = _normalize_title_for_match(ptitle)
+        if not p_norm:
+            continue
+        candidates.append((pid, ptitle, p_norm))
+
+    # 1) 完全相等
+    for pid, ptitle, p_norm in candidates:
+        if h_norm == p_norm:
+            return pid
+
+    # 2) 子串(双向)
+    for pid, ptitle, p_norm in candidates:
+        if h_norm in p_norm or p_norm in h_norm:
+            shorter = min(len(h_norm), len(p_norm))
+            if shorter >= 20:
+                return pid
+
+    # 3) 共同 token 累计长度(启发式,适应 LLM 简化标题的情况)
+    best_pid = ""
+    best_overlap = 0
+    h_tokens = set(h_norm.split())
+    for pid, ptitle, p_norm in candidates:
+        p_tokens = set(p_norm.split())
+        common = h_tokens & p_tokens
+        overlap = sum(len(t) for t in common)
+        if overlap > best_overlap and overlap >= 20:
+            best_overlap = overlap
+            best_pid = pid
+    return best_pid

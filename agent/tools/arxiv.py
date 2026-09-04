@@ -234,7 +234,9 @@ def generate_daily_summary_arxiv() -> str:
         papers_text += f"{i}. **{p['title']}**\n"
         papers_text += f"   - 作者: {p.get('authors', '未知')}\n"
         papers_text += f"   - ID: `{p['id']}` | [arXiv链接]({p['link']})\n"
-        papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
+        # 2026-09-04:abstract 从 300 缩到 180(66 篇 × 180 = 12k chars,
+        # 之前 300 → 20k chars 撞 180s timeout)
+        papers_text += f"   - 摘要: {p.get('abstract', 'N/A')[:180]}...\n\n"
 
     prompt = f"""
     你现在是一个科研助手。以下是从 arXiv.org quant-ph 抓取的**今日 new submission**列表（共 {len(papers)} 篇,只含 primary category 是 quant-ph 的新论文,不含 cross-list 和 replacement)。
@@ -262,10 +264,13 @@ def generate_daily_summary_arxiv() -> str:
     try:
         # 2026-09-04 用户拍板:批量 daily summary 强制不开思考
         # 66+ 篇 × 思考 token = 慢+贵,格式化任务不需要
-        summary = _call_llm(prompt, enable_thinking=False)
+        # 2026-09-04 加:timeout 提到 600s(防 MiniMax 等慢模型 12k+ prompt 撞 timeout)
+        summary = _call_llm(prompt, enable_thinking=False, timeout=600)
         # 2026-09-03: 同步解析 + 同步补 LLM 字段到 summary_item
+        # 2026-09-04 加:把已抓取的 papers 传进去,parser 在 LLM 漏掉 DOI/arXiv ID 时
+        # 用 title 回退匹配(用户实测 89% arxiv 缺字段的根因)
         _persist_parsed_summary_fields(
-            parsed=parse_summary_markdown(summary),
+            parsed=parse_summary_markdown(summary, fetched_papers=papers),
             source='arxiv_daily',
             summary_date=today,
         )
@@ -333,7 +338,8 @@ def analyze_today_topic_arxiv(topic: str) -> str:
     papers_text = ""
     for i, p in enumerate(papers, 1):
         papers_text += f"{i}. [{p['title']}]({p['link']})\n"
-        papers_text += f"   摘要: {p['abstract'][:500]}...\n\n"
+        # 2026-09-04:abstract 从 500 缩到 200(虽然篇数少,但质量比冗长好)
+        papers_text += f"   摘要: {p.get('abstract', 'N/A')[:200]}...\n\n"
 
     prompt = f"""
     你现在是一个科研助手。以下是今天 arXiv"量子物理"类别的新论文列表（共 {len(papers)} 篇）。
@@ -354,6 +360,6 @@ def analyze_today_topic_arxiv(topic: str) -> str:
 
     try:
         # 主题分析也是批量筛选+格式化,不开思考
-        return _call_llm(prompt, enable_thinking=False)
+        return _call_llm(prompt, enable_thinking=False, timeout=300)
     except Exception as e:
         return f"❌ 生成主题分析失败: {e}"

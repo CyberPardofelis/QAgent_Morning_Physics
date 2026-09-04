@@ -27,13 +27,12 @@ from agent.llm_clients import (
     resolve_legacy_model,
     classify_llm_error,
 )
-from agent.controller import MODE_TO_PROVIDER_MODEL
 
 logger = logging.getLogger(__name__)
 
 
 def _get_provider_key(provider: str) -> str:
-    """动态从 agent.infra.api_keys 读 key（3 层兜底：.api_keys.json > QSettings > .env）"""
+    """动态从 agent.infra.api_keys 读 key(3 层兜底:.api_keys.json > QSettings > .env)"""
     try:
         from agent.infra.api_keys import get_api_key
         return get_api_key(provider)
@@ -63,8 +62,17 @@ def _resolve_chat_mode_params() -> tuple:
 
     Returns:
         (provider: str, model: str, enable_thinking: bool)
+
+    2026-09-04 修:不能顶层 import agent.controller(循环 import:
+    controller -> tools.registry -> tools.llm -> controller)
+    改为函数内 lazy import。
     """
     default = ("deepseek", "deepseek-v4-flash", False)
+    try:
+        from agent.controller import MODE_TO_PROVIDER_MODEL
+    except Exception:
+        return default
+
     try:
         from config.settings import get_settings
         settings = get_settings()
@@ -194,10 +202,17 @@ def _call_llm(
         kwargs.pop("frequency_penalty", None)
         kwargs.pop("presence_penalty", None)
 
+    # 2026-09-04 P0 fix:把 timeout 传给 client.chat.completions.create()
+    # 之前 timeout 是 _call_llm 的入参但没被透传 — daily summary 类工具传 timeout=600
+    # 完全被忽略,默认 180s 撞 timeout(用户 9 月 4 日实测 MiniMax-M3 跑 9.7k prompt 卡 180s)
+    # OpenAI Python SDK 的 chat.completions.create(**kwargs) 接受 timeout kwarg 透传
+    # 给底层 HTTPX 请求,直接放 kwargs 里即可
+    kwargs["timeout"] = timeout
+
     try:
         import time as _t
         _t0 = _t.time()
-        print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符", flush=True)
+        print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符 timeout={timeout}s", flush=True)
         out = client.chat.completions.create(**kwargs).choices[0].message.content
         print(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符", flush=True)
         return out
