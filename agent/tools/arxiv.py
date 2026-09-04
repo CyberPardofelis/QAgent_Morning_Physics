@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 #   - 抓文 → 同步 save_summary_item(只存 title/authors/abstract)
 #   - LLM 总结 → 同步解析 → 同步 UPDATE 已存在行
 #   - 不走 _async,不调嵌入
+#
+# 2026-09-04 用户拍板:只总结 new submission,跳过 cross 和 replacement
+# 原因:cross/replacement 量也很大,但不属于"今天的 quant-ph 新工作",总结价值低
+# 方案:继续用 listing 页抓(arxiv 已经做好日期切分),只解析 "New submissions" 那个 dl 块
+# 备选:arxiv API(`cat:quant-ph` + `primary_category==quant-ph` 过滤)需要自己算日期范围 + 分页
+#       + 限流,得不偿失,listing 页一行 HTTP 就够
 # ============================================================
 
 
@@ -30,13 +36,20 @@ _ARXIV_LISTING_URL = "https://arxiv.org/list/quant-ph/new"
 
 def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     """
-    抓取 arXiv quant-ph "今日新论文" 列表并解析。
+    抓取 arXiv quant-ph "今日 new submission" 列表并解析。
+
+    2026-09-04 改:只拿 "New submissions" 块,跳过 "Cross submissions" 和 "Replacement submissions"
+    - listing 页结构:1 个日期 h3 + 3 个 h3 分类标题(Each followed by a dl)
+      - "New submissions (showing X of Y entries)"     ← 只拿这个
+      - "Cross submissions (showing X of Y entries)"   ← 跳过
+      - "Replacement submissions (showing X of Y entries)" ← 跳过
+    - 解析 dl 块内所有 <dt> + <dd> 配对
 
     Returns:
         list of dict: [{'id', 'title', 'abstract', 'link', 'authors'?}, ...]
 
     Raises:
-        RuntimeError: 抓取或解析失败
+        RuntimeError: 抓取或解析失败,或找不到 "New submissions" 块
     """
     import time as _t
     _t0 = _t.time()
@@ -46,9 +59,21 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
 
+    # 2026-09-04 找 "New submissions" h3 所标注的 dl
+    # (h3 是前一个 dl 的 label,不是后一个)
+    new_dl = _find_section_dl(soup, "New submissions")
+    if new_dl is None:
+        raise RuntimeError("找不到 'New submissions' 块(arxiv 页面结构可能变了)")
+
+    # 统计其它 section(用于日志)
+    cross_dl = _find_section_dl(soup, "Cross submissions")
+    repl_dl = _find_section_dl(soup, "Replacement submissions")
+    cross_count = len(cross_dl.find_all('dt')) if cross_dl else 0
+    repl_count = len(repl_dl.find_all('dt')) if repl_dl else 0
+
     papers = []
-    dts = soup.find_all('dt')
-    dds = soup.find_all('dd')
+    dts = new_dl.find_all('dt')
+    dds = new_dl.find_all('dd')
     for dt, dd in zip(dts, dds):
         arxiv_id_tag = dt.find('a', title='Abstract')
         if arxiv_id_tag:
@@ -83,8 +108,32 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
                 paper['authors'] = "未知"
 
         papers.append(paper)
-    print(f"[arxiv] 解析到 {len(papers)} 篇 papers  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
+    print(
+        f"[arxiv] 解析到 {len(papers)} 篇 (new) + 跳过 cross={cross_count} + replacement={repl_count}  累计耗时 {_t.time()-_t0:.1f}s",
+        flush=True,
+    )
     return papers
+
+
+def _find_section_dl(soup, section_label: str):
+    """2026-09-04 加:在 listing 页里找 h3 文本以 section_label 开头的那个 h3 所标注的 dl
+
+    关键:arxiv listing 页的 h3 是**它前面那个 dl 的 label**,不是后面的 dl!
+    实际 DOM 结构(2026-09-04 实测):
+      <h3>Showing new listings for Friday, 4 September 2026</h3>     ← 页头,无对应 dl
+      <dl id="articles">...66 个 new submission dt/dd...</dl>
+      <h3>New submissions (showing 66 of 66 entries)</h3>             ← 这是上面 dl 的 label
+      <dl id="articles">...18 个 cross dt/dd...</dl>
+      <h3>Cross submissions (showing 18 of 18 entries)</h3>           ← 这是上面 dl 的 label
+      <dl id="articles">...68 个 replacement dt/dd...</dl>
+      <h3>Replacement submissions (showing 68 of 68 entries)</h3>     ← 这是上面 dl 的 label
+
+    所以要找 h3 对应的 dl,要用 `find_previous('dl')`,不是 `find_next('dl')`!
+    """
+    for h3 in soup.find_all('h3'):
+        if h3.get_text(strip=True).startswith(section_label):
+            return h3.find_previous('dl')
+    return None
 
 
 def _format_arxiv_links(text: str) -> str:
@@ -188,11 +237,12 @@ def generate_daily_summary_arxiv() -> str:
         papers_text += f"   - 摘要: {p['abstract'][:300]}...\n\n"
 
     prompt = f"""
-    你现在是一个科研助手。以下是从 arXiv.org 抓取的"量子物理（quant-ph）"类别最新论文列表（共 {len(papers)} 篇）。
-    请按研究方向分类总结，每个类别挑选 **4-5 篇** 亮点论文，并确保在描述亮点时**包含该论文的 arXiv ID 和超链接**（使用格式 `[标题](链接)`）。
+    你现在是一个科研助手。以下是从 arXiv.org quant-ph 抓取的**今日 new submission**列表（共 {len(papers)} 篇,只含 primary category 是 quant-ph 的新论文,不含 cross-list 和 replacement)。
+
+    请按研究方向分类总结，**对每篇论文都生成笔记**（不需要挑选亮点），并确保描述时**包含该论文的 arXiv ID 和超链接**（使用格式 `[标题](链接)`）。
 
     **任务要求：**
-    1. **整体概览**：一句话说明今天新上榜论文总数。
+    1. **整体概览**：一句话说明今天 new submission 总数。
     2. **分类总结**：根据标题和摘要，将论文分为合理的研究方向（例如：量子算法与纠错、量子模拟、量子信息理论、实验与测量技术、量子机器学习等）。
     3. **格式要求**：
         ### 研究方向
@@ -210,7 +260,9 @@ def generate_daily_summary_arxiv() -> str:
     """
 
     try:
-        summary = _call_llm(prompt)
+        # 2026-09-04 用户拍板:批量 daily summary 强制不开思考
+        # 66+ 篇 × 思考 token = 慢+贵,格式化任务不需要
+        summary = _call_llm(prompt, enable_thinking=False)
         # 2026-09-03: 同步解析 + 同步补 LLM 字段到 summary_item
         _persist_parsed_summary_fields(
             parsed=parse_summary_markdown(summary),
@@ -301,6 +353,7 @@ def analyze_today_topic_arxiv(topic: str) -> str:
     """
 
     try:
-        return _call_llm(prompt)
+        # 主题分析也是批量筛选+格式化,不开思考
+        return _call_llm(prompt, enable_thinking=False)
     except Exception as e:
         return f"❌ 生成主题分析失败: {e}"

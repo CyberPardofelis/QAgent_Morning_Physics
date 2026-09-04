@@ -179,7 +179,10 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         论文列表：
         {papers_text}
         """
-        summary_md = _call_llm(prompt)
+        # 2026-09-04 用户拍板:daily summary 类任务(批量格式化 + 轻度摘要)强制不开思考
+        # 原因:60+ 篇 × 思考 token = 2-5x 延迟 + 2-3x 成本,质量提升有限
+        # analyze_paper 那种单篇深读场景保留"跟 chat 走",需要时再显式开思考
+        summary_md = _call_llm(prompt, enable_thinking=False)
 
         # 2026-09-03: 同步解析 LLM 输出 → 补 核心贡献/方法/意义/关键词
         # 主流程同步 save,不创建后台线程(防 P0.6 蓝屏)

@@ -9,6 +9,14 @@
 - 改用 agent.infra.api_keys.get_api_key(provider) 动态读（保证永远最新）
 - 旧 model 名兼容 + 错误分类统一在 agent.llm_clients
 - 支持 provider 参数（"deepseek" / "minimax" / ...），默认 deepseek 保持向后兼容
+
+2026-09-04 用户拍板:工具内部调 LLM 默认跟主界面 chat mode 走
+- 之前硬编码 default provider="deepseek" model="deepseek-v4-flash"
+- 跟 chat_window.mode_combo 选啥没关系
+- 现在:_call_llm 不传 provider/model 时,自动从 QSettings `chat_mode` 读,
+  复用 controller 的 MODE_TO_PROVIDER_MODEL 映射
+- 思考模式也跟(`chat_think_mode`)
+- 工具如果想强制用某个 model(比如 _smoke 测试),还是显式传 provider/model
 """
 import logging
 from openai import OpenAI
@@ -19,6 +27,7 @@ from agent.llm_clients import (
     resolve_legacy_model,
     classify_llm_error,
 )
+from agent.controller import MODE_TO_PROVIDER_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +39,7 @@ def _get_provider_key(provider: str) -> str:
         return get_api_key(provider)
     except Exception as e:
         logger.warning("[tools.llm] 读 %s api_key 失败: %s", provider, e)
-        # 最后兜底：读模块级常量（仅 deepseek / openai 有）
+        # 最后兜底:读模块级常量(仅 deepseek / openai 有)
         try:
             from agent.tools import config as _cfg
             return getattr(_cfg, f"{provider.upper()}_API_KEY", "") or ""
@@ -38,10 +47,77 @@ def _get_provider_key(provider: str) -> str:
             return ""
 
 
+def _resolve_chat_mode_params() -> tuple:
+    """
+    2026-09-04 加:从 QSettings 读主界面 chat mode,返回 (provider, model, enable_thinking)。
+
+    复用 controller.MODE_TO_PROVIDER_MODEL 映射,跟主界面 controller 用同一份。
+    优先级:
+      1. QSettings `chat_mode` 存在且在 MODE_TO_PROVIDER_MODEL 里 → 走它
+      2. 兜底:provider="deepseek", model="deepseek-v4-flash", enable_thinking=False
+         (跟旧版默认行为一致,保证向后兼容)
+
+    注意:不是所有 mode 都有 model 字段(e.g. "openai" 走 Config.get_openai_model())
+    这种情况下:
+      - openai:用 Config.get_openai_model() 或 PROVIDERS["openai"].default_model
+
+    Returns:
+        (provider: str, model: str, enable_thinking: bool)
+    """
+    default = ("deepseek", "deepseek-v4-flash", False)
+    try:
+        from config.settings import get_settings
+        settings = get_settings()
+    except Exception:
+        return default
+
+    try:
+        mode = (settings.value("chat_mode", "", type=str) or "").strip()
+    except Exception:
+        return default
+    if not mode or mode not in MODE_TO_PROVIDER_MODEL:
+        return default
+
+    provider_name, default_model = MODE_TO_PROVIDER_MODEL[mode]
+    if provider_name is None:
+        # "custom" mode(worker 模式,无默认 provider/model)
+        return default
+
+    # 解析 model(provider-specific 兜底)
+    if default_model:
+        model = default_model
+    else:
+        # provider-specific(参考 controller._resolve_client_and_model)
+        try:
+            from config import _config as Config
+            if provider_name == "openai":
+                model = Config.Config.get_openai_model() or PROVIDERS["openai"].default_model
+            elif provider_name == "deepseek":
+                model = Config.Config.get_deepseek_model() or PROVIDERS["deepseek"].default_model
+            elif provider_name == "minimax":
+                cfg_model = (settings.value("MINIMAX_MODEL", "") or "").strip()
+                model = cfg_model or PROVIDERS["minimax"].default_model
+            else:
+                model = PROVIDERS[provider_name].default_model
+        except Exception:
+            model = PROVIDERS[provider_name].default_model
+
+    # 思考模式跟主界面:仅在 provider=deepseek 时同步(其它 provider 思考模式行为未验证)
+    think = False
+    if provider_name == "deepseek":
+        try:
+            think_str = settings.value("chat_think_mode", "false", type=str)
+            think = (think_str == "true")
+        except Exception:
+            think = False
+
+    return (provider_name, model, think)
+
+
 def _call_llm(
         prompt: str,
-        model: str = "deepseek-v4-flash",
-        enable_thinking: bool = False,
+        model: str = None,   # 2026-09-04 改:None 表示跟主界面 chat mode
+        enable_thinking: bool = None,  # None = 跟主界面
         reasoning_effort: str = "high",  # "high" 或 "max"
         temperature: float = 0.3,
         top_p: float = 0.8,
@@ -49,18 +125,35 @@ def _call_llm(
         presence_penalty: float = 0.0,
         max_tokens: int = 40000,
         timeout: int = 180,
-        provider: str = "deepseek",
+        provider: str = None,  # 2026-09-04 改:None = 跟主界面
 ) -> str:
     """
-    工具内部用的 LLM 调用（同步、非流式）。
+    工具内部用的 LLM 调用(同步、非流式)。
     用于 generate_daily_summary_arxiv / generate_aps_daily_summary / analyze_paper 等工具内的总结生成。
 
-    参数:
-        provider: LLM provider id（"deepseek" / "minimax" / "openai"），默认 "deepseek" 保持向后兼容。
-                  客户端、API key、base_url 都从 agent.llm_clients 拿，保持 3 层兜底。
+    2026-09-04 用户拍板:默认 provider/model/enable_thinking 跟主界面 chat mode 走。
+    - 之前硬编码 provider="deepseek" model="deepseek-v4-flash" enable_thinking=False
+    - 现在:不传时,从 QSettings `chat_mode` 读,复用 controller.MODE_TO_PROVIDER_MODEL
+    - 工具如果想强制用某个 model(smoke 测试等),显式传 provider/model 即可
 
-    返回：成功时为 LLM 输出文本；失败时为带错误提示的字符串（不再 print 错误就吞掉）。
+    参数:
+        provider: LLM provider id("deepseek" / "minimax" / "openai"),None = 跟主界面
+        model:    具体 model 名称,None = 跟主界面
+        enable_thinking: 是否走思考模式,None = 跟主界面(仅 deepseek 时同步)
+        reasoning_effort / temperature / ...: 透传给 chat.completions.create
+
+    返回:成功时为 LLM 输出文本;失败时为带错误提示的字符串(不再 print 错误就吞掉)。
     """
+    # 2026-09-04:默认参数从 chat mode 读
+    if provider is None or model is None or enable_thinking is None:
+        chat_provider, chat_model, chat_think = _resolve_chat_mode_params()
+        if provider is None:
+            provider = chat_provider
+        if model is None:
+            model = chat_model
+        if enable_thinking is None:
+            enable_thinking = chat_think
+
     # 校验 provider
     if provider not in PROVIDERS:
         return f"❌ 未知 LLM provider: {provider!r}。支持: {list(PROVIDERS.keys())}"
@@ -68,14 +161,14 @@ def _call_llm(
     cfg = PROVIDERS[provider]
     display_name = cfg.display_name
 
-    # 1. 拿 client（自动处理 3 层兜底 + 缓存）
+    # 1. 拿 client(自动处理 3 层兜底 + 缓存)
     try:
         client = get_client(provider)
     except Exception as e:
-        # get_client 内部已经封装错误，e 是 LLMClientError
+        # get_client 内部已经封装错误,e 是 LLMClientError
         return classify_llm_error(display_name, e)
 
-    # 2. 旧 model 名兼容（仅 deepseek 有 legacy 映射，其他 provider 透传）
+    # 2. 旧 model 名兼容(仅 deepseek 有 legacy 映射,其他 provider 透传)
     model, enable_thinking, reasoning_effort = resolve_legacy_model(model, enable_thinking)
 
     # 3. 构造请求参数
@@ -96,7 +189,7 @@ def _call_llm(
             "presence_penalty": presence_penalty,
         })
 
-    # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限，统一剥离避免 400。
+    # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限,统一剥离避免 400。
     if provider == "minimax":
         kwargs.pop("frequency_penalty", None)
         kwargs.pop("presence_penalty", None)

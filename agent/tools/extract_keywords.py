@@ -68,7 +68,7 @@ def extract_keywords_with_llm(title: str, abstract: str, max_retries: int = 1) -
         try:
             from agent.tools.llm import _call_llm
             # P0 fix: 显式 timeout=30s,防单次卡死
-            result = _call_llm(prompt, temperature=0.2, max_tokens=200, timeout=30)
+            result = _call_llm(prompt, enable_thinking=False, temperature=0.2, max_tokens=200, timeout=30)
             return _parse_keywords(result)
         except Exception as e:
             logger.warning("[extract_keywords] LLM 失败(attempt %d): %s", attempt + 1, e)
