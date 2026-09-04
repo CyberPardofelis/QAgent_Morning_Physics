@@ -3,13 +3,18 @@ from config import EMBEDDING_ENABLED
 from agent.vector_store import VectorStore
 
 import importlib
+import logging
+logger = logging.getLogger(__name__)
+
 Embedder = None
 if EMBEDDING_ENABLED:
     try:
         embedder_module = importlib.import_module('agent.local_embedder')
         Embedder = embedder_module.Embedder
-    except:
-        pass
+    except ImportError as e:
+        # 2026-09-02 P0 fix: 裸 `except:` 会吞掉 KeyboardInterrupt / SystemExit / MemoryError,
+        # 用户按 Ctrl+C 都无法中断进程。改成只捕获 ImportError。
+        logger.warning("[paper_indexer] 加载 agent.local_embedder 失败(非致命): %s", e)
 
 def extract_text(pdf_path):
     reader = PyPDF2.PdfReader(pdf_path)

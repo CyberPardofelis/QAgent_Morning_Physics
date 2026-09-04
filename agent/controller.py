@@ -187,6 +187,12 @@ MODE_TO_PROVIDER_MODEL = {
 NEW_BUBBLE = "\x1cNEW_BUBBLE"
 
 
+# 2026-09-02 P0 fix: 工具循环死循环兜底（模块级常量, 方便 smoke test 验证 + 调优）
+# LLM 持续调同工具 / 工具持续返空 / 工具持续报错 都会让 LLM 反复重试,
+# 无 MAX_ROUNDS 会撞 cost_guard 50 ceiling + 内存累积 + 费用爆
+MAX_ROUNDS = 20
+
+
 def _resolve_client_and_model(mode: str) -> tuple:
     if mode not in MODE_TO_PROVIDER_MODEL:
         raise LLMClientError(
@@ -333,6 +339,23 @@ def run_agent_stream(
     _think_state = [False, ""]
     while True:
         _round += 1
+        # 2026-09-02 P0 fix: 超过 MAX_ROUNDS 强制退出, yield 友好提示给用户
+        if _round > MAX_ROUNDS:
+            print(f"[controller] ⚠ 工具循环超过 {MAX_ROUNDS} 轮, 强制退出(round={_round})", flush=True)
+            logger.warning(
+                "[controller] 工具循环超过 %d 轮, 强制退出(可能 LLM 死循环或工具持续返空)",
+                MAX_ROUNDS,
+            )
+            yield (
+                f"\n\n[已停止: 工具循环超过 {MAX_ROUNDS} 轮]\n"
+                f"可能原因:\n"
+                f"  - LLM 持续调同一工具(死循环)\n"
+                f"  - 工具持续返回空结果\n"
+                f"  - 工具持续返回错误\n\n"
+                f"已自动终止,避免内存/费用爆。如需继续,请重新提问。\n"
+            )
+            yield NEW_BUBBLE
+            return
         print(f"[controller] LLM round {_round} start  mode={provider_name} model={actual_model} messages={len(messages)}", flush=True)
         request_params = {
             "model": actual_model,

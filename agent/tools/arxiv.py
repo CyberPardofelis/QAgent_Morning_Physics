@@ -7,15 +7,18 @@ from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
+from agent.tools.summary import save_summary_item
+from agent.tools.summary_parser import parse_summary_markdown
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 2026-09-02 P0.9 彻底回退(跟 agent/tools/aps.py 同步):
-# 完全回退 P0.6 加的协同逻辑,见 aps.py 顶部注释。
-# arxiv 跟 aps 同模式 — 30 篇 → 60 线程 → 蓝屏,所以一并回退。
-# 现在只做两件事:抓文 + LLM 总结(同步、零后台线程)。
-# 关键词由 LLM 在 prompt 里一次性输出,主流程不解析。
+# 2026-09-03 接回 LLM 总结字段落库(用户拍板):
+# 跟 aps.py 同步 — 抓文元数据同步落库,LLM 总结后补 核心贡献/方法/意义/关键词。
+# **零后台线程**(防 P0.6 蓝屏复刻):
+#   - 抓文 → 同步 save_summary_item(只存 title/authors/abstract)
+#   - LLM 总结 → 同步解析 → 同步 UPDATE 已存在行
+#   - 不走 _async,不调嵌入
 # ============================================================
 
 
@@ -149,6 +152,9 @@ def generate_daily_summary_arxiv() -> str:
     调用 LLM 生成分类总结，并确保亮点论文包含 arXiv ID 和超链接。
 
     返回完整 Markdown 总结。controller 会识别这是"直接输出"工具，单独分气泡渲染。
+
+    2026-09-03: LLM 总结里的 核心贡献/方法/意义/关键词 同步落库到 summary_items.db
+    (零后台线程,主流程同步解析 + 同步 save/update)
     """
     try:
         papers = _fetch_arxiv_listing(include_authors=True)
@@ -158,10 +164,21 @@ def generate_daily_summary_arxiv() -> str:
     if not papers:
         return "未找到论文列表，请稍后重试。"
 
-    # 2026-09-02 P0.9 彻底回退:不做任何后台落库/关键词提取,只走 LLM 总结(同步、单线程)。
-    # 关键词由 prompt 要求 LLM 在每篇亮点论文里输出"**关键词**:"行,主流程不解析。
-    # 之前 P0.6 协同:每篇 paper 独立后台线程 → 30 篇 60 线程 → Windows 蓝屏。
-    # 见模块顶部注释 + aps.py 同名函数。
+    # 2026-09-03: 抓文元数据同步落库(title/authors/abstract)
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    for p in papers:
+        try:
+            save_summary_item(
+                paper_id=p['id'],
+                source='arxiv_daily',
+                summary_date=today,
+                title=p['title'],
+                authors=p.get('authors', ''),
+                abstract=p.get('abstract', ''),
+            )
+        except Exception as e:
+            logger.warning("[arxiv] 抓文元数据落库失败(已吞): paper=%s err=%s", p['id'], e)
 
     papers_text = ""
     for i, p in enumerate(papers, 1):
@@ -194,9 +211,55 @@ def generate_daily_summary_arxiv() -> str:
 
     try:
         summary = _call_llm(prompt)
+        # 2026-09-03: 同步解析 + 同步补 LLM 字段到 summary_item
+        _persist_parsed_summary_fields(
+            parsed=parse_summary_markdown(summary),
+            source='arxiv_daily',
+            summary_date=today,
+        )
         return _format_arxiv_links(summary)
     except Exception as e:
         return f"❌ 生成总结失败: {e}"
+
+
+def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> None:
+    """2026-09-03: 把 LLM 解析出的字段 UPDATE 到已存在的 summary_item 行
+
+    跟 aps.py 同款(两边各保留一份,避免互相 import)
+    关键:单连接批 UPDATE,不开 30 个连接(防 FTS5 触发器在多连接下损坏索引)
+    """
+    if not parsed:
+        return
+    valid = [ps for ps in parsed if ps.is_valid()]
+    if not valid:
+        return
+    saved = 0
+    try:
+        from agent.infra.db import connect
+        with connect("summary_items") as conn:
+            for ps in valid:
+                try:
+                    cur = conn.execute(
+                        """
+                        UPDATE summary_item
+                        SET core_method = COALESCE(NULLIF(?, ''), core_method),
+                            core_contrib = COALESCE(NULLIF(?, ''), core_contrib),
+                            keywords = COALESCE(NULLIF(?, ''), keywords),
+                            outlook = COALESCE(NULLIF(?, ''), outlook)
+                        WHERE paper_id = ? AND source = ? AND summary_date = ?
+                        """,
+                        (ps.core_method, ps.core_contrib, ps.keywords, ps.outlook,
+                         ps.paper_id, source, summary_date),
+                    )
+                    if cur.rowcount > 0:
+                        saved += 1
+                except Exception as e:
+                    logger.warning("[arxiv→db] 单条 UPDATE 失败(已吞): paper=%s err=%s",
+                                   ps.paper_id, e)
+    except Exception as e:
+        logger.warning("[arxiv→db] 批 UPDATE 失败(已吞): %s", e)
+    if saved:
+        print(f"[arxiv→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
 
 
 # ============================================================

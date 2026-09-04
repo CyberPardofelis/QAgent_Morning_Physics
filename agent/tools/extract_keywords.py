@@ -26,6 +26,12 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# 2026-09-02 P0 fix: 限制 update_keywords_for_paper_async 后台线程并发数, 防 P0.6 蓝屏复刻
+# 30 papers 调 update_keywords_for_paper_async → 最多 4 个后台线程同时跑
+# (per-paper dedup 由调用方决定,Semaphore 是全局并发限流)
+_BG_SEMAPHORE = threading.Semaphore(4)
+
+
 # LLM 提关键词的 prompt
 _EXTRACT_PROMPT = """从以下论文的标题和摘要中,提取 5-10 个最核心的英文关键词(technical terms)。
 要求:
@@ -40,7 +46,7 @@ _EXTRACT_PROMPT = """从以下论文的标题和摘要中,提取 5-10 个最核�
 关键词:"""
 
 
-def extract_keywords_with_llm(title: str, abstract: str, max_retries: int = 2) -> str:
+def extract_keywords_with_llm(title: str, abstract: str, max_retries: int = 1) -> str:
     """
     调 LLM 提 5-10 个关键词(逗号分隔字符串)
     失败返 ""
@@ -49,6 +55,10 @@ def extract_keywords_with_llm(title: str, abstract: str, max_retries: int = 2) -
     - 单次 LLM 调用(L1 档,符合 cost_tier 规范)
     - max_retries:失败重试次数(网络/限流场景)
     - 不抛异常,只 log
+
+    2026-09-02 P0 fix:
+    - max_retries 默认 2 → 1(原 3 attempts × 180s = 540s/paper,30 papers = 270 min 阻塞)
+    - 显式传 timeout=30s(_call_llm 默认 180s,过长会卡 Semaphore 槽位)
     """
     if not title:
         return ""
@@ -57,7 +67,8 @@ def extract_keywords_with_llm(title: str, abstract: str, max_retries: int = 2) -
     for attempt in range(max_retries + 1):
         try:
             from agent.tools.llm import _call_llm
-            result = _call_llm(prompt, temperature=0.2, max_tokens=200)
+            # P0 fix: 显式 timeout=30s,防单次卡死
+            result = _call_llm(prompt, temperature=0.2, max_tokens=200, timeout=30)
             return _parse_keywords(result)
         except Exception as e:
             logger.warning("[extract_keywords] LLM 失败(attempt %d): %s", attempt + 1, e)
@@ -192,8 +203,14 @@ def update_keywords_for_paper_async(
         except Exception as e:
             logger.warning("[update_keywords_for_paper_async] 失败(已吞): paper=%s err=%s", paper_id, e)
 
+    def _bg_wrapped():
+        """2026-09-02 P0 fix: Semaphore 包 _bg, 防 30 papers 起 30 线程
+        acquire 阻塞直到有可用槽位(不会无限等待太久,因为 max_retries=1 + timeout=30 限流)"""
+        with _BG_SEMAPHORE:
+            _bg()
+
     t = threading.Thread(
-        target=_bg, name=f"update_keywords_{paper_id[:20]}", daemon=True,
+        target=_bg_wrapped, name=f"update_keywords_{paper_id[:20]}", daemon=True,
     )
     t.start()
 

@@ -51,14 +51,126 @@ CREATE TABLE IF NOT EXISTS summary_item (
 CREATE INDEX IF NOT EXISTS idx_summary_date  ON summary_item(summary_date);
 CREATE INDEX IF NOT EXISTS idx_summary_source ON summary_item(source);
 CREATE INDEX IF NOT EXISTS idx_summary_in_papers ON summary_item(in_papers_db);
+
+-- 2026-09-03 加:FTS5 全文检索
+-- 不用 external content(content='summary_item'),因为:
+--   - external content + triggers + WAL + 多连接 = 索引状态错乱(malformed)
+--   - 改成 FTS5 自带存储,触发器更新数据,稳得多
+-- 代价:FTS5 多存一份文本(对 summary_item 这种小数据可接受)
+-- 2026-09-03 加上 outlook(用户原话:"意义与展望"应该可搜)
+CREATE VIRTUAL TABLE IF NOT EXISTS summary_item_fts USING fts5(
+    title, abstract, core_method, core_contrib, keywords, outlook,
+    tokenize='unicode61 remove_diacritics 2'
+);
 """
 
 
+# 2026-09-03 加:outlook 列(LLM 总结"意义与展望") + FTS5 触发器(自动同步)
+SCHEMA_MIGRATION_SQL = """
+-- outlook: LLM "意义与展望"
+-- 用 try/except 模式,首次加后 ALTER 失败(列已存在)就忽略
+"""
+
+
+def _safe_alter(conn, sql: str) -> None:
+    """ALTER TABLE 失败不抛(列已存在)"""
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+            return
+        raise
+
+
+def _ensure_outlook_column(conn) -> None:
+    """2026-09-03: 加 outlook 列(若已存在则跳过)"""
+    row = conn.execute(
+        "SELECT 1 FROM pragma_table_info('summary_item') WHERE name='outlook'"
+    ).fetchone()
+    if not row:
+        conn.execute("ALTER TABLE summary_item ADD COLUMN outlook TEXT")
+        logger.info("[summary] 已为 summary_item 添加 outlook 列")
+
+
+def _ensure_fts_triggers(conn) -> None:
+    """2026-09-03: FTS5 触发器(INSERT/UPDATE/DELETE 时同步 summary_item_fts)
+    非 external content 模式,触发器直接写数据进 FTS5,稳。
+
+    2026-09-03 P0 fix:
+    - 之前用 external content + 'delete' 特殊语法,跟 WAL + 多连接冲突,索引 malformed
+    - 改成自带存储的 FTS5,触发器 INSERT/DELETE 实体行,UPDATE 拆 delete+insert
+    """
+    conn.executescript("""
+    CREATE TRIGGER IF NOT EXISTS summary_item_ai AFTER INSERT ON summary_item BEGIN
+        INSERT INTO summary_item_fts(rowid, title, abstract, core_method, core_contrib, keywords, outlook)
+        VALUES (new.id, new.title, new.abstract, new.core_method, new.core_contrib, new.keywords, new.outlook);
+    END;
+    CREATE TRIGGER IF NOT EXISTS summary_item_ad AFTER DELETE ON summary_item BEGIN
+        DELETE FROM summary_item_fts WHERE rowid = old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS summary_item_au AFTER UPDATE ON summary_item BEGIN
+        DELETE FROM summary_item_fts WHERE rowid = old.id;
+        INSERT INTO summary_item_fts(rowid, title, abstract, core_method, core_contrib, keywords, outlook)
+        VALUES (new.id, new.title, new.abstract, new.core_method, new.core_contrib, new.keywords, new.outlook);
+    END;
+    """)
+
+
+def _backfill_fts(conn) -> None:
+    """2026-09-03: 如果 summary_item_fts 是空的但 summary_item 有数据,全量回填一次
+    触发器只能管新增,旧数据得手动 backfill
+    """
+    cur = conn.execute("SELECT COUNT(*) FROM summary_item_fts")
+    if cur.fetchone()[0] > 0:
+        return
+    cur = conn.execute("SELECT COUNT(*) FROM summary_item")
+    if cur.fetchone()[0] == 0:
+        return
+    conn.execute("""
+        INSERT INTO summary_item_fts(rowid, title, abstract, core_method, core_contrib, keywords, outlook)
+        SELECT id, title, abstract, core_method, core_contrib, keywords, outlook FROM summary_item
+    """)
+    logger.info("[summary] FTS5 已 backfill 旧 summary_item 数据")
+
+
+def _drop_legacy_external_fts(conn) -> None:
+    """2026-09-03 P0 fix: 检测并删除旧的 FTS5(任何 schema 不匹配的版本)
+    旧版 1:external-content(content='summary_item') + triggers + WAL + 多连接 = malformed
+    旧版 2:non-external 但缺 outlook 列(2026-09-03 早期版本,用户需求 outlook 也要可搜)
+    """
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='summary_item_fts'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if not row or not row["sql"]:
+        return
+    sql = row["sql"]
+    is_external = "content=" in sql.lower()
+    has_outlook = "outlook" in sql.lower()
+    if is_external or not has_outlook:
+        logger.warning("[summary] 检测到旧版 FTS5 (external=%s, has_outlook=%s),删除重建",
+                       is_external, has_outlook)
+        conn.executescript("""
+            DROP TRIGGER IF EXISTS summary_item_ai;
+            DROP TRIGGER IF EXISTS summary_item_ad;
+            DROP TRIGGER IF EXISTS summary_item_au;
+            DROP TABLE IF EXISTS summary_item_fts;
+        """)
+        # 重建在 SCHEMA_SQL 里跑(幂等 CREATE),这里不重复
+
+
 def init_schema() -> None:
-    """建表(幂等,可多次调用)"""
+    """建表(幂等,可多次调用) + 跑迁移"""
     from agent.infra.db import connect
     with connect("summary_items") as conn:
+        # 先检查并删除旧版 external-content FTS5(P0 fix)
+        _drop_legacy_external_fts(conn)
         conn.executescript(SCHEMA_SQL)
+        _ensure_outlook_column(conn)
+        _ensure_fts_triggers(conn)
+        _backfill_fts(conn)
     logger.info("[summary] summary_items.db schema 初始化完成")
 
 
@@ -77,6 +189,10 @@ except Exception as e:
 # ============================================================
 _async_lock = threading.Lock()
 _async_inflight = set()  # paper_id 集合,防止同一 paper 短时间内重复触发
+# 2026-09-02 P0 fix: 限制 save_summary_item_async 后台线程并发数,防 P0.6 蓝屏复刻
+# 30 papers 调 save_summary_item_async → 最多 4 个后台线程同时跑
+# (per-paper dedup 仍由 _async_inflight 守,Semaphore 是全局并发限流)
+_SAVE_SEMAPHORE = threading.Semaphore(4)
 
 
 def save_summary_item_async(
@@ -89,6 +205,7 @@ def save_summary_item_async(
     core_method: Optional[str] = None,
     core_contrib: Optional[str] = None,
     keywords: Optional[str] = None,
+    outlook: Optional[str] = None,   # 2026-09-03 加
 ) -> None:
     """异步落库(后台线程)
 
@@ -97,6 +214,7 @@ def save_summary_item_async(
     - 失败只 log,不抛
     - 用 in_flight set 短时间 dedup(避免同 paper 短时间内多次触发)
     - 用 threading 而非 asyncio:agent 工具是同步的,简化
+    - 2026-09-02 P0 fix: _bg 受 Semaphore(4) 限流, 防 30 papers 起 30 线程 → 蓝屏
     """
     if not paper_id or not source or not title:
         logger.warning("[summary] save_summary_item_async 缺关键字段: paper_id=%s source=%s title=%s",
@@ -117,7 +235,8 @@ def save_summary_item_async(
             row_id = save_summary_item(
                 paper_id=paper_id, source=source, summary_date=summary_date,
                 title=title, authors=authors, abstract=abstract,
-                core_method=core_method, core_contrib=core_contrib, keywords=keywords,
+                core_method=core_method, core_contrib=core_contrib,
+                keywords=keywords, outlook=outlook,
             )
             # 2026-09-02 P2.5: 落库成功后,顺手嵌入 paper_keywords collection(L0,纯本地)
             # row_id == -1 表示 UNIQUE 冲突没插,跳过嵌入(旧条目已有)
@@ -134,7 +253,14 @@ def save_summary_item_async(
             with _async_lock:
                 _async_inflight.discard(paper_id)
 
-    t = threading.Thread(target=_bg, name=f"summary_save_{paper_id[:20]}", daemon=True)
+    def _bg_wrapped():
+        """2026-09-02 P0 fix: Semaphore 包 _bg, 限流后台线程数
+        30 papers 调 save → 最多 4 个同时跑 + 其余在 acquire 阻塞等槽位
+        单次 _bg 通常 < 1s(SQLite insert + 一次 chromadb add),不会卡死 Semaphore"""
+        with _SAVE_SEMAPHORE:
+            _bg()
+
+    t = threading.Thread(target=_bg_wrapped, name=f"summary_save_{paper_id[:20]}", daemon=True)
     t.start()
 
 
@@ -148,6 +274,7 @@ def save_summary_item(
     core_method: Optional[str] = None,
     core_contrib: Optional[str] = None,
     keywords: Optional[str] = None,
+    outlook: Optional[str] = None,   # 2026-09-03 加:LLM "意义与展望"
 ) -> int:
     """同步落库,返回 row id (新增) 或 -1 (UNIQUE 冲突)
 
@@ -161,11 +288,11 @@ def save_summary_item(
             """
             INSERT OR IGNORE INTO summary_item (
                 paper_id, source, summary_date, title, authors, abstract,
-                core_method, core_contrib, keywords
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                core_method, core_contrib, keywords, outlook
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (paper_id, source, summary_date, title, authors, abstract,
-             core_method, core_contrib, keywords),
+             core_method, core_contrib, keywords, outlook),
         )
         if cur.lastrowid == 0:
             # UNIQUE 冲突,没插入
@@ -182,6 +309,7 @@ def list_summary_items(
     source: Optional[str] = None,
     since_date: Optional[str] = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """列 summary_item 记录
 
@@ -189,6 +317,7 @@ def list_summary_items(
         source: 按 source 过滤(如 "arxiv_daily")
         since_date: 按 summary_date >= since_date 过滤
         limit: 最多返回多少条
+        offset: 跳过前 N 条(分页用,2026-09-03 加)
     """
     from agent.infra.db import connect
     sql = "SELECT * FROM summary_item WHERE 1=1"
@@ -199,10 +328,59 @@ def list_summary_items(
     if since_date:
         sql += " AND summary_date >= ?"
         params.append(since_date)
-    sql += " ORDER BY summary_date DESC, id DESC LIMIT ?"
-    params.append(limit)
+    sql += " ORDER BY summary_date DESC, id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     with connect("summary_items") as conn:
         rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_summary_items_fts(
+    keyword: str,
+    source: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """2026-09-03 加:FTS5 全文检索 summary_item
+
+    走 summary_item_fts MATCH,匹配 title/abstract/core_method/core_contrib/keywords
+    自动加 '*' 前缀支持模糊匹配(e.g. "量子" → "量子*")
+    """
+    if not keyword or not keyword.strip():
+        return []
+    from agent.infra.db import connect
+    # 加 * 支持部分匹配 + 转义双引号(FTS5 syntax)
+    fts_query = keyword.strip().replace('"', '""') + "*"
+    sql = """
+        SELECT s.* FROM summary_item s
+        JOIN summary_item_fts f ON s.id = f.rowid
+        WHERE summary_item_fts MATCH ?
+    """
+    params: list = [fts_query]
+    if source:
+        sql += " AND s.source = ?"
+        params.append(source)
+    sql += " ORDER BY rank LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    with connect("summary_items") as conn:
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as e:
+            # FTS5 syntax 错误(用户输入特殊字符),降级到 LIKE
+            logger.warning("[summary→fts] MATCH 失败,降级 LIKE: %s", e)
+            sql2 = """
+                SELECT * FROM summary_item
+                WHERE (title LIKE ? OR abstract LIKE ? OR core_method LIKE ?
+                       OR core_contrib LIKE ? OR keywords LIKE ?)
+            """
+            like_pat = f"%{keyword}%"
+            params2 = [like_pat] * 5
+            if source:
+                sql2 += " AND source = ?"
+                params2.append(source)
+            sql2 += " ORDER BY summary_date DESC, id DESC LIMIT ? OFFSET ?"
+            params2.extend([limit, offset])
+            rows = conn.execute(sql2, params2).fetchall()
     return [dict(r) for r in rows]
 
 

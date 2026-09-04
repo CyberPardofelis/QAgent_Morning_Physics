@@ -7,19 +7,20 @@ from agent.tools.llm import _call_llm
 from agent.tools.utils import JOURNAL_CONFIG
 from agent.tools.registry import register_tool
 from agent.tools.browser_pool import get_browser_pool
+from agent.tools.summary import save_summary_item
+from agent.tools.summary_parser import parse_summary_markdown
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 2026-09-02 P0.9 彻底回退(用户拍板):
-# 完全回退 P0.6 加的协同逻辑(save_summary_item_async / update_keywords_for_paper_async):
-#   - 之前 30 篇 paper → 60 个并发后台线程(LLM 关键词 + bge-large 嵌入 + chromadb 写)
-#   - Windows 句柄/内存耗尽 → 用户连续 2 次蓝屏(memory manage)
-# 现在 daily summary 只做两件事:抓文 + LLM 总结,完全同步、零后台线程。
-# 关键词由 LLM 在总结时**一次性输出**(prompt 里加要求行),不再单独 LLM 调用。
-#
-# 落库/SQLite/chromadb 嵌入:全部不做,回到"老版本"最简行为。
-# 恢复协同:必须先加 Semaphore 限流 + bge-large 单例 + chromadb 加锁,见 README/memory。
+# 2026-09-03 接回 LLM 总结字段落库(用户拍板):
+# 之前 2026-09-02 P0.9 彻底回退只走了"抓文 + LLM 总结 return 文本",没存任何 LLM 产出。
+# 用户原话:"LLM 总结完了就完了?" —— 应该把 LLM 输出的 核心贡献/方法/意义/关键词 都入库。
+# 关键安全约束(防 P0.6 蓝屏复刻):
+#   - **零后台线程**:主流程同步解析 markdown + 同步 save_summary_item()(走同步版,不走 _async)
+#   - **30 篇 paper → 30 次顺序 SQLite INSERT** → 毫秒级,绝对安全
+#   - **不调嵌入**:LLM 总结只入 summary_items.db,不入 chromadb
+#     (chroma P0.5 嵌入仍由 analyze_paper 走 section-aware chunk 那条线,跟这条解耦)
 # ============================================================
 
 
@@ -118,6 +119,9 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
     通过浏览器自动化抓取 APS 最新论文，调用 LLM 生成总结。
 
     controller 会识别这是"直接输出"工具，单独分气泡渲染。
+
+    2026-09-03: LLM 总结里的 核心贡献/方法/意义/关键词 会同步落库到 summary_items.db
+    (零后台线程,主流程同步解析 + 同步 save_summary_item)
     """
     config = JOURNAL_CONFIG.get(journal)
     if not config:
@@ -130,10 +134,22 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         if not papers:
             return f"未找到 {config['name']} 论文列表，请稍后重试。"
 
-        # 2026-09-02 P0.9 彻底回退:不做任何后台落库/关键词提取,只走 LLM 总结(同步、单线程)。
-        # 关键词由 prompt 要求 LLM 在每篇论文里输出"**关键词**:"行,主流程不解析,直接显示给用户看。
-        # 之前的 P0.6 协同(save_summary_item_async + update_keywords_for_paper_async)
-        # 30 篇 paper → 60 个并发线程 → Windows 蓝屏,见模块顶部注释。
+        # 2026-09-03: 抓文元数据同步落库(title/authors/abstract),不等 LLM
+        # 走 save_summary_item() 同步版(不走 _async),绝对安全
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        for p in papers:
+            try:
+                save_summary_item(
+                    paper_id=p['id'],
+                    source='aps_daily',
+                    summary_date=today,
+                    title=p['title'],
+                    authors=p.get('authors', ''),
+                    abstract=p.get('abstract', ''),
+                )
+            except Exception as e:
+                logger.warning("[aps] 抓文元数据落库失败(已吞): paper=%s err=%s", p['id'], e)
 
         papers_text = ""
         for i, p in enumerate(papers, 1):
@@ -163,9 +179,67 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
         论文列表：
         {papers_text}
         """
-        return _call_llm(prompt)
+        summary_md = _call_llm(prompt)
+
+        # 2026-09-03: 同步解析 LLM 输出 → 补 核心贡献/方法/意义/关键词
+        # 主流程同步 save,不创建后台线程(防 P0.6 蓝屏)
+        _persist_parsed_summary_fields(
+            parsed=parse_summary_markdown(summary_md),
+            source='aps_daily',
+            summary_date=today,
+        )
+
+        return summary_md
     except Exception as e:
         return f"❌ 抓取或总结失败: {str(e)}"
+
+
+def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> None:
+    """2026-09-03: 把解析出的 LLM 字段同步 UPDATE 到 summary_item 已存在的行
+
+    为什么 UPDATE 而非 INSERT:
+    - 抓文时已 INSERT 一行(只有 title/authors/abstract)
+    - LLM 出来后再补 core_method/core_contrib/keywords/outlook
+    - UNIQUE(paper_id, source, summary_date) 已存在,直接 UPDATE
+
+    关键(2026-09-03 P0 防 P0.6 蓝屏复刻):
+    - **单连接批 UPDATE**:30 篇用 1 个事务做完,不开 30 个连接
+      (开 30 个连接 + FTS5 触发器会触发 "database disk image is malformed")
+    - **不走 _async**:同步主流程,绝对安全
+    - **失败不抛**:单条失败吞掉,主流程不受影响
+    """
+    if not parsed:
+        return
+    valid = [ps for ps in parsed if ps.is_valid()]
+    if not valid:
+        return
+    saved = 0
+    try:
+        from agent.infra.db import connect
+        with connect("summary_items") as conn:
+            for ps in valid:
+                try:
+                    cur = conn.execute(
+                        """
+                        UPDATE summary_item
+                        SET core_method = COALESCE(NULLIF(?, ''), core_method),
+                            core_contrib = COALESCE(NULLIF(?, ''), core_contrib),
+                            keywords = COALESCE(NULLIF(?, ''), keywords),
+                            outlook = COALESCE(NULLIF(?, ''), outlook)
+                        WHERE paper_id = ? AND source = ? AND summary_date = ?
+                        """,
+                        (ps.core_method, ps.core_contrib, ps.keywords, ps.outlook,
+                         ps.paper_id, source, summary_date),
+                    )
+                    if cur.rowcount > 0:
+                        saved += 1
+                except Exception as e:
+                    logger.warning("[aps→db] 单条 UPDATE 失败(已吞): paper=%s err=%s",
+                                   ps.paper_id, e)
+    except Exception as e:
+        logger.warning("[aps→db] 批 UPDATE 失败(已吞): %s", e)
+    if saved:
+        print(f"[aps→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
 
 
 def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
