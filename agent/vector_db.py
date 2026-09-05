@@ -36,17 +36,28 @@ def _make_embedding_function():
     """
     用本地 bge-large-en-v1.5 当 embedding function。
 
-    为什么不用 chroma 默认：
+    为什么不用 chroma 默认:
     - chroma 默认会下载 all-MiniLM-L6-v2 (80MB) 到 ~/.cache/chroma/onnx_models/
     - 国内网络下 80MB 要 30+ 分钟
-    - 用户本地已下好 bge-large-en-v1.5（配置 MODEL_PATH 指向）
-    - 1024 维（vs 默认 384 维），向量质量更好
+    - 用户本地已下好 bge-large-en-v1.5(配置 MODEL_PATH 指向)
+    - 1024 维(vs 默认 384 维), 向量质量更好
 
-    失败回退：返回 None，chroma 会用默认（让代码至少能跑）
+    失败回退: 返回 None, chroma 会用默认(让代码至少能跑)
+
+    2026-09-05 加: 检查 Config.get_embedding_enabled(), False 时不加载 BGE 直接返 None
+    (之前 EMBEDDING_ENABLED=False 也会加载 BGE, 跟 PyQt6 多线程竞争偶发 0xC0000005 段错误)
     """
     global _chroma_embedding_fn
     if _chroma_embedding_fn is not None:
         return _chroma_embedding_fn
+    # P0 段错误绕开: 用户在 settings 显式关掉 BGE 时, 不加载模型
+    try:
+        from config import Config
+        if not Config.get_embedding_enabled():
+            logger.info("[vector_db] EMBEDDING_ENABLED=False, 跳过 BGE 加载, 用 chroma 默认")
+            return None
+    except Exception:
+        pass
     try:
         from chromadb.utils import embedding_functions
         from config import Config
@@ -54,7 +65,7 @@ def _make_embedding_function():
         if not model_path or not Path(model_path).exists():
             logger.warning(
                 "[vector_db] 本地 embedding model 路径不存在: %s。"
-                "回退到 chroma 默认（会触发 80MB onnx 下载，可能很慢）",
+                "回退到 chroma 默认(会触发 80MB onnx 下载, 可能很慢)",
                 model_path,
             )
             return None
