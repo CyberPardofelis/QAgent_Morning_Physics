@@ -47,12 +47,23 @@ class MemoryEmbedder:
         self._dim: Optional[int] = None
 
     def is_ready(self) -> bool:
-        """检查 embedding 是否可用。"""
+        """检查 embedding 是否可用。
+
+        2026-09-05 P0 fix: 优先读 QSettings (Config.get_embedding_enabled()),
+        而不是 local_embedder 的 env EMBEDDING_ENABLED 常量。
+        之前用户关掉 BGE (QSettings False) 但 env 默认 True → memory 库仍加载 BGE
+        → 跟 PyQt6 多线程竞争 0xC0000005 段错误
+        """
         try:
-            from agent.local_embedder import Embedder, EMBEDDER_TYPE, EMBEDDING_ENABLED
+            from config import Config
+            from agent.local_embedder import EMBEDDER_TYPE
         except ImportError:
             return False
-        if not EMBEDDING_ENABLED:
+        # QSettings 优先 (跟 vector_db 路径一致)
+        try:
+            if not Config.get_embedding_enabled():
+                return False
+        except Exception:
             return False
         if EMBEDDER_TYPE not in ("local", "openai"):
             return False

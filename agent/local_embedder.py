@@ -1,12 +1,27 @@
 import importlib
 import threading
 import numpy as np
-from config import EMBEDDING_ENABLED, EMBEDDER_TYPE, OPENAI_EMBEDDING_MODEL, MODEL_PATH, OPENAI_API_KEY, LOCAL_EMBEDDER_NAME
+from config import EMBEDDER_TYPE, OPENAI_EMBEDDING_MODEL, MODEL_PATH, OPENAI_API_KEY, LOCAL_EMBEDDER_NAME
 import os
 import openai
+
+# 2026-09-05 P0 fix: 改读 Config.get_embedding_enabled() (QSettings) 而非 env EMBEDDING_ENABLED
+# 之前只读 .env, 跟 UI 设置的 QSettings 不同步, 偶发 BGE 在用户禁用后仍被加载
+def _is_embedding_enabled() -> bool:
+    """统一入口: QSettings 优先, env 兜底, 默认 False"""
+    try:
+        from config import Config
+        return Config.get_embedding_enabled()
+    except Exception:
+        pass
+    # env 兜底
+    return os.getenv("EMBEDDING_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+_EMBEDDING_ENABLED = _is_embedding_enabled()
 torch = None
 SentenceTransformer = None
-if EMBEDDING_ENABLED:
+if _EMBEDDING_ENABLED:
     try:
         torch = importlib.import_module('torch')
         sentence_transformers = importlib.import_module('sentence_transformers')
@@ -24,6 +39,11 @@ class Embedder:
 
     @classmethod
     def get_model(cls):
+        # 2026-09-05 P0 fix: 运行时再检查, 防止 SentenceTransformer 已被 import 但用户禁用了
+        if not _is_embedding_enabled():
+            raise RuntimeError(
+                "Embedding 已被禁用 (EMBEDDING_ENABLED=False). 改用 OpenAI 嵌入或启用本地模型."
+            )
         if EMBEDDER_TYPE == "local":
             if cls._model is None:           # 快路径: 已加载直接返
                 with cls._init_lock:         # 慢路径: 抢锁防并发
@@ -54,6 +74,9 @@ class Embedder:
 
     @classmethod
     def embed(cls, texts):
+        # 运行时再检查 (防止 import 时检查过后用户改了设置)
+        if not _is_embedding_enabled():
+            raise RuntimeError("Embedding 已被禁用 (EMBEDDING_ENABLED=False)")
         model = cls.get_model()
         if EMBEDDER_TYPE == "local":
             # 本地模型：直接调用 encode
