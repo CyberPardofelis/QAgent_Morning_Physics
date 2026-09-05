@@ -28,9 +28,10 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
-    _HAS_WEBENGINE = True
+    HAS_QTWEBENGINE = True
 except ImportError:
-    _HAS_WEBENGINE = False
+    HAS_QTWEBENGINE = False
+    QWebEngineView = None  # type: ignore
 
 
 # 2026-09-05 P0 fix: 模块级 _DISABLED 标志, 避免 render() 每次读 process env
@@ -40,9 +41,6 @@ except ImportError:
 _DISABLED = os.getenv("DISABLE_FORMULA_RENDERER", "").lower() in ("true", "1", "yes")
 if _DISABLED:
     print("[FormulaRenderer] DISABLED via env DISABLE_FORMULA_RENDERER=1 (P0 段错误绕开)", flush=True)
-    HAS_QTWEBENGINE = True
-except ImportError:
-    HAS_QTWEBENGINE = False
 
 
 # 公式占位 HTML 模板(KaTeX 渲染用,内边距 4px)
