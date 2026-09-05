@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import requests
 from bs4 import BeautifulSoup
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
@@ -253,47 +254,109 @@ def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> No
 
 def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
     """
-    通过 chromium 下载 APS 论文 PDF。
-    使用 BrowserPool 复用浏览器进程，page/context 用完即关。
+    2026-09-04 改:用 `requests` 直接拿 APS 论文 PDF,不再走 Playwright。
+
+    之前用 Playwright 模拟点击 `<a download>` 触发下载,**根本触发不了**:
+    - APS 的 PDF endpoint 用 `Content-Disposition: inline`(在浏览器里打开)
+    - 浏览器不触发 download 事件,只是导航到 PDF URL
+    - Playwright 的 `expect_download()` 等不到事件,被 cancel
+    - 工具报"已下载"但实际什么也没下,用户报"工具只显示执行完成,没有报错信息"
+
+    现在的流程:
+    1. GET `https://doi.org/{doi}` → redirect 到 `https://journals.aps.org/{journal}/abstract/{doi}`
+       (顺便从最终 URL 拿到 journal code,如 prl/pra/...)
+    2. 把 `/abstract/` 换成 `/pdf/` 拿到 PDF 直链
+    3. GET PDF URL,设合理 headers(Referer + User-Agent)
+    4. 校验返回 application/pdf,把 body 写盘
+
+    优点:稳、无浏览器依赖、能区分 404 / 订阅墙 / 真实 PDF。
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    pool = get_browser_pool()
-    with pool.acquire_page(
-        browser_type="chromium",
-        accept_downloads=True,
-        viewport={'width': 1280, 'height': 800},
-    ) as page:
-        page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=30000)
-        final_url = page.url
+    # 2026-09-04 加:容错 — LLM 经常把 DOI 简写(漏 `10.1103/` 前缀),
+    # 自动补全常见格式;但要识别"已经是 URL"的情况
+    doi = doi.strip()
+    if doi:
+        if doi.startswith("https://doi.org/") or doi.startswith("http://doi.org/"):
+            # 已经是 URL,直接抽 DOI 部分
+            doi = doi.split("doi.org/")[-1]
+        elif not doi.startswith("10.1103/"):
+            # 看起来像短 DOI(prefix 漏了),自动补
+            doi = f"10.1103/{doi}"
+    print(f"[aps-dl] 处理后的 DOI: {doi!r}", flush=True)
 
-        pdf_link = page.locator('a[href*="/pdf/"]').first
-        if pdf_link.count() == 0:
-            pdf_url = final_url.replace('/abstract/', '/pdf/')
-        else:
-            pdf_url = pdf_link.get_attribute('href')
-            if not pdf_url.startswith('http'):
-                pdf_url = 'https://journals.aps.org' + pdf_url
+    # 1) 走 doi.org 拿真实 journal + final url
+    abs_url = f"https://doi.org/{doi}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8",
+    }
+    print(f"[aps-dl] GET {abs_url}", flush=True)
+    r0 = requests.get(abs_url, allow_redirects=True, timeout=30, headers=headers)
+    final_url = r0.url
+    print(f"[aps-dl] final URL: {final_url}  status={r0.status_code}", flush=True)
+    if r0.status_code != 200:
+        raise RuntimeError(
+            f"无法访问 DOI 页面(可能是无效 DOI): HTTP {r0.status_code} ({final_url})"
+        )
 
-        with page.expect_download() as download_info:
-            page.evaluate(f"""
-                const a = document.createElement('a');
-                a.href = '{pdf_url}';
-                a.download = '';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            """)
+    # 从 final URL 抽 journal code(/prl/abstract/xxx → prl)
+    # 兜底:URL 不是 /abstract/ 形态就 raise(不强行猜 journal)
+    if "/abstract/" not in final_url:
+        raise RuntimeError(
+            f"无法从 DOI 推断期刊(redirect 后 URL 形态不符): {final_url}"
+        )
+    journal = final_url.split("/abstract/")[0].rsplit("/", 1)[-1]
+    pdf_url = final_url.replace("/abstract/", "/pdf/")
 
-        download = download_info.value
+    # 2) GET PDF
+    pdf_headers = dict(headers)
+    pdf_headers["Referer"] = final_url
+    print(f"[aps-dl] GET {pdf_url}", flush=True)
+    r1 = requests.get(pdf_url, allow_redirects=True, timeout=60, headers=pdf_headers)
+    print(
+        f"[aps-dl] PDF status={r1.status_code}  "
+        f"Content-Type={r1.headers.get('content-type')}  "
+        f"size={len(r1.content)} bytes",
+        flush=True,
+    )
 
-        if filename is None:
-            article_id = final_url.split('/')[-1]
-            filename = f"{article_id}.pdf"
+    # 3) 校验
+    if r1.status_code == 404:
+        raise RuntimeError(f"APS 返回 404: {pdf_url} (DOI {doi} 不存在或已撤稿)")
+    if r1.status_code == 403:
+        raise RuntimeError(
+            f"APS 返回 403: {pdf_url} (需要机构订阅,免费用户无法下载)"
+        )
+    if r1.status_code != 200:
+        raise RuntimeError(
+            f"APS 返回 HTTP {r1.status_code}: {pdf_url}"
+        )
+    if not r1.content:
+        raise RuntimeError(f"PDF 内容为空: {pdf_url}")
+    if r1.content[:4] != b"%PDF":
+        # APS 有时候对订阅墙返 HTML 而不是 PDF
+        snippet = r1.content[:200].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"返回内容不是 PDF(可能是订阅墙 HTML): {pdf_url}\n"
+            f"前 200 字符: {snippet}"
+        )
 
-        filepath = os.path.join(save_dir, filename)
-        download.save_as(filepath)
-        return filepath
+    # 4) 写盘(filename 缺省用 doi 末尾作文件名)
+    if filename is None:
+        # URL 末尾的 id(去掉 .pdf 后缀,再加 .pdf)
+        last = pdf_url.rsplit("/", 1)[-1]
+        if last.lower().endswith(".pdf"):
+            last = last[:-4]
+        filename = f"{journal}_{last}.pdf"
+    filepath = os.path.join(save_dir, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(r1.content)
+    return filepath
 
 
 @register_tool(name="download_aps_paper", is_streaming=False, cost_tier="L0")
@@ -303,6 +366,6 @@ def download_aps_paper(doi: str) -> str:
     os.makedirs(save_dir, exist_ok=True)
     try:
         path = _download_with_playwright(doi, save_dir)
-        return f"✅ 已下载：{path}"
+        return f"✅ 已下载：{path}  ({os.path.getsize(path)} bytes)"
     except Exception as e:
         return f"❌ 下载失败: {str(e)}"

@@ -60,7 +60,7 @@ TOOL_GUIDE = """【可用工具指南】
   - 检索实时新闻、百科、技术文档等
 
 ### 工具
-- `run_python(code)` — 执行 Python 代码（子进程，60 秒超时）
+- (2026-09-04 起:run_python 工具已禁用 — 安全考虑,后续考虑加 sandbox/白名单后重新开放)
 
 【重要：每日总结工具（DIRECT_OUTPUT）】
 - 当你调用 `generate_daily_summary_arxiv` 或 `generate_aps_daily_summary` 后，工具会返回详细的论文列表和分析。

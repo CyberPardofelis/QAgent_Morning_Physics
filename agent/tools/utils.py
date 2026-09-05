@@ -2,7 +2,9 @@ import tempfile
 import subprocess
 import yaml
 import os
-from agent.tools.registry import register_tool
+# 2026-09-04 用户拍板:暂时从 LLM 工具列表中移除 run_python(安全考虑)
+# 函数保留 — 后续如果要加回(加 sandbox/资源限制),可以恢复
+# from agent.tools.registry import register_tool
 
 
 def load_journal_config():
@@ -16,9 +18,12 @@ def load_journal_config():
 JOURNAL_CONFIG = load_journal_config()
 
 
-@register_tool(name="run_python", is_streaming=False, cost_tier="L0")
+# 2026-09-04 注:run_python 工具已停用(用户拍板),函数暂时保留以备未来加回
+# (加 sandbox/资源限制/白名单 import 后再加),目前是 dead code
+# @register_tool(name="run_python", is_streaming=False, cost_tier="L0")
 def run_python(code: str) -> str:
-    """执行 Python 代码（子进程隔离），返回 stdout + stderr 合并输出"""
+    """执行 Python 代码(子进程隔离),返回 stdout + stderr 合并输出。
+    **当前未注册为 LLM 工具**(2026-09-04 起),仅供内部调用或未来加回。"""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
         f.write(code.encode())
         filename = f.name
@@ -29,11 +34,11 @@ def run_python(code: str) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,  # 安全：60 秒硬超时
+            timeout=60,  # 安全:60 秒硬超时
         )
         return (result.stdout or "") + (result.stderr or "")
     except subprocess.TimeoutExpired:
-        return "❌ 执行超时（> 60 秒）"
+        return "❌ 执行超时(> 60 秒)"
     except Exception as e:
         return f"❌ 执行失败: {e}"
     finally:

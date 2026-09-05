@@ -199,6 +199,29 @@ def _strip_think_tags(chunk_content: str, state: list):
     state[1] = pending
     return out
 
+
+# 2026-09-04 加:_strip_think_tags_from_text — 一次性剥离整段文本里的
+# <think>...</think> 块, 用于:
+# - 历史消息加载时(history_manager / conversation_controller)
+# - 发送给 LLM 前的清洗(_clean_messages_for_api)
+# - UI 旧对话回放时(避免老 thinking 污染气泡)
+# 因为整段文本已知完整, 不会跨 chunk, 用 regex 一行搞定
+# (state machine 留给流式路径 _strip_think_tags 用)
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think_tags_from_text(text: str) -> str:
+    """
+    从一段完整文本里剥掉所有 <think>...</think> 块。
+
+    用法:
+    - controller._strip_think_tags_from_text(conv_msg["content"])
+    - 若 text 不含 <think> 标签, 直接返回原对象(零拷贝优化)
+    """
+    if not text or "<think>" not in text:
+        return text
+    return _THINK_RE.sub("", text).strip()
+
 # mode -> (provider_name, default_model)
 MODE_TO_PROVIDER_MODEL = {
     "openai":            ("openai",   None),

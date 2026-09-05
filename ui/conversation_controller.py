@@ -85,12 +85,24 @@ class ConversationController(QObject):
         return self.default_system_prompt
 
     def _clean_messages_for_api(self, messages):
+        # 2026-09-04 加:对 assistant 消息的 content 跑一次 <think> 标签剥离
+        # 背景:之前老对话(MiniMax-M3 thinking 漏 <think> 标签)的 content
+        # 字段里直含 thinking 文本,送回 LLM 会让 LLM "看到" 自己的旧 thinking
+        # 污染下一轮回答。剥离后再送 LLM。
+        from agent.controller import _strip_think_tags_from_text
         cleaned = []
         for msg in messages:
             new_msg = msg.copy()
             if new_msg.get("role") == "tool" and "tool_call_id" not in new_msg:
                 new_msg["role"] = "assistant"
                 new_msg.pop("tool_calls", None)
+            # 2026-09-04 改:对所有 role 走一遍剥离(用户/工具/system 也可能含
+            # 泄漏的 thinking, 不限 assistant)
+            content = new_msg.get("content")
+            if isinstance(content, str) and content:
+                stripped = _strip_think_tags_from_text(content)
+                if stripped != content:
+                    new_msg["content"] = stripped
             cleaned.append(new_msg)
         return cleaned
 
@@ -520,9 +532,14 @@ class ConversationController(QObject):
             # v18:切对话不复读历史里的 system 消息 — user 要求
             # "切对话 = system 消息都消失"(无论是启动欢迎气泡还是历史的错误/对比提示)
             # 仍然复读 user + assistant
+            # 2026-09-04 加:复读前剥 <think> 标签,避免老 thinking 污染气泡
+            # (用户报"重启后看到 LLM 旧 thinking 整段显示")
+            from agent.controller import _strip_think_tags_from_text
             for msg in conv.messages:
                 if msg["role"] in ("user", "assistant") and msg.get("content", "").strip():
-                    self.new_message.emit(conv_id, msg["role"], msg["content"])
+                    content = msg["content"]
+                    stripped = _strip_think_tags_from_text(content)
+                    self.new_message.emit(conv_id, msg["role"], stripped)
             self.conversation_switched.emit()
             busy = conv_id in self._busy_conversation_ids
             has_user = any(m["role"] == "user" for m in conv.messages)

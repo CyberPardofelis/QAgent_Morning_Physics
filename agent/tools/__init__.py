@@ -35,7 +35,7 @@ from .aps import (
     generate_aps_daily_summary, download_aps_paper,
     fetch_aps_page_via_browser, parse_aps_papers_from_html,
 )
-from .utils import run_python, load_journal_config, JOURNAL_CONFIG
+from .utils import load_journal_config, JOURNAL_CONFIG  # run_python 2026-09-04 停用,函数仍在 utils.py 但不导入(避免误用)
 
 # attachment_reader / search 模块
 from .attachment_reader import (
@@ -75,8 +75,7 @@ __all__ = [
     "analyze_today_topic_arxiv",
     "generate_aps_daily_summary", "download_aps_paper",
     "fetch_aps_page_via_browser", "parse_aps_papers_from_html",
-    # 工具
-    "run_python",
+    # 工具(2026-09-04:run_python 停用,不导出)
     # 搜索
     "web_search",
     # 记忆库

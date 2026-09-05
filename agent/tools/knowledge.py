@@ -41,9 +41,24 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
 
     if pdf_path and os.path.exists(pdf_path):
         try:
-            text = extract_text_from_pdf(pdf_path)[:5000]
-        except Exception as e:
+            # 2026-09-04 改:
+            # - 不再 [:5000] 粗暴截断(用户报"analyze_paper JSON 解析失败,
+            #   LLM 拿不到全文,补只能 run_python 跑 PyMuPDF 绕过" 已确认)
+            # - pdf_utils 默认走 fitz(PyMuPDF)排版还原好,数字/公式完整
+            # - 上限 60K 字符(约 15K token),既给 LLM 全文又不超 prompt
+            # - 单页失败不连累整文(pdf_utils 已加 try/except)
+            text = extract_text_from_pdf(pdf_path, max_chars=60000)
+            if not text or not text.strip():
+                return (
+                    f"❌ PDF 文本提取为空({pdf_path}),可能扫描件无 OCR 层。"
+                    f"请先跑 OCR 或手动提供 arXiv ID 走摘要路径。"
+                )
+        except FileNotFoundError as e:
+            return f"❌ {e}"
+        except RuntimeError as e:
             return f"❌ 读取 PDF 失败: {e}"
+        except Exception as e:
+            return f"❌ 读取 PDF 失败(未分类错误): {e}"
     else:
         if pdf_path and not os.path.exists(pdf_path):
             pass  # 走 arXiv 兜底

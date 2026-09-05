@@ -19,7 +19,12 @@ ui.summary_kb_dialog — 论文摘要知识库 dialog(2026-09-03 翻页+搜索�
 - 分页:默认 page_size=50, 加上一页/下一页 + 跳转输入 + 当前页/总页显示
 - 搜索:走 search_summary_items_fts(FTS5 MATCH,NOT Python LIKE 遍历)
 - 详情 dialog:增加 outlook 字段
+
+2026-09-04 升级:
+- 关键词列显示修复:`_format_keywords_cell` 按逗号切,每行 1-2 个,
+  不再 `[:60]` 一行截掉换行/逗号
 """
+import re
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
@@ -261,9 +266,36 @@ class SummaryKBDialog(QDialog):
             self.result_table.setItem(row, 3, QTableWidgetItem(it.get("summary_date", "")))
             in_db = "✅" if it.get("in_papers_db") else "—"
             self.result_table.setItem(row, 4, QTableWidgetItem(in_db))
-            kw = (it.get("keywords") or "")[:60]
+            # 2026-09-04 改:关键词显示不再 [60] 一行截掉
+            # 之前 `keywords[:60]` 把换行/逗号分隔的多关键词全压一行 → 用户报
+            # "randomized measurement\n,\nRényi entropy\n..." 抽象排版
+            # 新逻辑:按逗号切,每行 1-2 个,最多显示 8 个,允许换行
+            kw = self._format_keywords_cell(it.get("keywords") or "")
             self.result_table.setItem(row, 5, QTableWidgetItem(kw))
         self.result_table.resizeColumnsToContents()
+
+    @staticmethod
+    def _format_keywords_cell(raw: str, max_items: int = 8) -> str:
+        """
+        格式化关键词单元格(2026-09-04):
+        - 按逗号/顿号/分号/换行/制表符切,strip, 去空
+        - 最多显示 max_items 个,末尾加 "+N more"
+        - 每行一个(简单清晰, 不要 2-gram 那种挤版)
+        - 全空返 "—"
+        """
+        if not raw or not raw.strip():
+            return "—"
+        # 兼容中英文标点:逗号(,/,), 顿号(、), 分号(;),
+        # 换行(\n), 制表(\t)
+        parts = re.split(r"[,\n\t;、,]+", raw)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if not parts:
+            return "—"
+        shown = parts[:max_items]
+        text = "\n".join(shown)
+        if len(parts) > max_items:
+            text += f"\n+{len(parts) - max_items} more"
+        return text
 
     def perform_search(self):
         """执行搜索 — 2026-09-03 重写:走 FTS5 / SQL 过滤,不再 Python 端遍历"""

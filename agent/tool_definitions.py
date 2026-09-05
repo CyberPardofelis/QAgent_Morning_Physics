@@ -16,23 +16,10 @@ from typing import Dict, Any
 
 # 所有 LLM 可调用的工具 schema 在这里声明
 TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    # ============================================================
-    # run_python: 执行任意 Python 代码（子进程运行）
-    # ============================================================
-    "run_python": {
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": "Execute python code",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string"}
-                },
-                "required": ["code"]
-            }
-        }
-    },
+    # 2026-09-04 用户拍板:run_python 工具停用(安全考虑)
+    # 之前 LLM 会用 run_python 跑 PyMuPDF 绕过 pdftotext 截断问题
+    # → 现在 run_python 完全从 LLM 工具列表移除(连 schema 都不暴露)
+    # 后续考虑:加 sandbox/资源限制/白名单 import 后再开放
 
     # ============================================================
     # search_arxiv: 在 arXiv 上搜索论文

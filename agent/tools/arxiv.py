@@ -181,14 +181,29 @@ def search_arxiv(query: str, max_results: int = 10) -> str:
 @register_tool(name="download_arxiv_paper", is_streaming=False, cost_tier="L0")
 def download_arxiv_paper(arxiv_id: str) -> str:
     """根据 arXiv ID 下载论文到 PAPER_DIR，返回本地路径"""
+    # 2026-09-04 加:容错 — LLM 经常传 "arXiv:2501.12345" 或 "https://arxiv.org/abs/2501.12345" 形式
+    # 抽纯 ID
+    arxiv_id = arxiv_id.strip()
+    import re as _re
+    m = _re.search(r'(\d{4}\.\d{4,5}(?:v\d+)?)', arxiv_id)
+    if not m:
+        return (
+            f"❌ 无效的 arXiv ID: {arxiv_id!r}。"
+            f"需要类似 '2501.12345' 或 'arXiv:2501.12345' 或 'https://arxiv.org/abs/2501.12345' 的格式"
+        )
+    arxiv_id = m.group(1)
+
     try:
         client = arxiv.Client()
         paper = next(client.results(arxiv.Search(id_list=[arxiv_id])))
         pdf_path = PAPER_DIR / f"{arxiv_id}.pdf"
         paper.download_pdf(filename=str(pdf_path))
-        return f"✅ 已下载：{pdf_path}"
+        size = pdf_path.stat().st_size
+        return f"✅ 已下载:{pdf_path}  ({size} bytes)"
+    except StopIteration:
+        return f"❌ arXiv 上找不到 ID: {arxiv_id}(可能 ID 写错,或论文已被撤稿)"
     except Exception as e:
-        return f"❌ 下载 arXiv 论文失败: {e}"
+        return f"❌ 下载 arXiv 论文失败: {type(e).__name__}: {e}"
 
 
 # ============================================================
