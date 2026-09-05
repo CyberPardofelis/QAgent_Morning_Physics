@@ -51,10 +51,26 @@ def _make_embedding_function():
     if _chroma_embedding_fn is not None:
         return _chroma_embedding_fn
     # P0 段错误绕开: 用户在 settings 显式关掉 BGE 时, 不加载模型
+    # 2026-09-05 加: 在 BGE 路径之前 return None, 防止 PyTorch 加载
+    # 实测 Config.get_embedding_enabled() 可能仍 True (用户开了), 需双重检查
     try:
         from config import Config
-        if not Config.get_embedding_enabled():
+        embedding_enabled = Config.get_embedding_enabled()
+        print(f"[vector_db] _make_embedding_function called, embedding_enabled={embedding_enabled}", flush=True)
+        if not embedding_enabled:
             logger.info("[vector_db] EMBEDDING_ENABLED=False, 跳过 BGE 加载, 用 chroma 默认")
+            print("[vector_db] EMBEDDING_ENABLED=False, 返 None, 走 chroma 默认", flush=True)
+            return None
+    except Exception as e:
+        print(f"[vector_db] check error: {e}", flush=True)
+        pass
+    # P0 加: 即使 QSettings=True, 也检查 env / 显式禁用标记
+    # 防止用户开了 QSettings 但实际仍崩的场景
+    try:
+        import os
+        env_disabled = os.getenv("DISABLE_LOCAL_EMBEDDING", "").lower() in ("true", "1", "yes")
+        if env_disabled:
+            print("[vector_db] DISABLE_LOCAL_EMBEDDING=true env 设置, 跳过 BGE", flush=True)
             return None
     except Exception:
         pass
@@ -70,6 +86,7 @@ def _make_embedding_function():
             )
             return None
         logger.info("[vector_db] 加载本地 embedding model: %s", model_path)
+        print(f"[vector_db] 即将加载 BGE: {model_path}", flush=True)
         fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=model_path,
             device="cpu",  # chroma 内置,默认 CPU

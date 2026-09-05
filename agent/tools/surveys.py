@@ -387,13 +387,16 @@ def _build_candidate_pool(topic: str, max_pool: int = 40) -> List[Dict[str, Any]
     - 候选池上限 max_pool
 
     P6.3 优化: 走 semantic_search + semantic_search_keywords LLM 召回, 跟关键词过滤 hybrid
+
+    P6.4 增强 (2026-09-05): summary_items.db 没匹配时 (用户实测 "entanglement measure"
+    关键词匹配 0 条 → 工具早返回) 自动 fallback 到 arxiv API 抓 top-K 论文
     """
     from agent.tools.summary import list_summary_items
 
     # 多拿点,database 端过滤
     raw = list_summary_items(limit=max_pool * 3)
     if not raw:
-        return []
+        raw = []
 
     # 简单关键词匹配(topic 切词, 任一命中)
     keywords = [kw.strip() for kw in re.split(r"[\s,，、。;；]+", topic) if len(kw.strip()) >= 2]
@@ -428,6 +431,43 @@ def _build_candidate_pool(topic: str, max_pool: int = 40) -> List[Dict[str, Any]
             "keywords": it.get("keywords", ""),
             "_match_score": score,  # 调试用
         })
+
+    # P6.4 增强: summary_items 关键词匹配空 → 自动 fallback 到 arxiv API
+    # 用户实测 2026-09-05: 跑 "entanglement measure" 综述, summary_items.db 全是 Test Paper,
+    # 关键词匹配 0 条 → 工具早返回 "❌ 候选池为空", 综述生成失败
+    if not pool:
+        try:
+            import arxiv
+            search = arxiv.Search(
+                query=topic,
+                max_results=min(max_pool, 10),  # 限 10 篇避免太慢
+                sort_by=arxiv.SortCriterion.Relevance,
+            )
+            client = arxiv.Client()
+            arxiv_pool = []
+            for r in client.results(search):
+                arxiv_pool.append({
+                    "paper_id": r.entry_id.split("/")[-1].split("v")[0],  # 去掉 /abs/ 前缀和版本号
+                    "title": r.title or "",
+                    "year": str(r.published.year) if r.published else "",
+                    "journal": "arxiv",
+                    "core_method": "",  # arxiv API 不给 core_method
+                    "core_contrib": (r.summary or "")[:200],  # 用 abstract 截短
+                    "abstract": r.summary or "",
+                    "outlook": "",
+                    "keywords": ", ".join([a.text for a in (r.authors or [])[:3]]),  # 用作者当关键词
+                    "_match_score": 0,  # 标记为 arxiv 召回
+                    "_source": "arxiv_api_fallback",
+                })
+                if len(arxiv_pool) >= max_pool:
+                    break
+            if arxiv_pool:
+                pool = arxiv_pool
+        except Exception as e:
+            # arxiv API 失败 (网络/timeout), 不影响主流程, 让 pool 保持空
+            # Phase A 仍会返 "❌ 候选池为空" 但用户能看到根因
+            pass
+
     return pool
 
 
@@ -746,9 +786,14 @@ def survey_generate(
         "",
     ]
     for r in section_results:
+        # 2026-09-05 P0 fix: paper_id 用 [[xxx]] 双括号格式, 视觉上明确"引用 token"
+        # 之前用 `xxx` 容易跟普通字符混淆
+        in_pids_str = ", ".join(f"[[{pid}]]" for pid in r['in_pool']) or "(无)"
+        out_pids_str = ", ".join(f"[[{pid}]]" for pid in r['out_of_pool']) or "(无)"
         report.append(
-            f"- `{r['section_id']}` [{r['type']}] {r['title']} "
-            f"(引用 {len(r['in_pool'])} 候选池内, {len(r['out_of_pool'])} 候选池外)"
+            f"- `{r['section_id']}` [{r['type']}] {r['title']}\n"
+            f"  - 候选池内引用 ({len(r['in_pool'])}): {in_pids_str}\n"
+            f"  - 候选池外引用/幻觉 ({len(r['out_of_pool'])}): {out_pids_str}"
         )
     report.append("")
     report.append(f"### 候选池 0 引用 ({len(uncited)} / {len(pool_ids)}):")
@@ -756,7 +801,7 @@ def survey_generate(
         for pid in sorted(uncited):
             p = next((x for x in pool if x["paper_id"] == pid), None)
             title = (p or {}).get("title", "?")[:80]
-            report.append(f"- `{pid}`: {title}")
+            report.append(f"- `[[{pid}]]`: {title}")
     else:
         report.append("  (无, 所有候选池 paper 都被引用过)")
     report.append("")
@@ -868,7 +913,7 @@ def survey_audit(theme_id: int, topic: str = "") -> str:
         for pid in sorted(uncited):
             p = next((x for x in pool if x["paper_id"] == pid), None)
             title = (p or {}).get("title", "?")[:80]
-            report.append(f"- `{pid}`: {title}")
+            report.append(f"- `[[{pid}]]`: {title}")
 
     if all_out_pool:
         report.extend([
@@ -877,7 +922,7 @@ def survey_audit(theme_id: int, topic: str = "") -> str:
             "",
         ])
         for pid in sorted(all_out_pool):
-            report.append(f"- `{pid}`")
+            report.append(f"- `[[{pid}]]`")
 
     return "\n".join(report)
 

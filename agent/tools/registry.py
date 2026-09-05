@@ -113,7 +113,19 @@ class ToolRegistry:
         """
         tool = cls._tools.get(name)
         if tool is None:
-            yield f"[工具错误] 未知工具: {name}"
+            # 2026-09-05 P0 fix: LLM 幻觉调用不存在的工具, 给 LLM 看可用列表自我修正
+            # 不只报"未知工具", 让 LLM 能选一个真正存在的工具
+            # 注意: Python 3.10 不支持 f-string 隐式拼接 (即使加括号), 用 + 拼接或单串
+            available = sorted(cls._tools.keys())
+            available_str = ", ".join(f"`{n}`" for n in available[:30])  # 限 30 避免超长
+            if len(available) > 30:
+                available_str += f" (等 {len(available)} 个工具)"
+            yield (
+                "[工具错误] 未知工具: `" + name + "`\n\n"
+                "**请不要调不存在的工具**。可用的工具列表:\n"
+                + available_str + "\n\n"
+                + "如果需要的能力没有, 直接告诉用户「该能力暂不支持」, 不要硬调。"
+            )
             return
 
         try:

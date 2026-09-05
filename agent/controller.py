@@ -617,10 +617,11 @@ def run_agent_stream(
                 yield result_text
                 return
 
-            # 普通工具：yield 一条简短完成提示 + 切新气泡（让后续 LLM 输出在另一个气泡里）
-            yield NEW_BUBBLE
-            yield f"[工具 {fn_name} 执行完毕]"
-            yield NEW_BUBBLE
+            # 普通工具：2026-09-05 P0 fix 简化: 不切气泡 (之前 NEW_BUBBLE × 2 产生 2 个空气泡)
+            # 把完成消息附在当前气泡末尾, 让后续 LLM 输出继续在同一气泡
+            # 用户实测: "工具调用时显示了多个空气泡" 根因
+            yield f"\n\n[工具 {fn_name} 执行完毕]\n\n"
+            yield NEW_BUBBLE  # 1 个 NEW_BUBBLE 够, 让 LLM 后续内容在新气泡
 
 
 def _dispatch_tool(fn_name: str, args: dict) -> str:

@@ -81,7 +81,17 @@ class SurveyWorkspaceDialog(QDialog):
         # 左: 树状列表
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["主题 / 章节", "类型"])
-        self.tree.setMinimumWidth(220)
+        # 2026-09-05 P0 fix: 主题/章节列太窄, 类型列太宽
+        # 用户实测报告: 左列 (主题/章节, 实际内容) 显示不全, 右列 (类型标签, intro/progress 等)
+        # 占用太多宽度 (auto-stretch)
+        # 修法: 显式设列宽, 让左列占 4/5, 右列固定 80px
+        self.tree.setColumnCount(2)
+        from PySide6.QtWidgets import QHeaderView
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)  # 主题/章节占主要宽度
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.setColumnWidth(1, 80)  # 类型列固定 80px
+        self.tree.setMinimumWidth(380)  # 总宽度从 220 提到 380 给主题列足够空间
         self.tree.itemSelectionChanged.connect(self._on_tree_select)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
