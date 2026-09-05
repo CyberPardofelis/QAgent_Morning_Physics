@@ -260,3 +260,482 @@ def health_check() -> Dict[str, Any]:
         info["n_themes"] = 0
         info["n_sections"] = 0
     return info
+
+
+# ============================================================
+# P6.2 综述生成(LLM 工具)— 2026-09-05
+# ============================================================
+# 6 段 pipeline: 候选池 → fact 提取 → 大纲 → 分章节生成 → 落库 → audit
+# 共享 prompt 模板 agent.prompts_survey + 工作区 agent.infra.survey_workspace
+
+import json
+import re
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+from agent.tools.registry import register_tool
+from agent.prompts_survey import (
+    build_fact_prompt,
+    build_outline_prompt,
+    build_section_prompt,
+)
+from agent.infra.survey_workspace import SurveyWorkspace, hash_topic
+
+
+# 抽 paper_id 的 regex(3 种格式, plan §3.1 + P6.2 LLM 实际行为)
+# 1) 简洁:  [2609.10003] / [0607734]              ← plan §3.1 prompt 强约束
+# 2) arXiv:  arXiv:2609.10003  / arXiv 0607734
+# 3) 链接:   papers/2609.10003.md  (从行内 markdown 链接 url 抽)
+# 注意: plan §3.1 反例里 LLM 偶尔只写完整链接不写简洁形式, 必须 3 种都识别
+# arXiv 编号两种格式: 新版 XXXX.XXXXX (如 2401.12345) / 旧版 XXXXXXX (如 0607734, 2007 年前)
+_PAPER_ID_SIMPLE_RE = re.compile(r"\[(\d{4,5}\.\d{4,5}|\d{7})\]")
+_PAPER_ID_ARXIV_RE = re.compile(r"arXiv[:\s]+(\d{4,5}\.\d{4,5}|\d{7})")
+_PAPER_ID_PAPERS_MD_RE = re.compile(r"papers/(\d{4,5}\.\d{4,5}|\d{7})\.md")
+
+
+def _safe_json_loads_array(text: str) -> Optional[list]:
+    """
+    容错 parse JSON 数组(LLM 经常在 closing `"}]` 前就停, P6.2 实测多次踩)。
+    策略(逐级):
+      1. 直接 json.loads
+      2. 补 '"}]' / ']' 等简单收尾
+      3. truncate 到最后一个完整 `{}` 之前, 补 `]`
+      4. regex 抽所有单层完整 {...} 对象重建数组
+    返 None 表示解析失败(不是空数组)
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # 1. 直接
+    try:
+        v = json.loads(s)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):  # 偶尔 LLM 返单 object 不返 array
+            return [v]
+    except (json.JSONDecodeError, SyntaxError):
+        pass
+    # 2. 补 "}]
+    for tail in ['"}]', '"]', '"', '}', ']']:
+        try:
+            v = json.loads(s.rstrip(",\n ") + tail)
+            if isinstance(v, list):
+                return v
+        except (json.JSONDecodeError, SyntaxError):
+            pass
+    # 3. truncate 到最后一个 } (P6.2 4b 案例: 末尾是 "y" 缺 }, 截掉)
+    last_brace = s.rfind('}')
+    if last_brace > 0:
+        try:
+            v = json.loads(s[: last_brace + 1] + ']')
+            if isinstance(v, list):
+                return v
+        except (json.JSONDecodeError, SyntaxError):
+            pass
+    # 4. regex 抽所有单层完整 {...} 对象(不允许嵌套 {})
+    obj_re = re.compile(r'\{[^{}]*\}', re.DOTALL)
+    objs = obj_re.findall(s)
+    if objs:
+        try:
+            v = json.loads("[" + ",".join(objs) + "]")
+            if isinstance(v, list):
+                return v
+        except (json.JSONDecodeError, SyntaxError):
+            pass
+    return None
+
+
+def _extract_paper_ids(text: str) -> List[str]:
+    """从 markdown 文本抽所有 paper_id 引用,3 种格式都识别,去重保序"""
+    if not text:
+        return []
+    seen = set()
+    out = []
+    # 顺序很重要: 简洁形式先(用户期望), 然后 arXiv: 形式, 然后链接 url
+    for pattern in (_PAPER_ID_SIMPLE_RE, _PAPER_ID_ARXIV_RE, _PAPER_ID_PAPERS_MD_RE):
+        for m in pattern.finditer(text):
+            pid = m.group(1)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(pid)
+    return out
+
+
+def _audit_section_paper_ids(content_md: str, pool_ids: set) -> Dict[str, List[str]]:
+    """候选池内/外分桶(plan §3.2 覆盖度审计核心)"""
+    cites = _extract_paper_ids(content_md or "")
+    in_pool = []
+    out_pool = []
+    for c in cites:
+        if c in pool_ids:
+            in_pool.append(c)
+        else:
+            out_pool.append(c)
+    return {
+        "in_pool": sorted(set(in_pool)),
+        "out_of_pool": sorted(set(out_pool)),
+        "total_cites": len(cites),
+    }
+
+
+def _build_candidate_pool(topic: str, max_pool: int = 40) -> List[Dict[str, Any]]:
+    """
+    Phase A: 候选池构建(MVP 简化版)
+    - 走 summary_items.db(0 LLM, 快)
+    - 关键词匹配 title/abstract/core_method/core_contrib/keywords/outlook
+    - 候选池上限 max_pool
+
+    P6.3 优化: 走 semantic_search + semantic_search_keywords LLM 召回, 跟关键词过滤 hybrid
+    """
+    from agent.tools.summary import list_summary_items
+
+    # 多拿点,database 端过滤
+    raw = list_summary_items(limit=max_pool * 3)
+    if not raw:
+        return []
+
+    # 简单关键词匹配(topic 切词, 任一命中)
+    keywords = [kw.strip() for kw in re.split(r"[\s,，、。;；]+", topic) if len(kw.strip()) >= 2]
+    if not keywords:
+        keywords = [topic]  # 兜底
+
+    def match(item: Dict[str, Any]) -> int:
+        """返回命中关键词数, 0 = 不匹配"""
+        score = 0
+        for field in ("title", "abstract", "core_method", "core_contrib", "keywords", "outlook"):
+            v = (item.get(field) or "").lower()
+            for kw in keywords:
+                if kw.lower() in v:
+                    score += 1
+        return score
+
+    scored = [(match(it), it) for it in raw]
+    scored = [(s, it) for s, it in scored if s > 0]
+    scored.sort(key=lambda x: -x[0])  # 高分优先
+
+    pool = []
+    for score, it in scored[:max_pool]:
+        pool.append({
+            "paper_id": it.get("paper_id", ""),
+            "title": it.get("title", ""),
+            "year": (it.get("summary_date") or "")[:4] if it.get("summary_date") else "",
+            "journal": it.get("source", ""),
+            "core_method": it.get("core_method", ""),
+            "core_contrib": it.get("core_contrib", ""),
+            "abstract": it.get("abstract", ""),
+            "outlook": it.get("outlook", ""),
+            "keywords": it.get("keywords", ""),
+            "_match_score": score,  # 调试用
+        })
+    return pool
+
+
+@register_tool(name="survey_generate", is_streaming=False, cost_tier="L2")
+def survey_generate(
+    topic: str,
+    max_pool: int = 40,
+    max_steps: int = 10,
+    dry_run: bool = False,
+) -> str:
+    """
+    生成综述(P6 主工具, L2 档)。
+
+    6 段 pipeline:
+      Phase A: 候选池构建 (0 LLM, summary_items.db 关键词匹配)
+      Phase B: (本轮跳过) 抓新 + analyze_paper
+      Phase C: fact 提取 (每篇 1 次 LLM, 3-5 fact/paper)
+      Phase D: 大纲生成 (1 次 LLM, 5 章节)
+      Phase E: 章节生成 (每章 1 次 LLM, 落 surveys.db)
+      Phase F: 覆盖度审计 (0 LLM, 写 _audit.md)
+
+    Args:
+        topic: 综述主题, 例 "量子纠错码近期进展"
+        max_pool: 候选池上限(默认 40)
+        max_steps: 暂未使用(预留 P4 ReAct 共享)
+        dry_run: True = 不调 LLM, 只构建候选池(用于 UI 快速测)
+
+    Returns:
+        markdown 报告, 含 surveys.db section_id 列表 + 覆盖度 audit
+    """
+    if not topic or not topic.strip():
+        return "❌ topic 不能为空"
+
+    topic = topic.strip()
+
+    # 0. workspace 准备
+    topic_hash = hash_topic(topic)
+    ws = SurveyWorkspace(topic_hash, topic=topic)
+    ws.set_status("init", 0, 0, f"topic={topic}")
+
+    # 1. Phase A: 候选池
+    pool = _build_candidate_pool(topic, max_pool=max_pool)
+    if not pool:
+        ws.set_status("failed", 0, 0, "pool empty")
+        return (
+            f"❌ 候选池为空\n"
+            f"- topic: {topic!r}\n"
+            f"- 主题词在 summary_items.db 里没匹配到任何 paper\n"
+            f"- 建议: 换个主题词, 或先跑 `抓文 → analyze_paper` 准备数据"
+        )
+    ws.save_pool(pool)
+    ws.set_status("pool_built", len(pool), max_pool, f"pool={len(pool)}")
+
+    if dry_run:
+        ws.save_audit(f"# dry_run audit\n- topic: {topic}\n- pool_size: {len(pool)}\n- workspace: {ws.path}\n")
+        return (
+            f"## survey_generate dry_run\n\n"
+            f"- topic: {topic}\n"
+            f"- 候选池: {len(pool)}\n"
+            f"- workspace: `{ws.path}`\n"
+            f"- 跳过 LLM 调用 (dry_run=True)\n\n"
+            f"### 候选池前 5 条:\n\n"
+            + "\n".join(
+                f"- `{p['paper_id']}`: {p.get('title', '?')[:80]}"
+                for p in pool[:5]
+            )
+        )
+
+    # 2. Phase C: fact 提取(每篇 1 次 LLM)
+    # P6.0 调子验证发现 deepseek 推理模型在 enable_thinking=False 下,LLM 思考/答案
+    # 都进 reasoning_content, fallback 出来的是 thinking 不是 answer。
+    # survey_generate 强制走 minimax-m3 (走主界面 chat mode 容易撞这 bug)
+    from agent.tools.llm import _call_llm
+
+    _LLM_PROVIDER = "minimax"
+    _LLM_MODEL = "MiniMax-M3"
+    _LLM_TEMPERATURE = 0.3
+
+    ws.set_status("fact_extraction", 0, len(pool), "")
+    all_facts: List[Dict[str, Any]] = []
+    for i, paper in enumerate(pool, 1):
+        fact_prompt = build_fact_prompt(
+            paper_id=paper["paper_id"],
+            title=paper.get("title", ""),
+            year=str(paper.get("year", "")),
+            journal=paper.get("journal", ""),
+            core_method=paper.get("core_method", ""),
+            core_contrib=paper.get("core_contrib", ""),
+            abstract=paper.get("abstract", ""),
+            outlook=paper.get("outlook", ""),
+        )
+        try:
+            out = _call_llm(
+                fact_prompt,
+                provider=_LLM_PROVIDER,
+                model=_LLM_MODEL,
+                enable_thinking=False,
+                temperature=0.2,
+                max_tokens=4000,  # P6.2 修: 2000 会被 min-max 截断(JSON 缺 "}]")
+                timeout=120,
+            )
+        except Exception as e:
+            ws.set_status(
+                "fact_extraction", i, len(pool),
+                f"⚠️ {paper['paper_id']} 失败: {type(e).__name__}: {e}",
+            )
+            continue
+        # 剥 <think>
+        if out and "<think>" in out:
+            out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+        # parse JSON(容错: LLM 经常缺 '"}]' 收尾)
+        m = re.search(r"\[[\s\S]*", out or "")
+        if not m:
+            ws.set_status("fact_extraction", i, len(pool), f"⚠️ {paper['paper_id']} 无 JSON")
+            continue
+        facts = _safe_json_loads_array(m.group(0))
+        if facts is None:
+            ws.set_status(
+                "fact_extraction", i, len(pool),
+                f"⚠️ {paper['paper_id']} JSON parse 失败 (含容错)",
+            )
+            continue
+        # 落 _facts.jsonl
+        for f in facts:
+            if not isinstance(f, dict):
+                continue
+            f.setdefault("paper_id", paper["paper_id"])
+            ws.append_fact(f)
+            all_facts.append(f)
+        ws.set_status(
+            "fact_extraction", i, len(pool),
+            f"{paper['paper_id']} → {len(facts)} facts",
+        )
+
+    # 3. Phase D: 大纲
+    ws.set_status("outline", 0, 1, "")
+    outline_prompt = build_outline_prompt(topic, pool)
+    try:
+        outline_raw = _call_llm(
+            outline_prompt,
+            provider=_LLM_PROVIDER,
+            model=_LLM_MODEL,
+            enable_thinking=False,
+            temperature=0.3,
+            max_tokens=3000,  # P6.2 修: 2000 不够 5 章节 outline
+            timeout=120,
+        )
+    except Exception as e:
+        ws.set_status("failed", 0, 0, f"outline failed: {e}")
+        return f"❌ 大纲生成失败: {type(e).__name__}: {e}"
+    if outline_raw and "<think>" in outline_raw:
+        outline_raw = re.sub(r"<think>.*?</think>", "", outline_raw, flags=re.DOTALL).strip()
+    m = re.search(r"\{[\s\S]*\}", outline_raw or "")
+    if not m:
+        ws.set_status("failed", 0, 0, "outline no JSON")
+        return "❌ 大纲 LLM 输出不是 JSON 对象, 检查 prompt 或模型"
+    try:
+        outline = json.loads(m.group(0))
+    except Exception as e:
+        ws.set_status("failed", 0, 0, f"outline JSON parse: {e}")
+        return f"❌ 大纲 JSON parse 失败: {e}"
+    ws.save_outline(outline)
+    sections = outline.get("sections", [])
+    ws.set_status("outline", 1, 1, f"sections={len(sections)}")
+    if not sections:
+        return "❌ 大纲 LLM 输出 sections 字段为空"
+
+    # 4. Phase E: 章节生成(每章 1 次 LLM + 落库)
+    ws.set_status("section_generation", 0, len(sections), "")
+    theme_id = create_theme(
+        name=topic,
+        description=f"P6 survey_generate 自动创建 at {datetime.now().isoformat(timespec='seconds')}",
+    )
+    section_results: List[Dict[str, Any]] = []
+    pool_ids = {p["paper_id"] for p in pool}
+
+    for j, sec in enumerate(sections, 1):
+        sec_type = (sec.get("section_type") or "intro").strip()
+        sec_title = sec.get("title") or f"section {j}"
+        # 兼容 LLM 偶尔写 sub_point 单数
+        sub_points = sec.get("sub_points") or sec.get("sub_point") or []
+        if isinstance(sub_points, list):
+            outline_section_md = "\n".join(f"- {sp}" for sp in sub_points)
+        else:
+            outline_section_md = str(sub_points)
+
+        ws.set_status(
+            "section_generation", j - 1, len(sections),
+            f"[{sec_type}] {sec_title}",
+        )
+
+        section_prompt = build_section_prompt(
+            topic=topic,
+            section_type=sec_type,
+            section_title=sec_title,
+            outline_section=outline_section_md,
+            papers=pool,
+        )
+        try:
+            sec_md = _call_llm(
+                section_prompt,
+                provider=_LLM_PROVIDER,
+                model=_LLM_MODEL,
+                enable_thinking=False,
+                temperature=0.4,
+                max_tokens=6000,  # P6.2 修: 4000 会截断 progress/method_compare 章节
+                timeout=180,
+            )
+        except Exception as e:
+            sec_md = f"⚠️ 章节生成失败: {type(e).__name__}: {e}\n\n(占位章节: {sec_title})"
+        if sec_md and "<think>" in sec_md:
+            sec_md = re.sub(r"<think>.*?</think>", "", sec_md, flags=re.DOTALL).strip()
+
+        # post-parse: 抽 [paper_id] (候选池内/外分桶)
+        bucket = _audit_section_paper_ids(sec_md, pool_ids)
+
+        # 落 surveys.db(注意: paper_ids 字段是 "逗号分隔" 字符串, plan §9.2 简化版)
+        # order_idx 由 create_section 自动算 max+1, 不传
+        sec_id = create_section(
+            theme_id=theme_id,
+            section_type=sec_type,
+            title=sec_title,
+            content_md=sec_md or "",
+            paper_ids=",".join(bucket["in_pool"]),
+        )
+        section_results.append({
+            "section_id": sec_id,
+            "title": sec_title,
+            "type": sec_type,
+            "in_pool": bucket["in_pool"],
+            "out_of_pool": bucket["out_of_pool"],
+        })
+        ws.set_status(
+            "section_generation", j, len(sections),
+            f"[{sec_type}] {sec_title} done",
+        )
+
+    # 5. Phase F: audit
+    ws.set_status("audit", 0, 1, "")
+    audit_lines = [
+        f"# 覆盖度审计 — {topic}",
+        "",
+        f"- workspace: `{ws.path}`",
+        f"- 候选池: {len(pool)}",
+        f"- 提取 fact: {len(all_facts)}",
+        f"- 章节: {len(section_results)} (theme_id={theme_id})",
+        "",
+        "## 每章节引用统计",
+        "",
+        "| 章节 | 类型 | 候选池内 | 候选池外(幻觉) |",
+        "|---|---|---|---|",
+    ]
+    cited_ids: set = set()
+    for r in section_results:
+        audit_lines.append(
+            f"| {r['title']} | {r['type']} | "
+            f"{len(r['in_pool'])} | {len(r['out_of_pool'])} |"
+        )
+        cited_ids.update(r["in_pool"])
+    uncited = pool_ids - cited_ids
+    audit_lines.extend([
+        "",
+        f"## ⚠️ 候选池 0 引用论文 ({len(uncited)} / {len(pool_ids)} = "
+        f"{len(uncited)*100//max(1,len(pool_ids))}%)",
+        "",
+    ])
+    for pid in sorted(uncited):
+        p = next((x for x in pool if x["paper_id"] == pid), None)
+        title = (p or {}).get("title", "?")[:80]
+        audit_lines.append(f"- `{pid}`: {title}")
+    audit_md = "\n".join(audit_lines)
+    ws.save_audit(audit_md)
+    ws.set_status(
+        "done", 1, 1,
+        f"theme_id={theme_id}, sections={len(section_results)}, audit=ok",
+    )
+
+    # 6. 返 markdown 报告
+    report = [
+        f"## survey_generate 完成 — {topic}",
+        "",
+        f"- workspace: `{ws.path}`",
+        f"- theme_id: `{theme_id}` (surveys.db survey_theme.id)",
+        f"- 候选池: {len(pool)} 篇",
+        f"- 提取 fact: {len(all_facts)} 条",
+        f"- 章节: {len(section_results)} 段",
+        f"- 覆盖度审计: `data/surveys/working/{topic_hash}/_audit.md`",
+        "",
+        "### 章节(section_id, 落库 surveys.db)",
+        "",
+    ]
+    for r in section_results:
+        report.append(
+            f"- `{r['section_id']}` [{r['type']}] {r['title']} "
+            f"(引用 {len(r['in_pool'])} 候选池内, {len(r['out_of_pool'])} 候选池外)"
+        )
+    report.append("")
+    report.append(f"### 候选池 0 引用 ({len(uncited)} / {len(pool_ids)}):")
+    if uncited:
+        for pid in sorted(uncited):
+            p = next((x for x in pool if x["paper_id"] == pid), None)
+            title = (p or {}).get("title", "?")[:80]
+            report.append(f"- `{pid}`: {title}")
+    else:
+        report.append("  (无, 所有候选池 paper 都被引用过)")
+    report.append("")
+    report.append(f"### 审计详情")
+    report.append(f"见 `{ws.path}/_audit.md`")
+
+    return "\n".join(report)
+

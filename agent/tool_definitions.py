@@ -674,6 +674,54 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             }
         }
     },
+
+    # ============================================================
+    # survey_generate: 综述生成（P6 主工具, L2 档）
+    # ============================================================
+    # 2026-09-05 P6.2 上线
+    # 6 段 pipeline: 候选池 → fact → 大纲 → 分章节 → 落库 → audit
+    # 走 agent.prompts_survey 的 3 个 prompt 模板 + agent.infra.survey_workspace 工作区
+    "survey_generate": {
+        "type": "function",
+        "function": {
+            "name": "survey_generate",
+            "description": (
+                "生成综述(P6 主工具, L2 档默认关)。"
+                "给定主题(topic), 走 6 段 pipeline 自动产出 markdown 综述章节, 落 surveys.db。"
+                "候选池从 summary_items.db 走关键词匹配(0 LLM), 然后每篇 paper 1 次 LLM 提 fact,"
+                "再 1 次 LLM 生成大纲, 接着每章 1 次 LLM 写 markdown, 最后 0 LLM 跑覆盖度审计。"
+                "返回 markdown 报告含: theme_id, section_id 列表, 候选池 0 引用列表, 审计路径。"
+                "适用: 用户说'生成 X 主题综述' / 'survey X' / '综述 X' 时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "综述主题, 例 '量子纠错码近期进展'"
+                    },
+                    "max_pool": {
+                        "type": "integer",
+                        "default": 40,
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "候选池上限, 默认 40 (单轮 6 段 pipeline token 估算 5-15K)"
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "预留 P4 ReAct 共享接口, 本轮未使用"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "True = 不调 LLM, 只构建候选池(快, 用于 UI 测)"
+                    }
+                },
+                "required": ["topic"]
+            }
+        }
+    },
 }
 
 
