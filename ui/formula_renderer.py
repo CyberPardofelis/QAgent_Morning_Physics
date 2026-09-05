@@ -205,7 +205,15 @@ class FormulaRenderer:
         同步渲染公式为 PNG,返回路径;失败返回 None。
         - 缓存命中立即返回(0ms) + console 标 "cache hit"(便于排查"console 重复 log")
         - 缓存未命中:首次需要 KaTeX 渲染(200-500ms) + console 标实际渲染
+
+        2026-09-05 P0 fix: DISABLE_FORMULA_RENDERER=1 env 时直接返 None
+        触发条件: QWebEngineView + BGE (sentence-transformers/PyTorch) 多线程
+        在 LLM 生成大量公式输出(150+)时偶发 0xC0000005 段错误 + 0xC00000FD 栈溢出
+        临时绕开: 让公式显示为 LaTeX 原文, 不渲染 PNG
         """
+        # P0 紧急: 显式禁用公式渲染
+        if os.getenv("DISABLE_FORMULA_RENDERER", "").lower() in ("true", "1", "yes"):
+            return None
         # 1. 检查缓存
         cache_path = self._cache_path(formula, display_mode)
         if self._is_valid_png(cache_path):
