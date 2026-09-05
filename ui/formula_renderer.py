@@ -28,6 +28,18 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
+    _HAS_WEBENGINE = True
+except ImportError:
+    _HAS_WEBENGINE = False
+
+
+# 2026-09-05 P0 fix: 模块级 _DISABLED 标志, 避免 render() 每次读 process env
+# 触发条件: QWebEngineView (Chromium) + BGE (sentence-transformers) 共享 native 资源
+# 在 LLM 输出 150+ 公式时偶发 0xC0000005 段错误
+# 设 DISABLE_FORMULA_RENDERER=1 让公式显示 LaTeX 原文, 不渲染 PNG
+_DISABLED = os.getenv("DISABLE_FORMULA_RENDERER", "").lower() in ("true", "1", "yes")
+if _DISABLED:
+    print("[FormulaRenderer] DISABLED via env DISABLE_FORMULA_RENDERER=1 (P0 段错误绕开)", flush=True)
     HAS_QTWEBENGINE = True
 except ImportError:
     HAS_QTWEBENGINE = False
@@ -211,8 +223,8 @@ class FormulaRenderer:
         在 LLM 生成大量公式输出(150+)时偶发 0xC0000005 段错误 + 0xC00000FD 栈溢出
         临时绕开: 让公式显示为 LaTeX 原文, 不渲染 PNG
         """
-        # P0 紧急: 显式禁用公式渲染
-        if os.getenv("DISABLE_FORMULA_RENDERER", "").lower() in ("true", "1", "yes"):
+        # P0 紧急: 显式禁用公式渲染 (模块级 _DISABLED 标志, 避免每次 render 读 process env)
+        if _DISABLED:
             return None
         # 1. 检查缓存
         cache_path = self._cache_path(formula, display_mode)

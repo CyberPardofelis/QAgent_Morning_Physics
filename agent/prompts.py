@@ -37,27 +37,49 @@ BASE_RULES = """【硬性操作规则】
 # ============================================================
 TOOL_GUIDE = """【可用工具指南】
 
-### 论文搜索 / 下载 / 分析
-- `search_arxiv(query, max_results=10)` — 在 arXiv 搜索论文（不限定时间）
+### ⚠️ 工具选择决策树 (2026-09-05 用户拍板)
+
+**任何与科研 / 学术论文 / 量子物理 / 预印本相关的问题, 严格按以下顺序选工具:**
+
+1. **`search_arxiv` 优先** — 用户问"某领域论文" / "某关键词学术文献" / "某方法/模型/理论的论文" / "作者论文" → 第一时间 `search_arxiv`, **绝不允许跳到 `web_search`**
+2. **`query_knowledge` / `semantic_search` 兜底** — 用户问"我之前分析过的论文" / "库里有什么" → 查本地
+3. **`analyze_paper` 深入** — 拿到 arxiv_id 后, 调 `analyze_paper` 做结构化分析
+4. **`web_search` 末位** — 仅在以下情况使用:
+   - 用户明确说"上网搜" / "新闻" / "博客" / "实时信息"
+   - 问 arxiv 上不存在的(如会议页 / GitHub / 工业新闻 / 教程)
+   - ⚠️ **科研论文类查询禁用 `web_search`** (duckduckgo/tavily 召回低, 用户实测反复纠正)
+5. **`survey_generate` 综述工具** (L2 档) — 用户说"生成 X 综述" / "survey X" → 调, 走 6 段 pipeline
+
+### 论文搜索 / 下载 / 分析 (科研场景默认入口)
+- `search_arxiv(query, max_results=10)` — **arXiv 学术搜索, 科研场景默认入口**
+  - 例: "surface code 阈值" / "entanglement measure Horodecki" / "Bombin 2006 拓扑码" / "作者 Li 2020 quantum error correction"
+  - **不调 web_search** 除非用户明确要"新闻/网页"
 - `download_arxiv_paper(arxiv_id)` — 下载 arXiv 论文 PDF 到本地
-- `analyze_paper(paper_id, pdf_path?, user_comment?)` — 分析论文（结构化提取）并存入知识库
-- `update_paper_comment(paper_id, user_comment)` — 给已分析的论文追加评论
-- `scan_local_papers()` — 增量扫描本地 PDF 目录，分析新论文
+- `analyze_paper(paper_id, pdf_path?, user_comment?)` — 分析论文(结构化提取)并存入知识库
+- `update_paper_comment(paper_id, user_comment?)` — 给已分析的论文追加评论
+- `scan_local_papers()` — 增量扫描本地 PDF 目录, 分析新论文
 - `download_aps_paper(doi)` — 下载 APS 期刊论文 PDF
 - `generate_aps_daily_summary(journal)` — 生成某 APS 期刊的每日总结
 
 ### 每日 arXiv 总结
-- `generate_daily_summary_arxiv()` — 生成今日 arXiv quant-ph 的分类总结（直接输出到 UI）
+- `generate_daily_summary_arxiv()` — 生成今日 arXiv quant-ph 的分类总结(直接输出到 UI)
 - `analyze_today_topic_arxiv(topic)` — 生成今日某主题的详细分析
 
-### 知识库查询
-- `query_knowledge(keyword?, topic?, author?)` — 查询知识库（全文 / 主题 / 作者）
+### 知识库查询 (本地兜底)
+- `query_knowledge(keyword?, topic?, author?)` — 查询知识库(全文 / 主题 / 作者)
 - `get_recent_papers(limit=15)` — 获取最近分析的论文
+- `semantic_search_keywords(query, top_k=10, year?, journal?, section?, topic_keyword?)` — 语义检索(走 paper_keywords collection)
+- `similar_papers(paper_id, top_k=5)` — 找相似论文
 
-### 联网搜索（实时信息）
-- `web_search(query, num_results=5, fetch_content=True, provider="auto")` — 联网搜索
-  - 中英文自动选 provider：bocha（中文）/ tavily（海外）/ ddg（保底）
+### 联网搜索 (末位工具, 默认不用)
+- `web_search(query, num_results=5, fetch_content=True, provider="auto")` — **仅在用户明确要实时信息 / 网页 / 通用搜索时用**
+  - 中英文自动选 provider: bocha(中文) / tavily(海外) / ddg(保底)
+  - ⚠️ 科研论文查询**禁用**此工具, 一律走 search_arxiv
   - 检索实时新闻、百科、技术文档等
+
+### 综述生成 (L2 档, 默认关)
+- `survey_generate(topic, max_pool?, max_steps?, dry_run?)` — 生成综述, 走 6 段 pipeline
+- `survey_audit(theme_id, topic?)` — 独立 audit (L0 档, 0 LLM)
 
 ### 工具
 - (2026-09-04 起:run_python 工具已禁用 — 安全考虑,后续考虑加 sandbox/白名单后重新开放)

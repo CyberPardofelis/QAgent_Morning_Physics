@@ -14,6 +14,21 @@ import sys
 import traceback
 from datetime import datetime
 
+# 2026-09-05 P0 紧急: 显式 load_dotenv, 让 .env 里的 DISABLE_FORMULA_RENDERER=1 /
+# EMBEDDING_ENABLED=false 启动时生效
+# 之前 config/__init__.py 读 os.getenv 但 process env 不会自动从 .env 加载,
+# 导致改 .env 对运行中程序无效, 只能重启 + 必须显式 load
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=False)  # override=False 不覆盖已有 process env
+        print(f"[main] .env loaded: {env_path}", flush=True)
+except ImportError:
+    print("[main] python-dotenv 未装, 跳过 .env 加载 (P0 紧急: pip install python-dotenv)", flush=True)
+except Exception as e:
+    print(f"[main] .env 加载失败: {e}", flush=True)
+
 try:
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QSettings

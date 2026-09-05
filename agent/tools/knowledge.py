@@ -807,14 +807,25 @@ def semantic_search_keywords(
     try:
         res = collection.query(**query_kwargs)
     except Exception as e:
-        logger.exception("semantic_search_keywords query 失败: %s", e)
-        return f"❌ 检索失败: {e}"
+        # P0 紧急: chroma where filter 类型错误(用户实测 $gte 拿到 string 失败)
+        # 降级: 去掉 where 重试 (忽略 source/since_date/in_papers_db 过滤)
+        logger.warning("semantic_search_keywords 带 where 失败 (%s), 降级去掉过滤重试", e)
+        try:
+            query_kwargs_no_where = {"query_texts": [query], "n_results": min(top_k, collection.count())}
+            res = collection.query(**query_kwargs_no_where)
+            # 报告里说明降级
+            res_note = f"⚠️ 过滤条件 {where} 类型不兼容 chroma, 已降级为无过滤检索\n\n"
+        except Exception as e2:
+            logger.exception("semantic_search_keywords 降级也失败: %s", e2)
+            return f"❌ 检索失败: {e}; 降级也失败: {e2}"
+    else:
+        res_note = ""
 
     if not res or not res.get("ids") or not res["ids"][0]:
         return f"未找到匹配 '{query}' 的 summary_item(可放宽过滤条件重试)。"
 
     # 整理结果
-    lines = [f"找到 {len(res['ids'][0])} 条相关 summary_item(query='{query}'):\n"]
+    lines = [f"{res_note}找到 {len(res['ids'][0])} 条相关 summary_item(query='{query}'):\n"]
     for i, cid in enumerate(res["ids"][0]):
         meta = res["metadatas"][0][i] if res.get("metadatas") else {}
         doc = res["documents"][0][i] if res.get("documents") else ""
