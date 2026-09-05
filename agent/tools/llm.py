@@ -213,7 +213,18 @@ def _call_llm(
         import time as _t
         _t0 = _t.time()
         print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符 timeout={timeout}s", flush=True)
-        out = client.chat.completions.create(**kwargs).choices[0].message.content
+        resp = client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        out = msg.content
+        # 2026-09-05 P6.0 fix: deepseek 推理模型在 enable_thinking=False 时把"实际答案"放 reasoning_content,
+        # message.content 字段为空字符串(实测 deepseek-v4-flash / pro 都是 0 chars,但 reasoning_content
+        # 几 K 字符)。P6 prompt demo 实测发现,严重影响 _call_llm 工具调用。兜底:content 空但
+        # reasoning_content 非空时,优先 reasoning_content。
+        if not (out and out.strip()):
+            rc = getattr(msg, "reasoning_content", None)
+            if rc and rc.strip():
+                out = rc
+                print(f"[llm] _call_llm fallback: content 空 → reasoning_content ({len(rc)} 字符)", flush=True)
         print(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符", flush=True)
         return out
     except Exception as e:

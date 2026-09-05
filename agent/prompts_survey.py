@@ -1,0 +1,321 @@
+"""
+agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
+
+设计: 跟 ROADMAP_NEXT §7 / SURVEY_GENERATION_PLAN.md §3.1 对齐。
+每个 prompt 是模块级常量 + build_xxx_prompt(...) 工厂函数(动态注入候选池/章节)。
+
+约束总览(每个 prompt 末尾都重申):
+  1. 事实性陈述句必须带 [paper_id]
+  2. 过渡/总结/铺垫句不带 [paper_id]
+  3. 不得引用候选池外的 paper_id
+  4. 不得编造方法/数字/实验结果
+  5. 行内 markdown 链接格式: [作者 年份, arXiv:xxxx.xxxxx](papers/xxxx.xxxxx.md)
+
+不依赖外部 LLM 客户端,本模块只负责"prompt 文本构造",不调 API。
+调用方(P6.2 survey_generate 工具)负责:
+  1. 调 _call_llm(prompt)
+  2. parse 输出
+  3. 走 post-parse 校验(候选池外引用 → ❌)
+
+历史:
+  - 2026-09-05: 3 个 prompt 模板首版(P6.0 阶段)
+"""
+from typing import List, Dict, Any, Optional
+
+
+# ============================================================
+# 候选池注入格式(三个 prompt 共享)
+# ============================================================
+def format_pool(papers: List[Dict[str, Any]]) -> str:
+    """
+    把候选池格式化成 LLM 友好的多行文本。
+
+    每行: - {paper_id} | {title} | {core_method} | {core_contrib}
+    paper_id 是 LLM 唯一可引用的标识;title 用作链接文本;core_method/contrib 提供上下文。
+
+    Args:
+        papers: 候选池 paper 列表,每条至少有 {paper_id, title, core_method, core_contrib}
+                可选 {year, authors, journal}
+
+    Returns:
+        多行字符串,每行一篇 paper。空候选池返回 "(空候选池)"
+    """
+    if not papers:
+        return "(空候选池)"
+    lines = []
+    for p in papers:
+        pid = p.get("paper_id", "?")
+        title = (p.get("title") or "").strip().replace("|", "/")
+        method = (p.get("core_method") or "").strip().replace("|", "/")
+        contrib = (p.get("core_contrib") or "").strip().replace("|", "/")
+        year = p.get("year") or "?"
+        journal = p.get("journal") or ""
+        prefix = f"- {pid} ({year}"
+        if journal:
+            prefix += f", {journal}"
+        prefix += ")"
+        # 单行不超过 ~200 chars,过长截断
+        def trunc(s: str, n: int) -> str:
+            return s if len(s) <= n else s[: n - 1] + "…"
+        lines.append(
+            f"{prefix}: {trunc(title, 100)} | method: {trunc(method, 80)} | "
+            f"contrib: {trunc(contrib, 80)}"
+        )
+    return "\n".join(lines)
+
+
+# ============================================================
+# 1. SURVEY_FACT_PROMPT — 从单篇 paper 提 3-5 个 fact(Phase C)
+# ============================================================
+SURVEY_FACT_PROMPT = """你是文献综述助手,任务:对**单篇论文**做事实提取,产出一组原子 fact。
+
+【输入论文】
+- paper_id: {paper_id}
+- title: {title}
+- authors: {authors}
+- year: {year}
+- journal: {journal}
+- abstract: {abstract}
+- core_method: {core_method}
+- core_contrib: {core_contrib}
+- outlook: {outlook}
+
+【任务】
+从上述论文中提取 **3-5 个** 原子 fact(每条 fact 是 1 句事实性陈述),用于后续综述章节生成引用。
+
+【fact 类型】(每条 fact 必须标一个):
+  - method: 用了什么方法/算法/框架
+  - result: 实验/理论结果(数字 / 性能 / 复杂度)
+  - conclusion: 核心结论(该论文最想说的)
+  - limitation: 局限/不足/未解决问题
+  - hypothesis: 假设/猜想(论文里"假设 X 成立"那种)
+
+【强制约束】
+1. 数量: 3-5 条,不多不少(中位数 4,根据信息密度自行调整)
+2. claim 末尾**必须**带 [paper_id](用上面给的 paper_id,不要编)
+3. support_quote 必须是**原文摘录**(可短可拼接),**不要改写或意译**;找不到原文就降级到 abstract 原句
+4. 不要编造方法/数字/实验结果,信息不够就少提,不要凑数
+5. 不输出论文的"复述",只提取"可被引用的原子事实"
+
+【输出格式】(严格 JSON 数组,不要 markdown 代码块包裹,不要解释)
+[
+  {{"fact_id": "f1", "fact_type": "method", "claim": "Smith 等提出用 surface code 做容错, [paper_id]", "support_quote": "We propose a surface code architecture for fault-tolerant quantum computation, [paper_id]"}},
+  {{"fact_id": "f2", "fact_type": "result", "claim": "...", "support_quote": "..."}}
+]
+
+只输出 JSON,不要前缀解释,不要后缀总结。"""
+
+
+def build_fact_prompt(
+    paper_id: str,
+    title: str = "",
+    authors: str = "",
+    year: str = "",
+    journal: str = "",
+    abstract: str = "",
+    core_method: str = "",
+    core_contrib: str = "",
+    outlook: str = "",
+) -> str:
+    """
+    构造单篇 paper 的 fact 提取 prompt。
+
+    缺字段传 "" 即可(模板里有占位符),LLM 对空字段容忍。
+    """
+    return SURVEY_FACT_PROMPT.format(
+        paper_id=paper_id,
+        title=title or "(无标题)",
+        authors=authors or "(未知作者)",
+        year=year or "?",
+        journal=journal or "(未知期刊)",
+        abstract=abstract or "(无摘要)",
+        core_method=core_method or "(未提取)",
+        core_contrib=core_contrib or "(未提取)",
+        outlook=outlook or "(未提取)",
+    )
+
+
+# ============================================================
+# 2. SURVEY_OUTLINE_PROMPT — 从候选池生成章节大纲(Phase D)
+# ============================================================
+SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池,生成结构化大纲。
+
+【综述主题】: {topic}
+
+【候选池】(共 {pool_size} 篇,paper_id 唯一):
+{pool_text}
+
+【章节类型与顺序】(固定 5 段,从上到下,不要漏)
+  1. intro: 背景 / 研究问题 / 本文综述范围(0-2 引用)
+  2. progress: 关键进展时间线 / 里程碑(5-10 引用,核心章节)
+  3. method_compare: 方法分类与对比(3-8 引用,按机制/性能/适用场景分组)
+  4. gap: 当前研究空白 / 不足(1-3 引用,以"反例"为主)
+  5. outlook: 未来方向 / 开放问题(0-2 引用,基于 gap 推断)
+
+【每章输出 schema】
+- title: 章节标题(中文,15 字以内)
+- section_type: 5 选 1(intro / progress / method_compare / gap / outlook)
+- sub_points: 2-4 个子点,每个子点是 1 句"该章节需要回答的问题"
+  ⚠️ 字段名严格用 sub_points(复数),任何 chapter 都不能写成 sub_point(单数)
+- is_transition: yes / no
+    - yes = 该章主要是铺垫/过渡,不强求引用(给 intro 的部分子节)
+    - no = 该章必须有事实引用(给 progress / method_compare / gap / outlook)
+
+【强制约束】
+1. 必须**严格按上面 5 段顺序**输出,不能合并章节,不能改顺序
+2. paper_id 只能从候选池里选,不能编造
+3. 引用配额按"章节类型"软约束:超过上下限会被审计标 ⚠️
+4. method_compare 的 sub_points 应该按"机制/性能/场景"维度组织,不要按时间组织(时间组织是 progress 的事)
+
+【输出格式】(严格 JSON 对象,不要 markdown 代码块包裹,不要解释)
+{{
+  "sections": [
+    {{"title": "...", "section_type": "intro", "sub_points": ["...", "..."], "is_transition": "yes"}},
+    {{"title": "...", "section_type": "progress", "sub_points": ["...", "...", "..."], "is_transition": "no"}}
+  ]
+}}
+
+只输出 JSON,不要前缀"以下是...",不要后缀"希望对你有帮助"。"""
+
+
+def build_outline_prompt(topic: str, papers: List[Dict[str, Any]]) -> str:
+    """
+    构造综述大纲生成 prompt。
+
+    papers: 候选池 paper 列表(同 format_pool 的输入)
+    """
+    return SURVEY_OUTLINE_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        pool_size=len(papers),
+        pool_text=format_pool(papers),
+    )
+
+
+# ============================================================
+# 3. SURVEY_SECTION_PROMPT — 单章生成 markdown 正文(Phase E)
+# ============================================================
+SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池 + 章节大纲,生成 1 个章节的 markdown 正文。
+
+【综述主题】: {topic}
+【本章节类型】: {section_type}
+【本章节标题】: {section_title}
+【本章节大纲】:
+{outline_section}
+
+【候选池】(共 {pool_size} 篇,paper_id 唯一):
+{pool_text}
+
+【强制约束】(违反会被自动审计标 ❌,请严格遵守)
+1. 事实性陈述句末尾**必须**带 [paper_id],格式: "...发现 X 提升了 Y% [paper_id]"
+2. 过渡/总结/铺垫/动机类句子**不要**带 [paper_id](这是关键,过渡句污染是常见错误)
+3. 不得引用候选池外的 paper_id(候选池外引用 = 幻觉,自动审计会标 ❌)
+4. 不得编造方法/数字/实验结果;不知道就跳过,不要凑
+5. 行内 markdown 链接格式: [作者 年份, arXiv:xxxx.xxxxx](papers/xxxx.xxxxx.md)
+   例: "拓扑码在 [Bombin 2006, arXiv:0607734](papers/0607734.md) 中被提出"
+6. 不带引用 [paper_id] 的行内链接不要写(纯链接没意义)
+7. markdown 格式: 标题用 ##, 列表用 -, 不嵌套列表超过 2 层
+
+【"事实句 vs 过渡句" 对比示例】
+
+  ✅ 事实句(带引用):
+    "表面码在 [Fowler 2012, arXiv:1208.0928](papers/1208.0928.md) 中展示了低于 1% 的逻辑错误率。"
+    "相较于早期方案, [Bravyi 2018, arXiv:1809.10727](papers/1809.10727.md) 提出的 XZZX 码在偏置噪声下表现更优。"
+
+  ✅ 过渡句(不带引用):
+    "本章将梳理量子纠错码的关键进展,并按机制分类对比。"
+    "尽管已有显著成果,以下问题仍待解决。"
+    "接下来我们讨论方法层面的差异。"
+
+  ❌ 错误 1(过渡句硬塞引用):
+    "本章将梳理量子纠错码的关键进展 [综述]。"  ← 综述不是 paper_id,应去掉
+
+  ❌ 错误 2(事实句漏引用):
+    "表面码展示了低于 1% 的逻辑错误率。"  ← 必须加 [Fowler 2012, arXiv:1208.0928](papers/1208.0928.md)
+
+  ❌ 错误 3(候选池外引用):
+    "Preskill 在 1997 年提出阈值定理 [10.1103/PhysRevA.55.900]。"  ← 候选池没这 paper_id,必须删
+
+【本章节引用配额】(软约束, 超过会被审计标 ⚠️)
+  {ref_quota}
+
+【输出】(直接 markdown 章节正文, 不要前缀"以下是...",不要后缀总结,不要"```markdown" 包裹)
+"""
+
+
+# 章节类型 → 引用配额(覆盖度审计的软约束参考)
+SECTION_REF_QUOTAS = {
+    "intro":          "0-2 个引用,主要讲背景和综述范围",
+    "progress":       "5-10 个引用,核心进展章节",
+    "method_compare": "3-8 个引用,按机制/性能/场景组织",
+    "gap":            "1-3 个引用,以反例为主",
+    "outlook":        "0-2 个引用,基于 gap 推断",
+}
+
+
+def build_section_prompt(
+    topic: str,
+    section_type: str,
+    section_title: str,
+    outline_section: str,
+    papers: List[Dict[str, Any]],
+    section_type_safe: Optional[str] = None,
+) -> str:
+    """
+    构造单章生成 prompt。
+
+    section_type_safe: 强校验后的小写 section_type;若不传则用 section_type.lower()。
+    """
+    safe_type = (section_type_safe or section_type or "").strip().lower()
+    if safe_type not in SECTION_REF_QUOTAS:
+        safe_type = "intro"  # 兜底,不让 LLM 看到陌生章节类型
+    return SURVEY_SECTION_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        section_type=safe_type,
+        section_title=section_title or "(无标题)",
+        outline_section=outline_section or "(无大纲)",
+        pool_size=len(papers),
+        pool_text=format_pool(papers),
+        ref_quota=SECTION_REF_QUOTAS[safe_type],
+    )
+
+
+# ============================================================
+# 模块自检(可独立 import 测试,不调 LLM)
+# ============================================================
+if __name__ == "__main__":
+    # 简单 sanity: 能构造出来
+    sample = [
+        {
+            "paper_id": "2401.12345",
+            "title": "Surface code under biased noise",
+            "year": 2024,
+            "journal": "PRX",
+            "core_method": "XZZX surface code with tailored bias",
+            "core_contrib": "10x threshold improvement under bias-100 noise",
+        },
+        {
+            "paper_id": "1809.10727",
+            "title": "Subsystem codes",
+            "year": 2018,
+            "journal": "PRX",
+            "core_method": "Pauli-based subsystem codes",
+            "core_contrib": "New subsystem framework for biased noise",
+        },
+    ]
+    print("=== build_outline_prompt ===")
+    print(build_outline_prompt("量子纠错码近期进展", sample)[:400], "...")
+    print()
+    print("=== build_section_prompt (progress) ===")
+    print(
+        build_section_prompt(
+            topic="量子纠错码近期进展",
+            section_type="progress",
+            section_title="关键进展时间线",
+            outline_section="- 早期突破 (2010-2015)\n- 中期优化 (2015-2020)\n- 近期进展 (2020+)",
+            papers=sample,
+        )[:400],
+        "...",
+    )
+    print()
+    print("=== build_fact_prompt ===")
+    print(build_fact_prompt(paper_id="2401.12345", title="Surface code", core_method="XZZX")[:300], "...")
