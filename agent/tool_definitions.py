@@ -722,6 +722,37 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             }
         }
     },
+
+    # ============================================================
+    # survey_audit: 对已有 survey 跑覆盖度审计(P6.4, L0 档, 0 LLM)
+    # ============================================================
+    "survey_audit": {
+        "type": "function",
+        "function": {
+            "name": "survey_audit",
+            "description": (
+                "对已落库的 survey 主题跑覆盖度审计(P6.4, L0 档, 0 LLM 调用)。"
+                "不重生成章节, 只对 surveys.db 已有 theme + sections 跑:"
+                "每章节候选池内/外引用统计, 总唯一引用, 候选池 0 引用列表(从 workspace _pool.json 读), 候选池外引用列表。"
+                "传 topic 字段可启用候选池覆盖度审计(否则只跑章节级)。"
+                "适用: 用户说'审计 X 综述' / 'survey audit X' / '看看 X 综述覆盖率' 时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "theme_id": {
+                        "type": "integer",
+                        "description": "survey_theme.id, surveys.db 里的主键"
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "可选, 综述主题(用来从 workspace 找候选池); 不传则跳过候选池覆盖度"
+                    }
+                },
+                "required": ["theme_id"]
+            }
+        }
+    },
 }
 
 
