@@ -1,4 +1,4 @@
-﻿"""
+"""
 ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 
 变更点（相对旧版）：
@@ -10,6 +10,7 @@ ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 """
 import json
 from datetime import datetime
+import time
 from PySide6.QtCore import QObject, Signal, QSettings
 from config.settings import get_settings
 from agent.history_manager import HistoryManager
@@ -50,6 +51,8 @@ class ConversationController(QObject):
         self._busy_conversation_ids = set()
         self._comparison_index = 0
         self._comparison_params = []
+        # 2026-09-07 P0 fix: 流式节流 save 时间戳 (每 30s 存一次, 防段错误丢数据)
+        self._last_stream_save_ts = 0.0
         self._comparison_modes = []
         self._comparison_messages = []
         self._comparison_target_conv = None
@@ -283,6 +286,18 @@ class ConversationController(QObject):
         else:
             target_conv.add_message("assistant", chunk)
         self.stream_chunk.emit(conv_id, chunk)
+
+        # 2026-09-07 P0 fix: 流式过程中节流 save (每 30s 一次)
+        # 之前: 段错误 (0xC0000005/0xC00000FD) 崩进程时 _on_worker_finished 不跑 → save_conversation 不调
+        # → 用户整段对话没存盘, 看起来"对话消失"
+        # 修法: 流式每 30s 强制 save 一次, 段错误最多丢 30s 数据
+        now_ts = time.monotonic()
+        if now_ts - self._last_stream_save_ts > 30:
+            try:
+                self.history_manager.save_conversation(target_conv)
+                self._last_stream_save_ts = now_ts
+            except Exception as e:
+                logger.warning("[controller] 流式节流 save 失败: %s", e)
 
     def _on_worker_finished(self, conv_id, full_reply, error, final_messages, bubble_list):
         """Worker.finished (conv_id, full_reply, error, final_messages, bubble_list) 回调"""

@@ -245,7 +245,9 @@ NEW_BUBBLE = "\x1cNEW_BUBBLE"
 # 2026-09-02 P0 fix: 工具循环死循环兜底（模块级常量, 方便 smoke test 验证 + 调优）
 # LLM 持续调同工具 / 工具持续返空 / 工具持续报错 都会让 LLM 反复重试,
 # 无 MAX_ROUNDS 会撞 cost_guard 50 ceiling + 内存累积 + 费用爆
-MAX_ROUNDS = 20
+# 2026-09-07 用户拍板: 综述生成任务多工具组合 (survey_generate 内部 9 次 LLM 调
+# + chat 多轮 follow-up) 20 轮不够, 调到 50
+MAX_ROUNDS = 50
 
 
 def _resolve_client_and_model(mode: str) -> tuple:
