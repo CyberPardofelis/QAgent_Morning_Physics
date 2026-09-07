@@ -110,9 +110,33 @@ def _call_llm_extract(content: str) -> Optional[Dict[str, Any]]:
             response_format={"type": "json_object"},
         )
         text = resp.choices[0].message.content
-        return json.loads(text)
     except Exception as e:
-        logger.warning("[MemoryExtractor] LLM \u8c03\u7528\u5931\u8d25: %s", e)
+        logger.warning("[MemoryExtractor] LLM 调用失败: %s", e)
+        return None
+    # 2026-09-07 P0 fix: 容错 JSON parse (LLM 经常缺 '"}]' 收尾, 同 survey_generate 修法)
+    # 之前 json.loads(text) 失败直接返 None, 实际 LLM 输出有 90% 缺 '"}]' 收尾
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # 容错: 补 '"}]' / ']' 收尾 + 抽完整 object 重建
+        for tail in ['"}]', '"]', ']']:
+            try:
+                fixed = text.rstrip(",\n ") + tail
+                v = json.loads(fixed)
+                if isinstance(v, (dict, list)):
+                    logger.info("[MemoryExtractor] 容错 parse 成功 (补 %r)", tail)
+                    return v
+            except Exception:
+                pass
+        # 抽单层完整 {...} 对象
+        import re as _re
+        m = _re.search(r"\{[^{}]*\"canonical\"[^{}]*\}", text)
+        if m:
+            try:
+                return json.loads("[" + m.group(0) + "]")
+            except Exception:
+                pass
+        logger.warning("[MemoryExtractor] JSON parse 失败(含容错): %s; text 末 200 chars: %r", e, text[-200:])
         return None
 
 

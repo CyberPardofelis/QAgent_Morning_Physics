@@ -85,6 +85,17 @@ def _make_embedding_function():
                 model_path,
             )
             return None
+        # 2026-09-07 P0 加: 第 4 道守护 — 加载 BGE 前再检查一次
+        # 用户实测: embedding_enabled=False 走到 print 但 BGE 仍被加载
+        # 可能原因: try/except 中 except pass 跳过 return, 或 chromadb 内部独立路径
+        # 强制最后一道: 不管上面怎么走, 加载前必须确认
+        try:
+            from config import Config as _Cfg
+            if not _Cfg.get_embedding_enabled():
+                print("[vector_db] 第 4 道守护: embedding_enabled=False, 强制不走 BGE", flush=True)
+                return None
+        except Exception:
+            pass
         logger.info("[vector_db] 加载本地 embedding model: %s", model_path)
         print(f"[vector_db] 即将加载 BGE: {model_path}", flush=True)
         fn = embedding_functions.SentenceTransformerEmbeddingFunction(

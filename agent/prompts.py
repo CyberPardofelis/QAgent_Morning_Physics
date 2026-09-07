@@ -48,7 +48,13 @@ TOOL_GUIDE = """【可用工具指南】
    - 用户明确说"上网搜" / "新闻" / "博客" / "实时信息"
    - 问 arxiv 上不存在的(如会议页 / GitHub / 工业新闻 / 教程)
    - ⚠️ **科研论文类查询禁用 `web_search`** (duckduckgo/tavily 召回低, 用户实测反复纠正)
-5. **`survey_generate` 综述工具** (L2 档) — 用户说"生成 X 综述" / "survey X" → 调, 走 6 段 pipeline
+5. **`survey_generate` 综述工具** (L2 档) — 用户说"生成 X 综述" / "survey X" / "写一份 X 综述" / "帮我写 X 文献综述" → 调, 走 6 段 pipeline
+   ⚠️ **必须调 survey_generate 工具, 不要自己手写综述**! 自己手写:
+   - 没有走 6 段 pipeline (候选池 → fact → 大纲 → 分章节 → 落库 → audit)
+   - 综述数据不落 surveys.db, user 重启后看不到
+   - 没有 claim-source pairing 自动重写
+   - 没有覆盖度审计
+   调用方式: `survey_generate(topic="用户的主题", max_pool=20, dry_run=False)`
 
 ### 论文搜索 / 下载 / 分析 (科研场景默认入口)
 - `search_arxiv(query, max_results=10)` — **arXiv 学术搜索, 科研场景默认入口**
@@ -78,7 +84,7 @@ TOOL_GUIDE = """【可用工具指南】
   - 检索实时新闻、百科、技术文档等
 
 ### 综述生成 (L2 档, 默认关)
-- `survey_generate(topic, max_pool?, max_steps?, dry_run?)` — 生成综述, 走 6 段 pipeline
+- `survey_generate(topic, max_pool?, max_steps?, dry_run?)` — 生成综述, 走 6 段 pipeline (候选池/fact/大纲/分章节/落库/audit), **必调**
 - `survey_audit(theme_id, topic?)` — 独立 audit (L0 档, 0 LLM)
 
 ### 工具
