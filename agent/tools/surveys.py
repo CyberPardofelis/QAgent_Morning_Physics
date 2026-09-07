@@ -809,15 +809,213 @@ def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
 
 
 def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
-    """step 1 stub — 后续 step 3 接入真实 fact 抽取 (复用 P6 fact prompt + 容错)"""
-    n = len(args.get("paper_ids", []))
-    yield f"👁️ 观察: [stub] extract_facts 暂未实现, 将抽 {n} 篇 fact\n"
+    """
+    extract_facts action (step 3 真实实现):
+      - 对每篇 paper 调 minimax LLM 抽 3-5 条 fact (JSON 数组)
+      - 复用 P6 build_fact_prompt + _safe_json_loads_array 容错
+      - fact 写 workspace/_facts.jsonl, 加 state['facts']
+      - 单篇失败不阻塞 batch
+    """
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_fact_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+
+    # 默认抽 state['pool'] 全部; 也可指定 paper_ids 子集
+    target_ids = args.get("paper_ids")
+    if target_ids:
+        targets = [p for p in state["pool"] if p["paper_id"] in target_ids]
+    else:
+        targets = list(state["pool"])
+
+    if not targets:
+        yield "⚠️ extract_facts: 0 篇目标 (paper_ids 不在 pool 中)\n"
+        yield f"👁️ 观察: extract_facts 0 篇, 累计 facts={len(state['facts'])} 条\n"
+        return
+
+    yield f"📝 extract_facts: 抽 {len(targets)} 篇, 调 {_PROVIDER}/{_MODEL}\n"
+
+    for i, paper in enumerate(targets, 1):
+        paper_id = paper["paper_id"]
+        yield f"  [{i}/{len(targets)}] {paper_id} 抽 fact...\n"
+        try:
+            fact_prompt = build_fact_prompt(
+                paper_id=paper_id,
+                title=paper.get("title", ""),
+                year=str(paper.get("year", "")),
+                journal=paper.get("journal", ""),
+                core_method=paper.get("core_method", ""),
+                core_contrib=paper.get("core_contrib", ""),
+                abstract=paper.get("abstract", ""),
+                outlook=paper.get("outlook", ""),
+            )
+            out = _call_llm(
+                fact_prompt,
+                provider=_PROVIDER,
+                model=_MODEL,
+                enable_thinking=False,
+                temperature=0.2,
+                max_tokens=4000,  # P6.2 经验: 2000 截断
+                timeout=120,
+            )
+            # 剥 <think>
+            if out and "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+            # 容错 parse JSON 数组
+            m = re.search(r"\[[\s\S]*", out or "")
+            if not m:
+                raise ValueError(f"LLM 输出无 JSON 数组: {(out or '')[:200]}")
+            facts = _safe_json_loads_array(m.group(0))
+            if facts is None:
+                raise ValueError(f"JSON parse 失败 (含容错): {(out or '')[:200]}")
+            # 落 _facts.jsonl
+            for f in facts:
+                if not isinstance(f, dict):
+                    continue
+                f.setdefault("paper_id", paper_id)
+                ws.append_fact(f)
+                state["facts"].append(f)
+            yield f"    ✅ 抽 {len(facts)} 条 fact\n"
+        except Exception as e:
+            # 单篇失败不阻塞 batch
+            friendly = _friendly_error(e, "extract_facts")
+            state["errors"].append({
+                "step": state["step"], "action": "extract_facts",
+                "paper": paper_id, "msg": friendly,
+            })
+            yield f"    ❌ {friendly}\n"
+
+    yield f"👁️ 观察: 抽 {len(targets)} 篇, 累计 facts={len(state['facts'])} 条, errors={len(state['errors'])}\n"
 
 
 def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
-    """step 1 stub — 后续 step 4 接入真实章节生成 + 流式 yield + 自动重写 out_of_pool"""
-    title = args.get("title", "?")
-    yield f"👁️ 观察: [stub] write_section 暂未实现, 将写章节 [{title}]\n"
+    """
+    write_section action (step 4 真实实现):
+      - 调 minimax LLM 写单个章节 markdown
+      - 复用 P6 build_section_prompt + _audit_section_paper_ids
+      - 自动重写 (P6.3): out_of_pool > 0 时加约束重试, 最多 2 次
+      - 章节落 surveys.db (create_section, paper_ids 逗号分隔)
+      - step 4 用非流式 LLM 拿完整 markdown 再 yield (真流式要 _call_llm_stream, 留 P+)
+    """
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_section_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+
+    title = args.get("title", "section")
+    sec_type = (args.get("section_type") or "intro").strip()
+    sub_points = args.get("sub_points") or []
+    if isinstance(sub_points, list):
+        outline_section_md = "\n".join(f"- {sp}" for sp in sub_points)
+    else:
+        outline_section_md = str(sub_points)
+
+    yield f"✍️ write_section: [{sec_type}] {title}\n"
+
+    # theme: 第一次创建, 后续复用
+    if "theme_id" not in state:
+        state["theme_id"] = create_theme(
+            name=state["topic"],
+            description=f"P6.5 survey_generate 自动创建 at {datetime.now().isoformat(timespec='seconds')}",
+        )
+        yield f"  📌 新建 theme (theme_id={state['theme_id']})\n"
+    theme_id = state["theme_id"]
+
+    pool_ids = {p["paper_id"] for p in state["pool"]}
+
+    # 自动重写 loop (P6.3: 最多 2 次, spec §3.3)
+    MAX_REWRITE = 2
+    sec_md = ""
+    bucket = {"in_pool": [], "out_of_pool": [], "total_cites": 0}
+    for rewrite_i in range(MAX_REWRITE + 1):
+        try:
+            section_prompt = build_section_prompt(
+                topic=state["topic"],
+                section_type=sec_type,
+                section_title=title,
+                outline_section=outline_section_md,
+                papers=state["pool"],
+            )
+            if rewrite_i > 0:
+                # 重写时加约束: 只能用候选池内 paper_id
+                extra_constraint = (
+                    f"\n\n【P6.3 自动重写 {rewrite_i}/{MAX_REWRITE}】"
+                    f"\n⚠️ 你上一次的输出引用了候选池外的 paper_id ({bucket['out_of_pool']}),"
+                    f"\n这会被自动审计标 ❌ (幻觉风险). 现在重写, **只能用候选池内**的 paper_id:"
+                    f"\n候选池 paper_id 列表: {sorted(pool_ids)}"
+                    f"\n请删除/替换所有候选池外引用, 然后再 output 完整章节 markdown。"
+                )
+                section_prompt = section_prompt + extra_constraint
+                yield f"  🔁 out_of_pool={len(bucket['out_of_pool'])} → 重写 {rewrite_i}/{MAX_REWRITE}\n"
+
+            sec_md = _call_llm(
+                section_prompt,
+                provider=_PROVIDER,
+                model=_MODEL,
+                enable_thinking=False,
+                temperature=0.4,
+                max_tokens=6000,  # P6.2 经验
+                timeout=180,
+            )
+        except Exception as e:
+            # 异常不重试
+            sec_md = f"⚠️ 章节生成失败: {_friendly_error(e, 'write_section')}\n\n(占位章节: {title})"
+            state["errors"].append({
+                "step": state["step"], "action": "write_section",
+                "msg": _friendly_error(e, "write_section"),
+            })
+            yield f"  ❌ LLM 失败: {_friendly_error(e, 'write_section')}\n"
+            break
+
+        # 剥 <think>
+        if sec_md and "<think>" in sec_md:
+            sec_md = re.sub(r"<think>.*?</think>", "", sec_md, flags=re.DOTALL).strip()
+
+        # 审计引用
+        bucket = _audit_section_paper_ids(sec_md, pool_ids)
+        if not bucket["out_of_pool"] or rewrite_i >= MAX_REWRITE:
+            if rewrite_i > 0:
+                yield f"  ✅ 重写 {rewrite_i} 次后 out_of_pool={len(bucket['out_of_pool'])}\n"
+            break
+        # out_of_pool > 0 且还能重写
+
+    # 章节内容整体 yield (非 token 流式, spec §11 开放问题 3)
+    yield f"\n--- [{sec_type}] {title} ---\n"
+    for line in sec_md.split("\n"):
+        yield line + "\n"
+    yield "--- 章节结束 ---\n"
+
+    # 落 surveys.db
+    try:
+        sec_id = create_section(
+            theme_id=theme_id,
+            section_type=sec_type,
+            title=title,
+            content_md=sec_md or "",
+            paper_ids=",".join(bucket["in_pool"]),
+        )
+        state["sections"].append({
+            "section_id": sec_id,
+            "title": title,
+            "type": sec_type,
+            "in_pool": bucket["in_pool"],
+            "out_of_pool": bucket["out_of_pool"],
+        })
+        yield (
+            f"  💾 落 surveys.db (section_id={sec_id}, "
+            f"引用 {len(bucket['in_pool'])} 内, {len(bucket['out_of_pool'])} 外)\n"
+        )
+    except Exception as e:
+        friendly = _friendly_error(e, "create_section")
+        state["errors"].append({
+            "step": state["step"], "action": "write_section.create_section",
+            "msg": friendly,
+        })
+        yield f"  ❌ 落库失败: {friendly}\n"
+
+    yield f"👁️ 观察: write_section 完成, 已写 {len(state['sections'])} 章, errors={len(state['errors'])}\n"
 
 
 def action_finish(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
@@ -827,18 +1025,106 @@ def action_finish(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[s
 
 
 def _finalize_survey(state: Dict[str, Any], ws) -> str:
-    """收尾 (step 1 stub — 后续 step 5 落 surveys.db + audit + 最终 markdown)"""
-    return (
-        f"\n## survey_generate 完成 (step 1 骨架 stub) — {state['topic']}\n\n"
-        f"- workspace: `{ws.path}`\n"
-        f"- 候选池: {len(state['pool'])} 篇\n"
-        f"- ReAct steps: {state['step']}\n"
-        f"- 已写章节 (stub): {len(state['sections'])}\n"
-        f"- 错误数: {len(state['errors'])}\n"
-        f"- 抽 fact (stub): {len(state['facts'])}\n"
-        f"\n⏳ step 1 仅验证 generator + 主循环骨架, 业务逻辑 (search_more / extract_facts / "
-        f"write_section / finish) 将在 step 2-5 逐步替换。\n"
+    """
+    收尾 (step 5 真实实现):
+      - 算 audit: 候选池 0 引用论文
+      - 落 workspace/_audit.md
+      - 落 surveys.db theme (已经在 write_section 第一次创建)
+      - yield 最终 markdown 报告
+    """
+    topic = state["topic"]
+    pool = state["pool"]
+    sections = state["sections"]
+    pool_ids = {p["paper_id"] for p in pool}
+
+    # 覆盖度 audit
+    cited_ids: set = set()
+    for r in sections:
+        cited_ids.update(r.get("in_pool", []))
+    uncited = pool_ids - cited_ids
+
+    audit_lines = [
+        f"# 覆盖度审计 — {topic}",
+        "",
+        f"- workspace: `{ws.path}`",
+        f"- 候选池: {len(pool)}",
+        f"- 抽 fact: {len(state['facts'])}",
+        f"- 章节: {len(sections)} (theme_id={state.get('theme_id', '?')})",
+        f"- ReAct steps: {state['step']}",
+        f"- 错误数: {len(state['errors'])}",
+        "",
+        "## 每章节引用统计",
+        "",
+        "| 章节 | 类型 | 候选池内 | 候选池外(幻觉) |",
+        "|---|---|---|---|",
+    ]
+    for r in sections:
+        audit_lines.append(
+            f"| {r['title']} | {r['type']} | "
+            f"{len(r['in_pool'])} | {len(r['out_of_pool'])} |"
+        )
+    audit_lines.extend([
+        "",
+        f"## ⚠️ 候选池 0 引用论文 ({len(uncited)} / {len(pool_ids)} = "
+        f"{len(uncited)*100//max(1,len(pool_ids))}%)",
+        "",
+    ])
+    for pid in sorted(uncited):
+        p = next((x for x in pool if x["paper_id"] == pid), None)
+        title = (p or {}).get("title", "?")[:80]
+        audit_lines.append(f"- `{pid}`: {title}")
+    audit_md = "\n".join(audit_lines)
+    ws.save_audit(audit_md)
+    ws.set_status(
+        "done", 1, 1,
+        f"theme_id={state.get('theme_id', '?')}, sections={len(sections)}, audit=ok",
     )
+
+    # 最终 markdown 报告
+    report = [
+        f"## survey_generate 完成 — {topic}",
+        "",
+        f"- workspace: `{ws.path}`",
+        f"- theme_id: `{state.get('theme_id', '?')}` (surveys.db survey_theme.id)",
+        f"- 候选池: {len(pool)} 篇",
+        f"- 抽 fact: {len(state['facts'])} 条",
+        f"- 章节: {len(sections)} 段",
+        f"- ReAct steps: {state['step']}",
+        f"- 错误数: {len(state['errors'])}",
+        f"- 覆盖度审计: `{ws.path}/_audit.md`",
+        "",
+        "### 章节 (section_id, 落库 surveys.db)",
+        "",
+    ]
+    for r in sections:
+        in_pids_str = ", ".join(f"[[{pid}]]" for pid in r['in_pool']) or "(无)"
+        out_pids_str = ", ".join(f"[[{pid}]]" for pid in r['out_of_pool']) or "(无)"
+        report.append(
+            f"- `{r['section_id']}` [{r['type']}] {r['title']}\n"
+            f"  - 候选池内引用 ({len(r['in_pool'])}): {in_pids_str}\n"
+            f"  - 候选池外引用/幻觉 ({len(r['out_of_pool'])}): {out_pids_str}"
+        )
+    report.append("")
+    report.append(f"### 候选池 0 引用 ({len(uncited)} / {len(pool_ids)}):")
+    if uncited:
+        for pid in sorted(uncited):
+            p = next((x for x in pool if x["paper_id"] == pid), None)
+            title = (p or {}).get("title", "?")[:80]
+            report.append(f"- `[[{pid}]]`: {title}")
+    else:
+        report.append("  (无, 所有候选池 paper 都被引用过)")
+    if state["errors"]:
+        report.append("")
+        report.append(f"### ⚠️ 错误 ({len(state['errors'])} 条)")
+        for e in state["errors"][:10]:  # 最多列 10 条
+            report.append(f"- step {e.get('step', '?')} [{e.get('action', '?')}] {e.get('msg', '?')}")
+        if len(state["errors"]) > 10:
+            report.append(f"- ... 还有 {len(state['errors']) - 10} 条")
+    report.append("")
+    report.append(f"### 审计详情")
+    report.append(f"见 `{ws.path}/_audit.md`")
+
+    return "\n".join(report)
 
 
 # ============================================================
