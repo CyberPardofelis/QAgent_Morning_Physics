@@ -665,8 +665,147 @@ def _append_react_trace(ws, trace_entry: Dict[str, Any]) -> None:
 # ---- 4 个 action stub (step 2-5 逐步替换为真实实现) ----
 
 def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
-    """step 1 stub — 后续 step 2 接 arxiv API + 单篇 summarize LLM + 写 summary_items.db"""
-    yield "👁️ 观察: [stub] search_more 暂未实现, 将在 step 2 接入 (arxiv + summarize 入库)\n"
+    """
+    search_more action (step 2 真实实现):
+      1. arxiv API 抓 k 篇
+      2. 每篇调 minimax LLM 跑单篇 summarize (4 字段)
+      3. 写 summary_items.db (source='survey_search')
+      4. 加进 state['pool']
+
+    单篇失败不阻塞 batch (spec §7.2 D).
+    """
+    from agent.tools.summary import save_summary_item
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_summarize_prompt
+
+    query = args.get("query") or state["topic"]
+    k = args.get("k", 5)
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+
+    yield f"🔎 搜索 arxiv: query={query!r}, k={k}\n"
+
+    # 1. arxiv API 抓
+    try:
+        raw_papers = _arxiv_search(query, k)
+    except Exception as e:
+        friendly = _friendly_error(e, "search_more.arxiv")
+        state["errors"].append({
+            "step": state["step"], "action": "search_more.arxiv",
+            "msg": friendly,
+        })
+        yield f"❌ arxiv 搜索失败: {friendly}\n"
+        return
+
+    if not raw_papers:
+        yield "⚠️ arxiv 返回 0 篇, 候选池无新增\n"
+        yield f"👁️ 观察: search_more 0 篇新增, 累计 pool={len(state['pool'])} 篇\n"
+        return
+
+    yield f"📥 arxiv 返回 {len(raw_papers)} 篇, 开始单篇 summarize (调 {_PROVIDER}/{_MODEL})\n"
+
+    # 2. 单篇 summarize + 写库
+    new_pool = []
+    for i, p in enumerate(raw_papers, 1):
+        paper_id = p["paper_id"]
+        yield f"  [{i}/{len(raw_papers)}] summarize {paper_id}: {p.get('title', '?')[:60]}...\n"
+        try:
+            # 调 LLM 抽 4 字段
+            sum_prompt = build_summarize_prompt(
+                paper_id=paper_id,
+                title=p.get("title", ""),
+                authors=p.get("authors", ""),
+                abstract=p.get("abstract", ""),
+            )
+            out = _call_llm(
+                sum_prompt,
+                provider=_PROVIDER,
+                model=_MODEL,
+                enable_thinking=False,
+                temperature=0.2,
+                max_tokens=2000,
+                timeout=60,
+            )
+            # 剥 <think>
+            if out and "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+            # parse JSON (容错)
+            m = re.search(r"\{[\s\S]*\}", out or "")
+            if not m:
+                raise ValueError(f"summarize LLM 输出无 JSON: {(out or '')[:200]}")
+            try:
+                summary_dict = json.loads(m.group(0))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"summarize JSON parse 失败: {e}")
+
+            # 写 summary_items.db (source='survey_search', spec §7.2 C)
+            row_id = save_summary_item(
+                paper_id=paper_id,
+                source="survey_search",
+                title=p.get("title", ""),
+                authors=p.get("authors", ""),
+                abstract=p.get("abstract", ""),
+                core_method=summary_dict.get("core_method", ""),
+                core_contrib=summary_dict.get("core_contrib", ""),
+                keywords=summary_dict.get("keywords", ""),
+                outlook=summary_dict.get("outlook", ""),
+            )
+            if row_id == -1:
+                yield f"    ⚠️ UNIQUE 冲突 (paper={paper_id}), 跳过\n"
+            else:
+                yield f"    ✅ 入库 (row_id={row_id})\n"
+
+            # 加进 state['pool'], 沿用 Phase A 候选池 dict 格式
+            new_pool.append({
+                "paper_id": paper_id,
+                "title": p.get("title", ""),
+                "year": str(p.get("year", "")),
+                "journal": "arxiv",
+                "core_method": summary_dict.get("core_method", ""),
+                "core_contrib": summary_dict.get("core_contrib", ""),
+                "abstract": p.get("abstract", ""),
+                "outlook": summary_dict.get("outlook", ""),
+                "keywords": summary_dict.get("keywords", ""),
+                "_source": "arxiv_api_via_survey_search",
+            })
+        except Exception as e:
+            # 单篇失败不阻塞 batch (spec §7.2 D)
+            friendly = _friendly_error(e, "search_more.summarize")
+            state["errors"].append({
+                "step": state["step"], "action": "search_more.summarize",
+                "paper": paper_id, "msg": friendly,
+            })
+            yield f"    ❌ {friendly}\n"
+
+    state["pool"].extend(new_pool)
+    yield (
+        f"👁️ 观察: 抓 {len(raw_papers)} 篇, 成功 {len(new_pool)} 篇入库, "
+        f"累计 pool={len(state['pool'])} 篇, errors={len(state['errors'])}\n"
+    )
+
+
+def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    """arxiv API 抓 k 篇, 返回 dict list."""
+    import arxiv
+    search = arxiv.Search(
+        query=query,
+        max_results=k,
+        sort_by=arxiv.SortCriterion.Relevance,
+    )
+    client = arxiv.Client()
+    out: List[Dict[str, Any]] = []
+    for r in client.results(search):
+        out.append({
+            "paper_id": r.entry_id.split("/")[-1].split("v")[0],  # 去 /abs/ 前缀和版本号
+            "title": r.title or "",
+            "year": str(r.published.year) if r.published else "",
+            "authors": ", ".join([a.name for a in (r.authors or [])[:5]]),
+            "abstract": r.summary or "",
+            "keywords": ", ".join([a.name for a in (r.authors or [])[:3]]),
+        })
+        if len(out) >= k:
+            break
+    return out
 
 
 def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:

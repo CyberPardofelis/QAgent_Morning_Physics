@@ -287,6 +287,40 @@ def build_section_prompt(
 
 
 # ============================================================
+# P6.5 search_more 用的单篇 summarize prompt
+# (复用 analyze_paper 风格, 但简化到 4 字段, 适配 summary_items.db)
+# ============================================================
+def build_summarize_prompt(
+    paper_id: str,
+    title: str,
+    authors: str = "",
+    abstract: str = "",
+) -> str:
+    """
+    单篇 paper summarize prompt — 写进 summary_items.db (source='survey_search')
+
+    输出 4 字段 JSON:
+      - core_method: 技术方法 + 创新点, 50-200 词
+      - core_contrib: 主要贡献 + 结果, 50-150 词
+      - keywords: 3-8 关键词 (逗号分隔字符串)
+      - outlook: 意义与展望, 30-100 词
+    """
+    return f"""Analyze the following paper and return a **valid JSON object** with these fields:
+
+- core_method: Technical methods and innovative points, about 50-200 words (中文或英文都可, 但要完整)
+- core_contrib: Main contribution and result, about 50-150 words
+- keywords: list of 3-8 keywords (output as comma-separated string, e.g. "quantum entanglement, entropy, fidelity")
+- outlook: significance and outlook, about 30-100 words
+
+Paper ID: {paper_id}
+Title: {title}
+Authors: {authors}
+Abstract: {abstract[:3000]}
+
+Output ONLY the JSON object, no other text, no markdown fence."""
+
+
+# ============================================================
 # 模块自检(可独立 import 测试,不调 LLM)
 # ============================================================
 if __name__ == "__main__":
