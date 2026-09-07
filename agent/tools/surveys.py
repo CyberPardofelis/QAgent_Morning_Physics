@@ -271,7 +271,7 @@ def health_check() -> Dict[str, Any]:
 import json
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 
 from agent.tools.registry import register_tool
 from agent.prompts_survey import (
@@ -471,35 +471,33 @@ def _build_candidate_pool(topic: str, max_pool: int = 40) -> List[Dict[str, Any]
     return pool
 
 
-@register_tool(name="survey_generate", is_streaming=False, cost_tier="L2")
+@register_tool(name="survey_generate", is_streaming=True, cost_tier="L2")
 def survey_generate(
     topic: str,
-    max_pool: int = 40,
-    max_steps: int = 10,
+    max_steps: int = 20,
     dry_run: bool = False,
-) -> str:
+) -> Iterator[str]:
     """
-    生成综述(P6 主工具, L2 档)。
+    生成综述 (P6.5 ReAct 改写) — L2 档, 流式 yield 进度 + 章节内容.
 
-    6 段 pipeline:
-      Phase A: 候选池构建 (0 LLM, summary_items.db 关键词匹配)
-      Phase B: (本轮跳过) 抓新 + analyze_paper
-      Phase C: fact 提取 (每篇 1 次 LLM, 3-5 fact/paper)
-      Phase D: 大纲生成 (1 次 LLM, 5 章节)
-      Phase E: 章节生成 (每章 1 次 LLM, 落 surveys.db)
-      Phase F: 覆盖度审计 (0 LLM, 写 _audit.md)
+    ReAct 主循环:
+      Step 0: 初始候选池 (Phase A, 0 LLM)
+      Step 1..max_steps: LLM 观察 state → 决策 action → 派发 → yield obs
+        action: search_more / extract_facts / write_section / finish
+      收尾: theme + sections 落 surveys.db, _audit.md, 最终 markdown
 
     Args:
-        topic: 综述主题, 例 "量子纠错码近期进展"
-        max_pool: 候选池上限(默认 40)
-        max_steps: 暂未使用(预留 P4 ReAct 共享)
-        dry_run: True = 不调 LLM, 只构建候选池(用于 UI 快速测)
+        topic: 综述主题, 例 "量子纠缠度量计算"
+        max_steps: ReAct 循环上限 (默认 20, spec §7.1)
+        dry_run: True = 不调 LLM, 只走 Phase A 候选池构建
 
-    Returns:
-        markdown 报告, 含 surveys.db section_id 列表 + 覆盖度 audit
+    Yields:
+        流式进度 + 章节内容, chat stream_chunk signal 消费
+        (is_streaming=True 标记, agent.py 派发层识别为 generator)
     """
     if not topic or not topic.strip():
-        return "❌ topic 不能为空"
+        yield "❌ topic 不能为空\n"
+        return
 
     topic = topic.strip()
 
@@ -508,307 +506,200 @@ def survey_generate(
     ws = SurveyWorkspace(topic_hash, topic=topic)
     ws.set_status("init", 0, 0, f"topic={topic}")
 
-    # 1. Phase A: 候选池
-    pool = _build_candidate_pool(topic, max_pool=max_pool)
+    yield f"🔍 开始综述: {topic}\n"
+
+    # 1. Step 0: Phase A 初始候选池 (0 LLM, summary_items.db + arxiv fallback)
+    pool = _build_candidate_pool(topic)
     if not pool:
         ws.set_status("failed", 0, 0, "pool empty")
-        return (
+        yield (
             f"❌ 候选池为空\n"
             f"- topic: {topic!r}\n"
-            f"- 主题词在 summary_items.db 里没匹配到任何 paper\n"
-            f"- 建议: 换个主题词, 或先跑 `抓文 → analyze_paper` 准备数据"
+            f"- 主题词在 summary_items.db 里没匹配到任何 paper, arxiv API fallback 也失败\n"
+            f"- 建议: 换个主题词, 或先跑 `抓文 → analyze_paper` 准备数据\n"
         )
+        return
     ws.save_pool(pool)
-    ws.set_status("pool_built", len(pool), max_pool, f"pool={len(pool)}")
+    yield f"📚 初始候选池: {len(pool)} 篇\n\n"
+
+    # state 初始化
+    state: Dict[str, Any] = {
+        "topic": topic,
+        "topic_hash": topic_hash,
+        "pool": pool,
+        "facts": [],
+        "sections": [],
+        "errors": [],
+        "step": 0,
+        "finish_requested": False,
+        "max_steps": max_steps,
+    }
 
     if dry_run:
-        ws.save_audit(f"# dry_run audit\n- topic: {topic}\n- pool_size: {len(pool)}\n- workspace: {ws.path}\n")
-        return (
+        ws.save_audit(
+            f"# dry_run audit\n- topic: {topic}\n- pool_size: {len(pool)}\n- workspace: {ws.path}\n"
+        )
+        yield (
             f"## survey_generate dry_run\n\n"
             f"- topic: {topic}\n"
             f"- 候选池: {len(pool)}\n"
             f"- workspace: `{ws.path}`\n"
-            f"- 跳过 LLM 调用 (dry_run=True)\n\n"
-            f"### 候选池前 5 条:\n\n"
-            + "\n".join(
-                f"- `{p['paper_id']}`: {p.get('title', '?')[:80]}"
-                for p in pool[:5]
-            )
+            f"- 跳过 ReAct 循环 (dry_run=True)\n"
         )
+        return
 
-    # 2. Phase C: fact 提取(每篇 1 次 LLM)
-    # P6.0 调子验证发现 deepseek 推理模型在 enable_thinking=False 下,LLM 思考/答案
-    # 都进 reasoning_content, fallback 出来的是 thinking 不是 answer。
-    # survey_generate 强制走 minimax-m3 (走主界面 chat mode 容易撞这 bug)
-    from agent.tools.llm import _call_llm
+    # 2. ReAct 主循环
+    while state["step"] < state["max_steps"] and not state["finish_requested"]:
+        state["step"] += 1
+        yield f"\n--- Step {state['step']} ---\n"
 
-    _LLM_PROVIDER = "minimax"
-    _LLM_MODEL = "MiniMax-M3"
-    _LLM_TEMPERATURE = 0.3
+        # 2.1 LLM 决策 (step 1 用 mock, 后续 step 接真实 _call_llm + parse_decision)
+        decision = _decide_action(state)
 
-    ws.set_status("fact_extraction", 0, len(pool), "")
-    all_facts: List[Dict[str, Any]] = []
-    for i, paper in enumerate(pool, 1):
-        fact_prompt = build_fact_prompt(
-            paper_id=paper["paper_id"],
-            title=paper.get("title", ""),
-            year=str(paper.get("year", "")),
-            journal=paper.get("journal", ""),
-            core_method=paper.get("core_method", ""),
-            core_contrib=paper.get("core_contrib", ""),
-            abstract=paper.get("abstract", ""),
-            outlook=paper.get("outlook", ""),
-        )
+        yield f"💭 思考: {decision['thought']}\n"
+        args_str = json.dumps(decision.get("args", {}), ensure_ascii=False)
+        yield f"➡️ 行动: {decision['action']}({args_str})\n"
+
+        # 2.2 派发 action (try/except 包裹, 失败塞 state["errors"], 不中断)
         try:
-            out = _call_llm(
-                fact_prompt,
-                provider=_LLM_PROVIDER,
-                model=_LLM_MODEL,
-                enable_thinking=False,
-                temperature=0.2,
-                max_tokens=4000,  # P6.2 修: 2000 会被 min-max 截断(JSON 缺 "}]")
-                timeout=120,
-            )
+            for chunk in _dispatch_action(decision, state, ws):
+                if chunk:
+                    yield chunk
         except Exception as e:
-            ws.set_status(
-                "fact_extraction", i, len(pool),
-                f"⚠️ {paper['paper_id']} 失败: {type(e).__name__}: {e}",
-            )
-            continue
-        # 剥 <think>
-        if out and "<think>" in out:
-            out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
-        # parse JSON(容错: LLM 经常缺 '"}]' 收尾)
-        m = re.search(r"\[[\s\S]*", out or "")
-        if not m:
-            ws.set_status("fact_extraction", i, len(pool), f"⚠️ {paper['paper_id']} 无 JSON")
-            continue
-        facts = _safe_json_loads_array(m.group(0))
-        if facts is None:
-            ws.set_status(
-                "fact_extraction", i, len(pool),
-                f"⚠️ {paper['paper_id']} JSON parse 失败 (含容错)",
-            )
-            continue
-        # 落 _facts.jsonl
-        for f in facts:
-            if not isinstance(f, dict):
-                continue
-            f.setdefault("paper_id", paper["paper_id"])
-            ws.append_fact(f)
-            all_facts.append(f)
-        ws.set_status(
-            "fact_extraction", i, len(pool),
-            f"{paper['paper_id']} → {len(facts)} facts",
-        )
+            friendly = _friendly_error(e, decision["action"])
+            state["errors"].append({
+                "step": state["step"],
+                "action": decision["action"],
+                "msg": friendly,
+            })
+            yield f"👁️ 观察: ❌ {friendly}\n"
 
-    # 3. Phase D: 大纲
-    ws.set_status("outline", 0, 1, "")
-    outline_prompt = build_outline_prompt(topic, pool)
-    try:
-        outline_raw = _call_llm(
-            outline_prompt,
-            provider=_LLM_PROVIDER,
-            model=_LLM_MODEL,
-            enable_thinking=False,
-            temperature=0.3,
-            max_tokens=3000,  # P6.2 修: 2000 不够 5 章节 outline
-            timeout=120,
-        )
-    except Exception as e:
-        ws.set_status("failed", 0, 0, f"outline failed: {e}")
-        return f"❌ 大纲生成失败: {type(e).__name__}: {e}"
-    if outline_raw and "<think>" in outline_raw:
-        outline_raw = re.sub(r"<think>.*?</think>", "", outline_raw, flags=re.DOTALL).strip()
-    m = re.search(r"\{[\s\S]*\}", outline_raw or "")
-    if not m:
-        ws.set_status("failed", 0, 0, "outline no JSON")
-        return "❌ 大纲 LLM 输出不是 JSON 对象, 检查 prompt 或模型"
-    try:
-        outline = json.loads(m.group(0))
-    except Exception as e:
-        ws.set_status("failed", 0, 0, f"outline JSON parse: {e}")
-        return f"❌ 大纲 JSON parse 失败: {e}"
-    ws.save_outline(outline)
-    sections = outline.get("sections", [])
-    ws.set_status("outline", 1, 1, f"sections={len(sections)}")
-    if not sections:
-        return "❌ 大纲 LLM 输出 sections 字段为空"
-
-    # 4. Phase E: 章节生成(每章 1 次 LLM + 落库)
-    ws.set_status("section_generation", 0, len(sections), "")
-    theme_id = create_theme(
-        name=topic,
-        description=f"P6 survey_generate 自动创建 at {datetime.now().isoformat(timespec='seconds')}",
-    )
-    section_results: List[Dict[str, Any]] = []
-    pool_ids = {p["paper_id"] for p in pool}
-
-    for j, sec in enumerate(sections, 1):
-        sec_type = (sec.get("section_type") or "intro").strip()
-        sec_title = sec.get("title") or f"section {j}"
-        # 兼容 LLM 偶尔写 sub_point 单数
-        sub_points = sec.get("sub_points") or sec.get("sub_point") or []
-        if isinstance(sub_points, list):
-            outline_section_md = "\n".join(f"- {sp}" for sp in sub_points)
-        else:
-            outline_section_md = str(sub_points)
-
-        ws.set_status(
-            "section_generation", j - 1, len(sections),
-            f"[{sec_type}] {sec_title}",
-        )
-
-        section_prompt = build_section_prompt(
-            topic=topic,
-            section_type=sec_type,
-            section_title=sec_title,
-            outline_section=outline_section_md,
-            papers=pool,
-        )
-
-        # P6.3 强化: 最多自动重写 2 次 (out_of_pool > 0 时)
-        sec_md = ""
-        bucket = {"in_pool": [], "out_of_pool": [], "total_cites": 0}
-        MAX_REWRITE = 2
-        for rewrite_i in range(MAX_REWRITE + 1):  # 0 = 首次, 1-2 = 重写
-            try:
-                sec_md = _call_llm(
-                    section_prompt,
-                    provider=_LLM_PROVIDER,
-                    model=_LLM_MODEL,
-                    enable_thinking=False,
-                    temperature=0.4,
-                    max_tokens=6000,  # P6.2 修: 4000 会截断 progress/method_compare 章节
-                    timeout=180,
-                )
-            except Exception as e:
-                sec_md = f"⚠️ 章节生成失败: {type(e).__name__}: {e}\n\n(占位章节: {sec_title})"
-                break  # 异常不重试
-            if sec_md and "<think>" in sec_md:
-                sec_md = re.sub(r"<think>.*?</think>", "", sec_md, flags=re.DOTALL).strip()
-
-            bucket = _audit_section_paper_ids(sec_md, pool_ids)
-            if not bucket["out_of_pool"] or rewrite_i >= MAX_REWRITE:
-                if rewrite_i > 0:
-                    ws.set_status(
-                        "section_generation", j - 1, len(sections),
-                        f"[{sec_type}] {sec_title} 重写 {rewrite_i} 次后 out_of_pool={len(bucket['out_of_pool'])}",
-                    )
-                break  # 干净或达上限, 跳出
-            # out_of_pool > 0 且还能重写: 加约束再试一次
-            extra_constraint = (
-                f"\n\n【P6.3 自动重写 {rewrite_i + 1}/{MAX_REWRITE}】"
-                f"\n⚠️ 你上一次的输出引用了候选池外的 paper_id ({bucket['out_of_pool']}),"
-                f"\n这会被自动审计标 ❌ (幻觉风险). 现在重写, **只能用候选池内**的 paper_id:"
-                f"\n候选池 paper_id 列表: {sorted(pool_ids)}"
-                f"\n请删除/替换所有候选池外引用, 然后再 output 完整章节 markdown。"
-            )
-            section_prompt = section_prompt + extra_constraint
-            ws.set_status(
-                "section_generation", j - 1, len(sections),
-                f"[{sec_type}] {sec_title} out_of_pool={len(bucket['out_of_pool'])} → 自动重写 {rewrite_i + 1}",
-            )
-
-        # 落 surveys.db(注意: paper_ids 字段是 "逗号分隔" 字符串, plan §9.2 简化版)
-        # order_idx 由 create_section 自动算 max+1, 不传
-        sec_id = create_section(
-            theme_id=theme_id,
-            section_type=sec_type,
-            title=sec_title,
-            content_md=sec_md or "",
-            paper_ids=",".join(bucket["in_pool"]),
-        )
-        section_results.append({
-            "section_id": sec_id,
-            "title": sec_title,
-            "type": sec_type,
-            "in_pool": bucket["in_pool"],
-            "out_of_pool": bucket["out_of_pool"],
+        # 2.3 trace 落盘 (spec §6 _react_trace.jsonl)
+        _append_react_trace(ws, {
+            "step": state["step"],
+            "thought": decision["thought"],
+            "action": decision["action"],
+            "args": decision.get("args", {}),
+            "n_errors": len(state["errors"]),
         })
-        ws.set_status(
-            "section_generation", j, len(sections),
-            f"[{sec_type}] {sec_title} done (引用 {len(bucket['in_pool'])} 内, {len(bucket['out_of_pool'])} 外)",
-        )
 
-    # 5. Phase F: audit
-    ws.set_status("audit", 0, 1, "")
-    audit_lines = [
-        f"# 覆盖度审计 — {topic}",
-        "",
-        f"- workspace: `{ws.path}`",
-        f"- 候选池: {len(pool)}",
-        f"- 提取 fact: {len(all_facts)}",
-        f"- 章节: {len(section_results)} (theme_id={theme_id})",
-        "",
-        "## 每章节引用统计",
-        "",
-        "| 章节 | 类型 | 候选池内 | 候选池外(幻觉) |",
-        "|---|---|---|---|",
-    ]
-    cited_ids: set = set()
-    for r in section_results:
-        audit_lines.append(
-            f"| {r['title']} | {r['type']} | "
-            f"{len(r['in_pool'])} | {len(r['out_of_pool'])} |"
-        )
-        cited_ids.update(r["in_pool"])
-    uncited = pool_ids - cited_ids
-    audit_lines.extend([
-        "",
-        f"## ⚠️ 候选池 0 引用论文 ({len(uncited)} / {len(pool_ids)} = "
-        f"{len(uncited)*100//max(1,len(pool_ids))}%)",
-        "",
-    ])
-    for pid in sorted(uncited):
-        p = next((x for x in pool if x["paper_id"] == pid), None)
-        title = (p or {}).get("title", "?")[:80]
-        audit_lines.append(f"- `{pid}`: {title}")
-    audit_md = "\n".join(audit_lines)
-    ws.save_audit(audit_md)
-    ws.set_status(
-        "done", 1, 1,
-        f"theme_id={theme_id}, sections={len(section_results)}, audit=ok",
-    )
+    # 3. 收尾 (step 1 stub — 后续 step 5 落 surveys.db + audit + 最终 markdown)
+    final = _finalize_survey(state, ws)
+    yield final
 
-    # 6. 返 markdown 报告
-    report = [
-        f"## survey_generate 完成 — {topic}",
-        "",
-        f"- workspace: `{ws.path}`",
-        f"- theme_id: `{theme_id}` (surveys.db survey_theme.id)",
-        f"- 候选池: {len(pool)} 篇",
-        f"- 提取 fact: {len(all_facts)} 条",
-        f"- 章节: {len(section_results)} 段",
-        f"- 覆盖度审计: `data/surveys/working/{topic_hash}/_audit.md`",
-        "",
-        "### 章节(section_id, 落库 surveys.db)",
-        "",
-    ]
-    for r in section_results:
-        # 2026-09-05 P0 fix: paper_id 用 [[xxx]] 双括号格式, 视觉上明确"引用 token"
-        # 之前用 `xxx` 容易跟普通字符混淆
-        in_pids_str = ", ".join(f"[[{pid}]]" for pid in r['in_pool']) or "(无)"
-        out_pids_str = ", ".join(f"[[{pid}]]" for pid in r['out_of_pool']) or "(无)"
-        report.append(
-            f"- `{r['section_id']}` [{r['type']}] {r['title']}\n"
-            f"  - 候选池内引用 ({len(r['in_pool'])}): {in_pids_str}\n"
-            f"  - 候选池外引用/幻觉 ({len(r['out_of_pool'])}): {out_pids_str}"
-        )
-    report.append("")
-    report.append(f"### 候选池 0 引用 ({len(uncited)} / {len(pool_ids)}):")
-    if uncited:
-        for pid in sorted(uncited):
-            p = next((x for x in pool if x["paper_id"] == pid), None)
-            title = (p or {}).get("title", "?")[:80]
-            report.append(f"- `[[{pid}]]`: {title}")
+
+# ============================================================
+# P6.5 ReAct helpers (step 1 骨架 — action stub + mock decision)
+# 业务实现将在 step 2-5 逐步替换 action_* stub 内容
+# ============================================================
+
+def _friendly_error(e: Exception, action: str) -> str:
+    """把异常翻译成友好提示 (spec §4). step 1 简单实现, 后续 step 扩展查表."""
+    err_type = type(e).__name__
+    msg = str(e)[:200]
+    return f"{action} 失败 ({err_type}): {msg}"
+
+
+def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    LLM 决策 (step 1 mock).
+
+    step 1 用固定顺序返回 action (smoke 验证用):
+      step 1 → extract_facts (前 3 篇)
+      step 2 → write_section (引言)
+      step 3 → finish (收尾)
+
+    后续 step 接真实 _call_llm + parse_decision (build_react_prompt + 解析 JSON).
+    """
+    step = state["step"]
+    if step == 1:
+        return {
+            "thought": "[mock] 候选池已构建, 先抽前 3 篇 fact 备用",
+            "action": "extract_facts",
+            "args": {"paper_ids": [p["paper_id"] for p in state["pool"][:3]]},
+        }
+    if step == 2:
+        return {
+            "thought": "[mock] fact 抽好, 写第 1 章引言",
+            "action": "write_section",
+            "args": {
+                "title": "引言",
+                "section_type": "intro",
+                "sub_points": ["背景", "动机", "本综述范围"],
+            },
+        }
+    # step >= 3 → finish
+    return {
+        "thought": "[mock] 已写 1 章, 测试用直接 finish, 实际由 LLM 决定何时收尾",
+        "action": "finish",
+        "args": {},
+    }
+
+
+def _dispatch_action(decision: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """派发 action 到 4 个 handler (step 1 stub, 后续替换真实实现)"""
+    action = decision["action"]
+    args = decision.get("args", {})
+    if action == "search_more":
+        yield from action_search_more(args, state, ws)
+    elif action == "extract_facts":
+        yield from action_extract_facts(args, state, ws)
+    elif action == "write_section":
+        yield from action_write_section(args, state, ws)
+    elif action == "finish":
+        yield from action_finish(args, state, ws)
     else:
-        report.append("  (无, 所有候选池 paper 都被引用过)")
-    report.append("")
-    report.append(f"### 审计详情")
-    report.append(f"见 `{ws.path}/_audit.md`")
+        yield f"⚠️ 未知 action: {action!r}\n"
 
-    return "\n".join(report)
+
+def _append_react_trace(ws, trace_entry: Dict[str, Any]) -> None:
+    """写 _react_trace.jsonl (spec §6). 失败不阻塞主流程."""
+    try:
+        trace_path = ws.path / "_react_trace.jsonl"
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(trace_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("[survey_generate] _react_trace 写盘失败: %s", e)
+
+
+# ---- 4 个 action stub (step 2-5 逐步替换为真实实现) ----
+
+def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """step 1 stub — 后续 step 2 接 arxiv API + 单篇 summarize LLM + 写 summary_items.db"""
+    yield "👁️ 观察: [stub] search_more 暂未实现, 将在 step 2 接入 (arxiv + summarize 入库)\n"
+
+
+def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """step 1 stub — 后续 step 3 接入真实 fact 抽取 (复用 P6 fact prompt + 容错)"""
+    n = len(args.get("paper_ids", []))
+    yield f"👁️ 观察: [stub] extract_facts 暂未实现, 将抽 {n} 篇 fact\n"
+
+
+def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """step 1 stub — 后续 step 4 接入真实章节生成 + 流式 yield + 自动重写 out_of_pool"""
+    title = args.get("title", "?")
+    yield f"👁️ 观察: [stub] write_section 暂未实现, 将写章节 [{title}]\n"
+
+
+def action_finish(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """finish action — 标记收尾, 主循环下次 break"""
+    state["finish_requested"] = True
+    yield "👁️ 观察: 🏁 收尾中...\n"
+
+
+def _finalize_survey(state: Dict[str, Any], ws) -> str:
+    """收尾 (step 1 stub — 后续 step 5 落 surveys.db + audit + 最终 markdown)"""
+    return (
+        f"\n## survey_generate 完成 (step 1 骨架 stub) — {state['topic']}\n\n"
+        f"- workspace: `{ws.path}`\n"
+        f"- 候选池: {len(state['pool'])} 篇\n"
+        f"- ReAct steps: {state['step']}\n"
+        f"- 已写章节 (stub): {len(state['sections'])}\n"
+        f"- 错误数: {len(state['errors'])}\n"
+        f"- 抽 fact (stub): {len(state['facts'])}\n"
+        f"\n⏳ step 1 仅验证 generator + 主循环骨架, 业务逻辑 (search_more / extract_facts / "
+        f"write_section / finish) 将在 step 2-5 逐步替换。\n"
+    )
 
 
 # ============================================================
