@@ -64,15 +64,13 @@ class ConversationTreePanel(QWidget):
             group_item.setData(0, Qt.UserRole, f"group:{group_id}")
             group_items[group_id] = group_item
         # 2026-09-07 P0 fix: 修复 "未分组" 节点空 bug
-        # 之前: `if group_id is None: continue` 跳过 None
-        #       `grouped.get(None, [])` 拿空 → "未分组" 节点 0 child
-        #       'ungrouped' 字符串 key 的 convs 不被处理
-        # 现在: 显式处理 'ungrouped' 字符串 key
-        for group_id, convs in grouped.items():
-            if group_id is None:
-                continue
+        # 之前 9291b3b: `if group_id is None: continue` 跳过 None → 11 条历史 NULL convs 不可见
+        # 现在: NULL 与 'ungrouped' 字符串都归到同一 "未分组" 节点
+        # (DB 查询 `get_conversations_by_group()` 用 `IS NULL` 返回 None,
+        #  9-07 之后用字符串 'ungrouped' 写入 — UI 语义等价)
+        for raw_group_id, convs in grouped.items():
+            group_id = 'ungrouped' if raw_group_id is None else raw_group_id
             if group_id == 'ungrouped':
-                # 'ungrouped' 是约定俗成的 "未分组" 标识, 不是真 group, 单独处理
                 ungrouped_item = QTreeWidgetItem(self.conv_tree)
                 ungrouped_item.setText(0, "未分组")
                 ungrouped_item.setData(0, Qt.UserRole, "group:ungrouped")
