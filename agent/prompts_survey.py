@@ -321,6 +321,59 @@ Output ONLY the JSON object, no other text, no markdown fence."""
 
 
 # ============================================================
+# P6.5 ReAct 决策 prompt (step 6, LLM 真选 action)
+# ============================================================
+def build_react_prompt(state: Dict[str, Any]) -> str:
+    """
+    ReAct 决策 prompt — 把当前 state + 候选池 paper_ids 序列化给 LLM, 让它自己选下一步 action.
+
+    LLM 必须返回严格 JSON: {thought, action, args}
+    """
+    pool_size = len(state["pool"])
+    fact_count = len(state["facts"])
+    section_count = len(state["sections"])
+    error_count = len(state["errors"])
+    step = state["step"]
+    max_steps = state["max_steps"]
+    topic = state["topic"]
+    section_titles = [s["title"] for s in state["sections"]]
+
+    # 关键: 把候选池 paper_ids 列给 LLM, 避免编 paper_id (P6.5 step 6 fix)
+    # 限前 30 条, 避免 prompt 过长
+    pool_pids = [p.get("paper_id", "?") for p in state["pool"][:30]]
+    pool_ids_block = "\n".join(f"  - {pid}" for pid in pool_pids)
+    if len(state["pool"]) > 30:
+        pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 30 个 paper_id)"
+
+    return f"""你是综述生成 ReAct 决策者. 当前状态:
+
+- 主题: {topic}
+- 候选池: {pool_size} 篇
+- 提取 fact: {fact_count} 条
+- 已写章节 ({section_count}): {section_titles if section_titles else "(无)"}
+- 错误数: {error_count}
+- ReAct step: {step}/{max_steps}
+
+候选池 paper_id 列表 (**严格使用这里的 id, 不要编造**):
+{pool_ids_block}
+
+可选 action (选一个, 严格 JSON 输出):
+1. search_more {{"query": "...", "k": 5}} — 扩候选池 (LLM 觉得 pool 不够时)
+2. extract_facts {{"paper_ids": ["上面的真 id"]}} — 抽 fact
+3. write_section {{"title": "...", "section_type": "intro/method/progress/outlook", "sub_points": [...]}} — 写章节
+4. finish {{}} — 收尾
+
+启发式 (你可以超越):
+- 候选池 < 5 时优先 search_more
+- 候选池 ≥ 5 且 fact 不足时, extract_facts 用上面的真 paper_id
+- 写了 ≥ 2 章 (且主题覆盖到) 时 finish
+- 候选池 ≥ 3 但 fact 0 时 extract_facts
+
+请返回严格 JSON (不要 markdown fence, 不要其它 text):
+{{"thought": "为什么这样选 (一句话)", "action": "action_name", "args": {{...}}}}"""
+
+
+# ============================================================
 # 模块自检(可独立 import 测试,不调 LLM)
 # ============================================================
 if __name__ == "__main__":

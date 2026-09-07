@@ -602,25 +602,71 @@ def _friendly_error(e: Exception, action: str) -> str:
 
 def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    LLM 决策 (step 1 mock).
+    ReAct LLM 真决策 (step 6 真实实现).
 
-    step 1 用固定顺序返回 action (smoke 验证用):
-      step 1 → extract_facts (前 3 篇)
-      step 2 → write_section (引言)
-      step 3 → finish (收尾)
-
-    后续 step 接真实 _call_llm + parse_decision (build_react_prompt + 解析 JSON).
+    1. 调 minimax LLM 拿 decision (build_react_prompt)
+    2. parse JSON {thought, action, args}
+    3. 失败 fallback 到 _state_driven_decide (state 规则保底)
     """
-    step = state["step"]
-    if step == 1:
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_react_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+
+    fallback = _state_driven_decide(state)
+
+    try:
+        prompt = build_react_prompt(state)
+        out = _call_llm(
+            prompt,
+            provider=_PROVIDER,
+            model=_MODEL,
+            enable_thinking=False,
+            temperature=0.3,
+            max_tokens=1000,
+            timeout=60,
+        )
+        if out and "<think>" in out:
+            out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+        m = re.search(r"\{[\s\S]*\}", out or "")
+        if not m:
+            raise ValueError("LLM 输出无 JSON")
+        decision = json.loads(m.group(0))
+        action = decision.get("action", "")
+        if action not in ("search_more", "extract_facts", "write_section", "finish"):
+            raise ValueError(f"未知 action: {action!r}")
+        if not isinstance(decision.get("args"), dict):
+            decision["args"] = {}
+        decision.setdefault("thought", "")
+        decision["_source"] = "llm"  # 标记是 LLM 决策, 不是 fallback
+        return decision
+    except Exception as e:
+        # LLM 决策失败 -> fallback state 规则 (spec §1.3 容错)
         return {
-            "thought": "[mock] 候选池已构建, 先抽前 3 篇 fact 备用",
-            "action": "extract_facts",
-            "args": {"paper_ids": [p["paper_id"] for p in state["pool"][:3]]},
+            "thought": f"[fallback] LLM 决策失败 ({type(e).__name__}: {str(e)[:80]}), 走 state 规则",
+            "action": fallback["action"],
+            "args": fallback["args"],
+            "_source": "fallback",
         }
-    if step == 2:
+
+
+def _state_driven_decide(state: Dict[str, Any]) -> Dict[str, Any]:
+    """state-driven fallback 规则 (LLM 决策失败时用, 也是测试兜底)."""
+    pool_size = len(state["pool"])
+    fact_count = len(state["facts"])
+    section_count = len(state["sections"])
+    step = state["step"]
+
+    if pool_size < 5:
+        return {"action": "search_more", "args": {"query": state["topic"], "k": 5}}
+    if fact_count < 5 and pool_size > 0:
         return {
-            "thought": "[mock] fact 抽好, 写第 1 章引言",
+            "action": "extract_facts",
+            "args": {"paper_ids": [p["paper_id"] for p in state["pool"][:5]]},
+        }
+    if section_count == 0:
+        return {
             "action": "write_section",
             "args": {
                 "title": "引言",
@@ -628,12 +674,17 @@ def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
                 "sub_points": ["背景", "动机", "本综述范围"],
             },
         }
-    # step >= 3 → finish
-    return {
-        "thought": "[mock] 已写 1 章, 测试用直接 finish, 实际由 LLM 决定何时收尾",
-        "action": "finish",
-        "args": {},
-    }
+    if section_count == 1:
+        return {
+            "action": "write_section",
+            "args": {
+                "title": "核心方法",
+                "section_type": "method",
+                "sub_points": ["主要方法", "对比分析", "适用场景"],
+            },
+        }
+    # >= 2 章 -> finish
+    return {"action": "finish", "args": {}}
 
 
 def _dispatch_action(decision: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
