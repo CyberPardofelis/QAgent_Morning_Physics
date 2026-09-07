@@ -42,6 +42,31 @@ _DISABLED = os.getenv("DISABLE_FORMULA_RENDERER", "").lower() in ("true", "1", "
 if _DISABLED:
     print("[FormulaRenderer] DISABLED via env DISABLE_FORMULA_RENDERER=1 (P0 段错误绕开)", flush=True)
 
+# 2026-09-07 P0 fix: time-window rate limit (用户拍板, 防止高强度公式渲染段错误)
+# 设计: 30s 滑动窗口最多渲染 30 个公式, 超出的 fallback LaTeX 原文
+# 实际触发链: 150+ 公式 → QWebEngineView (Chromium) + BGE (sentence-transformers/PyTorch) 共享 native
+# 累积 150+ 后 Windows 句柄/DWM 资源耗尽 → 0xC0000005 段错误
+# rate limit 是动态的 (过了窗口就恢复), 跟 _DISABLED 永久禁用不同
+_RATE_LIMIT_WINDOW = 30.0   # 30s 窗口
+_RATE_LIMIT_MAX = 30         # 窗口内最多 30 个公式
+_rate_window: List[float] = []  # 存最近渲染成功的时间戳 (模块级单例)
+
+
+def _try_consume_rate_limit_token() -> bool:
+    """
+    Rate limit 滑动窗口检查 + 消耗 1 token.
+    True = 允许渲染 (并消耗 1 token), False = 限流 (返 None / fallback).
+    线程安全: render() 在 UI 线程同步串行, 不需要 lock.
+    """
+    now = time.monotonic()
+    # 清理窗口外的时间戳
+    while _rate_window and _rate_window[0] < now - _RATE_LIMIT_WINDOW:
+        _rate_window.pop(0)
+    if len(_rate_window) >= _RATE_LIMIT_MAX:
+        return False
+    _rate_window.append(now)
+    return True
+
 
 # 公式占位 HTML 模板(KaTeX 渲染用,内边距 4px)
 # 不用 auto-render.min.js:它在 file:// 协议下 UMD 不挂全局 renderMathInElement
@@ -220,11 +245,16 @@ class FormulaRenderer:
         触发条件: QWebEngineView + BGE (sentence-transformers/PyTorch) 多线程
         在 LLM 生成大量公式输出(150+)时偶发 0xC0000005 段错误 + 0xC00000FD 栈溢出
         临时绕开: 让公式显示为 LaTeX 原文, 不渲染 PNG
+
+        2026-09-07 P0 fix: time-window rate limit (用户拍板)
+        30s 滑动窗口最多渲染 30 个公式, 超出的 fallback LaTeX 原文
+        避免高强度公式渲染触发 QWebEngineView + BGE 共享 native 段错误
+        跟 _DISABLED 不同: rate limit 是动态的, 过了窗口就能继续渲染
         """
         # P0 紧急: 显式禁用公式渲染 (模块级 _DISABLED 标志, 避免每次 render 读 process env)
         if _DISABLED:
             return None
-        # 1. 检查缓存
+        # 1. 检查缓存 (先查缓存, 缓存命中不消耗 rate limit token, 只有 miss 才限流)
         cache_path = self._cache_path(formula, display_mode)
         if self._is_valid_png(cache_path):
             self.stats['cache_hits'] += 1
@@ -235,6 +265,10 @@ class FormulaRenderer:
             if self.stats['cache_hits'] <= 5 or self.stats['cache_hits'] % 50 == 0:
                 print(f'[FormulaRenderer] cache hit #{self.stats["cache_hits"]}: {formula[:50]!r}')
             return cache_path
+        # 2026-09-07 rate limit: 30s 滑动窗口最多 30 个公式 (只对 cache miss 生效)
+        if not _try_consume_rate_limit_token():
+            print(f"[FormulaRenderer] rate limit 触发, 30s 内已渲染 ≥{_RATE_LIMIT_MAX} 个公式, 公式 fallback: {formula[:50]!r}", flush=True)
+            return None  # 限流 → fallback LaTeX 原文
 
         # 2. 渲染
         self.stats['cache_misses'] += 1
