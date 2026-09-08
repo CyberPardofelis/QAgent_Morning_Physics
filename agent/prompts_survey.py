@@ -205,6 +205,18 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 【候选池】(共 {pool_size} 篇,paper_id 唯一):
 {pool_text}
 
+【9-08 user 拍板 写作风格 — 最关键】
+1. **章节是讲"领域/方向的内容、机制、进展",不是讲"哪些 paper 各自做了啥"**
+   - 错误: 每段以 paper 为单位, "...A 提出了 X [paper1]...B 提出了 Y [paper2]...C 改进了 Z [paper3]" — 这是罗列 paper 摘要
+   - 正确: 以"机制/思路/技术路线"为线索, 把多篇 paper 串成一个连贯论述, 在关键事实点上 cite [paper_id] 佐证
+2. **典型结构**:
+   - 开篇 1-2 段: 这个章节要回答的科学/工程问题是什么, 为什么重要, 整体思路
+   - 主体 N 段 (按 sub_point 展开): 每段先讲清一个机制/技术/思路, 再用多篇 paper 佐证"哪几篇贡献了哪个具体点/数字/结果"
+   - 收尾 1 段: 本章小结 + 跟下一章的衔接
+3. **长度要求**: 单章 markdown **800-1500 字** (sub_points × 2-3 段/子点), 内容要饱满, 不要惜字如金
+4. **每个 sub_point 至少配 2-4 个 paper_id 引用** (关键事实/数字/结果 处必带), 引用的 paper 是"佐证", 不是"中心"
+5. **不要复述 paper 摘要**: 不要写 "A 提出了 X, 它的核心方法是 Y", 写 "X 已成为主流路径 (A [p1], B [p2], C [p3] 都在此方向), 关键改进点在于 ..."
+
 【强制约束】(违反会被自动审计标 ❌,请严格遵守)
 1. 事实性陈述句末尾**必须**带 [paper_id] 简洁形式, 格式: "...发现 X 提升了 Y% [paper_id]"
    ⚠️ **关键**: 简洁 [paper_id] 形式必带, 完整 markdown 链接 `[作者 年份, arXiv:xxx](papers/xxx.md)` 是**补充**, 不能替代
@@ -222,25 +234,15 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 - 如果 out_of_pool > 0, 系统会自动用"只允许候选池内 paper_id"作为额外约束重写该章节 (最多 2 次)
 - 第 2 次重写后仍 out_of_pool > 0, 接受并落库 (覆盖度审计报告里标 ⚠️)
 
-【"事实句 vs 过渡句" 对比示例】
+【"领域叙述 vs paper 罗列" 对比示例】
 
-  ✅ 事实句(带引用):
-    "表面码在 [Fowler 2012, arXiv:1208.0928](papers/1208.0928.md) 中展示了低于 1% 的逻辑错误率。"
-    "相较于早期方案, [Bravyi 2018, arXiv:1809.10727](papers/1809.10727.md) 提出的 XZZX 码在偏置噪声下表现更优。"
+  ❌ 罗列 paper 摘要 (错误):
+    "A 提出了表面码 [p1]。B 改进了表面码 [p2]。C 提出了 XZZX 码 [p3]。D 比较了多种码 [p4]。"
+    (把多篇 paper 各开一段, 章节读起来像 "list of paper summaries")
 
-  ✅ 过渡句(不带引用):
-    "本章将梳理量子纠错码的关键进展,并按机制分类对比。"
-    "尽管已有显著成果,以下问题仍待解决。"
-    "接下来我们讨论方法层面的差异。"
-
-  ❌ 错误 1(过渡句硬塞引用):
-    "本章将梳理量子纠错码的关键进展 [综述]。"  ← 综述不是 paper_id,应去掉
-
-  ❌ 错误 2(事实句漏引用):
-    "表面码展示了低于 1% 的逻辑错误率。"  ← 必须加 [Fowler 2012, arXiv:1208.0928](papers/1208.0928.md)
-
-  ❌ 错误 3(候选池外引用):
-    "Preskill 在 1997 年提出阈值定理 [10.1103/PhysRevA.55.900]。"  ← 候选池没这 paper_id,必须删
+  ✅ 领域叙述 + paper 佐证 (正确):
+    "表面码自 Fowler 2012 展示低于 1% 逻辑错误率以来, 已成为容错量子计算的主流路径 [p1]。其核心思路是用二维网格上的物理比特编码单个逻辑比特, 通过周期测量稳定子算子检测错误 [p1][p2]。在偏置噪声场景下, Bravyi 等指出传统表面码阈值显著退化, 由此提出 XZZX 码并展示了 ~10x 的阈值改进 [p3]。近期工作进一步把表面码扩展到子系统码, 在硬件开销和纠错能力间取得新平衡 [p4]。"
+    (以"机制演化"为线索, 多篇 paper 串成一个连贯论述, 关键事实点 cite)
 
 【本章节引用配额】(软约束, 超过会被审计标 ⚠️)
   {ref_quota}
@@ -345,12 +347,25 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
     if len(state["pool"]) > 30:
         pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 30 个 paper_id)"
 
+    # ============ 9-08 user 拍板: 固定候选池规则 ============
+    # 硬规则(写进 prompt 给 LLM 看, fallback 也走这套):
+    #   - 候选池 < 20: 优先 search_more
+    #   - 候选池 ≥ 40 且 fact 不足: extract_facts
+    #   - 20 ≤ pool < 40: LLM 自由判断(用户没指定)
+    # 加 outline: 9-08 user 拍板, 把"写章节"拆成 write_outline + write_section,
+    # 顺序: 先 write_outline, 再按 outline 章节写
+    POOL_MIN = 20
+    POOL_ENOUGH = 40
+    has_outline = bool(state.get("outline_sections"))
+    fact_low = fact_count < 5  # fact 不足的硬阈值
+
     return f"""你是综述生成 ReAct 决策者. 当前状态:
 
 - 主题: {topic}
-- 候选池: {pool_size} 篇
+- 候选池: {pool_size} 篇 (硬规则阈值: 最小 {POOL_MIN}, 充裕 {POOL_ENOUGH})
 - 提取 fact: {fact_count} 条
 - 已写章节 ({section_count}): {section_titles if section_titles else "(无)"}
+- 综述大纲: {"已有 (" + str(len(state.get("outline_sections", []))) + " 章)" if has_outline else "(无, 必须先 write_outline)"}
 - 错误数: {error_count}
 - ReAct step: {step}/{max_steps}
 
@@ -358,16 +373,27 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 {pool_ids_block}
 
 可选 action (选一个, 严格 JSON 输出):
-1. search_more {{"query": "...", "k": 5}} — 扩候选池 (LLM 觉得 pool 不够时)
+1. search_more {{"query": "...", "k": 5}} — 扩候选池
 2. extract_facts {{"paper_ids": ["上面的真 id"]}} — 抽 fact
-3. write_section {{"title": "...", "section_type": "intro/method/progress/outlook", "sub_points": [...]}} — 写章节
-4. finish {{}} — 收尾
+3. write_outline {{}} — 生成综述大纲(章节结构), 必须在 write_section 之前
+4. write_section {{"section_idx": <int>}} — 按 outline 写第 section_idx 章(0-based); 0=intro, 1=progress, ...
+5. finish {{}} — 收尾
 
-启发式 (你可以超越):
-- 候选池 < 5 时优先 search_more
-- 候选池 ≥ 5 且 fact 不足时, extract_facts 用上面的真 paper_id
-- 写了 ≥ 2 章 (且主题覆盖到) 时 finish
-- 候选池 ≥ 3 但 fact 0 时 extract_facts
+【固定候选池规则】(user 9-08 拍板, 硬规则)
+- 候选池 < {POOL_MIN} → 优先 search_more(候选池太小, 综述地基不稳)
+- 候选池 ≥ {POOL_ENOUGH} 且 fact < 5 → 优先 extract_facts(候选池够大, 缺的是精读)
+- 候选池在 [{POOL_MIN}, {POOL_ENOUGH}) 区间 → LLM 自由判断(用户没指定, 走"启发式")
+
+【综述生成顺序】(user 9-08 拍板, 拆分 write_section)
+- 必须先 write_outline 生成大纲, 再 write_section 按章节写
+- write_outline 只调一次, 调完就锁住 state["outline_sections"]
+- write_section 用 section_idx 指定写第几章(0-based, 按 outline_sections 顺序)
+- 写完所有 outline 章节后 → finish
+
+启发式 (20-39 中间区或边界情况可参考):
+- fact_count < 5 且 pool 充裕 → extract_facts
+- 写完所有 outline 章节 → finish
+- outline 章节用完不要继续 write_section, 直接 finish
 
 请返回严格 JSON (不要 markdown fence, 不要其它 text):
 {{"thought": "为什么这样选 (一句话)", "action": "action_name", "args": {{...}}}}"""

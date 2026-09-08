@@ -278,6 +278,7 @@ from agent.prompts_survey import (
     build_fact_prompt,
     build_outline_prompt,
     build_section_prompt,
+    SECTION_REF_QUOTAS,            # 9-08 修: action_write_outline 用它校验 section_type
 )
 from agent.infra.survey_workspace import SurveyWorkspace, hash_topic
 
@@ -523,12 +524,16 @@ def survey_generate(
     yield f"📚 初始候选池: {len(pool)} 篇\n\n"
 
     # state 初始化
+    # 9-08 user 拍板: 加 outline 字段, 把"写章节"拆成 write_outline + write_section 两个 action
+    # outline_sections: list of {title, section_type, sub_points, is_transition}
     state: Dict[str, Any] = {
         "topic": topic,
         "topic_hash": topic_hash,
         "pool": pool,
         "facts": [],
         "sections": [],
+        "outline": None,                # 综述大纲原始 LLM 输出 (str)
+        "outline_sections": [],         # 大纲结构化: [{title, section_type, sub_points, is_transition}, ...]
         "errors": [],
         "step": 0,
         "finish_requested": False,
@@ -634,7 +639,7 @@ def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("LLM 输出无 JSON")
         decision = json.loads(m.group(0))
         action = decision.get("action", "")
-        if action not in ("search_more", "extract_facts", "write_section", "finish"):
+        if action not in ("search_more", "extract_facts", "write_outline", "write_section", "finish"):
             raise ValueError(f"未知 action: {action!r}")
         if not isinstance(decision.get("args"), dict):
             decision["args"] = {}
@@ -652,49 +657,57 @@ def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _state_driven_decide(state: Dict[str, Any]) -> Dict[str, Any]:
-    """state-driven fallback 规则 (LLM 决策失败时用, 也是测试兜底)."""
+    """
+    state-driven fallback 规则 (LLM 决策失败时用, 也是测试兜底).
+
+    9-08 user 拍板的固定候选池规则:
+      - 候选池 < 20  → search_more (硬规则, 优先)
+      - 候选池 ≥ 40 且 fact < 5  → extract_facts (硬规则, 优先)
+      - 20 ≤ pool < 40  → LLM 自由(中间区不强制, 让 LLM 按主题判断)
+    9-08 user 拍板的拆分:
+      - 没 outline → write_outline (硬规则, 写章节前必须先生成大纲)
+      - 有 outline 且未写完所有章节 → write_section(section_idx)
+      - 写完所有 outline 章节 → finish
+    """
     pool_size = len(state["pool"])
     fact_count = len(state["facts"])
     section_count = len(state["sections"])
-    step = state["step"]
+    outline_sections = state.get("outline_sections", [])
 
-    if pool_size < 5:
+    # ========== 候选池硬规则 ==========
+    if pool_size < 20:
         return {"action": "search_more", "args": {"query": state["topic"], "k": 5}}
-    if fact_count < 5 and pool_size > 0:
+    if pool_size >= 40 and fact_count < 5:
         return {
             "action": "extract_facts",
             "args": {"paper_ids": [p["paper_id"] for p in state["pool"][:5]]},
         }
-    if section_count == 0:
+
+    # ========== 大纲规则: 写章节前必须先 write_outline ==========
+    if not outline_sections:
+        return {"action": "write_outline", "args": {}}
+
+    # ========== 写章节: 按 outline_sections 顺序, 用 section_idx 标识 ==========
+    if section_count < len(outline_sections):
         return {
             "action": "write_section",
-            "args": {
-                "title": "引言",
-                "section_type": "intro",
-                "sub_points": ["背景", "动机", "本综述范围"],
-            },
+            "args": {"section_idx": section_count},  # 0-based, 下一章
         }
-    if section_count == 1:
-        return {
-            "action": "write_section",
-            "args": {
-                "title": "核心方法",
-                "section_type": "method",
-                "sub_points": ["主要方法", "对比分析", "适用场景"],
-            },
-        }
-    # >= 2 章 -> finish
+
+    # ========== 收尾 ==========
     return {"action": "finish", "args": {}}
 
 
 def _dispatch_action(decision: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
-    """派发 action 到 4 个 handler (step 1 stub, 后续替换真实实现)"""
+    """派发 action 到 5 个 handler (9-08 加 write_outline, 拆 write_section 前的结构生成)"""
     action = decision["action"]
     args = decision.get("args", {})
     if action == "search_more":
         yield from action_search_more(args, state, ws)
     elif action == "extract_facts":
         yield from action_extract_facts(args, state, ws)
+    elif action == "write_outline":
+        yield from action_write_outline(args, state, ws)
     elif action == "write_section":
         yield from action_write_section(args, state, ws)
     elif action == "finish":
@@ -774,8 +787,8 @@ def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Itera
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.2,
-                max_tokens=2000,
-                timeout=60,
+                max_tokens=10000,   # 9-08 user 拍板: 上限 10000
+                timeout=180,
             )
             # 剥 <think>
             if out and "<think>" in out:
@@ -907,8 +920,8 @@ def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.2,
-                max_tokens=4000,  # P6.2 经验: 2000 截断
-                timeout=120,
+                max_tokens=10000,   # 9-08 user 拍板: 上限 10000
+                timeout=180,
             )
             # 剥 <think>
             if out and "<think>" in out:
@@ -940,6 +953,146 @@ def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     yield f"👁️ 观察: 抽 {len(targets)} 篇, 累计 facts={len(state['facts'])} 条, errors={len(state['errors'])}\n"
 
 
+def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+    """
+    write_outline action (9-08 新增, user 拍板拆分 write_section):
+      - 调 minimax LLM 走 build_outline_prompt 生成综述大纲(5 段固定: intro/progress/method_compare/gap/outlook)
+      - 解析 JSON: {sections: [{title, section_type, sub_points, is_transition}, ...]}
+      - 存 state["outline"] (raw) + state["outline_sections"] (结构化 list)
+      - 落 workspace/_outline.json (SurveyWorkspace.save_outline 已有)
+      - outline_sections 锁住后, write_section 按 section_idx 顺序写
+
+    大纲生成失败不重试(LLM 调用本身就贵, 失败就让 LLM 下一轮重选 action)
+    """
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_outline_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+
+    # 已存在大纲 → 跳过(避免 LLM 重复调)
+    if state.get("outline_sections"):
+        yield (
+            f"⚠️ write_outline: 大纲已存在 ({len(state['outline_sections'])} 章), 跳过\n"
+            f"👁️ 观察: outline_sections={len(state['outline_sections'])}, sections={len(state['sections'])}\n"
+        )
+        return
+
+    yield f"📋 write_outline: 生成综述大纲, 调 {_PROVIDER}/{_MODEL}\n"
+
+    try:
+        prompt = build_outline_prompt(topic=state["topic"], papers=state["pool"])
+        out = _call_llm(
+            prompt,
+            provider=_PROVIDER,
+            model=_MODEL,
+            enable_thinking=False,
+            temperature=0.3,
+            max_tokens=10000,    # 9-08 user 拍板: 上限 10000
+            timeout=180,
+        )
+    except Exception as e:
+        friendly = _friendly_error(e, "write_outline")
+        state["errors"].append({
+            "step": state["step"], "action": "write_outline",
+            "msg": friendly,
+        })
+        yield f"  ❌ LLM 失败: {friendly}\n"
+        return
+
+    # 剥 <think>
+    if out and "<think>" in out:
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+
+    # parse JSON {sections: [...]}
+    parsed: Optional[Dict[str, Any]] = None
+    if out:
+        # 1) 直接
+        try:
+            v = json.loads(out.strip())
+            if isinstance(v, dict) and "sections" in v:
+                parsed = v
+        except (json.JSONDecodeError, SyntaxError):
+            pass
+        # 2) regex 抓最大 {...}
+        if parsed is None:
+            m = re.search(r"\{[\s\S]*\}", out)
+            if m:
+                try:
+                    v = json.loads(m.group(0))
+                    if isinstance(v, dict) and "sections" in v:
+                        parsed = v
+                except (json.JSONDecodeError, SyntaxError):
+                    pass
+        # 3) 修常见尾巴
+        if parsed is None:
+            for tail in ['"}]', '"}', '}', ']']:
+                try:
+                    s = out.strip().rstrip(",\n ") + tail
+                    v = json.loads(s)
+                    if isinstance(v, dict) and "sections" in v:
+                        parsed = v
+                        break
+                except (json.JSONDecodeError, SyntaxError):
+                    pass
+
+    if not parsed or not isinstance(parsed.get("sections"), list) or not parsed["sections"]:
+        state["errors"].append({
+            "step": state["step"], "action": "write_outline",
+            "msg": f"JSON parse 失败: {(out or '')[:200]}",
+        })
+        yield f"  ❌ 大纲 JSON parse 失败, 下一轮重试\n"
+        return
+
+    # 规范化 sections
+    normalized = []
+    for sec in parsed["sections"]:
+        if not isinstance(sec, dict):
+            continue
+        title = (sec.get("title") or "").strip()
+        sec_type = (sec.get("section_type") or "").strip().lower()
+        if not title or sec_type not in SECTION_REF_QUOTAS:
+            continue  # 跳过非法 section (避免污染 outline)
+        sub_points = sec.get("sub_points") or []
+        if not isinstance(sub_points, list):
+            sub_points = [str(sub_points)]
+        sub_points = [str(sp).strip() for sp in sub_points if str(sp).strip()]
+        if not sub_points:
+            sub_points = ["(待定)"]
+        is_transition = str(sec.get("is_transition", "no")).strip().lower()
+        normalized.append({
+            "title": title,
+            "section_type": sec_type,
+            "sub_points": sub_points,
+            "is_transition": "yes" if is_transition in ("yes", "true", "1") else "no",
+        })
+
+    if not normalized:
+        state["errors"].append({
+            "step": state["step"], "action": "write_outline",
+            "msg": "规范化后 sections 为空 (全部非法, section_type 不在 5 段列表)",
+        })
+        yield f"  ❌ 大纲规范化失败, section_type 必须从 intro/progress/method_compare/gap/outlook 选\n"
+        return
+
+    # 存 state + 落盘
+    state["outline"] = out or ""
+    state["outline_sections"] = normalized
+    try:
+        ws.save_outline({"sections": normalized, "raw": out or ""})
+    except Exception as e:
+        logger.warning("[write_outline] save_outline 失败: %s", e)
+
+    yield f"  ✅ 大纲生成: {len(normalized)} 章\n"
+    for i, sec in enumerate(normalized):
+        yield f"    {i}. [{sec['section_type']}] {sec['title']} ({len(sec['sub_points'])} 子点)\n"
+    yield f"💾 落 workspace/_outline.json\n"
+    yield (
+        f"👁️ 观察: outline_sections={len(normalized)}, "
+        f"pool={len(state['pool'])}, facts={len(state['facts'])}, sections={len(state['sections'])}\n"
+    )
+
+
 def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
     """
     write_section action (step 4 真实实现):
@@ -955,15 +1108,43 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
 
-    title = args.get("title", "section")
-    sec_type = (args.get("section_type") or "intro").strip()
-    sub_points = args.get("sub_points") or []
-    if isinstance(sub_points, list):
-        outline_section_md = "\n".join(f"- {sp}" for sp in sub_points)
-    else:
-        outline_section_md = str(sub_points)
+    # 9-08 user 拍板: 章节内容必须基于 outline (先 write_outline 再 write_section)
+    # title / section_type / sub_points 全部从 outline_sections[section_idx] 拿
+    # 旧的 args.title / args.sub_points 字段废弃, 但允许 LLM 老调用通过 (会忽略)
+    outline_sections = state.get("outline_sections", [])
+    if not outline_sections:
+        yield (
+            f"❌ write_section: 大纲未生成, 必须先 write_outline (state['outline_sections'] 空)\n"
+            f"👁️ 观察: 跳到下一轮, LLM 应选 write_outline\n"
+        )
+        state["errors"].append({
+            "step": state["step"], "action": "write_section",
+            "msg": "大纲未生成, write_section 被拒",
+        })
+        return
 
-    yield f"✍️ write_section: [{sec_type}] {title}\n"
+    # section_idx 默认 = 已写章节数 (下一章)
+    section_idx = args.get("section_idx")
+    if section_idx is None:
+        section_idx = len(state["sections"])
+    if not isinstance(section_idx, int) or section_idx < 0 or section_idx >= len(outline_sections):
+        yield (
+            f"❌ write_section: section_idx={section_idx} 越界 "
+            f"(outline 共 {len(outline_sections)} 章, 已写 {len(state['sections'])} 章)\n"
+        )
+        state["errors"].append({
+            "step": state["step"], "action": "write_section",
+            "msg": f"section_idx={section_idx} 越界",
+        })
+        return
+
+    outline_sec = outline_sections[section_idx]
+    title = outline_sec["title"]
+    sec_type = outline_sec["section_type"]
+    sub_points = outline_sec["sub_points"]
+    outline_section_md = "\n".join(f"- {sp}" for sp in sub_points)
+
+    yield f"✍️ write_section: [{sec_type}] {title} (section_idx={section_idx}/{len(outline_sections)-1})\n"
 
     # theme: 第一次创建, 后续复用
     if "theme_id" not in state:
@@ -1007,8 +1188,8 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.4,
-                max_tokens=6000,  # P6.2 经验
-                timeout=180,
+                max_tokens=10000,  # 9-08 user 拍板: 上限 10000
+                timeout=240,
             )
         except Exception as e:
             # 异常不重试
@@ -1144,9 +1325,26 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
         f"- 错误数: {len(state['errors'])}",
         f"- 覆盖度审计: `{ws.path}/_audit.md`",
         "",
+    ]
+
+    # ========== 9-08 user 拍板: 综述结构先展示, 再展开 ==========
+    # 用 outline_sections 列出"完整大纲", 让 user 在收尾报告里先看结构, 再看章节引用
+    outline_sections = state.get("outline_sections", [])
+    if outline_sections:
+        report.extend([
+            "## 综述结构 (大纲)",
+            "",
+        ])
+        for i, sec in enumerate(outline_sections):
+            sps = " / ".join(sec.get("sub_points", []) or ["(无)"])
+            report.append(f"**{i+1}. [{sec.get('section_type', '?')}] {sec.get('title', '?')}**  ({'过渡' if sec.get('is_transition') == 'yes' else '实质'})")
+            report.append(f"   - 子点: {sps}")
+        report.append("")
+
+    report.extend([
         "### 章节 (section_id, 落库 surveys.db)",
         "",
-    ]
+    ])
     for r in sections:
         in_pids_str = ", ".join(f"[[{pid}]]" for pid in r['in_pool']) or "(无)"
         out_pids_str = ", ".join(f"[[{pid}]]" for pid in r['out_of_pool']) or "(无)"
