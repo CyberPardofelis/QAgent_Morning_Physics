@@ -23,6 +23,16 @@ agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
 from typing import List, Dict, Any, Optional
 
 
+def _get_min_pool() -> int:
+    """
+    候选池最小阈值 (9-08 抽 env 后用).
+    函数内 lazy import agent.tools.config: 避开 prompts_survey → surveys → prompts_survey 循环依赖。
+    (surveys.py 顶层 import prompts_survey, 所以 prompts_survey 不能顶层 import agent.tools.*)
+    """
+    from agent.tools.config import get_min_pool_papers
+    return get_min_pool_papers()
+
+
 # ============================================================
 # 候选池注入格式(三个 prompt 共享)
 # ============================================================
@@ -350,22 +360,24 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
     topic = state["topic"]
     section_titles = [s["title"] for s in state["sections"]]
 
-    # 关键: 把候选池 paper_ids 列给 LLM, 避免编 paper_id (P6.5 step 6 fix)
-    # 限前 30 条, 避免 prompt 过长
-    pool_pids = [p.get("paper_id", "?") for p in state["pool"][:30]]
-    pool_ids_block = "\n".join(f"  - {pid}" for pid in pool_pids)
-    if len(state["pool"]) > 30:
-        pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 30 个 paper_id)"
-
-    # ============ 9-08 17:00 user 拍板: 固定候选池规则 ============
+    # ============ 9-08 抽 env: 固定候选池规则 ============
     # 硬规则(写进 prompt 给 LLM 看, fallback 也走这套):
-    #   - 候选池 < 30: 优先 search_more (9-08 17:00 上调, 最小 30 篇)
-    #   - 候选池 ≥ 40 且 fact 不足: extract_facts
-    #   - 30 ≤ pool < 40: LLM 自由判断(用户没指定)
+    #   - 候选池 < 最小阈值: 优先 search_more (env QAGENT_SURVEY_MIN_POOL, 默认 30)
+    #   - 候选池 ≥ 最小阈值+10 且 fact 不足: extract_facts
+    #   - 最小阈值 ≤ pool < 最小阈值+10: LLM 自由判断(用户没指定)
     # 加 outline: 9-08 user 拍板, 把"写章节"拆成 write_outline + write_section,
     # 顺序: 先 write_outline, 再按 outline 章节写
-    POOL_MIN = 30        # 9-08 17:00 user 拍板: 最小 30 篇 (之前 20)
-    POOL_ENOUGH = 40
+    POOL_MIN = _get_min_pool()             # 9-08 抽 env, 默认 30 (之前 user 拍板硬编码 30)
+    POOL_ENOUGH = POOL_MIN + 10            # 充裕门槛 = 最小 + 10, 保持原有 +10 关系
+
+    # 关键: 把候选池 paper_ids 列给 LLM, 避免编 paper_id (P6.5 step 6 fix)
+    # 显示窗口联动 POOL_MIN (9-08 抽 env 后调整): LLM 至少能看到跟最小阈值等量的 paper_id,
+    # 避免候选池达标 (>= 最小) 但 LLM 看不到全部 id, 出现"自创 id" 的边角问题。
+    # 池子 < 最小阈值时 (search_more 阶段) 仍按池子实际大小显示。
+    pool_pids = [p.get("paper_id", "?") for p in state["pool"][:min(POOL_MIN, pool_size)]]
+    pool_ids_block = "\n".join(f"  - {pid}" for pid in pool_pids)
+    if len(state["pool"]) > min(POOL_MIN, pool_size):
+        pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 {min(POOL_MIN, pool_size)} 个 paper_id)"
     has_outline = bool(state.get("outline_sections"))
     fact_low = fact_count < 5  # fact 不足的硬阈值
 

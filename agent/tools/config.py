@@ -25,3 +25,37 @@ os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 EMBEDDING_ENABLED = os.getenv("EMBEDDING_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+# ============================================================
+# Survey 工具: 候选池最小论文数 (2026-09-08 抽 env)
+# ============================================================
+# 之前硬编码 30 (9-08 17:00 user 拍板), 现统一读 env, 改阈值不用动代码。
+# 默认 30 保持向后兼容; user 想临时调大就改 .env / export。
+#
+#   - 未设 / 空字符串 / 非整数 / < 1 → 默认 30 (跟历史行为一致)
+#   - 设了合法正整数                  → 用环境变量值
+#
+# 注意: load_dotenv() 在文件顶部, 这里再 getenv 能拿到 .env 里的值。
+#      但 .env 修改需重启进程 (load_dotenv 注释说"只在第一次 import 时执行")。
+def _resolve_survey_min_pool() -> int:
+    raw = os.getenv("QAGENT_SURVEY_MIN_POOL", "").strip()
+    if not raw:
+        return 30
+    try:
+        v = int(raw)
+        return v if v >= 1 else 30
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[config] QAGENT_SURVEY_MIN_POOL=%r 不是合法整数, 走默认 30", raw,
+        )
+        return 30
+
+
+SURVEY_MIN_POOL_PAPERS = _resolve_survey_min_pool()
+
+
+def get_min_pool_papers() -> int:
+    """候选池最小论文数 (survey 工具统一阈值). 见 SURVEY_MIN_POOL_PAPERS 注释."""
+    return SURVEY_MIN_POOL_PAPERS

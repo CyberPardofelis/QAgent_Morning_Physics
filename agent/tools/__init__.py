@@ -37,6 +37,10 @@ from .aps import (
 )
 from .utils import load_journal_config, JOURNAL_CONFIG  # run_python 2026-09-04 停用,函数仍在 utils.py 但不导入(避免误用)
 
+# 9-08 20:08 user 拍板: 加 surveys import, 触发 @register_tool(survey_generate, survey_audit)
+# (之前 __init__.py 漏 import surveys, 装饰器没跑, survey_generate 一直不在 LLM 工具集里)
+from . import surveys
+
 # attachment_reader / search 模块
 from .attachment_reader import (
     extract_text, compose_llm_user_content, is_supported,

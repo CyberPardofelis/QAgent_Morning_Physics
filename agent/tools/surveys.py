@@ -23,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from agent.tools.config import get_min_pool_papers
+
 logger = logging.getLogger(__name__)
 
 
@@ -391,10 +393,12 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
       2. chroma 向量检索 (如果 vector_db 可用)
          - 9-08 新增: 走语义相似度, 召回 summary_items 关键词匹配漏掉的论文
       3. arxiv API 兜底
-         - 候选池 < 30 时, 拉 arxiv 补足 (9-08 user 拍板 最小 30 篇)
+         - 候选池 < 最小阈值 时, 拉 arxiv 补足 (9-08 user 拍板 抽 env QAGENT_SURVEY_MIN_POOL, 默认 30)
 
     9-08 user 拍板: 让 survey 工具能查看到"摘要数据库"更多内容, 不要只依赖 keywords 字段
     """
+    # 候选池最小阈值 (9-08 抽 env, 默认 30, 充裕 = min+10)
+    _MIN_POOL = get_min_pool_papers()
     from agent.tools.summary import list_summary_items
 
     # 9-08 修: 拆成多路召回, 每路各取 top, 然后 union + 去重
@@ -462,8 +466,8 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
         from agent.vector_db import get_vector_db
         vdb = get_vector_db()
         if vdb and vdb.count() > 0:
-            # 用 topic 调, 多取点 (top_k=40), 让 union 后能到 30+
-            chroma_results = vdb.search(topic, top_k=min(40, max_pool))
+            # 用 topic 调, 多取点 (top_k=min+10), 让 union 后能到 最小阈值+
+            chroma_results = vdb.search(topic, top_k=min(_MIN_POOL + 10, max_pool))
             for r in chroma_results:
                 meta = r.get("metadata", {}) or {}
                 pid = meta.get("paper_id") or r.get("id", "")
@@ -487,11 +491,11 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
         # chroma 不可用是正常的 (项目可选), 不影响主流程
         logger.debug("[_build_candidate_pool] chroma 召回跳过: %s", e)
 
-    # ========== 3. arxiv API 兜底 (9-08: 最小 30 篇) ==========
-    if len(pool_dict) < 30:
+    # ========== 3. arxiv API 兜底 (9-08: 最小阈值走 env QAGENT_SURVEY_MIN_POOL, 默认 30) ==========
+    if len(pool_dict) < _MIN_POOL:
         try:
             import arxiv
-            need = max(30, max_pool) - len(pool_dict)
+            need = max(_MIN_POOL, max_pool) - len(pool_dict)
             search = arxiv.Search(
                 query=topic,
                 max_results=min(need, 20),  # 限 20 篇避免太慢
@@ -515,7 +519,7 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
                     "_match_score": 0,
                     "_source": "arxiv_api_fallback",
                 })
-                if len(pool_dict) >= max(30, max_pool):
+                if len(pool_dict) >= max(_MIN_POOL, max_pool):
                     break
         except Exception as e:
             logger.warning("[_build_candidate_pool] arxiv 兜底失败: %s", e)
@@ -762,10 +766,11 @@ def _state_driven_decide(state: Dict[str, Any]) -> Dict[str, Any]:
     outline_sections = state.get("outline_sections", [])
     section_gaps = state.get("section_gaps", []) or []
 
-    # ========== 候选池硬规则 (9-08 17:00 user 拍板: 最小 30 篇, 之前 20) ==========
-    if pool_size < 30:
+    # ========== 候选池硬规则 (9-08 抽 env QAGENT_SURVEY_MIN_POOL, 默认 30; 充裕 = min+10) ==========
+    _MIN_POOL = get_min_pool_papers()
+    if pool_size < _MIN_POOL:
         return {"action": "search_more", "args": {"query": state["topic"], "k": 5}}
-    if pool_size >= 40 and fact_count < 5:
+    if pool_size >= _MIN_POOL + 10 and fact_count < 5:
         return {
             "action": "extract_facts",
             "args": {"paper_ids": [p["paper_id"] for p in state["pool"][:5]]},
