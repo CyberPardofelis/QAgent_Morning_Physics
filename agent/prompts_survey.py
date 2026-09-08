@@ -247,6 +247,16 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 【本章节引用配额】(软约束, 超过会被审计标 ⚠️)
   {ref_quota}
 
+【9-08 user 拍板 — 缺漏反馈机制】(关键)
+- 如果你写完本章节后, **发现还缺某些方向的直接文献** (例如: "本章还缺 BB84 原始文献"、"需要 MDI-QKD 实验证据"、"缺少诱骗态方法" 等)
+- 你可以在 markdown 正文末尾加一行 HTML 注释标注, **系统会自动捕获并回到 search_more 循环补文章**:
+  `<!-- QAgent: missing_queries=["BB84 原始协议", "MDI-QKD 实验", "诱骗态方法"] -->`
+- 写这个标注 = 你"诚实承认"本章覆盖不完整, **不会扣分**, 反而让综述更扎实
+- 不写 = 章节完整 (你确认本章节已覆盖 sub_points 所需的所有证据)
+- **query 应该是搜索关键词, 不是 paper_id** (系统会用 query 调 arxiv 扩候选池)
+- **query 应该精准**: 1-5 个, 每个 query 是一类文献的关键词 (例: "BB84 protocol original", "MDI-QKD experiment", "decoy-state method")
+- **注意**: 标注必须是合法 HTML 注释格式, 且在 markdown 末尾 (其他内容前/中会被审计标 ❌)
+
 【输出】(直接 markdown 章节正文, 不要前缀"以下是...",不要后缀总结,不要"```markdown" 包裹)
 """
 
@@ -347,17 +357,40 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
     if len(state["pool"]) > 30:
         pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 30 个 paper_id)"
 
-    # ============ 9-08 user 拍板: 固定候选池规则 ============
+    # ============ 9-08 17:00 user 拍板: 固定候选池规则 ============
     # 硬规则(写进 prompt 给 LLM 看, fallback 也走这套):
-    #   - 候选池 < 20: 优先 search_more
+    #   - 候选池 < 30: 优先 search_more (9-08 17:00 上调, 最小 30 篇)
     #   - 候选池 ≥ 40 且 fact 不足: extract_facts
-    #   - 20 ≤ pool < 40: LLM 自由判断(用户没指定)
+    #   - 30 ≤ pool < 40: LLM 自由判断(用户没指定)
     # 加 outline: 9-08 user 拍板, 把"写章节"拆成 write_outline + write_section,
     # 顺序: 先 write_outline, 再按 outline 章节写
-    POOL_MIN = 20
+    POOL_MIN = 30        # 9-08 17:00 user 拍板: 最小 30 篇 (之前 20)
     POOL_ENOUGH = 40
     has_outline = bool(state.get("outline_sections"))
     fact_low = fact_count < 5  # fact 不足的硬阈值
+
+    # ============ 9-08 user 拍板: 缺漏反馈 section_gaps ============
+    # LLM 写章节时如果觉得还缺文章, 会在 markdown 末尾加
+    # `<!-- QAgent: missing_queries=[...] -->` 标注, system 解析后塞进 state["section_gaps"]
+    # finish 看到 section_gaps 不空 → 拒绝结束, 让 LLM 回到 search_more 循环补
+    section_gaps = state.get("section_gaps", [])
+    if section_gaps:
+        gaps_block = "\n".join(
+            f"  - 章节 '{g.get('title', '?')}' 缺: {g.get('queries', [])}"
+            for g in section_gaps
+        )
+    else:
+        gaps_block = "  (无)"
+
+    # ============ 9-08 17:00 user 拍板: 未引用 paper 反馈 ============
+    # 审核发现的"候选池 0 引用"传给 LLM, 不能再重复犯错
+    unused_papers = state.get("unused_pool_papers", []) or []
+    if unused_papers:
+        unused_preview = ", ".join(unused_papers[:15])
+        more = f" 等 {len(unused_papers)} 篇" if len(unused_papers) > 15 else ""
+        unused_block = f"  - {unused_preview}{more}"
+    else:
+        unused_block = "  (无, 所有候选池 paper 都已被引用)"
 
     return f"""你是综述生成 ReAct 决策者. 当前状态:
 
@@ -366,6 +399,11 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 - 提取 fact: {fact_count} 条
 - 已写章节 ({section_count}): {section_titles if section_titles else "(无)"}
 - 综述大纲: {"已有 (" + str(len(state.get("outline_sections", []))) + " 章)" if has_outline else "(无, 必须先 write_outline)"}
+  {f"⚠️ 大纲只有 {len(state.get('outline_sections', []))} 段, 少于 5 段必被 action_finish 拒绝! 重新 write_outline 出 5 段" if has_outline and len(state.get("outline_sections", [])) < 5 else ""}
+- 章节缺漏 (section_gaps, {len(section_gaps)} 个待补):
+{gaps_block}
+- ⚠️ 候选池 0 引用 paper ({len(unused_papers)} 篇, 后续章节请尽量引用):
+{unused_block}
 - 错误数: {error_count}
 - ReAct step: {step}/{max_steps}
 
@@ -394,6 +432,8 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 - fact_count < 5 且 pool 充裕 → extract_facts
 - 写完所有 outline 章节 → finish
 - outline 章节用完不要继续 write_section, 直接 finish
+- 9-08 缺漏处理: 如果 section_gaps 有待补 query, 优先用这些 query 调 search_more 扩候选池, 扩完后再视情况 extract_facts / 重新 write_section
+- search_more 的 query 应该是 "BB84 协议" 这种关键词, 不要传 paper_id (system 会调 arxiv 拉新文章)
 
 请返回严格 JSON (不要 markdown fence, 不要其它 text):
 {{"thought": "为什么这样选 (一句话)", "action": "action_name", "args": {{...}}}}"""

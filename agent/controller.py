@@ -581,12 +581,17 @@ def run_agent_stream(
             t0 = time.monotonic()
 
             # 工具结果收集（同步或流式）
+            # 9-08 17:15 修: commit 6d91bc3 把 "yield chunk 给 UI" 删了, 改成只 collect
+            #   导致 survey_generate 内部 ReAct 进度 ("--- Step X ---" / "💭 思考" / "➡️ 行动" / "👁️ 观察")
+            #   只进 messages 历史, 用户看不到任何"工具在做什么" 的提示
+            # 修: 边 collect 边 yield, 这样 UI 能实时看到工具内部进度, 收集到的 result_text 仍进 LLM 历史
             collected_chunks: list[str] = []
             dispatch_failed = False
             try:
                 for chunk in ToolRegistry.dispatch(fn_name, args):
                     if chunk:
                         collected_chunks.append(chunk)
+                        yield chunk   # 9-08 17:15 修: 同步 yield 给 UI (跟之前 commit 6d91bc3 之前一致)
             except Exception as e:
                 dispatch_failed = True
                 logger.exception("[controller] [tool-call] ✗ %s dispatch 异常: %s", fn_name, e)
