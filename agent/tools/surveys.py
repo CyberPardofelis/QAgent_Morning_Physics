@@ -23,7 +23,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from agent.tools.config import get_min_pool_papers
+from agent.tools.config import (
+    get_min_pool_papers,
+    get_max_section_tokens,
+    get_relevance_threshold,
+    get_chroma_sim_threshold,
+    get_relevance_batch_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +390,7 @@ def _audit_section_paper_ids(content_md: str, pool_ids: set) -> Dict[str, List[s
 
 def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]]:
     """
-    Phase A: 候选池构建 (9-08 多源召回版)
+    Phase A: 候选池构建 (9-09 升级: 三道防线)
 
     三路召回, union + 去重:
       1. summary_items.db 关键词匹配 (title/abstract/core_method/core_contrib/keywords/outlook)
@@ -392,10 +398,16 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
          - 9-08 修: 不再过度依赖 keywords 字段 (很多核心论文 keywords 缺失)
       2. chroma 向量检索 (如果 vector_db 可用)
          - 9-08 新增: 走语义相似度, 召回 summary_items 关键词匹配漏掉的论文
+         - 9-09 升级: 用相似度阈值 (默认 0.97, env QAGENT_SURVEY_CHROMA_SIM_THRESHOLD) 代替 top_k
+           远距离论文不进入 pool, 防"quantum state verification" 召进 "quantum state tomography"
       3. arxiv API 兜底
          - 候选池 < 最小阈值 时, 拉 arxiv 补足 (9-08 user 拍板 抽 env QAGENT_SURVEY_MIN_POOL, 默认 30)
 
     9-08 user 拍板: 让 survey 工具能查看到"摘要数据库"更多内容, 不要只依赖 keywords 字段
+    9-09 user 拍板: 加 per-paper LLM 相关性评分 (0-10) 精筛, 解决"邻近子领域误召"问题
+                    (env QAGENT_SURVEY_RELEVANCE_THRESHOLD, 默认 7; 设 0 = 关闭)
+
+    整体流程: 3 路 recall → union → relevance 精筛 → 按相关性排序 → 限 max_pool
     """
     # 候选池最小阈值 (9-08 抽 env, 默认 30, 充裕 = min+10)
     _MIN_POOL = get_min_pool_papers()
@@ -459,21 +471,33 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
     except Exception as e:
         logger.warning("[_build_candidate_pool] summary_items 召回失败: %s", e)
 
-    # ========== 2. chroma 向量检索 (9-08 新增) ==========
+    # ========== 2. chroma 向量检索 (9-09 升级: 相似度阈值) ==========
     # 9-08 user 拍板: 修复底层索引, 让 survey 能查看到更多数据库信息
-    # chroma 索引里的论文 metadata 通常比 summary_items 更全, 走语义相似度召回
+    # 9-09 user 拍板: 改 top_k 为相似度阈值 (默认 0.97), 防"邻近子领域"误召
+    #   - sim 0.97 = distance 0.03 (chroma cosine distance)
+    #   - 比"quantum state verification" vs "quantum state tomography" 在 embedding 空间更近
+    #     的论文全踢掉, 只留真正主题的
+    #   - 用 top_k = max(50, max_pool*2) 多拉点, 再用阈值卡
     try:
         from agent.vector_db import get_vector_db
         vdb = get_vector_db()
         if vdb and vdb.count() > 0:
-            # 用 topic 调, 多取点 (top_k=min+10), 让 union 后能到 最小阈值+
-            chroma_results = vdb.search(topic, top_k=min(_MIN_POOL + 10, max_pool))
+            sim_threshold = get_chroma_sim_threshold()  # 默认 0.97
+            dist_threshold = 1.0 - sim_threshold  # 默认 0.03
+            # 多拉候选, 阈值过滤后会少; 留 2x 余量
+            chroma_top_k = max(50, max_pool * 2)
+            chroma_results = vdb.search(topic, top_k=chroma_top_k)
+            kept = 0
             for r in chroma_results:
                 meta = r.get("metadata", {}) or {}
                 pid = meta.get("paper_id") or r.get("id", "")
                 if not pid:
                     continue
                 distance = r.get("distance", 1.0) or 1.0
+                # 9-09 升级: 相似度阈值过滤 (cosine distance > dist_threshold 跳过)
+                if distance > dist_threshold:
+                    continue
+                kept += 1
                 add_pool_entry({
                     "paper_id": pid,
                     "title": meta.get("title", ""),
@@ -487,6 +511,10 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
                     "_match_score": int((1 - distance) * 100) if distance is not None else 0,
                     "_source": "chroma_vector",
                 })
+            logger.info(
+                "[_build_candidate_pool] chroma: top_k=%d, sim>=%.2f, kept=%d",
+                chroma_top_k, sim_threshold, kept,
+            )
     except Exception as e:
         # chroma 不可用是正常的 (项目可选), 不影响主流程
         logger.debug("[_build_candidate_pool] chroma 召回跳过: %s", e)
@@ -524,17 +552,161 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
         except Exception as e:
             logger.warning("[_build_candidate_pool] arxiv 兜底失败: %s", e)
 
-    # 排序: match_score 降序, 同分按 source 优先级 (chroma > summary_items > arxiv)
+    # ========== 4. 9-09 user 拍板: per-paper LLM 相关性评分精筛 ==========
+    # 解决"邻近子领域误召" (例: 量子态验证召进 30 篇层析/密钥分发)
+    # chroma 阈值 + summary_items 关键词都是召回层粗筛, 仍有邻域 paper 漏过
+    # 这里 LLM 看 paper 实情 (core_method + core_contrib) 打 0-10 分, 阈值 (默认 7) 踢出
+    relevance_threshold = get_relevance_threshold()
+    if relevance_threshold > 0 and pool_dict:
+        try:
+            pool_dict = _relevance_filter_pool(topic, pool_dict, relevance_threshold)
+        except Exception as e:
+            logger.warning("[_build_candidate_pool] relevance filter 失败 (非致命, 用原 pool): %s", e)
+
+    # 排序: _relevance_score 降序 (relevance 跑过后) > _match_score (未跑) > source 优先级
     source_priority = {"chroma_vector": 0, "summary_items_keyword": 1, "arxiv_api_fallback": 2}
-    pool = sorted(
-        pool_dict.values(),
-        key=lambda x: (
-            -x.get("_match_score", 0),
-            source_priority.get(x.get("_source", ""), 9),
-        ),
-    )
+    def _sort_key(x: Dict[str, Any]) -> tuple:
+        rel = x.get("_relevance_score")
+        if rel is not None:
+            return (-rel, 0, source_priority.get(x.get("_source", ""), 9))
+        return (-x.get("_match_score", 0), 1, source_priority.get(x.get("_source", ""), 9))
+
+    pool = sorted(pool_dict.values(), key=_sort_key)
     # 限 max_pool
     return pool[:max_pool]
+
+
+def _relevance_filter_pool(
+    topic: str,
+    pool_dict: Dict[str, Dict[str, Any]],
+    threshold: int,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    per-paper LLM 相关性评分精筛 (9-09 user 拍板加).
+
+    输入: pool_dict (paper_id -> pool entry)
+    处理: 5 篇/批 (env 可调) 调 LLM, 每篇 0-10 打分
+    输出: pool_dict, score < threshold 的 paper 剔除, 其余加 _relevance_score 字段
+
+    容错:
+      - 整批 LLM 失败 → 该批 5 篇保留 (降级, 不剔除)
+      - 单篇 JSON parse 失败 → 该篇用 score=5 (中性) 保留
+      - 全部过滤后剩 0 篇 → 抛 ValueError, 调用方 fallback 用原 pool
+    """
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_relevance_score_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+    batch_size = get_relevance_batch_size()
+
+    items = list(pool_dict.values())
+    if not items:
+        return pool_dict
+
+    logger.info(
+        "[_relevance_filter_pool] topic=%r, 候选池 %d 篇, batch_size=%d, threshold=%d",
+        topic[:50], len(items), batch_size, threshold,
+    )
+
+    scored: Dict[str, Dict[str, Any]] = {}  # paper_id -> {score, reason, is_adjacent_field}
+
+    # 批量化
+    for i in range(0, len(items), batch_size):
+        batch = items[i: i + batch_size]
+        try:
+            prompt = build_relevance_score_prompt(topic, batch)
+            out = _call_llm(
+                prompt,
+                provider=_PROVIDER,
+                model=_MODEL,
+                enable_thinking=False,
+                temperature=0.2,
+                max_tokens=2000,    # 5 篇 × ~100 token/篇 + JSON overhead
+                timeout=120,
+            )
+            # 剥 <think>
+            if out and "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+            # 容错 parse
+            results = _safe_json_loads_array(out or "")
+            if results is None:
+                raise ValueError(f"relevance batch JSON parse 失败: {(out or '')[:200]}")
+            # 写入
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                pid = r.get("paper_id", "")
+                if not pid:
+                    continue
+                score = r.get("score")
+                if not isinstance(score, (int, float)):
+                    score = 5  # 中性 fallback
+                scored[pid] = {
+                    "score": int(score),
+                    "reason": str(r.get("reason", ""))[:200],
+                    "is_adjacent_field": bool(r.get("is_adjacent_field", False)),
+                }
+            # 漏评的 (LLM 没返) 用中性分保留
+            for p in batch:
+                pid = p.get("paper_id", "")
+                if pid and pid not in scored:
+                    scored[pid] = {"score": 5, "reason": "[fallback] LLM 未评, 用中性分", "is_adjacent_field": False}
+        except Exception as e:
+            # 整批失败: 整批 5 篇用中性分保留 (降级, 不剔除)
+            logger.warning("[_relevance_filter_pool] batch %d 失败 (整批保留): %s", i // batch_size, e)
+            for p in batch:
+                pid = p.get("paper_id", "")
+                if pid and pid not in scored:
+                    scored[pid] = {"score": 5, "reason": f"[batch_failed] {type(e).__name__}", "is_adjacent_field": False}
+
+    # 把 _relevance_score 写回 pool_dict
+    for pid, p in pool_dict.items():
+        s = scored.get(pid, {})
+        p["_relevance_score"] = s.get("score", 5)
+        p["_relevance_reason"] = s.get("reason", "")
+        p["_is_adjacent_field"] = s.get("is_adjacent_field", False)
+
+    # 过滤: 保留 score >= threshold 的; 兜底: 过滤后 < 5 篇时, 加回 top 5 by score
+    kept = {pid: p for pid, p in pool_dict.items() if p["_relevance_score"] >= threshold}
+
+    # 9-09 优化: 全部 paper 都标 [fallback] / [batch_failed] → LLM 整体失败, 不应用任何过滤
+    all_fallback = all(
+        p.get("_relevance_reason", "").startswith(("[fallback]", "[batch_failed]"))
+        for p in pool_dict.values()
+    )
+    if all_fallback:
+        logger.warning(
+            "[_relevance_filter_pool] 所有 paper 都是 LLM fallback/batch_failed 标记, "
+            "跳过 relevance 过滤, 原样返回 (LLM 整体不可用, 让 chroma/summary_items/arxiv 兜底)"
+        )
+        return dict(pool_dict)
+
+    if len(kept) < 5 and len(kept) > 0:
+        # 兜底: 取剩余的按 score 倒序, 补足到 5 篇 (避免下游 "候选池为空" 假阳)
+        remaining = sorted(
+            (p for pid, p in pool_dict.items() if pid not in kept),
+            key=lambda x: -x["_relevance_score"],
+        )
+        for p in remaining[:5 - len(kept)]:
+            kept[p["paper_id"]] = p
+        logger.warning(
+            "[_relevance_filter_pool] threshold=%d 过滤后剩 %d 篇 < 5, 兜底补足到 5 篇",
+            threshold, len(kept),
+        )
+
+    if not kept:
+        # 全部 0 分 → 抛错, 调用方 fallback 用原 pool
+        raise ValueError("relevance filter 把所有 paper 踢光 (可能主题太偏或 LLM 全失败)")
+
+    n_filtered = len(pool_dict) - len(kept)
+    if n_filtered > 0:
+        logger.info(
+            "[_relevance_filter_pool] 过滤掉 %d 篇 (score<%d), 保留 %d 篇",
+            n_filtered, threshold, len(kept),
+        )
+
+    return kept
 
 
 @register_tool(name="survey_generate", is_streaming=True, cost_tier="L2")
@@ -974,6 +1146,64 @@ def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
     return out
 
 
+def _arxiv_search_batch(queries: List[str], k_per_query: int = 3) -> List[Dict[str, Any]]:
+    """
+    多 query 批量 arxiv 召回 (9-09 user 拍板加).
+
+    跟 _arxiv_search 的区别:
+      - 单 query → 多 query (list of str)
+      - 每 query 拉 k_per_query (默认 3, 避免 5 个 query × 5 = 25 调用过慢)
+      - union + dedup by paper_id, 返回合并 list
+
+    使用场景 (9-09 拍板, 未来 wire in):
+      - Phase A 召回: 拿 LLM 扩展的多个学术 query (例: "quantum state verification" →
+        ["self-testing quantum states", "state verification protocol",
+         "device-independent certification", ...]), 一次 batch 召回, 比单 query 召回更聚焦
+      - action_search_more: section_gaps 触发 search_more 时, gap queries 是 list, 可直接喂
+
+    现有 _arxiv_search 不动 (单 query 场景仍可用, 跟 history 兼容)
+    """
+    import arxiv
+    if not queries:
+        return []
+    client = arxiv.Client()
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for q in queries:
+        q = (q or "").strip()
+        if not q:
+            continue
+        try:
+            search = arxiv.Search(
+                query=q,
+                max_results=k_per_query,
+                sort_by=arxiv.SortCriterion.Relevance,
+            )
+            for r in client.results(search):
+                pid = r.entry_id.split("/")[-1].split("v")[0]
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append({
+                    "paper_id": pid,
+                    "title": r.title or "",
+                    "year": str(r.published.year) if r.published else "",
+                    "authors": ", ".join([a.name for a in (r.authors or [])[:5]]),
+                    "abstract": r.summary or "",
+                    "keywords": ", ".join([a.name for a in (r.authors or [])[:3]]),
+                    "_query_source": q[:80],  # debug 用: 这条 paper 是哪个 query 召回来的
+                })
+        except Exception as e:
+            # 单 query 失败不阻塞整个 batch
+            logger.warning("[_arxiv_search_batch] query=%r failed: %s", q[:50], e)
+            continue
+    logger.info(
+        "[_arxiv_search_batch] %d queries × k=%d → union %d 篇 (deduped)",
+        len(queries), k_per_query, len(out),
+    )
+    return out
+
+
 def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
     """
     extract_facts action (step 3 真实实现):
@@ -1085,7 +1315,7 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
             model=_MODEL,
             enable_thinking=False,
             temperature=0.3,
-            max_tokens=10000,    # 9-08 user 拍板: 上限 10000
+            max_tokens=get_max_section_tokens(),   # 9-08 23:50 user 拍板: 10000 → 20000 (env: QAGENT_SURVEY_SECTION_MAX_TOKENS)
             timeout=180,
         )
     except Exception as e:
@@ -1200,12 +1430,46 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
         })
 
     # 9-08 17:00 user 拍板: LLM 偷懒只返 < 5 段时, 用 default 补足到 5 段
+    # 9-08 23:50 user 拍板: 升级到 claim-centric 视角, sub_points 从 3 个涨到 5-8 个,
+    # 每个 sub_point 用完整判断式陈述句 (跟 SURVEY_OUTLINE_PROMPT 措辞对齐)
     DEFAULT_OUTLINE = [
-        {"title": "引言", "sec_type": "intro", "sub_points": ["背景与动机", "研究问题", "本综述范围"], "is_transition": "yes"},
-        {"title": "关键进展时间线", "sec_type": "progress", "sub_points": ["早期突破", "中期优化", "近期进展"], "is_transition": "no"},
-        {"title": "方法分类与对比", "sec_type": "method_compare", "sub_points": ["按机制分类", "按性能对比", "适用场景"], "is_transition": "no"},
-        {"title": "研究空白与不足", "sec_type": "gap", "sub_points": ["技术瓶颈", "实验限制", "理论未解"], "is_transition": "no"},
-        {"title": "未来方向与展望", "sec_type": "outlook", "sub_points": ["可迁移方向", "开放问题", "标准化展望"], "is_transition": "no"},
+        {"title": "引言", "sec_type": "intro", "sub_points": [
+            "本领域的研究背景和核心科学/工程问题",
+            "已有综述覆盖的范围和本综述的差异化定位",
+            "本综述采用的分类法和分析框架",
+            "本综述的覆盖范围和时间窗口",
+            "全文组织结构",
+        ], "is_transition": "yes"},
+        {"title": "关键进展时间线", "sec_type": "progress", "sub_points": [
+            "领域的早期奠基工作和初始共识",
+            "第一次方法论突破及其驱动力",
+            "中期关键优化和性能提升",
+            "近期(2015-2020)的方法论转变",
+            "当前主流共识(2020-2025)",
+            "演化的内在驱动力: 为什么会有这些转折",
+            "未解决的科学/工程问题",
+        ], "is_transition": "no"},
+        {"title": "方法分类与对比", "sec_type": "method_compare", "sub_points": [
+            "按机制维度的分类法和命名规范",
+            "按性能维度的对比和基准测试结果",
+            "按适用场景的对比和工程取舍",
+            "各类方法的核心 trade-off",
+            "混合方法/组合方法的最新进展",
+            "不同分类法之间的等价性讨论",
+        ], "is_transition": "no"},
+        {"title": "研究空白与不足", "sec_type": "gap", "sub_points": [
+            "技术瓶颈: 当前方法在 X 场景无法扩展",
+            "实验限制: 已有 benchmark 的覆盖盲区",
+            "理论未解: 基础理论未能解释的现象",
+            "跨领域迁移失败的反例",
+            "为什么这些问题长期未解决(方法论或生态原因)",
+        ], "is_transition": "no"},
+        {"title": "未来方向与展望", "sec_type": "outlook", "sub_points": [
+            "短期可做方向(1-2 年内可见成果)",
+            "长期研究方向(5 年+的开放问题)",
+            "跨领域迁移机会(A 领域方法到 B 领域)",
+            "标准化展望(基准/评测/复现规范)",
+        ], "is_transition": "no"},
     ]
     if len(normalized) < 5:
         existing = {s["section_type"] for s in normalized}
@@ -1340,7 +1604,7 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.4,
-                max_tokens=10000,  # 9-08 user 拍板: 上限 10000
+                max_tokens=get_max_section_tokens(),  # 9-08 23:50 user 拍板: 10000 → 20000 (env: QAGENT_SURVEY_SECTION_MAX_TOKENS)
                 timeout=240,
             )
         except Exception as e:
@@ -1564,6 +1828,31 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
         cited_ids.update(r.get("in_pool", []))
     uncited = pool_ids - cited_ids
 
+    # ========== 9-09 user 拍板: 相关性分布统计 ==========
+    # 9-09 加了 per-paper LLM relevance 评分 (_relevance_score 0-10)
+    # 0-3 = 误召, 4-6 = 弱相关, 7-8 = 强相关, 9-10 = 核心
+    rel_high = []   # 9-10 核心
+    rel_mid = []    # 7-8 强相关
+    rel_low = []    # 4-6 弱相关
+    rel_noise = []  # 0-3 误召 (理论上已被 relevance filter 踢光, 这里兜底)
+    rel_no_score = []  # 没有 _relevance_score 字段的 (旧调用 / filter 跳过)
+    for p in pool:
+        s = p.get("_relevance_score")
+        pid = p.get("paper_id", "?")
+        title = (p.get("title") or "?")[:80]
+        is_adj = p.get("_is_adjacent_field", False)
+        item = (pid, title, is_adj, p.get("_relevance_reason", ""))
+        if s is None:
+            rel_no_score.append(item)
+        elif s >= 9:
+            rel_high.append(item)
+        elif s >= 7:
+            rel_mid.append(item)
+        elif s >= 4:
+            rel_low.append(item)
+        else:
+            rel_noise.append(item)
+
     audit_lines = [
         f"# 覆盖度审计 — {topic}",
         "",
@@ -1584,6 +1873,35 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
             f"| {r['title']} | {r['type']} | "
             f"{len(r['in_pool'])} | {len(r['out_of_pool'])} |"
         )
+
+    # 9-09 加: 相关性分布段 (跟覆盖度并列, 取代单看"0 引用")
+    total = len(pool)
+    audit_lines.extend([
+        "",
+        f"## 🎯 候选池相关性分布 (LLM 0-10 评分, 9-09 user 拍板加)",
+        "",
+        f"- 核心 (9-10): **{len(rel_high)}** 篇 ({len(rel_high)*100//max(1,total)}%)",
+        f"- 强相关 (7-8): **{len(rel_mid)}** 篇 ({len(rel_mid)*100//max(1,total)}%)",
+        f"- 弱相关 (4-6): {len(rel_low)} 篇 ({len(rel_low)*100//max(1,total)}%)",
+        f"- 误召/邻近 (0-3): {len(rel_noise)} 篇 ({len(rel_noise)*100//max(1,total)}%)",
+    ])
+    if rel_no_score:
+        audit_lines.append(
+            f"- 未评分 (filter 跳过/旧调用): {len(rel_no_score)} 篇"
+        )
+    # 列邻近子领域 paper (is_adjacent_field=True), 标 ❌
+    adjacent_papers = [item for item in (rel_mid + rel_low + rel_noise) if item[2]]
+    if adjacent_papers:
+        audit_lines.extend([
+            "",
+            f"## ⚠️ 邻近子领域 paper (is_adjacent_field=True, 实际不应被综述引用)",
+            "",
+        ])
+        for pid, title, _, reason in adjacent_papers[:20]:
+            audit_lines.append(f"- `{pid}`: {title}  —  *{reason[:100]}*")
+        if len(adjacent_papers) > 20:
+            audit_lines.append(f"- ... 还有 {len(adjacent_papers) - 20} 篇")
+
     audit_lines.extend([
         "",
         f"## ⚠️ 候选池 0 引用论文 ({len(uncited)} / {len(pool_ids)} = "
@@ -1593,7 +1911,10 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
     for pid in sorted(uncited):
         p = next((x for x in pool if x["paper_id"] == pid), None)
         title = (p or {}).get("title", "?")[:80]
-        audit_lines.append(f"- `{pid}`: {title}")
+        rel_info = ""
+        if p and p.get("_relevance_score") is not None:
+            rel_info = f"  (相关性 {p['_relevance_score']}/10)"
+        audit_lines.append(f"- `{pid}`: {title}{rel_info}")
     audit_md = "\n".join(audit_lines)
     ws.save_audit(audit_md)
     ws.set_status(
@@ -1648,9 +1969,34 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
         for pid in sorted(uncited):
             p = next((x for x in pool if x["paper_id"] == pid), None)
             title = (p or {}).get("title", "?")[:80]
-            report.append(f"- `[[{pid}]]`: {title}")
+            rel_info = ""
+            if p and p.get("_relevance_score") is not None:
+                rel_info = f"  (相关性 {p['_relevance_score']}/10)"
+            report.append(f"- `[[{pid}]]`: {title}{rel_info}")
     else:
         report.append("  (无, 所有候选池 paper 都被引用过)")
+
+    # ========== 9-09 user 拍板: 相关性分布快速摘要 ==========
+    # 跟上面的 0 引用列表并列, 一眼能看出 pool 健康度
+    adjacent_papers = [
+        (pid, title, is_adj, reason)
+        for pid, title, is_adj, reason in (rel_mid + rel_low + rel_noise)
+        if is_adj
+    ]
+    report.append("")
+    report.append("### 🎯 候选池相关性分布 (LLM 0-10 评分)")
+    report.append("")
+    report.append(f"- 核心 (9-10): **{len(rel_high)}** 篇")
+    report.append(f"- 强相关 (7-8): **{len(rel_mid)}** 篇")
+    report.append(f"- 弱相关 (4-6): {len(rel_low)} 篇")
+    report.append(f"- 误召/邻近 (0-3): {len(rel_noise)} 篇")
+    if adjacent_papers:
+        report.append("")
+        report.append(f"⚠️ **邻近子领域 paper: {len(adjacent_papers)} 篇**, 建议人工 review 是否真有引用必要")
+        for pid, title, _, reason in adjacent_papers[:5]:
+            report.append(f"  - `[[{pid}]]`: {title[:60]}  —  *{reason[:80]}*")
+        if len(adjacent_papers) > 5:
+            report.append(f"  - ... 还有 {len(adjacent_papers) - 5} 篇 (见 `_audit.md`)")
     if state["errors"]:
         report.append("")
         report.append(f"### ⚠️ 错误 ({len(state['errors'])} 条)")

@@ -148,40 +148,65 @@ def build_fact_prompt(
 # ============================================================
 # 2. SURVEY_OUTLINE_PROMPT — 从候选池生成章节大纲(Phase D)
 # ============================================================
-SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池,生成结构化大纲。
+SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池,生成**claim-centric** 的结构化大纲。
 
 【综述主题】: {topic}
 
 【候选池】(共 {pool_size} 篇,paper_id 唯一):
 {pool_text}
 
+【9-08 23:50 user 拍板 — claim-centric 视角】
+**综述的核心是"领域判断/分类/趋势",不是"罗列 paper 摘要"。**
+- 每个 sub_point = 1 个**领域宏观判断/分类/趋势/分类法**, 用完整陈述句表达, 不是"问题清单"
+- 后续章节写作时, paper 是"佐证", 是"判断的证据", 不是"段落的主角"
+- 大纲的丰富度直接决定章节能不能展开 — sub_point 越具体, 章节越有支撑, 引用越能挂上
+
 【章节类型与顺序】(固定 5 段,从上到下,不要漏)
   1. intro: 背景 / 研究问题 / 本文综述范围(0-2 引用)
-  2. progress: 关键进展时间线 / 里程碑(5-10 引用,核心章节)
-  3. method_compare: 方法分类与对比(3-8 引用,按机制/性能/适用场景分组)
-  4. gap: 当前研究空白 / 不足(1-3 引用,以"反例"为主)
-  5. outlook: 未来方向 / 开放问题(0-2 引用,基于 gap 推断)
+  2. progress: 关键进展时间线 / 里程碑 + 演化驱动力 (8-15 引用, 核心章节)
+  3. method_compare: 方法分类法 + trade-off 对比 + 适用场景(6-12 引用,核心章节)
+  4. gap: 当前研究空白 / 不足 / 反例(3-5 引用)
+  5. outlook: 未来方向 / 开放问题 / 跨领域迁移(0-2 引用,基于 gap 推断)
+
+【每章应包含的"宏观内容类型"】(9-08 23:50 user 拍板, 5 段各有侧重)
+  - intro:    研究背景 / 已有综述覆盖范围 / 本综述的切入角度 / 全文组织结构
+  - progress: 历史脉络(早期→中期→近期) / 转折点(为什么 X 替代了 Y) / 当前共识 / 演化的内在驱动力
+  - method_compare: 分类法(按 X 维度怎么分) / 各类的 trade-off 对比 / 适用场景 / 性能/复杂度对比
+  - gap:     公开问题清单(技术 / 实验 / 理论) / 各问题的解决难度 / 现有反例 / 为什么没解决
+  - outlook: 短期可做(1-2 年) / 长期方向(5 年+) / 跨领域迁移机会 / 标准化展望
 
 【每章输出 schema】
 - title: 章节标题(中文,15 字以内)
 - section_type: 5 选 1(intro / progress / method_compare / gap / outlook)
-- sub_points: 2-4 个子点,每个子点是 1 句"该章节需要回答的问题"
+- sub_points: **5-8 个宏观要点**,每个要点是 1 句完整的"领域判断/分类/趋势"陈述句
   ⚠️ 字段名严格用 sub_points(复数),任何 chapter 都不能写成 sub_point(单数)
+  ⚠️ sub_point 数量必须 5-8 个, 这是章节展开度的硬下限 (user 9-08 23:50 拍板, 防 LLM 偷懒)
 - is_transition: yes / no
     - yes = 该章主要是铺垫/过渡,不强求引用(给 intro 的部分子节)
     - no = 该章必须有事实引用(给 progress / method_compare / gap / outlook)
+
+【sub_point 措辞示例】(user 9-08 23:50 拍板, 错误写法会让 LLM 偷懒)
+  ❌ 错误 (问题式, 让 LLM 想敷衍):
+     "X 方法的工作原理"
+     "Y 方法有什么优点"
+     "该领域未来如何发展"
+  ✅ 正确 (判断式, 逼 LLM 写出来):
+     "X 方法通过 Y 机制将错误率压到 <1%, 已成为容错量子计算主流路径"
+     "Y 在大规模系统中遭遇性能瓶颈, 主要因为 Z 开销随节点数线性增长"
+     "跨领域迁移方面, A 领域的 W 技术有可能解决 B 领域长期未解的 V 问题"
 
 【强制约束】
 1. 必须**严格按上面 5 段顺序**输出,不能合并章节,不能改顺序
 2. paper_id 只能从候选池里选,不能编造
 3. 引用配额按"章节类型"软约束:超过上下限会被审计标 ⚠️
 4. method_compare 的 sub_points 应该按"机制/性能/场景"维度组织,不要按时间组织(时间组织是 progress 的事)
+5. **sub_points 数量 5-8 个**: 大纲生成后会被审计, < 5 个 sub_point 的章节会在 action_finish 被拒
 
 【输出格式】(严格 JSON 对象,不要 markdown 代码块包裹,不要解释)
 {{
   "sections": [
-    {{"title": "...", "section_type": "intro", "sub_points": ["...", "..."], "is_transition": "yes"}},
-    {{"title": "...", "section_type": "progress", "sub_points": ["...", "...", "..."], "is_transition": "no"}}
+    {{"title": "...", "section_type": "intro", "sub_points": ["...", "...", "...", "...", "..."], "is_transition": "yes"}},
+    {{"title": "...", "section_type": "progress", "sub_points": ["...", "...", "...", "...", "...", "..."], "is_transition": "no"}}
   ]
 }}
 
@@ -209,21 +234,28 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 【综述主题】: {topic}
 【本章节类型】: {section_type}
 【本章节标题】: {section_title}
-【本章节大纲】:
+【本章节大纲】(含 5-8 个 sub_point 宏观判断, 必须逐条展开):
 {outline_section}
 
 【候选池】(共 {pool_size} 篇,paper_id 唯一):
 {pool_text}
 
-【9-08 user 拍板 写作风格 — 最关键】
-1. **章节是讲"领域/方向的内容、机制、进展",不是讲"哪些 paper 各自做了啥"**
-   - 错误: 每段以 paper 为单位, "...A 提出了 X [paper1]...B 提出了 Y [paper2]...C 改进了 Z [paper3]" — 这是罗列 paper 摘要
-   - 正确: 以"机制/思路/技术路线"为线索, 把多篇 paper 串成一个连贯论述, 在关键事实点上 cite [paper_id] 佐证
-2. **典型结构**:
-   - 开篇 1-2 段: 这个章节要回答的科学/工程问题是什么, 为什么重要, 整体思路
-   - 主体 N 段 (按 sub_point 展开): 每段先讲清一个机制/技术/思路, 再用多篇 paper 佐证"哪几篇贡献了哪个具体点/数字/结果"
-   - 收尾 1 段: 本章小结 + 跟下一章的衔接
-3. **长度要求**: 单章 markdown **800-1500 字** (sub_points × 2-3 段/子点), 内容要饱满, 不要惜字如金
+【9-08 23:50 user 拍板 写作风格 — claim-centric (最关键)】
+1. **章节是讲"领域判断/分类/趋势",不是讲"哪些 paper 各自做了啥"**
+   - ❌ 错误 (paper-centric 罗列): 每段以 paper 为单位, "...A 提出了 X [paper1]...B 提出了 Y [paper2]...C 改进了 Z [paper3]" — 这是罗列 paper 摘要
+   - ✅ 正确 (claim-centric 论述): 每段**先抛出该段的领域判断/分类/趋势 (claim)**, 再用 2-4 个 paper_id 佐证
+     - claim 写法: 完整陈述句, 不是问题 (例: "X 方法已成为 Y 场景的主流路径, 关键改进点是 Z")
+     - 佐证写法: claim 后挂 [paper_id], 注明"哪几篇贡献了哪个具体点/数字/结果"
+2. **典型结构** (claim-first 视角):
+   - 开篇 1-2 段: 本章核心判断的预告 (1 段) + 本章将向读者展示哪些宏观结论 (1 段)
+   - 主体 N 段 (按 sub_point 展开): 每段 = 1 个 sub_point 的展开
+     - 段首: 抛出该 sub_point 的领域判断/分类/趋势 (claim, 1-2 句)
+     - 段中: 解释该判断的依据/机制/数据
+     - 段末: 挂 2-4 个 paper_id, 注明哪几篇贡献了哪个具体点/数字/结果
+   - 收尾 1 段: 本章宏观判断总结 + 跟下一章的衔接
+3. **长度要求** (9-08 23:50 user 拍板, 10000→20000 max_tokens 后放宽):
+   - 单章 markdown **1500-2500 字** (sub_points × 3-4 段/子点, 每段平均 200-300 字)
+   - 5-8 个 sub_point 决定章节下界 1500 字; 写得再短会被审计标 ⚠️
 4. **每个 sub_point 至少配 2-4 个 paper_id 引用** (关键事实/数字/结果 处必带), 引用的 paper 是"佐证", 不是"中心"
 5. **不要复述 paper 摘要**: 不要写 "A 提出了 X, 它的核心方法是 Y", 写 "X 已成为主流路径 (A [p1], B [p2], C [p3] 都在此方向), 关键改进点在于 ..."
 
@@ -244,25 +276,25 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 - 如果 out_of_pool > 0, 系统会自动用"只允许候选池内 paper_id"作为额外约束重写该章节 (最多 2 次)
 - 第 2 次重写后仍 out_of_pool > 0, 接受并落库 (覆盖度审计报告里标 ⚠️)
 
-【"领域叙述 vs paper 罗列" 对比示例】
+【"claim-centric 视角 vs paper 罗列" 对比示例】(9-08 23:50 视角升级)
 
-  ❌ 罗列 paper 摘要 (错误):
+  ❌ paper 罗列 (错误, paper 是主角):
     "A 提出了表面码 [p1]。B 改进了表面码 [p2]。C 提出了 XZZX 码 [p3]。D 比较了多种码 [p4]。"
     (把多篇 paper 各开一段, 章节读起来像 "list of paper summaries")
 
-  ✅ 领域叙述 + paper 佐证 (正确):
+  ✅ claim-centric (正确, 判断是主角, paper 是佐证):
     "表面码自 Fowler 2012 展示低于 1% 逻辑错误率以来, 已成为容错量子计算的主流路径 [p1]。其核心思路是用二维网格上的物理比特编码单个逻辑比特, 通过周期测量稳定子算子检测错误 [p1][p2]。在偏置噪声场景下, Bravyi 等指出传统表面码阈值显著退化, 由此提出 XZZX 码并展示了 ~10x 的阈值改进 [p3]。近期工作进一步把表面码扩展到子系统码, 在硬件开销和纠错能力间取得新平衡 [p4]。"
     (以"机制演化"为线索, 多篇 paper 串成一个连贯论述, 关键事实点 cite)
 
 【本章节引用配额】(软约束, 超过会被审计标 ⚠️)
   {ref_quota}
 
-【9-08 user 拍板 — 缺漏反馈机制】(关键)
-- 如果你写完本章节后, **发现还缺某些方向的直接文献** (例如: "本章还缺 BB84 原始文献"、"需要 MDI-QKD 实验证据"、"缺少诱骗态方法" 等)
-- 你可以在 markdown 正文末尾加一行 HTML 注释标注, **系统会自动捕获并回到 search_more 循环补文章**:
-  `<!-- QAgent: missing_queries=["BB84 原始协议", "MDI-QKD 实验", "诱骗态方法"] -->`
-- 写这个标注 = 你"诚实承认"本章覆盖不完整, **不会扣分**, 反而让综述更扎实
-- 不写 = 章节完整 (你确认本章节已覆盖 sub_points 所需的所有证据)
+【9-08 23:50 user 拍板 — 缺漏反馈机制】(关键, 加强版)
+- 写完本章节后, **主动扫一遍 sub_points, 看哪个 sub_point 的引用支撑偏少 (< 2 个 paper_id)**:
+  - 如果发现某些 sub_point 引用不足或缺方向性文献, 必须在 markdown 末尾加 HTML 注释标注, **系统会自动捕获并回到 search_more 循环补文章**:
+    `<!-- QAgent: missing_queries=["BB84 原始协议", "MDI-QKD 实验", "诱骗态方法"] -->`
+  - **主动声明缺失是更专业的综述态度**, 写这个标注**不会扣分**, 反而让综述更扎实
+  - **不写 ≠ 章节完整**: 即使你觉得章节"看起来完成", 也要自检每个 sub_point 至少有 2 个 paper_id 引用, 否则应当标注
 - **query 应该是搜索关键词, 不是 paper_id** (系统会用 query 调 arxiv 扩候选池)
 - **query 应该精准**: 1-5 个, 每个 query 是一类文献的关键词 (例: "BB84 protocol original", "MDI-QKD experiment", "decoy-state method")
 - **注意**: 标注必须是合法 HTML 注释格式, 且在 markdown 末尾 (其他内容前/中会被审计标 ❌)
@@ -272,11 +304,13 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 
 
 # 章节类型 → 引用配额(覆盖度审计的软约束参考)
+# 9-08 23:50 user 拍板: claim-centric 视角下, sub_points 涨到 5-8 个,
+# 章节长度 1500-2500 字, 引用配额同步上调 (progress/method_compare 核心章节翻倍)
 SECTION_REF_QUOTAS = {
     "intro":          "0-2 个引用,主要讲背景和综述范围",
-    "progress":       "5-10 个引用,核心进展章节",
-    "method_compare": "3-8 个引用,按机制/性能/场景组织",
-    "gap":            "1-3 个引用,以反例为主",
+    "progress":       "8-15 个引用,核心进展章节 (5-8 sub_point × 2-3 引用/sub_point)",
+    "method_compare": "6-12 个引用,按机制/性能/场景组织 (5-8 sub_point × 2-3 引用/sub_point)",
+    "gap":            "3-5 个引用,以反例为主, 支撑「研究空白」判断",
     "outlook":        "0-2 个引用,基于 gap 推断",
 }
 
@@ -449,6 +483,92 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 
 请返回严格 JSON (不要 markdown fence, 不要其它 text):
 {{"thought": "为什么这样选 (一句话)", "action": "action_name", "args": {{...}}}}"""
+
+
+# ============================================================
+# 4. SURVEY_RELEVANCE_SCORE_PROMPT — per-paper 相关性评分 (2026-09-09 加)
+# ============================================================
+# 9-09 user 实测: 量子态验证综述召回了 30+ 篇层析/密钥分发论文, chroma 语义相似误召严重
+# 解决: recall 完跑 LLM 0-10 精筛, 阈值 (默认 7) 踢出误召
+#
+# 设计要点:
+#   - 5 篇/批 (config 可调), 1 次 LLM = 1 个 batch 的 JSON 数组输出
+#   - 显式强调"邻近但不同子领域" 应降分, 防 LLM 因共享术语给高相关
+#   - is_adjacent_field 字段独立记录, 落 _pool.json 后 _audit.md 可展示"高/中/低相关分布"
+SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性判别助手。
+
+【综述主题】: {topic}
+
+【任务】: 对下面 {batch_size} 篇论文, **每篇独立打分** (0-10, 整数), 评估"该论文核心贡献是不是主题 X 本身"。
+
+【打分尺度】
+  9-10 = 核心论文, 主题完全契合, 应作为综述主引
+  7-8  = 强相关, 主题的某子方向或关键技术
+  4-6  = 弱相关, 共享术语但不是同一子领域
+  1-3  = 误召, 看起来像但不是 (邻近但不同子领域)
+  0    = 完全无关
+
+【特别注意】(user 9-09 反复实测的关键)
+"主题 X" **不等于** "包含 X 关键词"。邻近但不同的子领域要严格降分。
+经典反例:
+  - "quantum state verification" (yes/no 验证) ≠ "quantum state tomography" (完整密度矩阵重建)
+  - "容错量子计算" ≠ "量子模拟"
+  - "transformer 架构" ≠ "BERT 预训练"
+如果论文核心是邻近子领域, 即便共享主术语, score 应 <= 3。
+不要因为 title/abstract 含主题词就给高分 — 必须看 core_method + core_contrib 的实质内容。
+
+【论文列表】(共 {batch_size} 篇):
+{papers_block}
+
+【输出】(严格 JSON 数组, {batch_size} 个对象, 不要 markdown 包裹, 不要前缀解释)
+[
+  {{"paper_id": "<id>", "score": <int 0-10>, "reason": "1 句判断依据", "is_adjacent_field": <bool>}},
+  ...
+]
+只输出 JSON 数组, 不要其他文字。"""
+
+
+def build_relevance_score_prompt(topic: str, papers_batch: list) -> str:
+    """
+    构造 per-paper 相关性评分 prompt (5 篇/批, batch_size 由 config 决定).
+
+    papers_batch: list of pool entry dict, 每条至少有 {paper_id, title, core_method, core_contrib}
+                  可选 {abstract, year, journal} (缺字段容忍)
+    """
+    from agent.tools.config import get_relevance_batch_size
+    batch_size = get_relevance_batch_size()
+
+    lines = []
+    for i, p in enumerate(papers_batch, 1):
+        pid = p.get("paper_id", "?")
+        title = (p.get("title") or "").strip()
+        method = (p.get("core_method") or "").strip()
+        contrib = (p.get("core_contrib") or "").strip()
+        abstract = (p.get("abstract") or "").strip()
+        year = p.get("year", "") or ""
+        journal = p.get("journal", "") or ""
+
+        # 单论文 block: paper_id 必带, 其他缺则空字符串
+        block_lines = [f"{i}. paper_id={pid}"]
+        if title:
+            block_lines.append(f"   title: {title[:200]}")
+        if year or journal:
+            block_lines.append(f"   venue: {year}{', ' + journal if journal else ''}")
+        if method:
+            block_lines.append(f"   core_method: {method[:200]}")
+        if contrib:
+            block_lines.append(f"   core_contrib: {contrib[:200]}")
+        if abstract:
+            block_lines.append(f"   abstract: {abstract[:400]}")
+        lines.append("\n".join(block_lines))
+
+    papers_block = "\n\n".join(lines)
+
+    return SURVEY_RELEVANCE_SCORE_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        batch_size=batch_size,
+        papers_block=papers_block,
+    )
 
 
 # ============================================================
