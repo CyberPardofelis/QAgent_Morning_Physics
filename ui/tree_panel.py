@@ -1,4 +1,4 @@
-﻿# tree_panel.py
+# tree_panel.py
 import json
 from datetime import datetime
 from PySide6.QtCore import Qt, QSettings

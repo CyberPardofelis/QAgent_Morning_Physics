@@ -74,7 +74,7 @@ TOOL_GUIDE = """【可用工具指南】
 ### 知识库查询 (本地兜底)
 - `query_knowledge(keyword?, topic?, author?)` — 查询知识库(全文 / 主题 / 作者)
 - `get_recent_papers(limit=15)` — 获取最近分析的论文
-- `semantic_search_keywords(query, top_k=10, year?, journal?, section?, topic_keyword?)` — 语义检索(走 paper_keywords collection)
+- `semantic_search_keywords(query, top_k=10, year?, journal?, section?, topic_keyword?)` — 语义检索(走 paper_keywords collection, **9-09 改: 只返总数, 不返 paper_id / title / 摘要**, 需要单篇详情改调 `query_knowledge(paper_id)`)
 - `similar_papers(paper_id, top_k=5)` — 找相似论文
 
 ### 联网搜索 (末位工具, 默认不用)

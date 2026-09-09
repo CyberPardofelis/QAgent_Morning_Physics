@@ -1,4 +1,4 @@
-﻿# ui/comparison_config_dialog.py
+# ui/comparison_config_dialog.py
 import json
 from PySide6.QtCore import QSettings
 from config.settings import get_settings

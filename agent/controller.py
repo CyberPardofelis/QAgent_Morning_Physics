@@ -28,7 +28,6 @@ from agent.llm_clients import (
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools.registry import ToolRegistry
 from agent.cost_guard import get_cost_guard
-from agent.stream_utils import split_markdown_bubbles
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -638,22 +637,6 @@ def _dispatch_tool(fn_name: str, args: dict) -> str:
         if chunk:
             collected.append(chunk)
     return "".join(collected)
-
-
-def _split_into_bubbles(content: str) -> Iterator[str]:
-    """
-    把 DIRECT_OUTPUT 工具返回的长 Markdown 内容按 ### 标题切气泡。
-    每段 yield 一次（用 NEW_BUBBLE 分隔）。
-    如果没有 ### 标题，整个内容一个气泡。
-    """
-    if not content or not content.strip():
-        return
-
-    bubbles = split_markdown_bubbles(content)
-    for bubble in bubbles:
-        if bubble.strip():
-            yield bubble
-            yield NEW_BUBBLE
 
 
 # ============================================================

@@ -1,4 +1,4 @@
-﻿from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings
 from config.settings import get_settings
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QTextEdit, QHBoxLayout,

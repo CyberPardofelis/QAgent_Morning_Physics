@@ -1,4 +1,4 @@
-﻿# chat_window.py
+# chat_window.py
 import json
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QSettings, QEvent

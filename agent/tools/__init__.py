@@ -32,9 +32,12 @@ from .arxiv import (
     generate_daily_summary_arxiv, analyze_today_topic_arxiv,
 )
 from .aps import (
-    generate_aps_daily_summary, download_aps_paper,
+    generate_aps_daily_summary, download_aps_paper, search_aps,
     fetch_aps_page_via_browser, parse_aps_papers_from_html,
 )
+# 2026-09-09 P0.6: IOP 工具集 (新文件)
+from . import iop
+from .iop import search_iop
 from .utils import load_journal_config, JOURNAL_CONFIG  # run_python 2026-09-04 停用,函数仍在 utils.py 但不导入(避免误用)
 
 # 9-08 20:08 user 拍板: 加 surveys import, 触发 @register_tool(survey_generate, survey_audit)
@@ -74,11 +77,12 @@ __all__ = [
     "init_db", "get_paper_by_id", "update_paper_comment", "get_recent_papers",
     "get_recent_papers_raw", "update_paper_llm_summary", "update_full_paper",
     "analyze_paper", "query_knowledge", "scan_local_papers", "migrate_json_to_db",
-    # arXiv / APS
+    # arXiv / APS / IOP
     "search_arxiv", "download_arxiv_paper", "generate_daily_summary_arxiv",
     "analyze_today_topic_arxiv",
-    "generate_aps_daily_summary", "download_aps_paper",
+    "generate_aps_daily_summary", "download_aps_paper", "search_aps",
     "fetch_aps_page_via_browser", "parse_aps_papers_from_html",
+    "search_iop",
     # 工具(2026-09-04:run_python 停用,不导出)
     # 搜索
     "web_search",

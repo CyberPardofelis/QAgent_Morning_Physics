@@ -1,4 +1,4 @@
-﻿"""
+"""
 ui.settings_dialog — 设置对话框
 
 8 个标签页（按 WAgent 风格组织 + 保留 QAgent 专属）：

@@ -5,10 +5,23 @@ data/_*.txt
 data/_*.log
 data/
 
-test_stream_render.py
-
-test_v4.py
-tests/
+# P1.5 改: 不再整体排除 tests/, 改用精细排除
+# 真正测试 test_*.py 全部进 git
+# 临时 smoke/debug 脚本 _*.py 不进 git
+# _archive 目录整体不进 git
+# .qagent_qte_pids / __pycache__ 是运行残留, 不进 git
+tests/__pycache__/
+tests/.qagent_qte_pids
+tests/_archive/
+tests/_archive_debug_regress.py
+tests/_*.py
+tests/_*.txt
+tests/_*.log
+tests/_*.png
+tests/_*.bak
+tests/_archive_v6_mathimg_demo/
+tests/_archive_v7_mathimg_demo/
+tests/_matplotlib_test/
 
 *.spec
 
@@ -20,3 +33,6 @@ docs/
 
 mathjax/
 ui/mathjax/
+
+# 体检清理暂存区（git rm 前先 mv 到这里，等 user 拍板再永久删）
+_trash_*/

@@ -10,6 +10,14 @@ from agent.tools.registry import register_tool
 from agent.tools.browser_pool import get_browser_pool
 from agent.tools.summary import save_summary_item
 from agent.tools.summary_parser import parse_summary_markdown
+# 2026-09-09 P0.6: 走 OpenAlex API 搜 APS (避免 journals.aps.org 403 反爬)
+from agent.tools.openalex import (
+    openalex_search as _openalex_search,
+    format_paper_markdown as _openalex_format_paper,
+    resolve_source_ids as _resolve_openalex_source_ids,
+    OPENALEX_APS_SOURCES as _OPENALEX_APS_SOURCES,
+    OPENALEX_APS_DEFAULT_QUANT_PH as _OPENALEX_APS_DEFAULT_QUANT_PH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,3 +377,78 @@ def download_aps_paper(doi: str) -> str:
         return f"✅ 已下载：{path}  ({os.path.getsize(path)} bytes)"
     except Exception as e:
         return f"❌ 下载失败: {str(e)}"
+
+
+# ============================================================
+# 2026-09-09 P0.6: search_aps — APS 期刊关键词搜索
+# 走 OpenAlex API (避免 journals.aps.org 反爬)
+# 默认覆盖 quant-ph 主阵地: PRL + PRA + PRX Quantum + PRX + RMP
+# ============================================================
+@register_tool(name="search_aps", is_streaming=False, cost_tier="L0")
+def search_aps(
+    query: str,
+    max_results: int = 10,
+    journals: str = "",
+) -> str:
+    """
+    在 APS 期刊中按关键词搜索论文（走 OpenAlex, 不调 LLM）。
+
+    Args:
+        query: 自由文本查询, e.g. "quantum error correction" / "topological insulator"
+        max_results: 最多返回多少篇 (1-200, 默认 10)
+        journals: 逗号分隔的期刊 short_name, 限定搜索范围
+                  可选: prl, pra, prb, prc, prd, pre, prx, prxquantum, prapplied, prresearch, prmaterials, rmp
+                  空 = 默认 quant-ph 集 (prl, pra, prxquantum, prx, rmp)
+
+    Returns:
+        Markdown 格式的论文列表, 含 DOI 链接 / 作者 / 日期 / 期刊 / 摘要 / PDF (OA)
+
+    触发场景:
+      - 用户说 "搜一下 APS 上 X 主题的论文" / "PRL 有没有 X 的文章" / "在 PRA 找 X"
+      - 用户说 "search APS for X" / "find PRL paper on X"
+    """
+    if not query or not query.strip():
+        return "❌ query 不能为空"
+
+    query = query.strip()
+    max_results = max(1, min(int(max_results), 200))
+
+    # 解析 journals 参数
+    if journals and journals.strip():
+        wanted = [j.strip() for j in journals.split(",") if j.strip()]
+    else:
+        wanted = _OPENALEX_APS_DEFAULT_QUANT_PH
+    source_ids = _resolve_openalex_source_ids(wanted, _OPENALEX_APS_SOURCES)
+    if not source_ids:
+        return f"❌ 没有任何合法期刊 short_name (传入={wanted!r}, 可用={list(_OPENALEX_APS_SOURCES.keys())})"
+
+    # 哪些 short_name 落空了 (没匹配到)
+    resolved_short = set(_OPENALEX_APS_SOURCES.keys())
+    unmatched = [w for w in wanted if w.lower() not in resolved_short]
+
+    try:
+        results = _openalex_search(
+            query=query,
+            source_ids=source_ids,
+            max_results=max_results,
+        )
+    except Exception as e:
+        return f"❌ APS 搜索失败 (OpenAlex): {e}"
+
+    if not results:
+        return (
+            f"未找到匹配 '{query}' 的 APS 论文\n"
+            f"- 搜索范围: {', '.join(wanted)}\n"
+            f"- 建议: 换个关键词, 或放宽 journals (例: 空 = 默认 PRL+PRA+PRXQuantum+PRX+RMP)"
+        )
+
+    journal_label = ", ".join(wanted)
+    header_lines = [
+        f"找到 {len(results)} 篇 APS 论文 (query='{query}', 期刊: {journal_label}):\n",
+    ]
+    body = "\n\n".join(_openalex_format_paper(w, i) for i, w in enumerate(results, 1))
+    footer = ""
+    if unmatched:
+        footer = f"\n\n⚠ 未识别的 short_name: {unmatched} (可用的: {list(_OPENALEX_APS_SOURCES.keys())})"
+    return "\n".join(header_lines) + body + footer
+

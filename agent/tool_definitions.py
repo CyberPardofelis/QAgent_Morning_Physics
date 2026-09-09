@@ -203,6 +203,107 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
 
     # ============================================================
+    # search_aps: APS 期刊关键词搜索 (2026-09-09 P0.6 新增)
+    # 走 OpenAlex, 覆盖 PRL/PRA/PRB/PRC/PRD/PRE/PRX/PRXQuantum/RMP
+    # 默认 quant-ph 主阵地: PRL + PRA + PRX Quantum + PRX + RMP
+    # ============================================================
+    "search_aps": {
+        "type": "function",
+        "function": {
+            "name": "search_aps",
+            "description": (
+                "在 APS 期刊 (PRL/PRA/PRB/PRC/PRD/PRE/PRX/PRXQuantum/RMP 等) 中按关键词搜索论文, "
+                "走 OpenAlex 公开 API (不爬 journals.aps.org, 避免反爬)。返回 Markdown 格式论文列表, "
+                "含 DOI 链接 / 作者 / 发布日期 / 期刊 / 摘要 / 引用数 / PDF (OA)。\n"
+                "**触发场景**:\n"
+                "  - 用户说 '搜一下 APS 上 X 主题的论文' / 'PRL 有没有 X 的文章' / '在 PRA 找 X'\n"
+                "  - 用户说 'search APS for X' / 'find PRL paper on X' / 'APS X 方向'\n"
+                "**重要约束**:\n"
+                "  - journals 参数是逗号分隔的 short_name 列表, 例: 'prl,pra,prxquantum'\n"
+                "  - 空 = 默认 quant-ph 集 (prl, pra, prxquantum, prx, rmp)\n"
+                "  - 是 DIRECT_OUTPUT 工具, 调完工具后直接输出工具返回的 markdown"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自由文本查询, e.g. 'quantum error correction' / 'topological insulator'"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "最多返回多少篇"
+                    },
+                    "journals": {
+                        "type": "string",
+                        "default": "",
+                        "description": (
+                            "逗号分隔的 APS 期刊 short_name, 限定搜索范围. "
+                            "可选: prl, pra, prb, prc, prd, pre, prx, prxquantum, prapplied, "
+                            "prresearch, prmaterials, rmp. "
+                            "空 = 默认 quant-ph 集 (prl, pra, prxquantum, prx, rmp)"
+                        )
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ============================================================
+    # search_iop: IOP 期刊关键词搜索 (2026-09-09 P0.6 新增)
+    # 走 OpenAlex, 覆盖 NJP / J. Phys. A/B/D/CM / J. Opt. / J. Phys. Conf.
+    # 默认 quant-ph 主阵地: NJP + J. Phys. A + J. Phys. B + J. Opt.
+    # ============================================================
+    "search_iop": {
+        "type": "function",
+        "function": {
+            "name": "search_iop",
+            "description": (
+                "在 IOP 期刊 (NJP / J. Phys. A/B/D/Condensed Matter / J. Opt. / Conf. Series) 中按关键词搜索论文, "
+                "走 OpenAlex 公开 API (不爬 iopscience.iop.org, 避免 hCaptcha)。返回 Markdown 格式论文列表, "
+                "含 DOI 链接 / 作者 / 发布日期 / 期刊 / 摘要 / 引用数 / PDF (OA)。\n"
+                "**触发场景**:\n"
+                "  - 用户说 '搜一下 NJP 上 X 主题的论文' / 'IOP 有没有 X 的文章' / '在 New Journal of Physics 找 X'\n"
+                "  - 用户说 'search IOP for X' / 'find NJP paper on X'\n"
+                "**重要约束**:\n"
+                "  - journals 参数是逗号分隔的 short_name 列表, 例: 'njp,jphysa,jopt'\n"
+                "  - 空 = 默认 quant-ph 集 (njp, jphysa, jphysb, jopt)\n"
+                "  - 是 DIRECT_OUTPUT 工具, 调完工具后直接输出工具返回的 markdown"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自由文本查询, e.g. 'quantum error correction' / 'topological phase'"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "最多返回多少篇"
+                    },
+                    "journals": {
+                        "type": "string",
+                        "default": "",
+                        "description": (
+                            "逗号分隔的 IOP 期刊 short_name, 限定搜索范围. "
+                            "可选: njp, jphysa, jphysb, jphysd, jphyscm, jopt, jphysconf. "
+                            "空 = 默认 quant-ph 集 (njp, jphysa, jphysb, jopt)"
+                        )
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ============================================================
     # query_knowledge: 知识库查询
     # ============================================================
     "query_knowledge": {
@@ -373,7 +474,8 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "description": (
                 "基于语义相似度检索 summary_items 库(走 chroma paper_keywords collection,本地免费)。"
                 "支持 metadata 过滤(source / since_date / in_papers_db_only)。"
-                "返回按相似度排序的 summary_item 列表, 每条带 paper_id / title / source / date / distance。"
+                "**9-09 改: 只返总数 (例: '找到 5 条相关 summary_item'), 不返 paper_id / title / 摘要 / 相似度 等具体内容。**"
+                "LLM 需要单篇详情时, 改调 `query_knowledge(paper_id)` 按 id 精确查, 不要在本工具结果里展开。"
                 "跟 `semantic_search` 区别: `semantic_search` 走 papers chunks(已精细分析的论文,粒度=section级);"
                 "这个走 summary_items(抓文级,粒度=论文级,适用于召回没分析过的最新抓文)。"
                 "适用: '找和拓扑码贡献最像的论文' / '召回最近抓的 X 主题论文'。"

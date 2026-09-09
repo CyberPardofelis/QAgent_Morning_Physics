@@ -1,4 +1,4 @@
-﻿# input_panel.py — 移植 WAgent 附件系统 + 保留 QAgent 高度自适应
+# input_panel.py — 移植 WAgent 附件系统 + 保留 QAgent 高度自适应
 #
 # 结构（外层垂直布局）：
 #   1. 附件 chip 横滚条（无附件时高度=0 完全隐藏）

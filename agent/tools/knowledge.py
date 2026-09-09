@@ -824,36 +824,11 @@ def semantic_search_keywords(
     if not res or not res.get("ids") or not res["ids"][0]:
         return f"未找到匹配 '{query}' 的 summary_item(可放宽过滤条件重试)。"
 
-    # 整理结果
-    lines = [f"{res_note}找到 {len(res['ids'][0])} 条相关 summary_item(query='{query}'):\n"]
-    for i, cid in enumerate(res["ids"][0]):
-        meta = res["metadatas"][0][i] if res.get("metadatas") else {}
-        doc = res["documents"][0][i] if res.get("documents") else ""
-        dist = res["distances"][0][i] if res.get("distances") else None
-        title = meta.get("title", "(无标题)")
-        paper_id = meta.get("paper_id", "?")
-        src = meta.get("source", "?")
-        date = meta.get("summary_date", "")
-        in_db = meta.get("in_papers_db", False)
-        kw = meta.get("keywords", "")
-
-        lines.append(f"{i + 1}. **{title}**")
-        lines.append(f"   - ID: `{paper_id}`")
-        if src:
-            lines.append(f"   - 来源: {src} | 日期: {date}")
-        if kw:
-            lines.append(f"   - 关键词: {kw[:120]}")
-        if in_db:
-            lines.append(f"   - ✅ 已精细分析(可调 `query_knowledge` 看详情)")
-        if dist is not None:
-            lines.append(f"   - 相似度: {1 - dist:.3f} (distance={dist:.4f})")
-        # 摘要片段
-        snippet = (doc or "")[:300]
-        if snippet:
-            lines.append(f"   - 摘要片段: {snippet}...")
-        lines.append("")
-
-    return "\n".join(lines)
+    # 9-09 user 拍板: 只返总数, 不贴 paper_id / title / snippet / 相似度 等具体结果
+    # 完整信息: 内部 res 变量仍有 (调试时 print(res) 可见), 但不返给 LLM/用户
+    # LLM 需要详情时, 调 `query_knowledge(paper_id)` 按 id 单篇查; 不在 search 工具里展开
+    count = len(res["ids"][0])
+    return f"{res_note}找到 {count} 条相关 summary_item(query='{query}')。"
 
 
 # ============================================================
