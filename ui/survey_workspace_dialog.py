@@ -177,7 +177,10 @@ class SurveyWorkspaceDialog(QDialog):
         kind, nid = node.data(0, Qt.UserRole)
 
         # 切换前先检查是否有未保存
-        if self._dirty:
+        # 9-11 user 拍板: 查看 tab (index=0) 是只读浏览模式, 不弹未保存提示 (影响浏览体验)
+        # 只有编辑 tab (index=1) 才检查 dirty 并弹 Save/Discard/Cancel
+        is_view_tab = self.center_tabs.currentIndex() == 0
+        if self._dirty and not is_view_tab:
             ret = QMessageBox.question(
                 self, "未保存",
                 "当前章节有未保存修改, 是否保存?",
