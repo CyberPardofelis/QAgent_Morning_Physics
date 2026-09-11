@@ -128,9 +128,20 @@ def _audit_section_paper_ids(content_md: str, pool_ids: set) -> Dict[str, List[s
 # ============================================================
 # Phase A: 候选池构建 (9-09 升级: 三道防线)
 # ============================================================
-def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]]:
+def _build_candidate_pool(
+    topic: str,
+    max_pool: int = 50,
+) -> "tuple[List[Dict[str, Any]], Dict[str, str]]":
     """
-    Phase A: 候选池构建 (9-09 升级: 三道防线)
+    Phase A: 候选池构建 (9-09 升级: 三道防线, 9-09 19:30 user 拍板返 status dict)
+
+    Returns:
+        (pool, build_status)  ← 9-09 改返 tuple, 调用方能区分 arxiv 失败原因
+        - build_status["arxiv_status"]:
+            "skipped"     pool 已够大, 没调 arxiv
+            "0_results"   arxiv 调用成功但没返回 paper (常因中文 topic)
+            "exception:TypeError: msg"   arxiv 抛异常 (网络/解析/库问题)
+            "success"     arxiv 拉到了 paper
 
     三路召回, union + 去重:
       1. summary_items.db 关键词匹配 (title/abstract/core_method/core_contrib/keywords/outlook)
@@ -261,6 +272,7 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
 
     # ========== 3. arxiv API 兜底 (9-08: 最小阈值走 env QAGENT_SURVEY_MIN_POOL, 默认 30) ==========
     if len(pool_dict) < _MIN_POOL:
+        arxiv_status = "0_results"  # 默认 0 results, 拉到了再改 success
         try:
             import arxiv
             need = max(_MIN_POOL, max_pool) - len(pool_dict)
@@ -270,6 +282,7 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
                 sort_by=arxiv.SortCriterion.Relevance,
             )
             client = arxiv.Client()
+            arxiv_added = 0
             for r in client.results(search):
                 pid = r.entry_id.split("/")[-1].split("v")[0]
                 if pid in seen_ids:
@@ -287,10 +300,16 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
                     "_match_score": 0,
                     "_source": "arxiv_api_fallback",
                 })
+                arxiv_added += 1
                 if len(pool_dict) >= max(_MIN_POOL, max_pool):
                     break
+            if arxiv_added > 0:
+                arxiv_status = "success"
         except Exception as e:
+            arxiv_status = f"exception:{type(e).__name__}:{str(e)[:100]}"
             logger.warning("[_build_candidate_pool] arxiv 兜底失败: %s", e)
+    else:
+        arxiv_status = "skipped"  # pool 已够大, 没调 arxiv
 
     # ========== 4. 9-09 user 拍板: per-paper LLM 相关性评分精筛 ==========
     # 解决"邻近子领域误召" (例: 量子态验证召进 30 篇层析/密钥分发)
@@ -313,7 +332,7 @@ def _build_candidate_pool(topic: str, max_pool: int = 50) -> List[Dict[str, Any]
 
     pool = sorted(pool_dict.values(), key=_sort_key)
     # 限 max_pool
-    return pool[:max_pool]
+    return pool[:max_pool], {"arxiv_status": arxiv_status}
 
 
 # ============================================================
@@ -352,7 +371,7 @@ def _relevance_filter_pool(
         topic[:50], len(items), batch_size, threshold,
     )
 
-    scored: Dict[str, Dict[str, Any]] = {}  # paper_id -> {score, reason, is_adjacent_field}
+    scored: Dict[str, Dict[str, Any]] = {}  # paper_id -> {score, reason, is_about_topic, is_adjacent_field}
 
     # 批量化
     for i in range(0, len(items), batch_size):
@@ -385,33 +404,52 @@ def _relevance_filter_pool(
                 score = r.get("score")
                 if not isinstance(score, (int, float)):
                     score = 5  # 中性 fallback
+                # 9-09 严判: 提取 is_about_topic (跟 score 冗余但更清晰, 缺则从 score 回填)
+                about_raw = r.get("is_about_topic")
+                if about_raw is None:
+                    is_about = int(score) >= 8
+                else:
+                    is_about = bool(about_raw)
                 scored[pid] = {
                     "score": int(score),
                     "reason": str(r.get("reason", ""))[:200],
+                    "is_about_topic": is_about,
                     "is_adjacent_field": bool(r.get("is_adjacent_field", False)),
                 }
             # 漏评的 (LLM 没返) 用中性分保留
             for p in batch:
                 pid = p.get("paper_id", "")
                 if pid and pid not in scored:
-                    scored[pid] = {"score": 5, "reason": "[fallback] LLM 未评, 用中性分", "is_adjacent_field": False}
+                    scored[pid] = {
+                        "score": 5, "reason": "[fallback] LLM 未评, 用中性分",
+                        "is_about_topic": False, "is_adjacent_field": False,
+                    }
         except Exception as e:
             # 整批失败: 整批 5 篇用中性分保留 (降级, 不剔除)
             logger.warning("[_relevance_filter_pool] batch %d 失败 (整批保留): %s", i // batch_size, e)
             for p in batch:
                 pid = p.get("paper_id", "")
                 if pid and pid not in scored:
-                    scored[pid] = {"score": 5, "reason": f"[batch_failed] {type(e).__name__}", "is_adjacent_field": False}
+                    scored[pid] = {
+                        "score": 5, "reason": f"[batch_failed] {type(e).__name__}",
+                        "is_about_topic": False, "is_adjacent_field": False,
+                    }
 
-    # 把 _relevance_score 写回 pool_dict
+    # 把评分写回 pool_dict
     for pid, p in pool_dict.items():
         s = scored.get(pid, {})
         p["_relevance_score"] = s.get("score", 5)
         p["_relevance_reason"] = s.get("reason", "")
+        p["_is_about_topic"] = s.get("is_about_topic", False)
         p["_is_adjacent_field"] = s.get("is_adjacent_field", False)
 
-    # 过滤: 保留 score >= threshold 的; 兜底: 过滤后 < 5 篇时, 加回 top 5 by score
-    kept = {pid: p for pid, p in pool_dict.items() if p["_relevance_score"] >= threshold}
+    # 9-09 严判: 双重过滤 — score >= threshold **AND** is_about_topic = True
+    # is_about_topic 是 LLM 显式给的二元判断, 比单纯 score 阈值更可靠
+    # 邻近子领域 paper (is_about_topic=False) 一律踢掉, 即便 score=7
+    kept = {
+        pid: p for pid, p in pool_dict.items()
+        if p["_relevance_score"] >= threshold and p["_is_about_topic"]
+    }
 
     # 9-09 优化: 全部 paper 都标 [fallback] / [batch_failed] → LLM 整体失败, 不应用任何过滤
     all_fallback = all(
@@ -427,15 +465,16 @@ def _relevance_filter_pool(
 
     if len(kept) < 5 and len(kept) > 0:
         # 兜底: 取剩余的按 score 倒序, 补足到 5 篇 (避免下游 "候选池为空" 假阳)
+        before_rescue = len(kept)
         remaining = sorted(
             (p for pid, p in pool_dict.items() if pid not in kept),
-            key=lambda x: -x["_relevance_score"],
+            key=lambda x: (-x["_relevance_score"], not x["_is_about_topic"]),  # 优先 is_about_topic=True
         )
         for p in remaining[:5 - len(kept)]:
             kept[p["paper_id"]] = p
         logger.warning(
-            "[_relevance_filter_pool] threshold=%d 过滤后剩 %d 篇 < 5, 兜底补足到 5 篇",
-            threshold, len(kept),
+            "[_relevance_filter_pool] threshold=%d 严判后剩 %d 篇 < 5, 兜底补足到 %d 篇 (含邻近子领域, 审计时会标 ❌)",
+            threshold, before_rescue, len(kept),
         )
 
     if not kept:
@@ -445,11 +484,141 @@ def _relevance_filter_pool(
     n_filtered = len(pool_dict) - len(kept)
     if n_filtered > 0:
         logger.info(
-            "[_relevance_filter_pool] 过滤掉 %d 篇 (score<%d), 保留 %d 篇",
+            "[_relevance_filter_pool] 过滤掉 %d 篇 (score<%d 或 is_about_topic=False), 保留 %d 篇",
             n_filtered, threshold, len(kept),
         )
 
     return kept
+
+
+# ============================================================
+# per-fact 主题对齐审查 (9-09 user 拍板加, mechanism B)
+# ============================================================
+# 跟 _relevance_filter_pool 配套, 但作用于 fact 而非 paper
+# 位置: action_extract_facts 末尾 (Step 2 完成后, Step 3 write_outline 之前)
+#
+# 设计:
+#   - generator, 每批 yield 一次进度 (避免用户看到 30s 静默)
+#   - 8 条/批 (config 可调), 1 次 LLM = 1 个 batch 的 JSON 数组
+#   - 不删除非对齐 fact, 只打标 (audit 用, 落 _facts.jsonl + _finalize_survey 段)
+#   - LLM 整体失败 → 所有 fact 标 fallback, 不报错 (让用户看到原始 fact 列表)
+def _review_facts_topic_alignment(
+    topic: str,
+    facts: List[Dict[str, Any]],
+    threshold: int,
+) -> "tuple[Dict[str, Dict[str, Any]], Dict[str, int]]":
+    """
+    per-fact 主题对齐审查 (9-09 user 拍板加).
+
+    输入:
+      - topic: 综述主题
+      - facts: list of fact dict (来自 state["facts"], 每条至少有 fact_id/paper_id/claim)
+      - threshold: >= threshold 算主题对齐, < threshold 算邻近子领域
+
+    输出:
+      - scored_facts: dict[fact_id] -> {score, is_topic_aligned, reason}
+      - stats: {aligned: N, misaligned: M, fallback: K, total: T}
+
+    容错:
+      - 整批 LLM 失败 → 该批 8 条用中性分 (score=5, is_topic_aligned=True, 保留)
+      - 单条 JSON parse 失败 → 该条用中性分
+      - 全部 fallback → 返回 (空 scored, stats with fallback 计数)
+    """
+    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_fact_review_prompt
+
+    _PROVIDER = "minimax"
+    _MODEL = "MiniMax-M3"
+    from agent.tools.config import get_fact_review_batch_size
+    batch_size = get_fact_review_batch_size()
+
+    if not facts:
+        return {}, {"aligned": 0, "misaligned": 0, "fallback": 0, "total": 0}
+
+    logger.info(
+        "[_review_facts_topic_alignment] topic=%r, fact %d 条, batch_size=%d, threshold=%d",
+        topic[:50], len(facts), batch_size, threshold,
+    )
+
+    scored: Dict[str, Dict[str, Any]] = {}  # fact_id -> {score, is_topic_aligned, reason}
+    stats = {"aligned": 0, "misaligned": 0, "fallback": 0, "total": len(facts)}
+
+    # 用 fact_id 作 key, 如果 fact_id 缺失则用 (paper_id, claim 短 hash) 兜底
+    def _fact_key(f: Dict[str, Any], idx: int) -> str:
+        fid = f.get("fact_id")
+        if fid:
+            return str(fid)
+        pid = f.get("paper_id", "?")
+        claim_hash = hash(str(f.get("claim", ""))[:50]) & 0xFFFF
+        return f"{pid}:{idx}:{claim_hash}"
+
+    for i in range(0, len(facts), batch_size):
+        batch = facts[i: i + batch_size]
+        batch_keys = [_fact_key(f, i + j) for j, f in enumerate(batch)]
+        try:
+            prompt = build_fact_review_prompt(topic, batch)
+            out = _call_llm(
+                prompt,
+                provider=_PROVIDER,
+                model=_MODEL,
+                enable_thinking=False,
+                temperature=0.2,
+                max_tokens=3000,    # 8 条 × ~80 token/条 + JSON overhead
+                timeout=120,
+            )
+            if out and "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+            results = _safe_json_loads_array(out or "")
+            if results is None:
+                raise ValueError(f"fact review batch JSON parse 失败: {(out or '')[:200]}")
+            # 用 fact_id 匹配; LLM 可能没严格用我们的 fact_id, 用 paper_id + 顺序回退匹配
+            for j, r in enumerate(results):
+                if not isinstance(r, dict):
+                    continue
+                # 优先用 r["fact_id"]; 没有则按 batch 顺序回退
+                fid = r.get("fact_id") or batch_keys[min(j, len(batch_keys) - 1)]
+                score = r.get("score")
+                if not isinstance(score, (int, float)):
+                    score = 5
+                align_raw = r.get("is_topic_aligned")
+                if align_raw is None:
+                    is_aligned = int(score) >= threshold
+                else:
+                    is_aligned = bool(align_raw)
+                scored[fid] = {
+                    "score": int(score),
+                    "is_topic_aligned": is_aligned,
+                    "reason": str(r.get("reason", ""))[:200],
+                    "paper_id": r.get("paper_id", batch[min(j, len(batch) - 1)].get("paper_id", "?")),
+                }
+            # 漏评的用中性分
+            for j, f in enumerate(batch):
+                fk = batch_keys[j]
+                if fk not in scored:
+                    scored[fk] = {
+                        "score": 5, "is_topic_aligned": True,  # fallback 默认对齐 (保守)
+                        "reason": "[fallback] LLM 未评, 用中性分", "paper_id": f.get("paper_id", "?"),
+                    }
+        except Exception as e:
+            logger.warning("[_review_facts_topic_alignment] batch %d 失败 (整批保留): %s", i // batch_size, e)
+            for j, f in enumerate(batch):
+                fk = batch_keys[j]
+                if fk not in scored:
+                    scored[fk] = {
+                        "score": 5, "is_topic_aligned": True,
+                        "reason": f"[batch_failed] {type(e).__name__}", "paper_id": f.get("paper_id", "?"),
+                    }
+
+    # 统计
+    for s in scored.values():
+        if s["reason"].startswith(("[fallback]", "[batch_failed]")):
+            stats["fallback"] += 1
+        elif s["is_topic_aligned"]:
+            stats["aligned"] += 1
+        else:
+            stats["misaligned"] += 1
+
+    return scored, stats
 
 
 # ============================================================

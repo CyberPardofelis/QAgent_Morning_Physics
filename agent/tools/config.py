@@ -108,17 +108,17 @@ def get_max_section_tokens() -> int:
 def _resolve_survey_relevance_threshold() -> int:
     raw = os.getenv("QAGENT_SURVEY_RELEVANCE_THRESHOLD", "").strip()
     if not raw:
-        return 7
+        return 8  # 9-09 user 拍板: 7 → 8 严判 (只保留 is_about_topic=True 的 paper, 跟邻近子领域严格区分)
     try:
         v = int(raw)
-        # 0 = 不启用 relevance filter; 1-10 = 阈值, <7 太严, >8 太松
-        return v if 0 <= v <= 10 else 7
+        # 0 = 不启用 relevance filter; 1-10 = 阈值, <7 太严, >9 太松
+        return v if 0 <= v <= 10 else 8
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
-            "[config] QAGENT_SURVEY_RELEVANCE_THRESHOLD=%r 不是合法整数, 走默认 7", raw,
+            "[config] QAGENT_SURVEY_RELEVANCE_THRESHOLD=%r 不是合法整数, 走默认 8", raw,
         )
-        return 7
+        return 8
 
 
 SURVEY_RELEVANCE_THRESHOLD = _resolve_survey_relevance_threshold()
@@ -127,6 +127,60 @@ SURVEY_RELEVANCE_THRESHOLD = _resolve_survey_relevance_threshold()
 def get_relevance_threshold() -> int:
     """per-paper 相关性评分阈值 (0=禁用, 1-10). 见 SURVEY_RELEVANCE_THRESHOLD 注释."""
     return SURVEY_RELEVANCE_THRESHOLD
+
+
+# ============================================================
+# Survey 工具: fact 主题对齐审查 (2026-09-09 加, mechanism B)
+# ============================================================
+# 9-09 user 拍板: 在 extract_facts 之后、写章节之前, 对每条 fact 做主题对齐审查
+# 跟 mechanism A (paper 严判) 配套, 确保 pool + facts 都是"主题 X 本身" 而非邻近子领域
+#
+# 抽 env, 不想用就设 0 关闭。
+
+def _resolve_survey_fact_review_threshold() -> int:
+    raw = os.getenv("QAGENT_SURVEY_FACT_REVIEW_THRESHOLD", "").strip()
+    if not raw:
+        return 5  # 默认 5 分 (>=5 算主题对齐, <5 标邻近)
+    try:
+        v = int(raw)
+        return v if 0 <= v <= 10 else 5
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[config] QAGENT_SURVEY_FACT_REVIEW_THRESHOLD=%r 不是合法整数, 走默认 5", raw,
+        )
+        return 5
+
+
+SURVEY_FACT_REVIEW_THRESHOLD = _resolve_survey_fact_review_threshold()
+
+
+def get_fact_review_threshold() -> int:
+    """fact 主题对齐阈值 (0=禁用, 1-10). 见 SURVEY_FACT_REVIEW_THRESHOLD 注释."""
+    return SURVEY_FACT_REVIEW_THRESHOLD
+
+
+def _resolve_survey_fact_review_batch_size() -> int:
+    raw = os.getenv("QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE", "").strip()
+    if not raw:
+        return 8  # fact 比 paper 短, 可以一次批更多
+    try:
+        v = int(raw)
+        return v if 1 <= v <= 20 else 8
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[config] QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE=%r 不是合法整数, 走默认 8", raw,
+        )
+        return 8
+
+
+SURVEY_FACT_REVIEW_BATCH_SIZE = _resolve_survey_fact_review_batch_size()
+
+
+def get_fact_review_batch_size() -> int:
+    """fact 审查每批条数 (默认 8). 见 SURVEY_FACT_REVIEW_BATCH_SIZE 注释."""
+    return SURVEY_FACT_REVIEW_BATCH_SIZE
 
 
 def _resolve_survey_chroma_sim_threshold() -> float:

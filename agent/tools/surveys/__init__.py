@@ -68,6 +68,7 @@ from ._pool import (
     _audit_section_paper_ids,
     _build_candidate_pool,
     _relevance_filter_pool,
+    _review_facts_topic_alignment,
     _arxiv_search,
     _arxiv_search_batch,
 )
@@ -108,7 +109,7 @@ __all__ = [
     "survey_generate", "survey_audit",
     # 内部 API (下划线开头, 旧测试可能直接 import)
     "_safe_json_loads_array", "_extract_paper_ids", "_audit_section_paper_ids",
-    "_build_candidate_pool", "_relevance_filter_pool",
+    "_build_candidate_pool", "_relevance_filter_pool", "_review_facts_topic_alignment",
     "_arxiv_search", "_arxiv_search_batch",
     "_friendly_error", "_decide_action", "_state_driven_decide",
     "_dispatch_action", "_append_react_trace", "_finalize_survey",

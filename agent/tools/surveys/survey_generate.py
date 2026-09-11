@@ -68,14 +68,25 @@ def survey_generate(
     yield f"🔍 开始综述: {topic}\n"
 
     # 1. Step 0: Phase A 初始候选池 (0 LLM, summary_items.db + chroma + arxiv fallback, 9-08 多源召回)
-    pool = _build_candidate_pool(topic, max_pool=max_pool)
+    # 9-09 改: 9-09 19:30 user 拍板 返 (pool, build_status) tuple, 让候选池为空时能区分 arxiv 失败原因
+    pool, build_status = _build_candidate_pool(topic, max_pool=max_pool)
     if not pool:
         ws.set_status("failed", 0, 0, "pool empty")
+        arxiv_status = build_status.get("arxiv_status", "unknown")
+        # 9-09 user 拍板: 检测中文 topic, 给英文关键词建议 (arxiv 是英文 API)
+        has_chinese = any('\u4e00' <= c <= '\u9fff' for c in topic)
+        zh_hint = (
+            "\n- 💡 检测到中文 topic, arxiv 是英文 API, 建议用英文关键词重试 "
+            "(例: graph state hypergraph state entanglement)"
+            if has_chinese else ""
+        )
         yield (
             f"❌ 候选池为空\n"
             f"- topic: {topic!r}\n"
-            f"- 主题词在 summary_items.db 里没匹配到任何 paper, arxiv API fallback 也失败\n"
-            f"- 建议: 换个主题词, 或先跑 `抓文 → analyze_paper` 准备数据\n"
+            f"- summary_items.db 没匹配到 paper\n"
+            f"- arxiv fallback: {arxiv_status}\n"
+            f"- 建议: 换个主题词 (优先英文), 或先跑 `抓文 → analyze_paper` 准备数据"
+            f"{zh_hint}\n"
         )
         return
     ws.save_pool(pool)

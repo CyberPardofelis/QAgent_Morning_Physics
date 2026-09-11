@@ -486,43 +486,62 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# 4. SURVEY_RELEVANCE_SCORE_PROMPT — per-paper 相关性评分 (2026-09-09 加)
+# 4. SURVEY_RELEVANCE_SCORE_PROMPT — per-paper 相关性评分 (2026-09-09 加, 9-09 严判版)
 # ============================================================
-# 9-09 user 实测: 量子态验证综述召回了 30+ 篇层析/密钥分发论文, chroma 语义相似误召严重
-# 解决: recall 完跑 LLM 0-10 精筛, 阈值 (默认 7) 踢出误召
+# 9-09 user 实测 + 严判升级:
+#   - 9-09 初版: 量子态验证综述召回了 30+ 篇层析/密钥分发论文, 粗筛阈值 7 不够严
+#   - 9-09 严判版: 阈值 7→8, 新增 is_about_topic 字段
+#     is_about_topic=True 才是综述主引, 邻近子领域 paper 即便 score=7 也踢掉
 #
 # 设计要点:
 #   - 5 篇/批 (config 可调), 1 次 LLM = 1 个 batch 的 JSON 数组输出
-#   - 显式强调"邻近但不同子领域" 应降分, 防 LLM 因共享术语给高相关
-#   - is_adjacent_field 字段独立记录, 落 _pool.json 后 _audit.md 可展示"高/中/低相关分布"
-SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性判别助手。
+#   - 显式强调"X 本身" vs "X 的子方向" vs "邻近子领域" 三档
+#   - is_about_topic bool: 跟 score 冗余但 LLM 表达更清晰, 严判字段
+#   - is_adjacent_field bool: 跟 mechanism B fact review 配套, audit 用
+SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
 
 【综述主题】: {topic}
 
-【任务】: 对下面 {batch_size} 篇论文, **每篇独立打分** (0-10, 整数), 评估"该论文核心贡献是不是主题 X 本身"。
+【任务】: 对下面 {batch_size} 篇论文, **每篇独立打分** (0-10, 整数), 评估"该论文核心贡献是不是 X 本身 (而不是邻近子领域)"。
 
-【打分尺度】
-  9-10 = 核心论文, 主题完全契合, 应作为综述主引
-  7-8  = 强相关, 主题的某子方向或关键技术
-  4-6  = 弱相关, 共享术语但不是同一子领域
-  1-3  = 误召, 看起来像但不是 (邻近但不同子领域)
-  0    = 完全无关
+【打分尺度 - 9-09 严判版】(user 拍板)
+  10 = 完美命中, 论文核心就是 X
+  9  = 核心, 论文专门讲 X
+  8  = 强相关, X 是论文主方向之一 (但论文还有其他方向)
+  7  = 边缘相关, X 是论文的某子方向/应用/扩展
+  5-6 = 邻近子领域, 共享术语/方法但论文核心不是 X
+  3-4 = 误召, 看起来像但完全是另一领域
+  1-2 = 完全不相关
+  0   = 无关 (无 abstract / 完全无关)
 
-【特别注意】(user 9-09 反复实测的关键)
-"主题 X" **不等于** "包含 X 关键词"。邻近但不同的子领域要严格降分。
-经典反例:
+【特别注意 - 9-09 严判, user 拍板】
+**"是 X 的子方向" 跟 "是 X 本身" 要严格区分**:
+  - "X 的子方向" (score 7-8): 论文仍在 X 大伞下, 但有自己独立内容
+  - "邻近子领域" (score 5-6): 论文不在 X 大伞下, 只是共享术语/方法
+  - "误召" (score 3-4): 看起来像但完全是另一领域
+
+经典反例 (严判):
   - "quantum state verification" (yes/no 验证) ≠ "quantum state tomography" (完整密度矩阵重建)
+    → tomography paper 即便共享 "quantum state" 术语, score 应 <= 6, is_about_topic=False
   - "容错量子计算" ≠ "量子模拟"
+    → 量子模拟 paper 共享"量子"但核心不同, score 应 <= 6
   - "transformer 架构" ≠ "BERT 预训练"
-如果论文核心是邻近子领域, 即便共享主术语, score 应 <= 3。
+    → BERT paper 核心是预训练, 不是架构, score 应 <= 6
 不要因为 title/abstract 含主题词就给高分 — 必须看 core_method + core_contrib 的实质内容。
+
+【关键字段 - is_about_topic】(9-09 严判新增)
+新增 is_about_topic 字段 (bool), 判定规则:
+  - is_about_topic = true: score >= 8 (论文核心就是 X 本身, 综述主引)
+  - is_about_topic = false: score <= 7 (论文只是 X 的子方向或邻近子领域, 不应作为综述主引)
+  - threshold 8 严判: 只保留 is_about_topic = true 的 paper 进 pool
+  - 误召 paper (score <= 6) 必须 is_about_topic = false
 
 【论文列表】(共 {batch_size} 篇):
 {papers_block}
 
 【输出】(严格 JSON 数组, {batch_size} 个对象, 不要 markdown 包裹, 不要前缀解释)
 [
-  {{"paper_id": "<id>", "score": <int 0-10>, "reason": "1 句判断依据", "is_adjacent_field": <bool>}},
+  {{"paper_id": "<id>", "score": <int 0-10>, "is_about_topic": <bool>, "is_adjacent_field": <bool>, "reason": "1 句判断依据"}},
   ...
 ]
 只输出 JSON 数组, 不要其他文字。"""
@@ -568,6 +587,89 @@ def build_relevance_score_prompt(topic: str, papers_batch: list) -> str:
         topic=topic or "(未指定主题)",
         batch_size=batch_size,
         papers_block=papers_block,
+    )
+
+
+# ============================================================
+# 5. SURVEY_FACT_REVIEW_PROMPT — per-fact 主题对齐审查 (2026-09-09 加, mechanism B)
+# ============================================================
+# 9-09 user 拍板: pre-outline review 阶段, 对每条 fact 做主题对齐审查
+# 跟 mechanism A (paper 严判) 配套 — paper 严判只过滤 pool, 但 pool 内的 fact
+# 仍可能是从邻近子领域 paper 抽出来的"挂羊头卖狗肉" 内容
+#
+# 设计要点:
+#   - 8 条/批 (fact 比 paper 短, 可更多), 1 次 LLM = 1 batch JSON 数组
+#   - fact 来自哪篇 paper 跟评分无关 — 只看 fact 内容
+#   - is_topic_aligned bool 跟 score 冗余但更清晰
+#   - 不删除非对齐 fact, 只打标 (审计用, 落 _facts.jsonl + _audit.md)
+SURVEY_FACT_REVIEW_PROMPT = """你是综述 fact 主题对齐审核助手。
+
+【综述主题】: {topic}
+
+【任务】: 对每条 fact, 判断"该 fact 是否直接服务于综述主题 X 本身 (而不是邻近子领域)"。
+
+【打分尺度 - 9-09 严判版】(user 拍板, 跟 paper 严判对齐)
+  10 = fact 直接讲 X 本身, 必引
+  9  = fact 强相关 X 的关键子方向/方法
+  7-8 = fact 是 X 的扩展/应用/对比 (但仍可作为综述引用)
+  5-6 = fact 弱相关, 共享术语但讲邻近子领域
+  3-4 = fact 邻近子领域, 不应作为 X 综述核心引用
+  1-2 = fact 跟 X 完全无关
+
+【特别注意】
+- fact 来自哪篇 paper 跟评分无关 — 只看 fact 内容本身
+- "挂羊头卖狗肉" 严判: fact 可能是从邻近子领域 paper 抽出来的, 看起来相关但其实在讲别的
+- "X 的方法在 Y 领域的应用" 算 7-8 (应用/对比, 仍可引)
+- "Y 领域自己的方法, 跟 X 仅共享术语" 算 3-4 (邻近, 不应引)
+
+【关键字段 - is_topic_aligned】(9-09 新增)
+新增 is_topic_aligned 字段 (bool), 判定规则:
+  - is_topic_aligned = true: score >= 5 (fact 跟 X 直接相关, 综述可引)
+  - is_topic_aligned = false: score <= 4 (fact 邻近子领域, audit 标 ❌)
+  - threshold 5 默认 (env QAGENT_SURVEY_FACT_REVIEW_THRESHOLD 可调)
+
+【fact 列表】(共 {batch_size} 条):
+{facts_block}
+
+【输出】(严格 JSON 数组, {batch_size} 个对象, 不要 markdown 包裹, 不要前缀解释)
+[
+  {{"fact_id": "<id>", "paper_id": "<id>", "score": <int 0-10>, "is_topic_aligned": <bool>, "reason": "1 句"}},
+  ...
+]
+只输出 JSON 数组, 不要其他文字。"""
+
+
+def build_fact_review_prompt(topic: str, facts_batch: list) -> str:
+    """
+    构造 per-fact 主题对齐审查 prompt (8 条/批, batch_size 由 config 决定).
+
+    facts_batch: list of fact dict, 每条至少有 {fact_id, paper_id, claim, fact_type}
+    """
+    from agent.tools.config import get_fact_review_batch_size
+    batch_size = get_fact_review_batch_size()
+
+    lines = []
+    for i, f in enumerate(facts_batch, 1):
+        fid = f.get("fact_id", f"f{i}")
+        pid = f.get("paper_id", "?")
+        claim = (f.get("claim") or "").strip()
+        ftype = f.get("fact_type", "?")
+        support = (f.get("support_quote") or "").strip()
+
+        # 单 fact block
+        block_lines = [f"{i}. fact_id={fid} | paper_id={pid} | fact_type={ftype}"]
+        if claim:
+            block_lines.append(f"   claim: {claim[:250]}")
+        if support:
+            block_lines.append(f"   support_quote: {support[:150]}")
+        lines.append("\n".join(block_lines))
+
+    facts_block = "\n\n".join(lines)
+
+    return SURVEY_FACT_REVIEW_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        batch_size=batch_size,
+        facts_block=facts_block,
     )
 
 

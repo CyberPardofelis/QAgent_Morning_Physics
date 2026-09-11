@@ -390,6 +390,50 @@ def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     # 9-08 17:20 user 拍板: 只显示"抽了 N 条 fact" 高层
     yield f"👁️ 抽完 {len(targets)} 篇, 累计 {len(state['facts'])} 条 fact\n"
 
+    # ========== 9-09 user 拍板: pre-outline fact 主题对齐审查 (mechanism B) ==========
+    # 跟 _relevance_filter_pool (mechanism A) 配套 — paper 严判只过滤 pool,
+    # 但 pool 内的 fact 仍可能是从邻近子领域 paper 抽出来的"挂羊头卖狗肉" 内容
+    # 这里对每条 fact 做主题对齐审查, 不删非对齐 fact, 只打标 (audit 用)
+    from agent.tools.config import get_fact_review_threshold
+    fact_threshold = get_fact_review_threshold()
+    if fact_threshold > 0 and state["facts"]:
+        from agent.tools.surveys._pool import _review_facts_topic_alignment
+        yield "🔎 fact 主题对齐审查中...\n"
+        try:
+            scored_facts, fact_stats = _review_facts_topic_alignment(
+                topic=state["topic"],
+                facts=state["facts"],
+                threshold=fact_threshold,
+            )
+            # 把审查结果写回每条 fact
+            for i, f in enumerate(state["facts"]):
+                fid = f.get("fact_id")
+                if not fid:
+                    # 用同样的回退 key 逻辑
+                    pid = f.get("paper_id", "?")
+                    claim_hash = hash(str(f.get("claim", ""))[:50]) & 0xFFFF
+                    fid = f"{pid}:{i}:{claim_hash}"
+                s = scored_facts.get(fid, {})
+                f["_topic_alignment_score"] = s.get("score", 5)
+                f["_is_topic_aligned"] = s.get("is_topic_aligned", True)
+                f["_alignment_reason"] = s.get("reason", "")
+            # 存 stats 给 finalize 用
+            state["_fact_review_stats"] = fact_stats
+            yield (
+                f"👁️ fact 审查: 对齐 {fact_stats['aligned']} / 邻近 {fact_stats['misaligned']}"
+                f" / fallback {fact_stats['fallback']} (共 {fact_stats['total']} 条)\n"
+            )
+        except Exception as e:
+            friendly = _friendly_error(e, "fact_review")
+            state["errors"].append({
+                "step": state["step"], "action": "fact_review",
+                "msg": friendly,
+            })
+            yield f"👁️ fact 审查失败 ({friendly}), 跳过 — 用原始 fact 列表\n"
+    else:
+        # fact 审查关闭 或 无 fact, 不 yield 任何东西
+        pass
+
 
 def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
     """
@@ -1110,6 +1154,30 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
             report.append(f"  - `[[{pid}]]`: {title[:60]}  —  *{reason[:80]}*")
         if len(adjacent_papers) > 5:
             report.append(f"  - ... 还有 {len(adjacent_papers) - 5} 篇 (见 `_audit.md`)")
+
+    # ========== 9-09 user 拍板: pre-outline fact 主题对齐审查摘要 (mechanism B) ==========
+    fact_stats = state.get("_fact_review_stats")
+    if fact_stats and fact_stats.get("total", 0) > 0:
+        report.append("")
+        report.append("### 📋 pre-outline fact 主题对齐审查 (mechanism B, 9-09 加)")
+        report.append("")
+        report.append(f"- 主题对齐: **{fact_stats['aligned']}** 条 ({fact_stats['aligned']*100//fact_stats['total']}%)")
+        report.append(f"- 邻近子领域 (标 ❌): {fact_stats['misaligned']} 条")
+        if fact_stats.get("fallback", 0) > 0:
+            report.append(f"- LLM fallback (默认对齐): {fact_stats['fallback']} 条")
+        report.append(f"- 总计: {fact_stats['total']} 条 fact")
+        if fact_stats["misaligned"] > 0:
+            report.append("")
+            # 列前 5 条 misaligned fact (只显示 paper_id + claim 短, 不暴露具体 fact_id/全文)
+            report.append("**邻近子领域 fact 前 5 条** (不作为综述核心引用):")
+            for f in state.get("facts", []):
+                if f.get("_is_topic_aligned") is False and len([1 for x in report if "**邻近子领域 fact 前 5 条**" in x]) > 0:
+                    pid = f.get("paper_id", "?")
+                    claim = (f.get("claim") or "")[:80]
+                    reason = (f.get("_alignment_reason") or "")[:80]
+                    report.append(f"  - paper `[[{pid}]]`: {claim}...  —  *{reason}*")
+                    if len([1 for line in report if line.startswith("  - paper")]) >= 5:
+                        break
     if state["errors"]:
         report.append("")
         report.append(f"### ⚠️ 错误 ({len(state['errors'])} 条)")
