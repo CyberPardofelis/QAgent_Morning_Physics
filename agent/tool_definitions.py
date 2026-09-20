@@ -11,11 +11,10 @@
 
 注意：TOOL_SCHEMAS 只是数据声明，不依赖任何工具实现，避免循环 import。
 """
-from typing import Dict, Any
-
+from typing import Any
 
 # 所有 LLM 可调用的工具 schema 在这里声明
-TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     # 2026-09-04 用户拍板:run_python 工具停用(安全考虑)
     # 之前 LLM 会用 run_python 跑 PyMuPDF 绕过 pdftotext 截断问题
     # → 现在 run_python 完全从 LLM 工具列表移除(连 schema 都不暴露)

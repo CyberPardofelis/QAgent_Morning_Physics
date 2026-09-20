@@ -13,18 +13,19 @@ agent.tools.surveys.survey_generate — 综述生成主入口 (L2 工具)
 - 独立 audit 工具         → survey_audit.py
 """
 import logging
-from typing import Iterator, Dict, Any
+from collections.abc import Iterator
+from typing import Any
 
-from agent.tools.registry import register_tool
 from agent.infra.survey_workspace import SurveyWorkspace, hash_topic
+from agent.tools.registry import register_tool
 
-from ._pool import _build_candidate_pool
 from ._actions import (
+    _append_react_trace,
     _decide_action,
     _dispatch_action,
-    _append_react_trace,
     _finalize_survey,
 )
+from ._pool import _build_candidate_pool
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def survey_generate(
     #   → action_finish 看到 section_gaps 不空就拒绝结束, ReAct 回到 search_more 补
     # 9-18 加: pool_audit 字段, 把 _build_candidate_pool 的 audit 报告塞进 state,
     #           让 ReAct 主循环 LLM 决策时能看到 (候选池是否够格 / 是否需要 search_more / 是否要换方向)
-    state: Dict[str, Any] = {
+    state: dict[str, Any] = {
         "topic": topic,
         "topic_hash": topic_hash,
         "pool": pool,

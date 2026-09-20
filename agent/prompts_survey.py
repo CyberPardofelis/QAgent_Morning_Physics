@@ -20,7 +20,7 @@ agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
 历史:
   - 2026-09-05: 3 个 prompt 模板首版(P6.0 阶段)
 """
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 
 def _get_min_pool() -> int:
@@ -36,7 +36,7 @@ def _get_min_pool() -> int:
 # ============================================================
 # 候选池注入格式(三个 prompt 共享)
 # ============================================================
-def format_pool(papers: List[Dict[str, Any]]) -> str:
+def format_pool(papers: list[dict[str, Any]]) -> str:
     """
     把候选池格式化成 LLM 友好的多行文本。
 
@@ -213,7 +213,7 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
 只输出 JSON,不要前缀"以下是...",不要后缀"希望对你有帮助"。"""
 
 
-def build_outline_prompt(topic: str, papers: List[Dict[str, Any]]) -> str:
+def build_outline_prompt(topic: str, papers: list[dict[str, Any]]) -> str:
     """
     构造综述大纲生成 prompt。
 
@@ -320,8 +320,8 @@ def build_section_prompt(
     section_type: str,
     section_title: str,
     outline_section: str,
-    papers: List[Dict[str, Any]],
-    section_type_safe: Optional[str] = None,
+    papers: list[dict[str, Any]],
+    section_type_safe: str | None = None,
 ) -> str:
     """
     构造单章生成 prompt。
@@ -379,7 +379,7 @@ Output ONLY the JSON object, no other text, no markdown fence."""
 # ============================================================
 # P6.5 ReAct 决策 prompt (step 6, LLM 真选 action)
 # ============================================================
-def build_react_prompt(state: Dict[str, Any]) -> str:
+def build_react_prompt(state: dict[str, Any]) -> str:
     """
     ReAct 决策 prompt — 把当前 state + 候选池 paper_ids 序列化给 LLM, 让它自己选下一步 action.
 

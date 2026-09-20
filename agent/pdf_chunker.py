@@ -22,11 +22,12 @@ agent.pdf_chunker — P0.5 section-aware 论文切分（2026-09-02）
 - 2026-09-02 现状:3 篇不同期刊 smoke 验证 (要 4 个 section 全部识别)
 """
 from __future__ import annotations
+
 import logging
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any
 
 import fitz  # PyMuPDF
 
@@ -50,11 +51,11 @@ class Chunk:
     # paper 级 metadata(pdf_chunker 不知道, 由调用方填)
     paper_id: str = ""
     title: str = ""
-    year: Optional[int] = None
+    year: int | None = None
     journal: str = ""
     source: str = "arxiv"
 
-    def to_metadata(self) -> Dict[str, Any]:
+    def to_metadata(self) -> dict[str, Any]:
         """转成 chroma metadata(扁平,str/int/bool)"""
         return {
             "paper_id": self.paper_id,
@@ -112,7 +113,7 @@ _MAX_PARAGRAPH_WORDS = 500  # 长于这个按句子切
 _TARGET_CHUNK_WORDS = 250   # 目标
 
 
-def _is_section_title(line: str) -> Tuple[bool, str, str]:
+def _is_section_title(line: str) -> tuple[bool, str, str]:
     """判断一行是否像 section 标题
 
     Returns:
@@ -152,7 +153,7 @@ def _is_section_title(line: str) -> Tuple[bool, str, str]:
 # ============================================================
 # 段落切分
 # ============================================================
-def _split_into_paragraphs(text: str) -> List[str]:
+def _split_into_paragraphs(text: str) -> list[str]:
     """把一节文字切成段落
 
     策略:
@@ -204,7 +205,7 @@ def _split_into_paragraphs(text: str) -> List[str]:
     return [p for p in final if p.strip()]
 
 
-def _detect_equation_or_table(text: str) -> Tuple[bool, bool]:
+def _detect_equation_or_table(text: str) -> tuple[bool, bool]:
     """检测段落里有没有公式/表格的迹象
 
     启发式:
@@ -226,7 +227,7 @@ def _detect_equation_or_table(text: str) -> Tuple[bool, bool]:
 # ============================================================
 # 章节切分(主函数)
 # ============================================================
-def _split_by_outline(doc: fitz.Document) -> List[Tuple[str, int, int]]:
+def _split_by_outline(doc: fitz.Document) -> list[tuple[str, int, int]]:
     """用 PDF outline 切 section, 返回 [(title, page_start, page_end), ...]
 
     outline 为空时返空 list(调用方应 fallback 到启发式)
@@ -253,7 +254,7 @@ def _split_by_outline(doc: fitz.Document) -> List[Tuple[str, int, int]]:
     return result
 
 
-def _split_by_heuristic(doc: fitz.Document) -> List[Tuple[str, int, int]]:
+def _split_by_heuristic(doc: fitz.Document) -> list[tuple[str, int, int]]:
     """启发式:逐页找 section 标题,记录 page number
 
     简单:每页第一段扫一次,找匹配的行作为 section 起点
@@ -321,11 +322,11 @@ def chunk_by_section(
     pdf_path: str,
     paper_id: str = "",
     title: str = "",
-    year: Optional[int] = None,
+    year: int | None = None,
     journal: str = "",
     source: str = "arxiv",
     min_paragraph_words: int = _MIN_PARAGRAPH_WORDS,
-) -> List[Chunk]:
+) -> list[Chunk]:
     """主入口:section-aware 切分
 
     Args:
@@ -354,7 +355,7 @@ def chunk_by_section(
         )
 
         # 2. 逐 section 切段落
-        chunks: List[Chunk] = []
+        chunks: list[Chunk] = []
         for section_idx, (sec_title, page_start, page_end) in enumerate(section_bounds):
             sec_text = _extract_section_text(doc, page_start, page_end)
             if not sec_text.strip():
@@ -400,7 +401,7 @@ def chunk_by_section(
 # ============================================================
 # 健康检查
 # ============================================================
-def health_check() -> Dict[str, Any]:
+def health_check() -> dict[str, Any]:
     return {
         "pymupdf_version": fitz.__version__,
         "patterns_count": len(_SECTION_PATTERNS),

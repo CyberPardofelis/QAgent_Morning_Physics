@@ -4,13 +4,12 @@ surveys._actions._finalize — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: _finalize_survey
 """
 from __future__ import annotations
-import json
+
 import logging
-import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
-def _finalize_survey(state: Dict[str, Any], ws) -> str:
+def _finalize_survey(state: dict[str, Any], ws) -> str:
     """
     收尾 (step 5 真实实现):
       - 算 audit: 候选池 0 引用论文
@@ -79,7 +78,7 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
     total = len(pool)
     audit_lines.extend([
         "",
-        f"## 🎯 候选池相关性分布 (LLM 0-10 评分, 9-09 user 拍板加)",
+        "## 🎯 候选池相关性分布 (LLM 0-10 评分, 9-09 user 拍板加)",
         "",
         f"- 核心 (9-10): **{len(rel_high)}** 篇 ({len(rel_high)*100//max(1,total)}%)",
         f"- 强相关 (7-8): **{len(rel_mid)}** 篇 ({len(rel_mid)*100//max(1,total)}%)",
@@ -95,7 +94,7 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
     if adjacent_papers:
         audit_lines.extend([
             "",
-            f"## ⚠️ 邻近子领域 paper (is_adjacent_field=True, 实际不应被综述引用)",
+            "## ⚠️ 邻近子领域 paper (is_adjacent_field=True, 实际不应被综述引用)",
             "",
         ])
         for pid, title, _, reason in adjacent_papers[:20]:
@@ -230,7 +229,7 @@ def _finalize_survey(state: Dict[str, Any], ws) -> str:
         if len(state["errors"]) > 10:
             report.append(f"- ... 还有 {len(state['errors']) - 10} 条")
     report.append("")
-    report.append(f"### 审计详情")
+    report.append("### 审计详情")
     report.append(f"见 `{ws.path}/_audit.md`")
 
     return "\n".join(report)

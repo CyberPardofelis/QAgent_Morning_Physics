@@ -15,16 +15,15 @@ v7 公式渲染器(off-screen QWebEngineView + KaTeX + 截图 + PNG 缓存)
 - 缓存目录: data/cache/formulas/<md5>.png(按 app 数据根)
 """
 from __future__ import annotations
+
 import hashlib
 import os
 import re
 import time
 from pathlib import Path
-from typing import Optional, Tuple
 
-from PySide6.QtCore import QUrl, QSize, Qt, QEventLoop, QTimer, QBuffer, QIODevice
-from PySide6.QtGui import QImage, QPixmap, QPainter
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import QBuffer, QIODevice, Qt, QUrl
+from PySide6.QtWidgets import QApplication
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -49,7 +48,7 @@ if _DISABLED:
 # rate limit 是动态的 (过了窗口就恢复), 跟 _DISABLED 永久禁用不同
 _RATE_LIMIT_WINDOW = 30.0   # 30s 窗口
 _RATE_LIMIT_MAX = 30         # 窗口内最多 30 个公式
-_rate_window: List[float] = []  # 存最近渲染成功的时间戳 (模块级单例)
+_rate_window: list[float] = []  # 存最近渲染成功的时间戳 (模块级单例)
 
 
 def _try_consume_rate_limit_token() -> bool:
@@ -128,13 +127,13 @@ class FormulaRenderer:
             # 失败,fallback 原文
             ...
     """
-    _instance: Optional['FormulaRenderer'] = None
+    _instance: FormulaRenderer | None = None
 
     def __init__(self):
         if not HAS_QTWEBENGINE:
             raise RuntimeError("QWebEngineView 不可用,FormulaRenderer 无法初始化")
-        self._view: Optional[QWebEngineView] = None
-        self._cache_dir: Optional[Path] = None
+        self._view: QWebEngineView | None = None
+        self._cache_dir: Path | None = None
         self._ready = False
         # v8 改动: 资源路径不再依赖 ui.message_bubble_1._BASE_DIR(已删除),自己定位
         # 路径: ui/formula_renderer.py 同目录的 resources/katex/
@@ -235,7 +234,7 @@ class FormulaRenderer:
             _t.sleep(0.05)
         return False
 
-    def render(self, formula: str, display_mode: bool = False) -> Optional[Path]:
+    def render(self, formula: str, display_mode: bool = False) -> Path | None:
         """
         同步渲染公式为 PNG,返回路径;失败返回 None。
         - 缓存命中立即返回(0ms) + console 标 "cache hit"(便于排查"console 重复 log")
@@ -286,7 +285,7 @@ class FormulaRenderer:
             self.stats['render_failures'] += 1
         return png_path
 
-    def _do_render(self, formula: str, display_mode: bool) -> Optional[Path]:
+    def _do_render(self, formula: str, display_mode: bool) -> Path | None:
         """实际渲染逻辑"""
         import time as _t
         view = self._ensure_view()
@@ -345,7 +344,7 @@ class FormulaRenderer:
         # 同步等 load + typeset
         if not self._wait_for_load(view):
             tmp_html_path.unlink(missing_ok=True)
-            print(f'[FormulaRenderer] load 超时')
+            print('[FormulaRenderer] load 超时')
             return None
         t_typeset_start = _t.time()
         load_ms = (t_typeset_start - t_load_start) * 1000
@@ -435,7 +434,6 @@ class FormulaRenderer:
             #   不一致 → bbox 扫描失败 → crop 出来"大面积透明"
             # 修法:grab 之前**临时**把 view 背景设白,grab 完恢复
             # 这样 grab 出来是 RGB 白底 + 黑色公式字符,不需要 alpha_composite
-            from PySide6.QtCore import Qt as _Qt
             saved_qss = view.styleSheet()
             saved_bg = view.page().backgroundColor()
             # v14:不再 setZoomFactor(2.0) — zoom 让 LANCZOS resize 时降清晰度
@@ -467,12 +465,13 @@ class FormulaRenderer:
         # 关键:QPixmap.save 不接受 io.BytesIO!PySide6 要 QIODevice
         # 修法:用 QBuffer(继承 QIODevice)+ bytes() 转 Python bytes 给 PIL
         try:
-            from PIL import Image, ImageOps
             from io import BytesIO
+
+            from PIL import Image, ImageOps
             qbuf = QBuffer()
             qbuf.open(QIODevice.WriteOnly)
             if not pixmap.save(qbuf, 'PNG'):
-                print(f'[FormulaRenderer] pixmap.save 失败')
+                print('[FormulaRenderer] pixmap.save 失败')
                 return None
             data = bytes(qbuf.data())
             qbuf.close()
@@ -522,7 +521,7 @@ class FormulaRenderer:
 
 
 # 全局单例(在主线程调用)
-_instance: Optional[FormulaRenderer] = None
+_instance: FormulaRenderer | None = None
 
 
 def get_formula_renderer() -> FormulaRenderer:
@@ -542,7 +541,7 @@ _FORMULA_PATTERN = re.compile(
 )
 
 
-def extract_formulas(md_text: str) -> list[Tuple[str, bool, Tuple[int, int]]]:
+def extract_formulas(md_text: str) -> list[tuple[str, bool, tuple[int, int]]]:
     """
     从 markdown 提取所有公式。
     返回 [(formula_text, is_display, (start, end)), ...]

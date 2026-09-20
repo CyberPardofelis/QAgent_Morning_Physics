@@ -38,66 +38,61 @@ except Exception as e:
 # ============================================================
 # 重导出: CRUD (UI 用的)
 # ============================================================
+# ============================================================
+# 重导出: 内部 helpers (旧 import 路径兼容)
+# ============================================================
+from ._actions import (
+    _append_react_trace,
+    _decide_action,
+    _dispatch_action,
+    _finalize_survey,
+    _friendly_error,
+    _state_driven_decide,
+    action_extract_facts,
+    action_finish,
+    action_search_more,
+    action_write_outline,
+    action_write_section,
+)
 from ._crud import (
     SCHEMA_SQL,
-    init_schema,
-    # 主题 CRUD
-    create_theme,
-    list_themes,
-    get_theme,
-    update_theme,
-    delete_theme,
     # 章节 CRUD
     create_section,
-    list_sections,
-    get_section,
-    update_section,
+    # 主题 CRUD
+    create_theme,
     delete_section,
-    reorder_section,
+    delete_theme,
+    get_section,
+    get_theme,
     # 健康检查
     health_check,
+    init_schema,
+    list_sections,
+    list_themes,
+    reorder_section,
+    update_section,
+    update_theme,
 )
-
 
 # ============================================================
 # 重导出: 候选池/引用 (内部 API, 但旧测试可能直接用)
 # ============================================================
 from ._pool import (
-    _safe_json_loads_array,
-    _extract_paper_ids,
-    _audit_section_paper_ids,
-    _build_candidate_pool,
-    _relevance_filter_pool,
-    _review_facts_topic_alignment,
     _arxiv_search,
     _arxiv_search_batch,
+    _audit_section_paper_ids,
+    _build_candidate_pool,
+    _extract_paper_ids,
+    _relevance_filter_pool,
+    _review_facts_topic_alignment,
+    _safe_json_loads_array,
 )
-
+from .survey_audit import survey_audit
 
 # ============================================================
 # 重导出: 工具入口 (LLM 工具, @register_tool)
 # ============================================================
 from .survey_generate import survey_generate
-from .survey_audit import survey_audit
-
-
-# ============================================================
-# 重导出: 内部 helpers (旧 import 路径兼容)
-# ============================================================
-from ._actions import (
-    _friendly_error,
-    _decide_action,
-    _state_driven_decide,
-    _dispatch_action,
-    _append_react_trace,
-    _finalize_survey,
-    action_search_more,
-    action_extract_facts,
-    action_write_outline,
-    action_write_section,
-    action_finish,
-)
-
 
 __all__ = [
     # 公共 API (UI / 工具调用方用)

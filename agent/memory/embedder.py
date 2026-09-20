@@ -9,7 +9,7 @@ agent.memory.embedder — 包装 QAgent 现有 Embedder（CPU 优先）
 """
 import logging
 import threading
-from typing import List, Optional, Union
+from typing import Optional
 
 import numpy as np
 
@@ -44,7 +44,7 @@ class MemoryEmbedder:
             return
         self._initialized = True
         self._backend = None  # 'local' / 'openai' / None (未配置)
-        self._dim: Optional[int] = None
+        self._dim: int | None = None
 
     def is_ready(self) -> bool:
         """检查 embedding 是否可用。
@@ -55,8 +55,8 @@ class MemoryEmbedder:
         → 跟 PyQt6 多线程竞争 0xC0000005 段错误
         """
         try:
-            from config import Config
             from agent.local_embedder import EMBEDDER_TYPE
+            from config import Config
         except ImportError:
             return False
         # QSettings 优先 (跟 vector_db 路径一致)
@@ -120,7 +120,7 @@ class MemoryEmbedder:
             v = v / norm
         return v
 
-    def encode_batch(self, texts: List[str]) -> np.ndarray:
+    def encode_batch(self, texts: list[str]) -> np.ndarray:
         """
         批量编码。返回 2D numpy array (n, dim)。
         """
@@ -166,6 +166,6 @@ def encode_text(text: str) -> np.ndarray:
     return get_embedder().encode(text)
 
 
-def encode_texts(texts: List[str]) -> np.ndarray:
+def encode_texts(texts: list[str]) -> np.ndarray:
     """便捷函数：encode 批量文本。"""
     return get_embedder().encode_batch(texts)

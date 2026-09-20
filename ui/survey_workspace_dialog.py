@@ -15,16 +15,36 @@ ui.survey_workspace_dialog — 综述工作台 dialog(2026-09-02 P6 UI 准备)
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QTreeWidget, QTreeWidgetItem,
-    QPlainTextEdit, QTextBrowser, QPushButton, QLabel, QInputDialog, QMessageBox,
-    QTabWidget, QWidget, QMenu, QLineEdit, QDialogButtonBox, QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTabWidget,
+    QTextBrowser,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from agent.tools.surveys import (
+    create_section,
+    create_theme,
+    delete_section,
+    delete_theme,
+    get_section,
+    health_check,
+    list_sections,
+    list_themes,
+    update_section,
 )
 from ui.styles import get_stylesheet
-from agent.tools.surveys import (
-    list_themes, list_sections, get_section,
-    create_theme, create_section, update_section, delete_section, delete_theme,
-    health_check,
-)
 
 
 class SurveyWorkspaceDialog(QDialog):
@@ -308,7 +328,7 @@ class SurveyWorkspaceDialog(QDialog):
         if kind == "theme":
             ret = QMessageBox.question(
                 self, "确认",
-                f"删除主题会级联删所有章节, 确认?",
+                "删除主题会级联删所有章节, 确认?",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if ret != QMessageBox.Yes:
@@ -334,7 +354,7 @@ class SurveyWorkspaceDialog(QDialog):
                 return
             try:
                 delete_section(nid)
-                self.status_label.setText(f"✓ 已删章节")
+                self.status_label.setText("✓ 已删章节")
                 self.current_section_id = None
                 self._refresh_tree()
             except Exception as e:
@@ -364,7 +384,7 @@ class SurveyWorkspaceDialog(QDialog):
         prompt = question + context
         # 起后台线程调 LLM
         self.ai_output.append(f"\n\n> **你**: {question}\n")
-        self.ai_output.append(f"\n**AI**: ")
+        self.ai_output.append("\n**AI**: ")
         self._ai_thread = _AIWorker(prompt, self.ai_output)
         self._ai_thread.chunk.connect(self._on_ai_chunk)
         self._ai_thread.finished.connect(self._on_ai_done)

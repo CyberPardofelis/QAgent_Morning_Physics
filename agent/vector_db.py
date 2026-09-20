@@ -16,10 +16,11 @@ agent.vector_db — chroma 持久化向量库（论文 chunk 用，P0 新增 202
 - P0.5 完成后，老 faiss 索引才考虑清掉
 """
 from __future__ import annotations
+
 import logging
 import threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ def _make_embedding_function():
         pass
     try:
         from chromadb.utils import embedding_functions
+
         from config import Config
         model_path = Config.get_chroma_embedding_model_path()
         if not model_path or not Path(model_path).exists():
@@ -122,6 +124,7 @@ def get_chroma_client():
         if _chroma_client is not None:
             return _chroma_client
         import chromadb
+
         from config import Config
         persist_dir = Config.get_chroma_path()
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
@@ -171,7 +174,7 @@ class VectorDB:
         n = db.delete_paper("2401.12345")
     """
 
-    def __init__(self, collection_name: Optional[str] = None):
+    def __init__(self, collection_name: str | None = None):
         from config import Config
         self.collection_name = collection_name or Config.get_chroma_collection()
         self._collection = None
@@ -193,9 +196,9 @@ class VectorDB:
     def add_paper_chunks(
         self,
         paper_id: str,
-        chunks: List[str],
-        metadata: Optional[Dict[str, Any]] = None,
-        chunk_ids: Optional[List[str]] = None,
+        chunks: list[str],
+        metadata: dict[str, Any] | None = None,
+        chunk_ids: list[str] | None = None,
     ) -> int:
         """
         批量加论文 chunks。返回写入条数。
@@ -238,8 +241,8 @@ class VectorDB:
         self,
         query: str,
         top_k: int = 5,
-        where: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
+        where: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         语义检索。返回列表，每条含 {id, document, metadata, distance}。
         where 走 chroma metadata filter（如 {"year": 2024} 或 {"source": "arxiv"}）。
@@ -264,7 +267,7 @@ class VectorDB:
             })
         return results
 
-    def get_paper(self, paper_id: str) -> List[Dict[str, Any]]:
+    def get_paper(self, paper_id: str) -> list[dict[str, Any]]:
         """按 paper_id 拿所有 chunks（不重新 embed）。"""
         try:
             res = self.collection.get(where={"paper_id": paper_id})
@@ -308,13 +311,13 @@ def get_vector_db() -> VectorDB:
 # ============================================================
 # 健康检查
 # ============================================================
-def health_check() -> Dict[str, Any]:
+def health_check() -> dict[str, Any]:
     """
     给 settings_dialog "数据状态" tab 用。
     返回 {exists, path, collection, count, embedding_model, error?}
     """
     from config import Config
-    info: Dict[str, Any] = {
+    info: dict[str, Any] = {
         "path": Config.get_chroma_path(),
         "collection": Config.get_chroma_collection(),
         "embedding_model": Config.get_chroma_embedding_model_path(),

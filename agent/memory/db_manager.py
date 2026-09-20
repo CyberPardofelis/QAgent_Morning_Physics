@@ -22,8 +22,7 @@ import logging
 import sqlite3
 import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any, Optional
 
 from .schemas import DEFAULT_SCOPE, validate_metadata
 
@@ -87,10 +86,10 @@ class MemoryDBManager:
         memory_type: str = "general",
         importance: float = 0.5,
         scope: str = DEFAULT_SCOPE,
-        related_paper_id: Optional[str] = None,
-        source_conv_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        memory_id: Optional[str] = None,
+        related_paper_id: str | None = None,
+        source_conv_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        memory_id: str | None = None,
     ) -> str:
         """
         插入一条记忆。返回 memory_id。
@@ -125,7 +124,7 @@ class MemoryDBManager:
         logger.debug("[MemoryDB] 插入: id=%s type=%s importance=%.2f", mid[:8], memory_type, importance)
         return mid
 
-    def get(self, memory_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, memory_id: str) -> dict[str, Any] | None:
         """按 id 查一条。返回 dict 或 None。"""
         from agent.infra.db import connect
         with connect("memory") as conn:
@@ -137,7 +136,7 @@ class MemoryDBManager:
             return None
         return self._row_to_dict(row)
 
-    def list_by_ids(self, memory_ids: List[str]) -> List[Dict[str, Any]]:
+    def list_by_ids(self, memory_ids: list[str]) -> list[dict[str, Any]]:
         """按 id 批量查。保持输入顺序，去掉 None。"""
         if not memory_ids:
             return []
@@ -154,19 +153,19 @@ class MemoryDBManager:
 
     def list_recent(
         self,
-        scope: Optional[str] = None,
-        memory_type: Optional[str] = None,
-        related_paper_id: Optional[str] = None,
-        min_importance: Optional[float] = None,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        related_paper_id: str | None = None,
+        min_importance: float | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         按条件查（不带向量搜索）。
         按 importance DESC, created_at DESC 排序。
         """
         conditions = []
-        params: List[Any] = []
+        params: list[Any] = []
         if scope is not None:
             conditions.append("scope = ?")
             params.append(scope)
@@ -200,15 +199,15 @@ class MemoryDBManager:
     def search_keyword(
         self,
         keyword: str,
-        scope: Optional[str] = None,
+        scope: str | None = None,
         limit: int = 10,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """关键词 LIKE 搜索（content 字段）。"""
         if not keyword:
             return []
         from agent.infra.db import connect
         conditions = ["content LIKE ?"]
-        params: List[Any] = [f"%{keyword}%"]
+        params: list[Any] = [f"%{keyword}%"]
         if scope is not None:
             conditions.append("scope = ?")
             params.append(scope)
@@ -274,7 +273,7 @@ class MemoryDBManager:
             )
             return cursor.rowcount > 0
 
-    def delete_by_ids(self, memory_ids: List[str]) -> int:
+    def delete_by_ids(self, memory_ids: list[str]) -> int:
         """批量硬删除。"""
         if not memory_ids:
             return 0
@@ -290,9 +289,9 @@ class MemoryDBManager:
     # ============================================================
     # 统计
     # ============================================================
-    def count(self, scope: Optional[str] = None, memory_type: Optional[str] = None) -> int:
+    def count(self, scope: str | None = None, memory_type: str | None = None) -> int:
         conditions = []
-        params: List[Any] = []
+        params: list[Any] = []
         if scope is not None:
             conditions.append("scope = ?")
             params.append(scope)
@@ -308,12 +307,12 @@ class MemoryDBManager:
             ).fetchone()
         return row[0] if row else 0
 
-    def get_statistics(self, scope: Optional[str] = None) -> Dict[str, Any]:
+    def get_statistics(self, scope: str | None = None) -> dict[str, Any]:
         """统计信息（用于 UI / debug）。"""
         from agent.infra.db import connect
         with connect("memory") as conn:
             conn.row_factory = sqlite3.Row
-            params: List[Any] = []
+            params: list[Any] = []
             where = ""
             if scope is not None:
                 where = " WHERE scope = ?"
@@ -359,7 +358,7 @@ class MemoryDBManager:
     # Helper
     # ============================================================
     @staticmethod
-    def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         meta = d.get("metadata")
         if meta and isinstance(meta, str):

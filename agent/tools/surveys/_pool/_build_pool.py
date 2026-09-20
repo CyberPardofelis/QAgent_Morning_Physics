@@ -4,16 +4,26 @@ _pool._build_pool — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _build_candidate_pool
 """
 from __future__ import annotations
-import json
+
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
+
+from agent.tools.config import (
+    get_chroma_sim_threshold,
+    get_min_pool_papers,
+    get_relevance_threshold,
+)
+
+from ._openalex import _openalex_aps_search, _openalex_iop_search
+from ._pool_audit import _audit_pool_with_retry
+from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
 def _build_candidate_pool(
     topic: str,
     max_pool: int = 50,
-) -> "tuple[List[Dict[str, Any]], Dict[str, str]]":
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """
     Phase A: 候选池构建 (9-09 升级: 三道防线, 9-09 19:30 user 拍板返 status dict)
 
@@ -48,9 +58,9 @@ def _build_candidate_pool(
 
     # 9-08 修: 拆成多路召回, 每路各取 top, 然后 union + 去重
     seen_ids: set = set()
-    pool_dict: Dict[str, Dict[str, Any]] = {}  # paper_id -> pool entry
+    pool_dict: dict[str, dict[str, Any]] = {}  # paper_id -> pool entry
 
-    def add_pool_entry(entry: Dict[str, Any]) -> None:
+    def add_pool_entry(entry: dict[str, Any]) -> None:
         """union + 去重"""
         pid = entry.get("paper_id", "")
         if not pid or pid in seen_ids:
@@ -67,7 +77,7 @@ def _build_candidate_pool(
     try:
         raw = list_summary_items(limit=max_pool * 4)  # 多拿点
         if raw:
-            def kw_score(item: Dict[str, Any]) -> int:
+            def kw_score(item: dict[str, Any]) -> int:
                 # 9-08 修: 关键词字段权重降低, title + abstract 权重高
                 score = 0
                 for field, w in [
@@ -157,7 +167,7 @@ def _build_candidate_pool(
     # 现在: APS + IOP + arxiv 三路外部召回 (并行), pool 不再卡死在 arxiv 一家.
     # APS / IOP 走 OpenAlex (跟 search_aps / search_iop 同源), 优先 quant-ph 主阵地.
     # 9-18 user 拍板: "survey 工具应该用搜索工具搜索, 不要总用 arxiv".
-    external_status: Dict[str, str] = {}  # 每路状态: skipped / 0_results / success / exception:...
+    external_status: dict[str, str] = {}  # 每路状态: skipped / 0_results / success / exception:...
 
     # ========== 3a. APS (OpenAlex, PRL/PRA/PRXQuantum/PRX/RMP) ==========
     if len(pool_dict) < _MIN_POOL:
@@ -302,7 +312,7 @@ def _build_candidate_pool(
         "openalex_iop_api": 3,
         "arxiv_api_fallback": 4,
     }
-    def _sort_key(x: Dict[str, Any]) -> tuple:
+    def _sort_key(x: dict[str, Any]) -> tuple:
         rel = x.get("_relevance_score")
         if rel is not None:
             return (-rel, 0, source_priority.get(x.get("_source", ""), 9))

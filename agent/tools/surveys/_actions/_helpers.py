@@ -4,10 +4,10 @@ surveys._actions._helpers — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: _friendly_error, _append_react_trace
 """
 from __future__ import annotations
+
 import json
 import logging
-import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 def _friendly_error(e: Exception, action: str) -> str:
@@ -17,7 +17,7 @@ def _friendly_error(e: Exception, action: str) -> str:
     return f"{action} 失败 ({err_type}): {msg}"
 
 
-def _append_react_trace(ws, trace_entry: Dict[str, Any]) -> None:
+def _append_react_trace(ws, trace_entry: dict[str, Any]) -> None:
     """写 _react_trace.jsonl (spec §6). 失败不阻塞主流程."""
     try:
         trace_path = ws.path / "_react_trace.jsonl"

@@ -15,9 +15,17 @@ v9 状态 = v8 (整段抄 SAgent) + 3 个 QAgent 特色功能补回:
   (beginStreaming / append_stream_chunk / endStreaming 旧接口占位)
 """
 import re
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QTextBrowser, QSizePolicy
-from PySide6.QtCore import Qt, QTimer, QEvent, QSize
-from PySide6.QtGui import QTextOption, QDesktopServices
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
+from PySide6.QtGui import QDesktopServices, QTextOption
+from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QTextBrowser, QWidget
+
+# 9-20 加: 让测试 v4/v5 import 找到这个常量
+# (历史遗留: tests/test_v4.py 等引用 _BUBBLE_TEMPLATE_PATH,
+#  ui/resources/bubble_template.html (3315B) 还在, 但 message_bubble_1
+#  现在不再用这个 template, 测试 import 报 ImportError)
+_BUBBLE_TEMPLATE_PATH = Path(__file__).resolve().parent / "resources" / "bubble_template.html"
 
 
 # ============================================================
@@ -109,8 +117,9 @@ class MarkdownView(QTextBrowser):
           (不用 img_fmt.setWidth/setHeight — 那可能被 toImageFormat 转换丢失)
         """
         import os as _os
+
         from PIL import Image as _PILImage
-        from PySide6.QtGui import QTextCursor, QTextCharFormat, QTextLength, QTextFormat, QTextImageFormat
+        from PySide6.QtGui import QTextCursor, QTextImageFormat
         try:
             doc = self.document()
             cursor = QTextCursor(doc)

@@ -4,22 +4,19 @@ knowledge._analyze — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: analyze_paper
 """
 from __future__ import annotations
-import os
+
 import json
-import re
-import sqlite3
 import logging
+import os
+import re
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
 
 import arxiv
 
-from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
+from agent.tools.database import save_paper_record
 from agent.tools.llm import _call_llm
+from agent.tools.pdf_utils import extract_text_from_pdf
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -201,7 +198,8 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
     summary_updated = False
     try:
         from agent.tools.extract_keywords import (
-            update_summary_after_analyze, infer_source_from_paper_id,
+            infer_source_from_paper_id,
+            update_summary_after_analyze,
         )
         src = infer_source_from_paper_id(paper_id)
         kw_list = result.get("keywords", [])

@@ -18,13 +18,13 @@
 """
 from __future__ import annotations
 
-import os
 import importlib.util
+import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 # 支持的扩展名（小写，含点）
-SUPPORTED_EXTS: List[str] = [".docx", ".pdf", ".txt", ".md"]
+SUPPORTED_EXTS: list[str] = [".docx", ".pdf", ".txt", ".md"]
 
 # 文件对话框用的过滤串
 FILE_DIALOG_FILTER: str = (
@@ -91,7 +91,7 @@ def _read_pdf(path: str) -> str:
 
 
 # 扩展名 -> 提取器（按优先级排列；同后缀多个时前面的失败才用后面的）
-_EXTRACTORS: Dict[str, List[Callable[[str], str]]] = {
+_EXTRACTORS: dict[str, list[Callable[[str], str]]] = {
     ".docx": [_read_docx_via_com],
     ".pdf": [_read_pdf],
     ".txt": [_read_text_file],
@@ -117,7 +117,7 @@ def extract_text(path: str) -> str:
     if not extractors:
         raise ValueError(f"暂不支持的附件类型: {ext}")
 
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for fn in extractors:
         try:
             text = fn(path)

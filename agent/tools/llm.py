@@ -19,13 +19,12 @@
 - 工具如果想强制用某个 model(比如 _smoke 测试),还是显式传 provider/model
 """
 import logging
-from openai import OpenAI
 
 from agent.llm_clients import (
     PROVIDERS,
+    classify_llm_error,
     get_client,
     resolve_legacy_model,
-    classify_llm_error,
 )
 
 logger = logging.getLogger(__name__)

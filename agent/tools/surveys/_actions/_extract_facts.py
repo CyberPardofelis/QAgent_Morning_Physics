@@ -4,13 +4,17 @@ surveys._actions._extract_facts — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: action_extract_facts
 """
 from __future__ import annotations
-import json
+
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from typing import Any
+
+from .._pool import _safe_json_loads_array
+from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
-def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     extract_facts action (step 3 真实实现):
       - 对每篇 paper 调 minimax LLM 抽 3-5 条 fact (JSON 数组)
@@ -18,8 +22,8 @@ def action_extract_facts(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
       - fact 写 workspace/_facts.jsonl, 加 state['facts']
       - 单篇失败不阻塞 batch
     """
-    from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_fact_prompt
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"

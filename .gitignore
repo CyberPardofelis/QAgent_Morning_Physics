@@ -1,4 +1,14 @@
 .env
+
+# 9-20 P0#4 加: 根目录 _smoke_*.py 跟 tests/_*.py 同性质, 一次性诊断脚本, 不进 git
+# 之前 pytest.ini 注释里写过"应该移走或删除", 但实际没做, root 残留 10 个
+/_smoke_*.py
+
+# 9-20 P0#4 加: QtWebEngineProcess 残留 PID 文件 (main.py 启动时杀死的)
+# 跟 tests/.qagent_qte_pids 同性质, 已经在 tests/.qagent_qte_pids 模式里有,
+# 这里加根目录模式
+/.qagent_qte_pids
+
 # 临时诊断/冒烟脚本（一次性，写完确认无问题后应该移走或删除）
 data/_*.py
 data/_*.txt

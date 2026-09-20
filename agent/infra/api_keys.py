@@ -15,7 +15,6 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +37,20 @@ LEGACY_SETTINGS_KEYS = {
 # 读写（带线程锁）
 # ============================================================
 _lock = threading.RLock()  # 可重入锁：set_api_key 内部 _save_to_disk + _invalidate_cache 会嵌套
-_cache: Optional[Dict[str, str]] = None
+_cache: dict[str, str] | None = None
 
 
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_from_disk() -> Dict[str, str]:
+def _load_from_disk() -> dict[str, str]:
     """从 .api_keys.json 读所有 key（文件不存在返回空 dict）"""
     _ensure_data_dir()
     if not KEYS_FILE.exists():
         return {}
     try:
-        with open(KEYS_FILE, "r", encoding="utf-8") as f:
+        with open(KEYS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             logger.warning("%s 内容不是 dict，重置为空", KEYS_FILE)
@@ -63,7 +62,7 @@ def _load_from_disk() -> Dict[str, str]:
         return {}
 
 
-def _save_to_disk(keys: Dict[str, str]) -> None:
+def _save_to_disk(keys: dict[str, str]) -> None:
     _ensure_data_dir()
     # 原子写：先写临时文件再 rename
     tmp_file = KEYS_FILE.with_suffix(".json.tmp")
@@ -92,7 +91,7 @@ def _migrate_from_legacy_qsettings() -> bool:
     from config.settings import get_settings
 
     settings = get_settings()
-    migrated: Dict[str, str] = {}
+    migrated: dict[str, str] = {}
     for provider, qkey in LEGACY_SETTINGS_KEYS.items():
         try:
             legacy_value = settings.value(qkey, "")
@@ -114,7 +113,7 @@ def _migrate_from_legacy_qsettings() -> bool:
     return True
 
 
-def _get_keys_with_migration() -> Dict[str, str]:
+def _get_keys_with_migration() -> dict[str, str]:
     """获取 keys，自动做一次性迁移"""
     global _cache
     if _cache is not None:
@@ -194,7 +193,7 @@ def set_api_key(provider: str, key: str) -> None:
         _invalidate_cache()
 
 
-def get_all_api_keys() -> Dict[str, str]:
+def get_all_api_keys() -> dict[str, str]:
     """返回所有 key 的副本（避免外部修改）"""
     return dict(_get_keys_with_migration())
 

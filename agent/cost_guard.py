@@ -16,8 +16,7 @@ sqlite 写一次事务太重,反而拖慢 controller。
 """
 import logging
 import threading
-from datetime import datetime, date
-from typing import Optional, Tuple
+from datetime import date
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ class CostGuard:
         # 不在 __init__ 读 QSettings（PySide6 没启动时不能调），
         # 第一次 check_and_increment() 时 lazy 读
 
-    def _load(self) -> Tuple[str, int]:
+    def _load(self) -> tuple[str, int]:
         """从 QSettings 读 (date_str, count)。第一次读就缓存。"""
         from config.settings import get_settings
         s = get_settings()
@@ -83,7 +82,7 @@ class CostGuard:
             _, count = self._load()
             return count
 
-    def check_and_increment(self, ceiling: Optional[int] = None) -> Tuple[bool, str]:
+    def check_and_increment(self, ceiling: int | None = None) -> tuple[bool, str]:
         """检查 + 递增 + 返回 (is_ok, message)
 
         Returns:
@@ -148,7 +147,7 @@ class CostGuard:
 # ============================================================
 # 全局单例
 # ============================================================
-_guard_instance: Optional[CostGuard] = None
+_guard_instance: CostGuard | None = None
 _guard_lock = threading.Lock()
 
 

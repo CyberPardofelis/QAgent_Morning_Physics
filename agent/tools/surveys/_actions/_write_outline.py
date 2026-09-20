@@ -4,13 +4,17 @@ surveys._actions._write_outline — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: action_write_outline
 """
 from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from typing import Any
+
+from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
-def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+def action_write_outline(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     write_outline action (9-08 新增, user 拍板拆分 write_section):
       - 调 minimax LLM 走 build_outline_prompt 生成综述大纲(5 段固定: intro/progress/method_compare/gap/outlook)
@@ -21,9 +25,9 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
 
     大纲生成失败不重试(LLM 调用本身就贵, 失败就让 LLM 下一轮重选 action)
     """
-    from agent.tools.llm import _call_llm
+    from agent.prompts_survey import build_outline_prompt
     from agent.tools.config import get_max_section_tokens
-    from agent.prompts_survey import build_outline_prompt, SECTION_REF_QUOTAS
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
@@ -33,7 +37,7 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
         # 9-08 17:25 改: silent 跳过, 不 yield 啰嗦
         return
 
-    yield f"📋 生成综述大纲\n"
+    yield "📋 生成综述大纲\n"
 
     try:
         prompt = build_outline_prompt(topic=state["topic"], papers=state["pool"])
@@ -60,7 +64,7 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
 
     # parse JSON {sections: [...]}
-    parsed: Optional[Dict[str, Any]] = None
+    parsed: dict[str, Any] | None = None
     if out:
         # 1) 直接
         try:
@@ -96,7 +100,7 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
             "step": state["step"], "action": "write_outline",
             "msg": f"JSON parse 失败: {(out or '')[:200]}",
         })
-        yield f"  ❌ 大纲 JSON parse 失败, 下一轮重试\n"
+        yield "  ❌ 大纲 JSON parse 失败, 下一轮重试\n"
         return
 
     # 规范化 sections
@@ -105,7 +109,7 @@ def action_write_outline(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     #   - LLM 偷懒只返 2 段 → 补到 5 段 (intro/progress/method_compare/gap/outlook)
     VALID_TYPES = {"intro", "progress", "method_compare", "gap", "outlook"}
 
-    def _normalize_sec_type(raw: str) -> Optional[str]:
+    def _normalize_sec_type(raw: str) -> str | None:
         """拼写/分隔符容错, 返回合法 section_type 或 None"""
         s = (raw or "").strip().lower().replace("-", "_").replace(" ", "_")
         if not s:                          # 9-08 修: 空字符串不参与匹配 (避免 "" in "outlook" 误命中)

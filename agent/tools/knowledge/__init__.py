@@ -12,14 +12,9 @@ knowledge — 拆分子模块
 """
 
 from ._analyze import analyze_paper
-from ._query import query_knowledge
-from ._query import semantic_search
-from ._query import semantic_search_keywords
-from ._scan import scan_local_papers
-from ._scan import migrate_json_to_db
-from ._index import index_paper_to_chroma
-from ._index import reindex_all
-from ._index import sync_recent_to_chroma
+from ._index import index_paper_to_chroma, reindex_all, sync_recent_to_chroma
+from ._query import query_knowledge, semantic_search, semantic_search_keywords
+from ._scan import migrate_json_to_db, scan_local_papers
 from ._similar import similar_papers
 from ._utils import _safe_json_list
 

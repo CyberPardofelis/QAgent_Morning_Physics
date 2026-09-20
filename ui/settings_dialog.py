@@ -14,26 +14,45 @@ ui.settings_dialog — 设置对话框
 API key 存到 data/.api_keys.json（agent.infra.api_keys 统一管理，含 QSettings 兜底），
 避免明文在 QSettings/注册表里。
 """
-import os
 import json
-import yaml
+import os
 from pathlib import Path
-from PySide6.QtCore import Qt, QSettings, Signal
-from config.settings import get_settings
+
+import yaml
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QLineEdit, QCheckBox,
-    QComboBox, QDialogButtonBox, QLabel, QTabWidget, QWidget,
-    QScrollArea, QTextEdit, QPushButton, QMessageBox, QGroupBox,
-    QHBoxLayout, QSpinBox,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
+
 from agent.infra.api_keys import (
-    get_all_api_keys, set_api_key, has_api_key,
+    get_all_api_keys,
+    set_api_key,
 )
 from agent.infra.db import health_check
 from agent.llm_clients import reset_client_cache
+from config.settings import get_settings
 from ui.styles import (
-    get_stylesheet, list_themes, set_theme,
-    get_current_theme_name, load_user_themes, get_theme,
+    get_current_theme_name,
+    get_stylesheet,
+    list_themes,
+    load_user_themes,
+    set_theme,
 )
 
 # 数据根目录（与 agent.infra.db._data_root() 一致）
@@ -625,7 +644,7 @@ class SettingsDialog(QDialog):
     def _create_journal_inputs(self):
         yaml_path = self._get_yaml_path()
         try:
-            with open(yaml_path, 'r', encoding='utf-8') as f:
+            with open(yaml_path, encoding='utf-8') as f:
                 journals_data = yaml.safe_load(f)
             journals = journals_data.get('journals', {})
         except Exception as e:
@@ -646,7 +665,7 @@ class SettingsDialog(QDialog):
     def _load_journals_config(self):
         yaml_path = self._get_yaml_path()
         try:
-            with open(yaml_path, 'r', encoding='utf-8') as f:
+            with open(yaml_path, encoding='utf-8') as f:
                 journals_data = yaml.safe_load(f)
             journals = journals_data.get('journals', {})
             for journal_key, section_input in self.journal_section_inputs.items():
@@ -658,7 +677,7 @@ class SettingsDialog(QDialog):
     def _save_journals_config(self):
         yaml_path = self._get_yaml_path()
         try:
-            with open(yaml_path, 'r', encoding='utf-8') as f:
+            with open(yaml_path, encoding='utf-8') as f:
                 journals_data = yaml.safe_load(f) or {}
         except FileNotFoundError:
             journals_data = {'journals': {}}
@@ -677,7 +696,7 @@ class SettingsDialog(QDialog):
     def _get_journal_keys_from_yaml(self):
         yaml_path = self._get_yaml_path()
         try:
-            with open(yaml_path, 'r', encoding='utf-8') as f:
+            with open(yaml_path, encoding='utf-8') as f:
                 data = yaml.safe_load(f)
             return list(data.get('journals', {}).keys())
         except Exception:

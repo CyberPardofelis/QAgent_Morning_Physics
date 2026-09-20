@@ -4,12 +4,18 @@ _pool._utils — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _arxiv_author_name, _safe_json_loads_array, _extract_paper_ids, _audit_section_paper_ids, _safe_paper_id
 """
 from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# paper_id 抽取用 3 种 regex (原 _pool.py 顶部模块级常量)
+_PAPER_ID_SIMPLE_RE = re.compile(r"\[(\d{4,5}\.\d{4,5}|\d{7})\]")
+_PAPER_ID_ARXIV_RE = re.compile(r"arXiv[:\s]+(\d{4,5}\.\d{4,5}|\d{7})")
+_PAPER_ID_PAPERS_MD_RE = re.compile(r"papers/(\d{4,5}\.\d{4,5}|\d{7})\.md")
 def _arxiv_author_name(a: Any) -> str:
     """
     兼容不同 arxiv 库的 Author 表示 (9-18 修复: 'Author' object has no attribute 'text').
@@ -45,7 +51,7 @@ def _arxiv_author_name(a: Any) -> str:
     return s
 
 
-def _safe_json_loads_array(text: str) -> Optional[list]:
+def _safe_json_loads_array(text: str) -> list | None:
     """
     容错 parse JSON 数组 (LLM 经常在 closing `"}]` 前就停, P6.2 实测多次踩)。
 
@@ -99,7 +105,7 @@ def _safe_json_loads_array(text: str) -> Optional[list]:
     return None
 
 
-def _extract_paper_ids(text: str) -> List[str]:
+def _extract_paper_ids(text: str) -> list[str]:
     """从 markdown 文本抽所有 paper_id 引用, 3 种格式都识别, 去重保序"""
     if not text:
         return []
@@ -116,7 +122,7 @@ def _extract_paper_ids(text: str) -> List[str]:
     return out
 
 
-def _audit_section_paper_ids(content_md: str, pool_ids: set) -> Dict[str, List[str]]:
+def _audit_section_paper_ids(content_md: str, pool_ids: set) -> dict[str, list[str]]:
     """候选池内/外分桶 (plan §3.2 覆盖度审计核心)"""
     cites = _extract_paper_ids(content_md or "")
     in_pool = []

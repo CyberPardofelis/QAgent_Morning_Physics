@@ -11,19 +11,22 @@ agent.memory.processor — 记忆库总控
 """
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from .db_manager import MemoryDBManager
-from .vector_store import MemoryVectorStore
 from .embedder import MemoryEmbedder
 from .retriever import MemoryRetriever
 from .schemas import (
-    DEFAULT_SCOPE, MEMORY_TYPES, TRIGGER_KEYWORDS, content_has_trigger_keyword,
+    DEFAULT_SCOPE,
+    MEMORY_TYPES,
+    TRIGGER_KEYWORDS,
+    content_has_trigger_keyword,
 )
+from .vector_store import MemoryVectorStore
 
 logger = logging.getLogger(__name__)
 from .extractor import extract as _llm_extract
-from .judger import judge as _judge_triples, can_merge as _can_merge
+from .judger import judge as _judge_triples
 
 
 class MemoryProcessor:
@@ -57,7 +60,7 @@ class MemoryProcessor:
         sim_merge: float = 0.99,
         sim_similar: float = 0.75,
         top_k: int = 3,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         检查要保存的内容是否与库内已有记忆重复。
 
@@ -93,8 +96,8 @@ class MemoryProcessor:
             logger.debug("[MemoryProcessor] extract 异常: %s", e)
 
         # Step 2: 多路召回
-        all_matches: List[Dict[str, Any]] = []
-        seen_ids: Set[str] = set()
+        all_matches: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
 
         # ---- 路 0: 整体 embedding 召回 ----
         try:
@@ -121,14 +124,14 @@ class MemoryProcessor:
 
         # ---- 路 1 + 路 2: 按 entry 召回 (谓语向量) ----
         # 跟路 0 共享 embedder 状态: 如果路 0 失败, 这里也跳过
-        relations_for_recall: List[Dict[str, Any]] = []
+        relations_for_recall: list[dict[str, Any]] = []
         if new_extract:
             relations_for_recall = new_extract.get("relations", []) or []
         if vec is not None and relations_for_recall:
             try:
                 from .relation_vector_store import get_relation_vector_store
                 rvs = get_relation_vector_store()
-                entry_candidates: Dict[str, Dict[str, Any]] = {}  # memory_id -> {memory, similarity, _via}
+                entry_candidates: dict[str, dict[str, Any]] = {}  # memory_id -> {memory, similarity, _via}
                 for rel in relations_for_recall:
                     subj = rel.get("subj_canonical", "")
                     pred = rel.get("pred", "")
@@ -277,9 +280,9 @@ class MemoryProcessor:
         content: str,
         memory_type: str = "general",
         importance: float = 0.5,
-        related_paper_id: Optional[str] = None,
-        source_conv_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        related_paper_id: str | None = None,
+        source_conv_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
         scope: str = DEFAULT_SCOPE,
     ) -> str:
         """
@@ -343,8 +346,8 @@ class MemoryProcessor:
 
     def save_batch(
         self,
-        items: List[Dict[str, Any]],
-    ) -> List[str]:
+        items: list[dict[str, Any]],
+    ) -> list[str]:
         """批量 save。"""
         ids = []
         for it in items:
@@ -449,12 +452,12 @@ class MemoryProcessor:
         self,
         query: str,
         limit: int = 5,
-        scope: Optional[str] = None,
-        memory_type: Optional[str] = None,
-        related_paper_id: Optional[str] = None,
-        min_importance: Optional[float] = None,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        related_paper_id: str | None = None,
+        min_importance: float | None = None,
         method: str = "vector",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         检索记忆。委托给 retriever。
         """
@@ -468,19 +471,19 @@ class MemoryProcessor:
             method=method,
         )
 
-    def recall_for_paper(self, paper_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def recall_for_paper(self, paper_id: str, limit: int = 10) -> list[dict[str, Any]]:
         return self.retriever.retrieve_for_paper(paper_id, limit=limit)
 
-    def recall_important(self, limit: int = 10, min_importance: float = 0.7) -> List[Dict[str, Any]]:
+    def recall_important(self, limit: int = 10, min_importance: float = 0.7) -> list[dict[str, Any]]:
         return self.retriever.retrieve_important(limit=limit, min_importance=min_importance)
 
     def list_all(
         self,
-        scope: Optional[str] = None,
-        memory_type: Optional[str] = None,
-        min_importance: Optional[float] = None,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        min_importance: float | None = None,
         limit: int = 50,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         return self.db.list_recent(
             scope=scope, memory_type=memory_type, min_importance=min_importance, limit=limit,
         )
@@ -490,7 +493,7 @@ class MemoryProcessor:
     # ============================================================
     def format_for_context(
         self,
-        memories: List[Dict[str, Any]],
+        memories: list[dict[str, Any]],
         include_score: bool = False,
         max_chars: int = 4000,
     ) -> str:
@@ -512,7 +515,7 @@ class MemoryProcessor:
             total_chars += len(line)
         return "\n".join(lines)
 
-    def _format_one_memory(self, idx: int, m: Dict[str, Any], include_score: bool) -> str:
+    def _format_one_memory(self, idx: int, m: dict[str, Any], include_score: bool) -> str:
         parts = [f"{idx}."]
         if m.get("memory_type"):
             parts.append(f"[{m['memory_type']}]")
@@ -542,7 +545,7 @@ class MemoryProcessor:
     # ============================================================
     # 状态 / 统计
     # ============================================================
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         return {
             "sqlite": self.db.get_statistics(),
             "vector_store": self.vs.get_backend_info(),

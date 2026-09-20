@@ -19,19 +19,32 @@ IOP 是 quant-ph 第二大主阵地 (仅次于 APS):
 - search_iop: 关键词搜索, 默认 NJP + J. Phys. A + J. Phys. B + J. Opt. (quant-ph 主阵地)
 """
 import logging
-import requests
-from agent.tools.registry import register_tool
+
+from agent.tools.openalex import (
+    _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
+)
+from agent.tools.openalex import (
+    _RETRY_ON_5XX as _OPENALEX_RETRY,
+)
+from agent.tools.openalex import (
+    OPENALEX_IOP_DEFAULT_QUANT_PH as _OPENALEX_IOP_DEFAULT_QUANT_PH,
+)
+from agent.tools.openalex import (
+    OPENALEX_IOP_SOURCES as _OPENALEX_IOP_SOURCES,
+)
+from agent.tools.openalex import (
+    format_paper_markdown as _openalex_format_paper,
+)
+
 # 2026-09-09 P0.6: 跟 search_aps 共用 OpenAlex 客户端
 # 9-18 加: 顺手导入 timeout/retry 常量, 错误信息能告诉用户具体配置
 from agent.tools.openalex import (
     openalex_search as _openalex_search,
-    format_paper_markdown as _openalex_format_paper,
-    resolve_source_ids as _resolve_openalex_source_ids,
-    OPENALEX_IOP_SOURCES as _OPENALEX_IOP_SOURCES,
-    OPENALEX_IOP_DEFAULT_QUANT_PH as _OPENALEX_IOP_DEFAULT_QUANT_PH,
-    _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
-    _RETRY_ON_5XX as _OPENALEX_RETRY,
 )
+from agent.tools.openalex import (
+    resolve_source_ids as _resolve_openalex_source_ids,
+)
+from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +129,9 @@ def search_iop(
             )
         if msg.startswith("[conn]"):
             return (
-                f"❌ IOP 搜索失败: 网络连不上 OpenAlex\n"
-                f"- 可能是: DNS 失败 / 断网 / 防火墙\n"
-                f"- 建议: 1) 检查网络  2) 试 web_search 兜底"
+                "❌ IOP 搜索失败: 网络连不上 OpenAlex\n"
+                "- 可能是: DNS 失败 / 断网 / 防火墙\n"
+                "- 建议: 1) 检查网络  2) 试 web_search 兜底"
             )
         if msg.startswith("[http 4xx]"):
             return (

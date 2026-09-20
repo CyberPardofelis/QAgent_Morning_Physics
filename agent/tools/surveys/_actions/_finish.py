@@ -4,13 +4,13 @@ surveys._actions._finish — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: action_finish
 """
 from __future__ import annotations
-import json
+
 import logging
-import re
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
-def action_finish(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+def action_finish(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     finish action (9-08 19:30 三重校验 + 自动打回执行):
       1. 章节数校验: section_count < len(outline_sections) → 拒绝, 自动触发 write_section

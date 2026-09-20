@@ -14,14 +14,13 @@ v7 markdown → HTML with formulas
 - 代码块(```code```)和 inline code(`code`)被保护,不被公式提取破坏
 """
 from __future__ import annotations
+
 import html as _html
 import re
-from typing import List, Tuple
 
 import markdown
 
 from ui.formula_renderer import get_formula_renderer
-
 
 # ============================================================
 # 公式提取 + 渲染
@@ -120,8 +119,8 @@ def md_to_html_with_formulas(md_text: str) -> str:
     if not md_text:
         return ''
 
-    code_blocks: List[str] = []
-    formulas: List[Tuple[str, bool]] = []  # (latex, is_display)
+    code_blocks: list[str] = []
+    formulas: list[tuple[str, bool]] = []  # (latex, is_display)
 
     def save_code(m):
         idx = len(code_blocks)

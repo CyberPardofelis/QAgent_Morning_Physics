@@ -14,10 +14,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path  # 9-20 加: 让 _themes_file() 函数签名里的 Path 类型注解可用
 
 from PySide6.QtWidgets import QApplication
-
 
 # ============================================================
 # Theme 数据结构
@@ -35,7 +34,7 @@ class Theme:
     """
     name: str
     display_name: str
-    tokens: Dict[str, str]
+    tokens: dict[str, str]
     builtin: bool = True
 
     def get(self, token: str, default: str = "#000000") -> str:
@@ -47,7 +46,7 @@ class Theme:
 # ============================================================
 
 # ---------- LIGHT (现在这个,浅蓝白,专业感) ----------
-LIGHT_TOKENS: Dict[str, str] = {
+LIGHT_TOKENS: dict[str, str] = {
     # 背景
     "bg_main": "#fafaff",
     "bg_panel": "white",
@@ -102,7 +101,7 @@ LIGHT_TOKENS: Dict[str, str] = {
 }
 
 # ---------- DARK (深色基底,夜读/沉浸) ----------
-DARK_TOKENS: Dict[str, str] = {
+DARK_TOKENS: dict[str, str] = {
     # 背景 — 深炭灰系
     "bg_main": "#1a1d23",         # 主背景
     "bg_panel": "#23262e",         # 面板(左栏/菜单/tab 底)
@@ -157,7 +156,7 @@ DARK_TOKENS: Dict[str, str] = {
 }
 
 # ---------- PAPER (米黄底,稿纸感,适合写作) ----------
-PAPER_TOKENS: Dict[str, str] = {
+PAPER_TOKENS: dict[str, str] = {
     # 背景 — 米黄/纸色
     "bg_main": "#f4ecd8",
     "bg_panel": "#fbf6e9",
@@ -216,7 +215,7 @@ LIGHT = Theme(name="light", display_name="浅色", tokens=LIGHT_TOKENS, builtin=
 DARK = Theme(name="dark", display_name="深色", tokens=DARK_TOKENS, builtin=True)
 PAPER = Theme(name="paper", display_name="纸感", tokens=PAPER_TOKENS, builtin=True)
 
-THEMES: Dict[str, Theme] = {
+THEMES: dict[str, Theme] = {
     "light": LIGHT,
     "dark": DARK,
     "paper": PAPER,
@@ -944,19 +943,19 @@ QScrollArea#attachScroll QScrollBar::sub-line:horizontal {{
 # ============================================================
 
 _current_theme: str = DEFAULT_THEME
-_custom_themes: Dict[str, Theme] = {}
+_custom_themes: dict[str, Theme] = {}
 
 
 def get_current_theme_name() -> str:
     return _current_theme
 
 
-def get_theme(name: str) -> Optional[Theme]:
+def get_theme(name: str) -> Theme | None:
     """获取主题(优先 builtin,再 custom)"""
     return THEMES.get(name) or _custom_themes.get(name)
 
 
-def list_themes() -> List[Theme]:
+def list_themes() -> list[Theme]:
     """所有主题:builtin 优先,custom 追加在后面"""
     return list(THEMES.values()) + list(_custom_themes.values())
 
@@ -988,7 +987,7 @@ def _get_current_font_pt() -> int:
     return 14
 
 
-def get_stylesheet(theme_name: Optional[str] = None) -> str:
+def get_stylesheet(theme_name: str | None = None) -> str:
     """渲染指定主题的 QSS。None = 用当前主题。"""
     name = theme_name or _current_theme
     theme = get_theme(name)
@@ -1001,7 +1000,7 @@ def get_stylesheet(theme_name: Optional[str] = None) -> str:
     )
 
 
-def set_theme(name: str, app: Optional[QApplication] = None,
+def set_theme(name: str, app: QApplication | None = None,
               persist: bool = True) -> bool:
     """切换主题。
 
@@ -1031,7 +1030,7 @@ def set_theme(name: str, app: Optional[QApplication] = None,
             pass
     if persist:
         try:
-            from config.settings import get_settings, SettingsKeys
+            from config.settings import SettingsKeys, get_settings
             get_settings().setValue(SettingsKeys.UI_THEME, name)
         except Exception:
             pass
@@ -1048,7 +1047,7 @@ def apply_to_all_windows(app: QApplication, stylesheet: str) -> None:
             pass
 
 
-def apply_current_theme(app: Optional[QApplication] = None) -> None:
+def apply_current_theme(app: QApplication | None = None) -> None:
     """应用当前主题到 app(用于启动)
 
     1. 读 QSettings 里保存的主题,设到 _current_theme
@@ -1063,7 +1062,7 @@ def apply_current_theme(app: Optional[QApplication] = None) -> None:
         return
     # 先读用户保存的主题
     try:
-        from config.settings import get_settings, SettingsKeys
+        from config.settings import SettingsKeys, get_settings
         saved = get_settings().value(SettingsKeys.UI_THEME, DEFAULT_THEME)
         if get_theme(saved) is not None:
             global _current_theme
@@ -1134,7 +1133,7 @@ def _luminance(hex_color: str) -> float:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
-def derive_tokens(core: Dict[str, str]) -> Dict[str, str]:
+def derive_tokens(core: dict[str, str]) -> dict[str, str]:
     """从 8 个核心 token 派生 30+ 个完整 token dict。
 
     用于: 用户在编辑器里调 8 个核心色, 系统自动算出剩余 25+ token。
@@ -1156,7 +1155,7 @@ def derive_tokens(core: Dict[str, str]) -> Dict[str, str]:
     bg_panel = bg_card
     bg_input = _shade(bg_card, 1.04)  # 比 card 略亮一点(在 dark 主题)或略深(在 light)
 
-    out: Dict[str, str] = {
+    out: dict[str, str] = {
         # 用户调
         "bg_main": bg_main,
         "bg_card": bg_card,
@@ -1205,7 +1204,7 @@ def derive_tokens(core: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
-def get_default_core_tokens() -> Dict[str, str]:
+def get_default_core_tokens() -> dict[str, str]:
     """从 light 主题拿 8 个核心 token 的默认值(用于"新建自定义主题"对话框初始化)"""
     return {k: LIGHT.tokens[k] for k in CORE_TOKEN_KEYS}
 
@@ -1214,8 +1213,7 @@ def get_default_core_tokens() -> Dict[str, str]:
 # 持久化: data/themes.json
 # ============================================================
 
-def _themes_file() -> "Path":
-    from pathlib import Path
+def _themes_file() -> Path:
     return Path("data") / "themes.json"
 
 

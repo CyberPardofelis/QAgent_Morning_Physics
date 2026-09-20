@@ -10,31 +10,29 @@ agent.controller — 流式对话与工具调用编排（v3 — 实时流式 + �
   处理 MiniMax M3 把 thinking 直接拼在 content 字段的情况
 """
 import json
-import re
 import logging
+import re
 import time
-from typing import Iterator, Optional
+from collections.abc import Iterator
 
+from agent.cost_guard import get_cost_guard
+from agent.llm_clients import (
+    PROVIDERS,
+    LLMClientError,
+    classify_llm_error,
+    resolve_legacy_model,
+)
 from agent.llm_clients import (
     get_client as _get_client,
-    get_deepseek_client,
-    get_openai_client,
-    get_minimax_client,
-    LLMClientError,
-    PROVIDERS,
-    resolve_legacy_model,
-    classify_llm_error,
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools.registry import ToolRegistry
-from agent.cost_guard import get_cost_guard
 from config import Config
 
 logger = logging.getLogger(__name__)
 
 # 触发所有工具模块的 @register_tool 装饰器执行
 import agent.tools  # noqa: F401
-
 
 # 直接输出工具：这些工具返回的内容就是最终答案，需要按章节切气泡
 DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
@@ -288,7 +286,7 @@ def _resolve_client_and_model(mode: str) -> tuple:
 def run_agent_stream(
     messages: list,
     mode: str = "deepseek",
-    model: Optional[str] = None,
+    model: str | None = None,
     temperature: float = 0.3,
     top_p: float = 0.9,
     frequency_penalty: float = 0.0,
@@ -301,7 +299,7 @@ def run_agent_stream(
     timeout: int = 600,
     enable_thinking: bool = True,
     reasoning_effort: str = "high",
-    cost_tier: Optional[str] = None,  # 2026-09-02 P0.7 加:None = 从 Config 读
+    cost_tier: str | None = None,  # 2026-09-02 P0.7 加:None = 从 Config 读
     **_unused,
 ) -> Iterator[str]:
     """
@@ -474,8 +472,8 @@ def run_agent_stream(
         # 2026-09-04 加:心跳日志(每 5s 一次),让用户知道 LLM 还在跑(没卡死)
         # 之前 MiniMax-M3 跑 9.7k prompt + 30k output 可能要 60-200s,
         # 用户看到控制台"LLM round 1 start"然后什么都没了 → 误以为卡死
-        import time as _t
         import threading as _th
+        import time as _t
         _heartbeat_state = {"last_print": _t.time(), "stop": False}
 
         def _heartbeat():

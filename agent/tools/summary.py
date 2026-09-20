@@ -20,9 +20,8 @@ P2.5: paper_keywords 独立 collection,语义检索"找和 X 贡献最像的论�
 import logging
 import sqlite3
 import threading
-from datetime import date, datetime
-from pathlib import Path
-from typing import Optional, List, Dict, Any
+from datetime import date
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -199,13 +198,13 @@ def save_summary_item_async(
     paper_id: str,
     source: str,
     title: str,
-    authors: Optional[str] = None,
-    abstract: Optional[str] = None,
-    summary_date: Optional[str] = None,
-    core_method: Optional[str] = None,
-    core_contrib: Optional[str] = None,
-    keywords: Optional[str] = None,
-    outlook: Optional[str] = None,   # 2026-09-03 加
+    authors: str | None = None,
+    abstract: str | None = None,
+    summary_date: str | None = None,
+    core_method: str | None = None,
+    core_contrib: str | None = None,
+    keywords: str | None = None,
+    outlook: str | None = None,   # 2026-09-03 加
 ) -> None:
     """异步落库(后台线程)
 
@@ -268,13 +267,13 @@ def save_summary_item(
     paper_id: str,
     source: str,
     title: str,
-    summary_date: Optional[str] = None,
-    authors: Optional[str] = None,
-    abstract: Optional[str] = None,
-    core_method: Optional[str] = None,
-    core_contrib: Optional[str] = None,
-    keywords: Optional[str] = None,
-    outlook: Optional[str] = None,   # 2026-09-03 加:LLM "意义与展望"
+    summary_date: str | None = None,
+    authors: str | None = None,
+    abstract: str | None = None,
+    core_method: str | None = None,
+    core_contrib: str | None = None,
+    keywords: str | None = None,
+    outlook: str | None = None,   # 2026-09-03 加:LLM "意义与展望"
 ) -> int:
     """同步落库,返回 row id (新增) 或 -1 (UNIQUE 冲突)
 
@@ -306,11 +305,11 @@ def save_summary_item(
 # 查询接口(给 UI / P2.5 / smoke 用)
 # ============================================================
 def list_summary_items(
-    source: Optional[str] = None,
-    since_date: Optional[str] = None,
+    source: str | None = None,
+    since_date: str | None = None,
     limit: int = 100,
     offset: int = 0,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """列 summary_item 记录
 
     Args:
@@ -337,10 +336,10 @@ def list_summary_items(
 
 def search_summary_items_fts(
     keyword: str,
-    source: Optional[str] = None,
+    source: str | None = None,
     limit: int = 100,
     offset: int = 0,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """2026-09-03 加:FTS5 全文检索 summary_item
 
     走 summary_item_fts MATCH,匹配 title/abstract/core_method/core_contrib/keywords
@@ -384,14 +383,14 @@ def search_summary_items_fts(
     return [dict(r) for r in rows]
 
 
-def get_summary_item(item_id: int) -> Optional[Dict[str, Any]]:
+def get_summary_item(item_id: int) -> dict[str, Any] | None:
     from agent.infra.db import connect
     with connect("summary_items") as conn:
         row = conn.execute("SELECT * FROM summary_item WHERE id = ?", (item_id,)).fetchone()
     return dict(row) if row else None
 
 
-def get_summary_item_by_paper(paper_id: str, source: str) -> Optional[Dict[str, Any]]:
+def get_summary_item_by_paper(paper_id: str, source: str) -> dict[str, Any] | None:
     from agent.infra.db import connect
     with connect("summary_items") as conn:
         row = conn.execute(
@@ -401,7 +400,7 @@ def get_summary_item_by_paper(paper_id: str, source: str) -> Optional[Dict[str, 
     return dict(row) if row else None
 
 
-def count_summary_items(source: Optional[str] = None) -> int:
+def count_summary_items(source: str | None = None) -> int:
     """统计条数(给 UI 显示 / smoke 用)"""
     from agent.infra.db import connect
     sql = "SELECT COUNT(*) FROM summary_item"
@@ -415,11 +414,11 @@ def count_summary_items(source: Optional[str] = None) -> int:
 
 def update_summary_item_fields(
     item_id: int,
-    core_method: Optional[str] = None,
-    core_contrib: Optional[str] = None,
-    keywords: Optional[str] = None,
-    in_papers_db: Optional[bool] = None,
-    analysis_id: Optional[int] = None,
+    core_method: str | None = None,
+    core_contrib: str | None = None,
+    keywords: str | None = None,
+    in_papers_db: bool | None = None,
+    analysis_id: int | None = None,
 ) -> None:
     """更新 LLM 提取的字段(analyze_paper 完成后调)
 
@@ -461,11 +460,11 @@ def embed_summary_item_to_chroma(
     source: str,
     summary_date: str,
     title: str,
-    authors: Optional[str] = None,
-    abstract: Optional[str] = None,
-    core_method: Optional[str] = None,
-    core_contrib: Optional[str] = None,
-    keywords: Optional[str] = None,
+    authors: str | None = None,
+    abstract: str | None = None,
+    core_method: str | None = None,
+    core_contrib: str | None = None,
+    keywords: str | None = None,
     row_id: int = 0,
 ) -> bool:
     """
@@ -482,7 +481,7 @@ def embed_summary_item_to_chroma(
     - 跨 collection 检索时不会污染 filter
     """
     try:
-        from agent.vector_db import get_chroma_client, _make_embedding_function
+        from agent.vector_db import _make_embedding_function, get_chroma_client
         client = get_chroma_client()
         fn = _make_embedding_function()
         kwargs = {
@@ -542,7 +541,7 @@ def embed_summary_item_to_chroma(
 # ============================================================
 # 健康检查
 # ============================================================
-def health_check() -> Dict[str, Any]:
+def health_check() -> dict[str, Any]:
     from agent.infra.db import path_of
     p = path_of("summary_items")
     return {

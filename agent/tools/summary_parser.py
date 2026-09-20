@@ -15,10 +15,9 @@ agent.tools.summary_parser — 解析 LLM 输出的"每日总结" markdown,提�
   - 找不到 paper_id:跳过该 block(warn log)
 - **职责单一**:只解析,不落库、不调 LLM、不读文件
 """
-import re
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional
+import re
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +76,7 @@ _KNOWN_FIELDS = {
 }
 
 
-def _normalize_marker(marker: str) -> Optional[str]:
+def _normalize_marker(marker: str) -> str | None:
     """把 marker 文本归一化到字段名;未知返 None"""
     m = marker.strip().lower()
     # 去括号注释: "核心贡献(2-3句话)" → "核心贡献"
@@ -89,7 +88,7 @@ def _extract_field_value(text: str, field_name: str) -> str:
     """从一段 markdown 文本里找 `- **field_name**: value`,返 value"""
     # 按行扫(单 marker 不跨行,LLM prompt 限制了)
     lines = text.split('\n')
-    out_lines: List[str] = []
+    out_lines: list[str] = []
     in_field = False
     for line in lines:
         m = _FIELD_MARKER_RE.match(line)
@@ -153,7 +152,7 @@ def _clean_title(raw: str) -> str:
     return t.strip()
 
 
-def parse_summary_markdown(md_text: str, fetched_papers: List[dict] = None) -> List[PaperSummary]:
+def parse_summary_markdown(md_text: str, fetched_papers: list[dict] = None) -> list[PaperSummary]:
     """
     主入口:解析 LLM 输出的整篇 markdown 总结。
 
@@ -175,7 +174,7 @@ def parse_summary_markdown(md_text: str, fetched_papers: List[dict] = None) -> L
         return []
 
     # 找所有 paper header
-    blocks: List[tuple[int, str, str]] = []  # (start_pos, level_marker, header_text)
+    blocks: list[tuple[int, str, str]] = []  # (start_pos, level_marker, header_text)
     for m in _PAPER_HEADER_RE.finditer(md_text):
         blocks.append((m.start(), m.group(1), m.group(2)))
 
@@ -183,7 +182,7 @@ def parse_summary_markdown(md_text: str, fetched_papers: List[dict] = None) -> L
         logger.warning("[summary_parser] 没找到任何 paper header(`#### N.` 或 `### N.`)")
         return []
 
-    results: List[PaperSummary] = []
+    results: list[PaperSummary] = []
     for i, (start, marker, header_text) in enumerate(blocks):
         # block 内容范围:[start, 下一个 header start 或文末)
         end = blocks[i + 1][0] if i + 1 < len(blocks) else len(md_text)
@@ -270,7 +269,7 @@ def _normalize_title_for_match(title: str) -> str:
     return t
 
 
-def _match_paper_by_title(header_title: str, fetched_papers: List[dict]) -> str:
+def _match_paper_by_title(header_title: str, fetched_papers: list[dict]) -> str:
     """根据 header 里的 title,在已抓取的 papers 里找最匹配的,返回 paper_id
 
     匹配规则(从严到松):

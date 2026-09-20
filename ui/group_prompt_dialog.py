@@ -1,10 +1,8 @@
-from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QTextEdit, QVBoxLayout
+
 from config.settings import get_settings
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QTextEdit, QHBoxLayout,
-    QPushButton, QMessageBox
-)
 from ui.styles import get_stylesheet
+
 
 class GroupSystemPromptDialog(QDialog):
     def __init__(self, group_id, group_name, parent=None):

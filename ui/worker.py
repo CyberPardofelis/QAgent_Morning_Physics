@@ -6,7 +6,9 @@
 # 3. finished 同时给 final_messages 和 bubble_list（保留旧 QAgent 接口，
 #    ConversationController 用 bubble_list 落库；chat_window 用它兜底）
 import traceback
+
 from PySide6.QtCore import QThread, Signal
+
 from agent.controller import run_agent_stream
 
 NEW_BUBBLE = "\x1cNEW_BUBBLE"

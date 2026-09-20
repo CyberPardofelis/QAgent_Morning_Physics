@@ -4,13 +4,14 @@ surveys._actions._decide — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: _decide_action, _state_driven_decide
 """
 from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
-def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
+def _decide_action(state: dict[str, Any]) -> dict[str, Any]:
     """
     ReAct LLM 真决策 (step 6 真实实现).
 
@@ -21,8 +22,8 @@ def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
     9-08 19:30 加: finish_rejected 时直接走 state 规则 (不调 LLM, 不浪费 LLM 调用,
     因为 finish 刚被拒, 已经知道下一步该调什么, 没必要再问 LLM)
     """
-    from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_react_prompt
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
@@ -78,7 +79,7 @@ def _decide_action(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def _state_driven_decide(state: Dict[str, Any]) -> Dict[str, Any]:
+def _state_driven_decide(state: dict[str, Any]) -> dict[str, Any]:
     """
     state-driven fallback 规则 (LLM 决策失败时用, 也是测试兜底).
 

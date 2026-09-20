@@ -18,12 +18,11 @@ scripts.migrate_papers_to_chroma_v2 — P1 全量迁移 + P0.5 chunk 策略（20
 跑法(QAgent 根目录):
     venv/Scripts/python.exe scripts/migrate_papers_to_chroma_v2.py [--dry-run] [--limit N]
 """
-import os
-import sys
-import json
-import time
 import argparse
+import json
 import logging
+import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

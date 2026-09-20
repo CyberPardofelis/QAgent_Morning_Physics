@@ -4,23 +4,17 @@ knowledge._scan — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: scan_local_papers, migrate_json_to_db
 """
 from __future__ import annotations
-import os
+
 import json
-import re
-import sqlite3
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
-
-import arxiv
 
 from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
-from agent.tools.llm import _call_llm
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
+from agent.tools.database import get_db_connection, save_paper_record
 from agent.tools.registry import register_tool
+
+from ._analyze import analyze_paper
 
 logger = logging.getLogger(__name__)
 @register_tool(name="scan_local_papers", is_streaming=False)
@@ -59,7 +53,7 @@ def migrate_json_to_db():
     for json_file in _config.KNOWLEDGE_DIR.glob("*.json"):
         if json_file.name == "index.json":
             continue
-        with open(json_file, "r", encoding="utf-8") as f:
+        with open(json_file, encoding="utf-8") as f:
             data = json.load(f)
 
         if "paper_id" not in data:

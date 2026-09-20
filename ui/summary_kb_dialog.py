@@ -25,19 +25,30 @@ ui.summary_kb_dialog — 论文摘要知识库 dialog(2026-09-03 翻页+搜索�
   不再 `[:60]` 一行截掉换行/逗号
 """
 import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QMessageBox, QLabel, QTextEdit,
-    QDialogButtonBox, QSpinBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
 )
-from ui.styles import get_stylesheet
+
+from agent.tools.knowledge import semantic_search_keywords
 from agent.tools.summary import (
-    list_summary_items, count_summary_items, get_summary_item,
+    count_summary_items,
+    list_summary_items,
     search_summary_items_fts,
 )
-from agent.tools.knowledge import semantic_search_keywords
-
+from ui.styles import get_stylesheet
 
 # 2026-09-03:每页条数(用户可调)
 DEFAULT_PAGE_SIZE = 50
@@ -413,7 +424,6 @@ class SummaryKBDialog(QDialog):
             # 当前页没,直接按 paper_id + source 查最新一条
             # (翻页后双击不在当前页的,需要补查)
             try:
-                from agent.tools.summary import get_summary_item_by_paper
                 # 简单点:用 list_summary_items 不带 source,拿最近一条
                 items = list_summary_items(limit=10000, offset=0)
                 target = next((it for it in items if it.get("paper_id") == paper_id), None)

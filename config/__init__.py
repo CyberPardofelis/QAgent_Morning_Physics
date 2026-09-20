@@ -16,6 +16,7 @@ config — 统一配置层
 新代码推荐用 `Config.get_xxx()` 或 `SettingsKeys.xxx`。
 """
 import os
+
 from dotenv import load_dotenv
 
 # 触发 .env 加载
@@ -54,11 +55,12 @@ ARXIV_SEC = os.getenv("QAGENT_ARXIV_SEC", "quant-ph")
 def __getattr__(name):
     """延迟导入：仅在被访问时才 import config.settings（需要 PySide6）"""
     if name in ("get_settings", "AppInfo", "SettingsKeys", "Config"):
-        from config.settings import get_settings, AppInfo, SettingsKeys
-        # 本地定义 Config 类（避免循环 import settings <-> __init__）
-        from config._config import Config
         # 缓存到模块全局
         import sys
+
+        # 本地定义 Config 类（避免循环 import settings <-> __init__）
+        from config._config import Config
+        from config.settings import AppInfo, SettingsKeys, get_settings
         mod = sys.modules[__name__]
         mod.get_settings = get_settings
         mod.AppInfo = AppInfo

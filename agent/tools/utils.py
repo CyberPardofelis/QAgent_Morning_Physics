@@ -1,7 +1,9 @@
-import tempfile
-import subprocess
-import yaml
 import os
+import subprocess
+import tempfile
+
+import yaml
+
 # 2026-09-04 用户拍板:暂时从 LLM 工具列表中移除 run_python(安全考虑)
 # 函数保留 — 后续如果要加回(加 sandbox/资源限制),可以恢复
 # from agent.tools.registry import register_tool
@@ -11,7 +13,7 @@ def load_journal_config():
     # 获取当前文件（utils.py）所在目录的父目录（agent/）
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(base_dir, 'journals.yaml')
-    with open(config_path, 'r', encoding='utf-8') as f:
+    with open(config_path, encoding='utf-8') as f:
         config = yaml.safe_load(f)
         return config.get('journals', {})
 

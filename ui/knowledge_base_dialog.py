@@ -1,11 +1,20 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QMessageBox, QLabel
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
 )
-from ui.styles import get_stylesheet
-from agent.tools import query_knowledge, get_paper_by_id, get_recent_papers_raw
+
+from agent.tools import get_paper_by_id, get_recent_papers_raw, query_knowledge
 from ui.paper_edit_dialog import PaperEditDialog
+from ui.styles import get_stylesheet
 
 
 class KnowledgeBaseDialog(QDialog):

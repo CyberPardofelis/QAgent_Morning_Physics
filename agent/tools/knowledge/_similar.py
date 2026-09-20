@@ -4,23 +4,16 @@ knowledge._similar — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: similar_papers
 """
 from __future__ import annotations
-import os
-import json
-import re
-import sqlite3
-import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
 
-import arxiv
+import logging
+import sqlite3
+from pathlib import Path
 
 from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
-from agent.tools.llm import _call_llm
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
 from agent.tools.registry import register_tool
+
+from ._utils import _safe_json_list
 
 logger = logging.getLogger(__name__)
 @register_tool(name="similar_papers", is_streaming=False, cost_tier="L0")
@@ -51,7 +44,6 @@ def similar_papers(
     Returns:
         Markdown 格式的相似论文列表, 每条带 paper_id / title / 命中字段 / 相似度
     """
-    import json as _json
     db_path = Path(_config.KNOWLEDGE_DIR) / "papers.db"
     if not db_path.exists():
         return f"❌ papers.db 不存在: {db_path}"
@@ -127,7 +119,7 @@ def similar_papers(
     semantic_top = []
     if n_semantic > 0:
         try:
-            from agent.vector_db import get_chroma_client, _make_embedding_function
+            from agent.vector_db import _make_embedding_function, get_chroma_client
             client = get_chroma_client()
             fn = _make_embedding_function()
             kwargs = {"name": "paper_keywords", "metadata": {"hnsw:space": "cosine"}}

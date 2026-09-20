@@ -14,7 +14,7 @@ agent.memory.extractor \u2014 LLM-driven concept & relation extraction
 """
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +88,12 @@ EXTRACTION_PROMPT = """\u4f60\u662f\u4e00\u4e2a\u79d1\u7814\u8bb0\u5fc6\u5e93\u7
 # ============================================================
 # LLM \u8c03\u7528
 # ============================================================
-def _call_llm_extract(content: str) -> Optional[Dict[str, Any]]:
+def _call_llm_extract(content: str) -> dict[str, Any] | None:
     """
     \u8c03 deepseek \u62bd\u53d6\u5b57\u6bb5. \u5931\u8d25\u8fd4\u56de None.
     """
     try:
-        from agent.llm_clients import get_client, LLMClientError
+        from agent.llm_clients import get_client
         client = get_client("deepseek")
     except Exception as e:
         logger.warning("[MemoryExtractor] \u62ff\u4e0d\u5230 deepseek client: %s", e)
@@ -140,7 +140,7 @@ def _call_llm_extract(content: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _normalize_extract(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_extract(raw: dict[str, Any]) -> dict[str, Any]:
     """
     \u5f52\u4e00\u5316 LLM \u8fd4\u56de\u7684\u7ed3\u6784. \u4e22\u6389\u8106\u5f31\u5b57\u6bb5, \u9ed8\u8ba4\u503c\u586b\u4e2a\u5217\u8868.
     """
@@ -190,7 +190,7 @@ def _normalize_extract(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def extract(content: str, use_llm: bool = True) -> Dict[str, Any]:
+def extract(content: str, use_llm: bool = True) -> dict[str, Any]:
     """
     \u4ece content \u62bd\u53d6 4 \u5b57\u6bb5. \u9ed8\u8ba4\u8c03 LLM, \u53ef\u9009 fallback \u4e0d\u8c03.
 

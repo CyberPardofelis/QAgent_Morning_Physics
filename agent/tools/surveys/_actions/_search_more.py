@@ -4,13 +4,18 @@ surveys._actions._search_more — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: action_search_more
 """
 from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from typing import Any
+
+from .._pool import _arxiv_search, _openalex_aps_search, _openalex_iop_search
+from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
-def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     search_more action (step 2 真实实现):
       1. arxiv API 抓 k 篇
@@ -26,9 +31,9 @@ def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Itera
       - 多源时, 各路并行抓, 按 paper_id dedup, 然后跑 summarize
       - 控制台打印每路召回数
     """
-    from agent.tools.summary import save_summary_item
-    from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_summarize_prompt
+    from agent.tools.llm import _call_llm
+    from agent.tools.summary import save_summary_item
 
     query = args.get("query") or state["topic"]
     k = args.get("k", 5)
@@ -56,9 +61,9 @@ def action_search_more(args: Dict[str, Any], state: Dict[str, Any], ws) -> Itera
     yield "🔎 去找论文了\n"
 
     # 9-18 加: 多源并行召回. 单源失败不阻塞 batch.
-    raw_papers: List[Dict[str, Any]] = []
-    per_source_count: Dict[str, int] = {}
-    per_source_journal: Dict[str, str] = {}
+    raw_papers: list[dict[str, Any]] = []
+    per_source_count: dict[str, int] = {}
+    per_source_journal: dict[str, str] = {}
     seen_in_search: set = set()
     # 9-18 修: 给每个 paper 标 _src 标签 (arxiv / aps / iop), 后面 journal 标签检测用这个,
     # 不要用 per_source_journal.get("aps") 这种全局判断 (会误把 IOP paper 标成 APS)

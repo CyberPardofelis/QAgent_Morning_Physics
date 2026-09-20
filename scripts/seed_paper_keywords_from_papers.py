@@ -16,10 +16,9 @@ scripts.seed_paper_keywords_from_papers — P2.5 一次性回填脚本（2026-09
     # 然后:
     venv/Scripts/python.exe scripts/summary_items_to_chroma.py
 """
-import os
-import sys
-import sqlite3
 import logging
+import sqlite3
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,11 +46,12 @@ def _list_json_fields(s: str) -> list:
 
 
 def main():
-    from agent.tools.summary import (
-        save_summary_item, count_summary_items, list_summary_items,
-    )
-    from config import Config
     from agent.infra.db import _data_root  # noqa: F401  保留以防 monkey patch
+    from agent.tools.summary import (
+        count_summary_items,
+        list_summary_items,
+        save_summary_item,
+    )
 
     knowledge_dir = Path("data/knowledge")
     papers_db = knowledge_dir / "papers.db"

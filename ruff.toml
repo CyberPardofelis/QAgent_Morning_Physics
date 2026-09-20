@@ -1,0 +1,53 @@
+# ruff.toml — QAgent 代码体检后加的 lint/format 配置 (2026-09-20)
+# 装 ruff 后用: ruff check .   (lint)   /   ruff format .   (auto-format)
+
+# 行宽比 pycodestyle 默认 (88) 略宽 — 项目有大量 LLM prompt 多行字符串,
+# 改窄会刷出上千条 diff, 一次性全改不可控
+line-length = 120
+target-version = "py310"
+
+[lint]
+# E/F/W: pycodestyle + pyflakes + pycodestyle warnings
+# I: isort (import 排序)
+# B: flake8-bugbear (常见 bug 模式)
+# C4: flake8-comprehensions (comprehension 改写)
+# UP: pyupgrade (语法现代化, dict | dict 等)
+# SIM: flake8-simplify (可简化代码)
+select = ["E", "F", "W", "I", "B", "C4", "UP", "SIM"]
+
+# E501 line-too-long: 单独跑 formatter (ruff format) 处理
+# B008 function-call-in-default-argument: 项目里大量用 (datetime.now()) 默认参数, 改要刷一堆
+ignore = [
+    "E501",
+    "B008",
+]
+
+# 长函数 / 高复杂度 — 这是 9-20 体检重点, 把 C901 (complex-structure) 单独开
+# 让它 fail 而不是 warn, 防止再出现 343 行的 run_agent_stream
+extend-select = ["C901"]
+
+# 单文件粒度例外
+[lint.per-file-ignores]
+# tests/ 不强制 import 排序 + 不强制 B/SIM 类简化
+"tests/**" = ["B", "SIM", "I"]
+# __init__.py 大量 re-export, 允许未使用 import
+"**/__init__.py" = ["F401", "E402"]
+# 启动脚本 main.py 顶部允许 os/sys 同名 (Python 习惯)
+"main.py" = ["E402"]
+# agent/tools/surveys/* 是 P0 修复密度最高的位置, 复杂度限制松一些
+"agent/tools/surveys/_pool/_build_pool.py" = ["C901"]
+"agent/tools/surveys/_pool/_pool_audit.py" = ["C901"]
+"agent/tools/surveys/_pool/_relevance_filter.py" = ["C901"]
+# prompts.py 大量超长 docstring (LLM system prompt), 不限制 docstring 长度
+"agent/prompts.py" = ["E501"]
+"agent/prompts_survey.py" = ["E501"]
+
+[lint.mccabe]
+# 圈复杂度上限 — 比默认 10 高, 留点缓冲 (P6.5 综述函数 cplx 60+)
+max-complexity = 30
+
+[format]
+# 跟 pycodestyle 默认对齐
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"  # \n\n (Windows 文件用 CRLF 会被自动转)

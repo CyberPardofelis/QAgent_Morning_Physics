@@ -17,20 +17,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer, QEvent, QSettings
-from config.settings import get_settings
-from PySide6.QtGui import QPainter, QPen, QPalette
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QPlainTextEdit,
-    QPushButton, QSizePolicy, QToolButton, QScrollArea,
-    QFileDialog, QLabel,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from agent.tools.attachment_reader import (
-    SUPPORTED_EXTS, FILE_DIALOG_FILTER, is_supported, extract_text,
+    FILE_DIALOG_FILTER,
+    extract_text,
+    is_supported,
 )
+from config.settings import get_settings
 
 
 # ============================================================
@@ -40,8 +48,8 @@ from agent.tools.attachment_reader import (
 class AttachmentItem:
     """单个附件：路径 + 缓存的文本内容（懒加载）"""
     path: str
-    text: Optional[str] = None          # 第一次发送时再读
-    error: Optional[str] = None
+    text: str | None = None          # 第一次发送时再读
+    error: str | None = None
     size_chars: int = 0
 
     @property
@@ -174,7 +182,7 @@ class InputPanel(QWidget):
         self.attachment_error = None       # fn(msg: str) -> None
 
         # 附件列表
-        self._attachments: List[AttachmentItem] = []
+        self._attachments: list[AttachmentItem] = []
 
         # === 2026-09-02 加(抄 WAgent):send_stop_btn 二态状态 ===
         self._is_streaming = False         # LLM 是否在 streaming
@@ -403,7 +411,7 @@ class InputPanel(QWidget):
             return
 
         # 懒加载：发送时一次性读出所有附件文本
-        attachments_meta: List[dict] = []
+        attachments_meta: list[dict] = []
         had_error = False
         for item in self._attachments:
             try:

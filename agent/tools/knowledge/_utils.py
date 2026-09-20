@@ -4,23 +4,11 @@ knowledge._utils — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: _safe_json_list
 """
 from __future__ import annotations
-import os
+
 import json
-import re
-import sqlite3
 import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
 
-import arxiv
-
-from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
-from agent.tools.llm import _call_llm
-from agent.tools.registry import register_tool
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
 
 logger = logging.getLogger(__name__)
 def _safe_json_list(s) -> list:

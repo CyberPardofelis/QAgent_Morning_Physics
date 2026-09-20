@@ -5,10 +5,11 @@ config._config — Config 类实现
 （Config 类要 from .settings import get_settings，但 settings 要避免触发 __init__ 的全部执行）
 """
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from config.settings import get_settings, AppInfo, SettingsKeys
+    pass
 
 
 class Config:

@@ -16,10 +16,9 @@ scripts.summary_items_to_chroma — P2.5 summary_item 嵌入到 paper_keywords c
 跑法(QAgent 根目录):
     venv/Scripts/python.exe scripts/summary_items_to_chroma.py [--limit N] [--dry-run] [--rebuild]
 """
-import os
-import sys
-import logging
 import argparse
+import logging
+import sys
 from pathlib import Path
 
 # 让脚本能 import QAgent 模块
@@ -110,7 +109,7 @@ def main():
     args = parser.parse_args()
 
     # 1. 读 summary_items
-    from agent.tools.summary import list_summary_items, health_check
+    from agent.tools.summary import health_check, list_summary_items
     h = health_check()
     logger.info("summary_items.db 状态: %s", h)
     if h["count"] == 0:
@@ -129,7 +128,7 @@ def main():
         return 0
 
     # 2. 拿 chroma client
-    from agent.vector_db import get_chroma_client, _make_embedding_function
+    from agent.vector_db import _make_embedding_function, get_chroma_client
     client = get_chroma_client()
     fn = _make_embedding_function()
 

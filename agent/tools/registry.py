@@ -21,8 +21,9 @@ Tool Registry: 集中管理 LLM 可调用的工具（参考 WAgent 实现）。
 """
 import json
 import logging
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 class ToolDef:
     name: str
     description: str
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
     handler: Callable
     is_streaming: bool = False
     # 2026-09-02 P0.7 加:成本控制 3 档 (L0=纯本地, L1=单次 LLM, L2=重型多轮)
@@ -41,7 +42,7 @@ class ToolDef:
 
 
 class ToolRegistry:
-    _tools: Dict[str, ToolDef] = {}
+    _tools: dict[str, ToolDef] = {}
 
     @classmethod
     def register(cls, tool: ToolDef) -> None:
@@ -51,15 +52,15 @@ class ToolRegistry:
         logger.debug("注册工具: %s (streaming=%s)", tool.name, tool.is_streaming)
 
     @classmethod
-    def get(cls, name: str) -> Optional[ToolDef]:
+    def get(cls, name: str) -> ToolDef | None:
         return cls._tools.get(name)
 
     @classmethod
-    def all(cls) -> List[ToolDef]:
+    def all(cls) -> list[ToolDef]:
         return list(cls._tools.values())
 
     @classmethod
-    def list_schemas(cls) -> List[Dict[str, Any]]:
+    def list_schemas(cls) -> list[dict[str, Any]]:
         """导出 OpenAI function calling 格式的 schema 列表（给 LLM 看）
 
         2026-09-02 P0.7 加:在 function dict 顶层透传 x_cost_tier 元数据字段,
@@ -80,7 +81,7 @@ class ToolRegistry:
         ]
 
     @classmethod
-    def list_schemas_filtered(cls, cost_tier: str = "L2") -> List[Dict[str, Any]]:
+    def list_schemas_filtered(cls, cost_tier: str = "L2") -> list[dict[str, Any]]:
         """2026-09-02 P0.7 加:按当前档位过滤后导出 schema
 
         Args:
@@ -98,12 +99,12 @@ class ToolRegistry:
         ]
 
     @classmethod
-    def list_names(cls) -> List[str]:
+    def list_names(cls) -> list[str]:
         """所有已注册工具的名字列表"""
         return list(cls._tools.keys())
 
     @classmethod
-    def dispatch(cls, name: str, args: Dict[str, Any]) -> Iterator[str]:
+    def dispatch(cls, name: str, args: dict[str, Any]) -> Iterator[str]:
         """
         统一调度入口：返回字符串迭代器，controller 直接 yield from。
 
@@ -163,7 +164,7 @@ class ToolRegistry:
 
 
 def register_tool(
-    name: Optional[str] = None,
+    name: str | None = None,
     is_streaming: bool = False,
     cost_tier: str = "L1",
 ):

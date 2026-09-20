@@ -33,8 +33,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-
+from typing import Any
 
 # 数据根
 _DEFAULT_ROOT = Path("data/surveys/working")
@@ -61,7 +60,7 @@ class SurveyWorkspace:
     def __init__(
         self,
         topic_hash: str,
-        root: Optional[Path] = None,
+        root: Path | None = None,
         topic: str = "",  # 写 _status.json 时留个可读 topic, 不强制
     ):
         self.topic_hash = topic_hash
@@ -71,7 +70,7 @@ class SurveyWorkspace:
         self.path.mkdir(parents=True, exist_ok=True)
 
     # ============== _pool.json ==============
-    def save_pool(self, papers: List[Dict[str, Any]]) -> None:
+    def save_pool(self, papers: list[dict[str, Any]]) -> None:
         p = self.path / "_pool.json"
         payload = {
             "topic": self.topic,
@@ -85,7 +84,7 @@ class SurveyWorkspace:
             encoding="utf-8",
         )
 
-    def load_pool(self) -> List[Dict[str, Any]]:
+    def load_pool(self) -> list[dict[str, Any]]:
         p = self.path / "_pool.json"
         if not p.exists():
             return []
@@ -96,14 +95,14 @@ class SurveyWorkspace:
             return []
 
     # ============== _facts.jsonl ==============
-    def append_fact(self, fact: Dict[str, Any]) -> None:
+    def append_fact(self, fact: dict[str, Any]) -> None:
         p = self.path / "_facts.jsonl"
         # 每行一条 fact, json 序列化
         line = json.dumps(fact, ensure_ascii=False)
         with p.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-    def load_facts(self) -> List[Dict[str, Any]]:
+    def load_facts(self) -> list[dict[str, Any]]:
         p = self.path / "_facts.jsonl"
         if not p.exists():
             return []
@@ -119,14 +118,14 @@ class SurveyWorkspace:
         return facts
 
     # ============== _outline.json ==============
-    def save_outline(self, outline: Dict[str, Any]) -> None:
+    def save_outline(self, outline: dict[str, Any]) -> None:
         p = self.path / "_outline.json"
         p.write_text(
             json.dumps(outline, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    def load_outline(self) -> Optional[Dict[str, Any]]:
+    def load_outline(self) -> dict[str, Any] | None:
         p = self.path / "_outline.json"
         if not p.exists():
             return None
@@ -161,7 +160,7 @@ class SurveyWorkspace:
         )
         tmp.replace(p)
 
-    def load_status(self) -> Optional[Dict[str, Any]]:
+    def load_status(self) -> dict[str, Any] | None:
         p = self.path / "_status.json"
         if not p.exists():
             return None
@@ -175,14 +174,14 @@ class SurveyWorkspace:
         p = self.path / "_audit.md"
         p.write_text(audit_md, encoding="utf-8")
 
-    def load_audit(self) -> Optional[str]:
+    def load_audit(self) -> str | None:
         p = self.path / "_audit.md"
         if not p.exists():
             return None
         return p.read_text(encoding="utf-8")
 
     # ============== 元信息 ==============
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         """给 UI list_workspaces 用, 1 行摘要"""
         pool = self.load_pool()
         facts = self.load_facts()
@@ -201,7 +200,7 @@ class SurveyWorkspace:
 
 
 # ============== list_workspaces ==============
-def list_workspaces(root: Optional[Path] = None) -> List[Dict[str, Any]]:
+def list_workspaces(root: Path | None = None) -> list[dict[str, Any]]:
     """
     列出 data/surveys/working/ 下所有 workspace, 按 _status.json 的 updated_at 倒序。
     无 _status.json 的(可能是中断的)也列出, 标 phase="??"。

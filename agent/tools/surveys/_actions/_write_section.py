@@ -4,13 +4,19 @@ surveys._actions._write_section — 拆出自原 _actions.py (9-20 体检重构)
 包含函数: action_write_section
 """
 from __future__ import annotations
-import json
+
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from datetime import datetime
+from typing import Any
+
+from .._crud import create_section, create_theme
+from .._pool import _audit_section_paper_ids
+from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
-def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Iterator[str]:
+def action_write_section(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     write_section action (step 4 真实实现):
       - 调 minimax LLM 写单个章节 markdown
@@ -19,9 +25,9 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
       - 章节落 surveys.db (create_section, paper_ids 逗号分隔)
       - step 4 用非流式 LLM 拿完整 markdown 再 yield (真流式要 _call_llm_stream, 留 P+)
     """
-    from agent.tools.llm import _call_llm
-    from agent.tools.config import get_max_section_tokens
     from agent.prompts_survey import build_section_prompt
+    from agent.tools.config import get_max_section_tokens
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
@@ -32,8 +38,8 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     outline_sections = state.get("outline_sections", [])
     if not outline_sections:
         yield (
-            f"❌ write_section: 大纲未生成, 必须先 write_outline (state['outline_sections'] 空)\n"
-            f"👁️ 观察: 跳到下一轮, LLM 应选 write_outline\n"
+            "❌ write_section: 大纲未生成, 必须先 write_outline (state['outline_sections'] 空)\n"
+            "👁️ 观察: 跳到下一轮, LLM 应选 write_outline\n"
         )
         state["errors"].append({
             "step": state["step"], "action": "write_section",
@@ -167,7 +173,7 @@ def action_write_section(args: Dict[str, Any], state: Dict[str, Any], ws) -> Ite
     if m_missing:
         # 解析 query 列表 (简单 split, 容忍单引号/双引号)
         raw_queries = m_missing.group(1)
-        queries: List[str] = []
+        queries: list[str] = []
         try:
             import ast as _ast
             parsed = _ast.literal_eval(f"[{raw_queries}]")

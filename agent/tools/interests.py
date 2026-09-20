@@ -1,8 +1,8 @@
 # tools/interests.py
-import sqlite3
-import json
 from datetime import datetime
+
 from .database import get_db_connection
+
 
 class InterestModel:
     def __init__(self, user_id=1):

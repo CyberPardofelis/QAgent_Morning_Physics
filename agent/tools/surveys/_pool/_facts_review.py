@@ -4,17 +4,19 @@ _pool._facts_review — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _review_facts_topic_alignment
 """
 from __future__ import annotations
-import json
+
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
+
+from ._utils import _safe_json_loads_array
 
 logger = logging.getLogger(__name__)
 def _review_facts_topic_alignment(
     topic: str,
-    facts: List[Dict[str, Any]],
+    facts: list[dict[str, Any]],
     threshold: int,
-) -> "tuple[Dict[str, Dict[str, Any]], Dict[str, int]]":
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     """
     per-fact 主题对齐审查 (9-09 user 拍板加).
 
@@ -32,8 +34,8 @@ def _review_facts_topic_alignment(
       - 单条 JSON parse 失败 → 该条用中性分
       - 全部 fallback → 返回 (空 scored, stats with fallback 计数)
     """
-    from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_fact_review_prompt
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
@@ -48,11 +50,11 @@ def _review_facts_topic_alignment(
         topic[:50], len(facts), batch_size, threshold,
     )
 
-    scored: Dict[str, Dict[str, Any]] = {}  # fact_id -> {score, is_topic_aligned, reason}
+    scored: dict[str, dict[str, Any]] = {}  # fact_id -> {score, is_topic_aligned, reason}
     stats = {"aligned": 0, "misaligned": 0, "fallback": 0, "total": len(facts)}
 
     # 用 fact_id 作 key, 如果 fact_id 缺失则用 (paper_id, claim 短 hash) 兜底
-    def _fact_key(f: Dict[str, Any], idx: int) -> str:
+    def _fact_key(f: dict[str, Any], idx: int) -> str:
         fid = f.get("fact_id")
         if fid:
             return str(fid)

@@ -17,11 +17,11 @@ agent.memory.relation_vector_store — v3.2: relation 级 faiss 向量索引
 import logging
 import pickle
 import threading
-from typing import List, Dict, Optional, Any
+from typing import Any, Optional
 
 import numpy as np
 
-from .schemas import RELATION_FAISS_PATH, RELATION_META_PATH, DEFAULT_EMBEDDING_DIM
+from .schemas import DEFAULT_EMBEDDING_DIM, RELATION_FAISS_PATH, RELATION_META_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class RelationVectorStore:
     _instance: Optional["RelationVectorStore"] = None
     _lock = threading.Lock()
 
-    def __new__(cls, dim: Optional[int] = None):
+    def __new__(cls, dim: int | None = None):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -71,8 +71,8 @@ class RelationVectorStore:
         dim = getattr(self, "_dim_arg", None) or dim
         self.dim = dim
         self._write_lock = threading.Lock()
-        self._meta: List[Dict[str, Any]] = []
-        self._id_to_idx: Dict[str, int] = {}
+        self._meta: list[dict[str, Any]] = []
+        self._id_to_idx: dict[str, int] = {}
 
         # 加载已有索引
         if RELATION_FAISS_PATH.exists() and RELATION_META_PATH.exists():
@@ -130,7 +130,7 @@ class RelationVectorStore:
         pred_vector: np.ndarray,
         polarity: str = "support",
         idx_in_memory: int = 0,
-    ) -> Optional[int]:
+    ) -> int | None:
         """
         加一条 relation 向量.
 
@@ -176,9 +176,9 @@ class RelationVectorStore:
     def add_relations_batch(
         self,
         memory_id: str,
-        relations: List[Dict[str, Any]],
-        pred_vectors: List[np.ndarray],
-    ) -> List[int]:
+        relations: list[dict[str, Any]],
+        pred_vectors: list[np.ndarray],
+    ) -> list[int]:
         """
         批量加. relations = [{"subj_canonical", "pred", "obj_canonical", "polarity"}, ...]
         pred_vectors = [vec1, vec2, ...] 顺序对应
@@ -237,8 +237,8 @@ class RelationVectorStore:
         query_pred_vector: np.ndarray,
         top_k: int = 5,
         sim_threshold: float = 0.9,
-        exclude_memory_ids: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        exclude_memory_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         按谓语语义相似度召回 (路 2: 只匹配谓语).
 
@@ -291,8 +291,8 @@ class RelationVectorStore:
         obj_canonical: str,
         top_k: int = 5,
         sim_threshold: float = 0.9,
-        exclude_memory_ids: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        exclude_memory_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         按主+宾相同 + 谓语语义相似召回 (路 1).
 
@@ -339,12 +339,12 @@ class RelationVectorStore:
         scored.sort(key=lambda x: -x["similarity"])
         return scored[:top_k]
 
-    def get_metadata(self, row_idx: int) -> Optional[Dict[str, Any]]:
+    def get_metadata(self, row_idx: int) -> dict[str, Any] | None:
         if 0 <= row_idx < len(self._meta):
             return dict(self._meta[row_idx])
         return None
 
-    def get_vector(self, row_idx: int) -> Optional[np.ndarray]:
+    def get_vector(self, row_idx: int) -> np.ndarray | None:
         if row_idx < 0 or row_idx >= self.index.ntotal:
             return None
         try:

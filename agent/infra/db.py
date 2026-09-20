@@ -13,11 +13,12 @@ QAgent 数据布局（保留现有文件位置以兼容旧数据）：
 - data/knowledge/summary_items.db     → 论文摘要库（2026-09-02 P0.6）
 - data/knowledge/surveys.db           → 综述库（2026-09-02 P6 准备，UI 先上线）
 """
-import sqlite3
 import logging
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Dict, Any
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # 数据库注册表
 # ============================================================
 # 各数据库文件名（保留现有位置，兼容旧数据）
-DB_FILES: Dict[str, str] = {
+DB_FILES: dict[str, str] = {
     "conversations": "conversations/conversations.db",   # 对话历史
     "papers":        "knowledge/papers.db",              # 论文知识库
     "memory":        "memory/memories.db",               # 通用记忆库
@@ -92,16 +93,16 @@ def path_of(name: str) -> Path:
 # ============================================================
 # 健康检查
 # ============================================================
-def health_check() -> Dict[str, Dict[str, Any]]:
+def health_check() -> dict[str, dict[str, Any]]:
     """
     检查所有数据库状态。供诊断 / 状态栏 / 启动校验使用。
 
     返回 {db_name: {path, exists, size_bytes, table_count, writable, error?}}
     """
-    results: Dict[str, Dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
     for name in DB_FILES:
         p = path_of(name)
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             "path": str(p),
             "exists": p.exists(),
             "size_bytes": p.stat().st_size if p.exists() else 0,
@@ -125,6 +126,6 @@ def health_check() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def all_paths() -> Dict[str, Path]:
+def all_paths() -> dict[str, Path]:
     """返回所有库的路径（用于备份 / 调试）"""
     return {name: path_of(name) for name in DB_FILES}

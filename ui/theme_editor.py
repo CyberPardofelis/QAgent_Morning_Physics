@@ -16,27 +16,37 @@ ui/theme_editor.py
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
-from pathlib import Path
-from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPushButton,
-    QLabel, QComboBox, QColorDialog, QMessageBox, QGroupBox, QWidget,
-    QScrollArea, QSizePolicy, QInputDialog, QMenu, QFrame,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ui.styles import (
-    CORE_TOKEN_KEYS, LIGHT, DARK, PAPER,
-    derive_tokens, get_default_core_tokens,
-    register_custom_theme, list_themes, get_theme,
-    get_current_theme_name, set_theme,
-    upsert_user_theme, delete_user_theme,
-    get_stylesheet,
+    CORE_TOKEN_KEYS,
+    delete_user_theme,
+    derive_tokens,
+    get_current_theme_name,
+    get_default_core_tokens,
+    get_theme,
+    list_themes,
+    set_theme,
+    upsert_user_theme,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,7 +194,7 @@ class _PreviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tokens: Dict[str, str] = {}
+        self._tokens: dict[str, str] = {}
         self.setMinimumHeight(140)
         self._build()
 
@@ -237,7 +247,7 @@ class _PreviewWidget(QWidget):
 
         layout.addStretch()
 
-    def update_tokens(self, tokens: Dict[str, str]):
+    def update_tokens(self, tokens: dict[str, str]):
         """根据 token dict 重写小预览的 QSS"""
         self._tokens = tokens
         # 用 QSS 模板渲染
@@ -306,7 +316,7 @@ class ThemeEditorDialog(QDialog):
 
     theme_saved = Signal()  # 保存成功发出, 通知 settings_dialog 刷新下拉
 
-    def __init__(self, parent=None, edit_theme_name: Optional[str] = None):
+    def __init__(self, parent=None, edit_theme_name: str | None = None):
         """
         Args:
             edit_theme_name: 如果给定, 编辑现有主题; 否则新建
@@ -318,7 +328,7 @@ class ThemeEditorDialog(QDialog):
         self.setParent(None)
 
         self._editing_name = edit_theme_name
-        self._rows: Dict[str, _ColorRow] = {}
+        self._rows: dict[str, _ColorRow] = {}
         self._setup_ui()
 
         # 初始化 token
@@ -452,13 +462,13 @@ class ThemeEditorDialog(QDialog):
             self._rows[token].set_color(defaults[token])
         self._update_preview()
 
-    def _load_from_theme(self, full_tokens: Dict[str, str]):
+    def _load_from_theme(self, full_tokens: dict[str, str]):
         """从已有主题加载: full_tokens 是 30+ 完整 token, 提取 8 个核心"""
         for token in CORE_TOKEN_KEYS:
             if token in full_tokens:
                 self._rows[token].set_color(full_tokens[token])
 
-    def _current_core(self) -> Dict[str, str]:
+    def _current_core(self) -> dict[str, str]:
         return {t: self._rows[t].color() for t in CORE_TOKEN_KEYS}
 
     def _update_preview(self):

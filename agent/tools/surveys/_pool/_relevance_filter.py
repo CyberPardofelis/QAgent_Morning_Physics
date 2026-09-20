@@ -4,18 +4,22 @@ _pool._relevance_filter — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _relevance_filter_pool
 """
 from __future__ import annotations
-import json
+
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
+
+from agent.tools.config import get_relevance_batch_size
+
+from ._utils import _safe_json_loads_array
 
 logger = logging.getLogger(__name__)
 def _relevance_filter_pool(
     topic: str,
-    pool_dict: Dict[str, Dict[str, Any]],
+    pool_dict: dict[str, dict[str, Any]],
     threshold: int,
     strict: bool = False,    # 9-18 加: strict=True 时不 rescue 不抛错, 全 0 返空 dict
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """
     per-paper LLM 相关性评分精筛 (9-09 user 拍板加).
 
@@ -37,8 +41,8 @@ def _relevance_filter_pool(
       - 跟 strict=False 一致, 但不 rescue 不抛错
       - 全 0 返空 dict, 让调用方 retry 或 bailout
     """
-    from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_relevance_score_prompt
+    from agent.tools.llm import _call_llm
 
     _PROVIDER = "minimax"
     _MODEL = "MiniMax-M3"
@@ -53,7 +57,7 @@ def _relevance_filter_pool(
         topic[:50], len(items), batch_size, threshold, strict,
     )
 
-    scored: Dict[str, Dict[str, Any]] = {}  # paper_id -> {score, reason, is_about_topic, is_adjacent_field}
+    scored: dict[str, dict[str, Any]] = {}  # paper_id -> {score, reason, is_about_topic, is_adjacent_field}
 
     # 批量化
     for i in range(0, len(items), batch_size):

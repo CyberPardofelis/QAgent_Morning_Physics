@@ -1,11 +1,21 @@
 # ui/comparison_config_dialog.py
 import json
-from PySide6.QtCore import QSettings
-from config.settings import get_settings
+
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QCheckBox, QDoubleSpinBox, QSpinBox, QGroupBox, QPushButton, QMessageBox
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
 )
+
+from config.settings import get_settings
+
 
 class ComparisonConfigDialog(QDialog):
     def __init__(self, parent=None):

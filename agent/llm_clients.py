@@ -17,7 +17,6 @@ import hashlib
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from openai import OpenAI
 
@@ -43,7 +42,7 @@ class ProviderConfig:
     default_model: str       # 默认 model name
 
 
-PROVIDERS: Dict[str, ProviderConfig] = {
+PROVIDERS: dict[str, ProviderConfig] = {
     "deepseek": ProviderConfig(
         name="deepseek",
         display_name="DeepSeek",
@@ -116,7 +115,7 @@ _DEPRECATED_BASE_URLS = {
 class LLMClientError(RuntimeError):
     """LLM 客户端相关错误（API key 缺失、网络错误、配置错误等）"""
 
-    def __init__(self, provider: str, message: str, original: Optional[Exception] = None):
+    def __init__(self, provider: str, message: str, original: Exception | None = None):
         self.provider = provider
         self.original = original
         super().__init__(f"[{provider}] {message}")
@@ -129,7 +128,7 @@ class LLMClientError(RuntimeError):
 # reset_client_cache，下一次 get_client 调用会自动检测到变化并重建。
 # api_key 存 hash 而非明文，避免泄露到日志/异常。
 # ============================================================
-_clients: Dict[str, tuple] = {}  # provider_name -> (client, base_url, api_key_hash)
+_clients: dict[str, tuple] = {}  # provider_name -> (client, base_url, api_key_hash)
 _lock = threading.Lock()
 
 
@@ -230,7 +229,7 @@ def get_client(provider_name: str, force_new: bool = False) -> OpenAI:
             ) from e
 
 
-def reset_client_cache(provider_name: Optional[str] = None) -> None:
+def reset_client_cache(provider_name: str | None = None) -> None:
     """
     清空 client 缓存。
     - 不传参数：清空所有
@@ -247,7 +246,7 @@ def reset_client_cache(provider_name: Optional[str] = None) -> None:
 # ============================================================
 # 旧 model 名兼容（统一来源，controller 和 tools/llm 都从这 import）
 # ============================================================
-LEGACY_MODEL_MAP: Dict[str, tuple] = {
+LEGACY_MODEL_MAP: dict[str, tuple] = {
     # 旧 model 名 -> (新 model, enable_thinking, reasoning_effort)
     "deepseek-reasoner": ("deepseek-v4-pro", True, "max"),
     "deepseek-chat":     ("deepseek-v4-flash", False, "high"),

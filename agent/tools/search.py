@@ -12,8 +12,9 @@ API key 通过 agent.infra.api_keys 管理, key 名: bocha / tavily
 import json
 import logging
 import re
-from typing import List, Dict, Optional
+
 import requests
+
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ def _truncate(text: str, max_length: int) -> str:
 # ============================================================
 # Provider 实现
 # ============================================================
-def search_bocha(query: str, num_results: int, max_content_length: int) -> List[Dict]:
+def search_bocha(query: str, num_results: int, max_content_length: int) -> list[dict]:
     """
     博查搜索 API (国内主推, 中文源强)
     文档: https://open.bochaai.com/
@@ -70,7 +71,7 @@ def search_bocha(query: str, num_results: int, max_content_length: int) -> List[
         raise RuntimeError(f"博查 API 错误: code={data.get('code')}, msg={data.get('msg')}")
 
     pages = data.get("data", {}).get("webPages", {}).get("value", []) or []
-    results: List[Dict] = []
+    results: list[dict] = []
     for p in pages[:num_results]:
         content = p.get("summary") or p.get("snippet") or ""
         results.append({
@@ -86,7 +87,7 @@ def search_bocha(query: str, num_results: int, max_content_length: int) -> List[
     return results
 
 
-def search_tavily(query: str, num_results: int, fetch_content: bool, max_content_length: int) -> List[Dict]:
+def search_tavily(query: str, num_results: int, fetch_content: bool, max_content_length: int) -> list[dict]:
     """
     Tavily 搜索 API (海外主推, 英文源强)
     文档: https://docs.tavily.com/
@@ -110,7 +111,7 @@ def search_tavily(query: str, num_results: int, fetch_content: bool, max_content
     resp.raise_for_status()
     data = resp.json()
 
-    results: List[Dict] = []
+    results: list[dict] = []
     for r in data.get("results", [])[:num_results]:
         content = r.get("raw_content") or r.get("content") or ""
         results.append({
@@ -125,7 +126,7 @@ def search_tavily(query: str, num_results: int, fetch_content: bool, max_content
     return results
 
 
-def search_ddg(query: str, num_results: int, fetch_content: bool, max_content_length: int) -> List[Dict]:
+def search_ddg(query: str, num_results: int, fetch_content: bool, max_content_length: int) -> list[dict]:
     """
     DuckDuckGo HTML 搜索 (保底, 免 key, 但国内经常超时)
     保留作为最后兜底
@@ -142,7 +143,7 @@ def search_ddg(query: str, num_results: int, fetch_content: bool, max_content_le
 
     soup = BeautifulSoup(resp.text, "html.parser")
     result_divs = soup.find_all("div", class_="result")
-    results: List[Dict] = []
+    results: list[dict] = []
 
     for div in result_divs[:num_results]:
         link_elem = div.find("a", class_="result__a")
@@ -213,7 +214,7 @@ def _is_chinese(text: str) -> bool:
     return bool(_CN_RE.search(text))
 
 
-def _provider_status() -> Dict[str, bool]:
+def _provider_status() -> dict[str, bool]:
     """检查各 provider 是否可用 (key 已配)"""
     return {
         "bocha": bool(_get_api_key("bocha")),

@@ -8,16 +8,23 @@ ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 4. worker.finished 时触发 bubble_finalize(conv_id) → 通知 UI 调 MessageBubble.finalize()
 5. 用 self.sender() 拿到是哪个 worker 在回调
 """
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 import json
-from datetime import datetime
 import time
-from PySide6.QtCore import QObject, Signal, QSettings
-from config.settings import get_settings
-from agent.history_manager import HistoryManager
-from ui.worker import Worker, NEW_BUBBLE
-from agent.tools import get_paper_by_id, update_paper_llm_summary
-from agent.prompts import SYSTEM_PROMPT
+from datetime import datetime
+
+from PySide6.QtCore import QObject, Signal
+
 import config
+from agent.history_manager import HistoryManager
+from agent.prompts import SYSTEM_PROMPT
+from agent.tools import get_paper_by_id, update_paper_llm_summary
+from config.settings import get_settings
+from ui.worker import NEW_BUBBLE, Worker
 
 
 class ConversationController(QObject):

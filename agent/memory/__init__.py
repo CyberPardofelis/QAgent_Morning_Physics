@@ -17,27 +17,27 @@ agent.memory — 通用记忆库（参考 WAgent 设计，适配 QAgent 任务�
 - 读侧：决策 2=b — 不自动注入，LLM 想用就调 recall_memories 工具
 - 记忆类型：user_preference / research_fact / paper_note / reflection / task_state
 """
+from .db_manager import MemoryDBManager, get_db_manager
+from .embedder import (
+    MemoryEmbedder,
+    encode_text,
+    encode_texts,
+    get_embedder,
+)
+from .processor import MemoryProcessor
+from .retriever import MemoryRetriever
 from .schemas import (
-    VECTOR_DIR,
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_SCOPE,
     MEMORY_FAISS_PATH,
     MEMORY_META_PATH,
     MEMORY_TYPES,
-    DEFAULT_SCOPE,
-    DEFAULT_EMBEDDING_DIM,
-    validate_metadata,
     TRIGGER_KEYWORDS,
+    VECTOR_DIR,
     content_has_trigger_keyword,
-)
-from .embedder import (
-    MemoryEmbedder,
-    get_embedder,
-    encode_text,
-    encode_texts,
+    validate_metadata,
 )
 from .vector_store import MemoryVectorStore, get_vector_store
-from .db_manager import MemoryDBManager, get_db_manager
-from .retriever import MemoryRetriever
-from .processor import MemoryProcessor
 
 __all__ = [
     # 常量

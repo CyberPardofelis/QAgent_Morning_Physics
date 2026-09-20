@@ -1,14 +1,21 @@
 # tree_panel.py
-import json
 from datetime import datetime
-from PySide6.QtCore import Qt, QSettings
-from config.settings import get_settings
+
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QTreeWidget,
-    QTreeWidgetItem, QMenu, QInputDialog, QMessageBox
+    QInputDialog,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
+
 from agent.history_manager import Conversation
+from config.settings import get_settings
 
 
 class ConversationTreePanel(QWidget):

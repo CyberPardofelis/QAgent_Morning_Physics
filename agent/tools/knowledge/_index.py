@@ -4,22 +4,16 @@ knowledge._index — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: index_paper_to_chroma, reindex_all, sync_recent_to_chroma
 """
 from __future__ import annotations
-import os
-import json
-import re
-import sqlite3
-import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
 
-import arxiv
+import json
+import logging
+from pathlib import Path
+
+# ROOT 路径常量 (原 knowledge.py 顶部)
+ROOT = Path(__file__).resolve().parent.parent.parent
 
 from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
-from agent.tools.llm import _call_llm
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -31,6 +25,7 @@ def index_paper_to_chroma(paper_id: str) -> str:
     幂等:同 paper_id 先删后插。
     """
     import sqlite3
+
     from agent.pdf_chunker import chunk_by_section
     from agent.vector_db import VectorDB
 
@@ -145,8 +140,9 @@ def reindex_all(limit: int = 0) -> str:
     Args:
         limit: 最多重建多少篇(0=全部,给测试/部分重建用)
     """
-    import time
     import sqlite3
+    import time
+
     from agent.pdf_chunker import chunk_by_section
     from agent.vector_db import VectorDB
 
@@ -237,8 +233,9 @@ def sync_recent_to_chroma(days: int = 7, limit: int = 20) -> str:
     """
     import time
     from datetime import date, timedelta
-    from agent.tools.summary import list_summary_items
+
     from agent.pdf_chunker import chunk_by_section
+    from agent.tools.summary import list_summary_items
     from agent.vector_db import VectorDB
 
     since_date = (date.today() - timedelta(days=days)).isoformat()

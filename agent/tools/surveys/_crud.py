@@ -8,7 +8,7 @@ agent.tools.surveys._crud — 主题/章节 CRUD + 健康检查 (UI 同步调, 0
 """
 import logging
 import sqlite3
-from typing import Optional, List, Dict, Any
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def create_theme(name: str, description: str = "") -> int:
         return cur.lastrowid
 
 
-def list_themes() -> List[Dict[str, Any]]:
+def list_themes() -> list[dict[str, Any]]:
     """列所有主题"""
     from agent.infra.db import connect
     with connect("surveys") as conn:
@@ -75,7 +75,7 @@ def list_themes() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_theme(theme_id: int) -> Optional[Dict[str, Any]]:
+def get_theme(theme_id: int) -> dict[str, Any] | None:
     """按 id 拿主题"""
     from agent.infra.db import connect
     with connect("surveys") as conn:
@@ -143,7 +143,7 @@ def create_section(
         return cur.lastrowid
 
 
-def list_sections(theme_id: int) -> List[Dict[str, Any]]:
+def list_sections(theme_id: int) -> list[dict[str, Any]]:
     """列某主题下的所有章节 (按 order_idx 排序)"""
     from agent.infra.db import connect
     with connect("surveys") as conn:
@@ -155,7 +155,7 @@ def list_sections(theme_id: int) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_section(section_id: int) -> Optional[Dict[str, Any]]:
+def get_section(section_id: int) -> dict[str, Any] | None:
     """按 id 拿章节"""
     from agent.infra.db import connect
     with connect("surveys") as conn:
@@ -168,7 +168,7 @@ def update_section(
     section_id: int,
     title: str = "",
     section_type: str = "",
-    content_md: Optional[str] = None,  # None = 不传, "" = 清空
+    content_md: str | None = None,  # None = 不传, "" = 清空
     paper_ids: str = "",
 ) -> None:
     """更新章节 (只更新传入的字段, None 表示跳过)"""
@@ -220,7 +220,7 @@ def reorder_section(section_id: int, new_order: int) -> None:
 # ============================================================
 # 健康检查
 # ============================================================
-def health_check() -> Dict[str, Any]:
+def health_check() -> dict[str, Any]:
     from agent.infra.db import path_of
     p = path_of("surveys")
     info = {

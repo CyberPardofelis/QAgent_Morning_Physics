@@ -1,24 +1,32 @@
 # chat_window.py
 import json
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, QSettings, QEvent
-from config.settings import get_settings
+
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QMenu,
-    QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QComboBox, QInputDialog,
-    QPlainTextEdit, QMessageBox, QScrollArea, QSizePolicy, QCheckBox
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
 )
-from agent.history_manager import Conversation
-from ui.styles import get_stylesheet
-from ui.message_bubble_1 import MessageBubble
-from ui.settings_dialog import SettingsDialog
-from ui.group_prompt_dialog import GroupSystemPromptDialog
+
+from agent.prompts import SYSTEM_PROMPT
+from config.settings import get_settings
+from ui.chat_view import ChatView
 from ui.comparison_config_dialog import ComparisonConfigDialog
 from ui.conversation_controller import ConversationController
-from agent.prompts import SYSTEM_PROMPT
+from ui.group_prompt_dialog import GroupSystemPromptDialog
 from ui.input_panel import InputPanel
-from ui.chat_view import ChatView
+from ui.message_bubble_1 import MessageBubble
+from ui.settings_dialog import SettingsDialog
+from ui.styles import get_stylesheet
 from ui.tree_panel import ConversationTreePanel
 
 

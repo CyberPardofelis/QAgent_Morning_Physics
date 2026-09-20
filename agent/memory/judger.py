@@ -15,14 +15,14 @@ verdict \u53d6\u503c:
   - unrelated: \u4e0d\u76f8\u5173
 """
 import logging
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import Any
 
 from .extractor import is_pred_symmetric
 
 logger = logging.getLogger(__name__)
 
 
-def _concept_categories(extract: Dict[str, Any]) -> Set[Tuple[str, str]]:
+def _concept_categories(extract: dict[str, Any]) -> set[tuple[str, str]]:
     """\u8fd4\u56de {(canonical, category), ...}"""
     return {
         (c.get("canonical", ""), c.get("category", ""))
@@ -31,14 +31,14 @@ def _concept_categories(extract: Dict[str, Any]) -> Set[Tuple[str, str]]:
     }
 
 
-def _category_overlap(a: Dict[str, Any], b: Dict[str, Any]) -> Set[str]:
+def _category_overlap(a: dict[str, Any], b: dict[str, Any]) -> set[str]:
     """\u8fd4\u56de\u5171\u4eab\u7684 category \u96c6\u5408 (\u7528\u4e8e\u5feb\u901f\u8fc7\u6ee4)"""
     a_cats = {c.get("category", "") for c in a.get("core_concepts", [])}
     b_cats = {c.get("category", "") for c in b.get("core_concepts", [])}
     return a_cats & b_cats
 
 
-def judge(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[str, str]:
+def judge(a: dict[str, Any], b: dict[str, Any]) -> tuple[str, str]:
     """
     \u4e3b\u5165\u53e3: \u5224\u65ad\u4e24\u4e2a\u62bd\u53d6\u7ed3\u679c\u7684\u5173\u7cfb.
 
@@ -130,7 +130,7 @@ def judge(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[str, str]:
     return "unrelated", "\u65e0\u6709\u6548\u5173\u7cfb"
 
 
-def can_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool, str]:
+def can_merge(a: dict[str, Any], b: dict[str, Any]) -> tuple[bool, str]:
     """
     \u9ad8\u5c42\u63a5\u53e3: \u662f\u5426\u53ef\u4ee5\u5408\u5e76 (\u540c\u4e00\u4e8b\u5b9e).
 

@@ -4,8 +4,6 @@ agent.memory.schemas — 路径常量、记忆类型枚举、元数据 schema
 所有路径相对 data/ 根目录解析（与 agent/infra/db.py 一致）。
 """
 from pathlib import Path
-from typing import Dict, Any
-
 
 # ============================================================
 # 路径常量（与 paper 向量库分开，独立存储）
@@ -28,7 +26,7 @@ RELATION_META_PATH = VECTOR_DIR / "relations_meta.pkl"
 # ============================================================
 # 记忆类型（QAgent 任务场景定制，对照 WAgent 的 emotion/imagery/plot）
 # ============================================================
-MEMORY_TYPES: Dict[str, str] = {
+MEMORY_TYPES: dict[str, str] = {
     "user_preference": "用户的研究偏好/审美/格式习惯（'我喜欢看详细推导'、'输出别用 emoji'）",
     "research_fact":   "研究中的客观决策/约定/事实（'我决定用 VQE 路线'、'和导师约定周报格式'）",
     "paper_note":      "对某篇论文的笔记/摘录（关联 paper_id，例如 'Elben2022 的方法核心是...'）",

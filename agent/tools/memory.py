@@ -9,7 +9,6 @@ agent.tools.memory — 通用记忆库的 LLM 工具
 """
 import json
 import logging
-from typing import Optional
 
 from agent.tools.registry import register_tool
 
@@ -110,34 +109,34 @@ def save_memory(
                 paper_line = (chr(10) + f"- 关联论文: `{existing.get('related_paper_id')}`" if existing.get("related_paper_id") else "")
                 return (
                     f"⚠️ **已存在高度相似记忆（sim={sim:.3f} >= {SIM_MERGE_THRESHOLD}）**" + chr(10) + chr(10) +
-                    f"**已存在条目**:" + chr(10) +
+                    "**已存在条目**:" + chr(10) +
                     f"- ID: `{existing['id'][:8]}`" + chr(10) +
                     f"- 类型: `{existing.get('memory_type', 'general')}`" + chr(10) +
                     f"- 重要性: {existing.get('importance', 0.5):.2f}" + chr(10) +
                     f"- 内容: {existing.get('content', '')[:200]}{'...' if len(existing.get('content', '')) > 200 else ''}" + chr(10) +
                     f"{paper_line}" + chr(10) +
                     f"- 创建于: {existing.get('created_at', '')}" + chr(10) + chr(10) +
-                    f"**建议操作**:" + chr(10) +
-                    f"1. 如果新内容覆盖了旧条目 → 调用 update_memory(existing_id, new_content) 合并" + chr(10) +
-                    f"2. 如果确实是新主题（虽然相似）→ 再次调用 save_memory(..., force_save=True) 强制新建" + chr(10) +
-                    f"3. 如果旧条目不再重要 → 用 viewer 删除它后重试"
+                    "**建议操作**:" + chr(10) +
+                    "1. 如果新内容覆盖了旧条目 → 调用 update_memory(existing_id, new_content) 合并" + chr(10) +
+                    "2. 如果确实是新主题（虽然相似）→ 再次调用 save_memory(..., force_save=True) 强制新建" + chr(10) +
+                    "3. 如果旧条目不再重要 → 用 viewer 删除它后重试"
                 )
             if verdict == "opposite" and top_match:
                 # 三元组识别出对立观点, 不要合并
                 existing = top_match["memory"]
                 judge_reason = top_match.get("judge_reason", "")
                 return (
-                    f"⚠️ **检测到对立观点（三元组判断）**" + chr(10) + chr(10) +
-                    f"**已存在条目（与新内容矛盾）**:" + chr(10) +
+                    "⚠️ **检测到对立观点（三元组判断）**" + chr(10) + chr(10) +
+                    "**已存在条目（与新内容矛盾）**:" + chr(10) +
                     f"- ID: `{existing['id'][:8]}`" + chr(10) +
                     f"- 类型: `{existing.get('memory_type', 'general')}`" + chr(10) +
                     f"- 内容: {existing.get('content', '')[:200]}{'...' if len(existing.get('content', '')) > 200 else ''}" + chr(10) + chr(10) +
                     f"**判断依据**: {judge_reason}" + chr(10) + chr(10) +
-                    f"**不要合并** — 两条都是有效观点, 需要同时保留以跟踪演化." + chr(10) +
-                    f"如果确认要覆盖旧观点，调用 update_memory 合并即可."
+                    "**不要合并** — 两条都是有效观点, 需要同时保留以跟踪演化." + chr(10) +
+                    "如果确认要覆盖旧观点，调用 update_memory 合并即可."
                 )
             elif verdict == "similar" and all_matches:
-                lines_list = [f"⚠️ **发现类似记忆（sim 0.75-0.95）**:" + chr(10)]
+                lines_list = ["⚠️ **发现类似记忆（sim 0.75-0.95）**:" + chr(10)]
                 for m in all_matches[:3]:
                     mm = m["memory"]
                     lines_list.append(
@@ -161,13 +160,13 @@ def save_memory(
 
     paper_line2 = (chr(10) + f"- 关联论文: `{related_paper_id}`" if related_paper_id else "")
     return (
-        f"✅ 记忆已保存" + chr(10) + chr(10) +
+        "✅ 记忆已保存" + chr(10) + chr(10) +
         f"- ID: `{mid[:8]}`" + chr(10) +
         f"- 类型: `{memory_type}`" + chr(10) +
         f"- 重要性: {imp:.2f}" + chr(10) +
         f"- 内容: {content[:80]}{'...' if len(content) > 80 else ''}" + chr(10) +
         f"{paper_line2}" + chr(10) +
-        chr(10) + f"未来对话中可被 recall_memories 检索到。"
+        chr(10) + "未来对话中可被 recall_memories 检索到。"
     )
 
 
@@ -315,7 +314,7 @@ def update_memory(
 
     paper_line3 = (chr(10) + f"- 关联论文: `{str(updated.get('related_paper_id', ''))}`" if updated.get("related_paper_id") else "")
     return (
-        f"✅ 记忆已更新" + chr(10) + chr(10) +
+        "✅ 记忆已更新" + chr(10) + chr(10) +
         f"- ID: `{updated['id'][:8]}`" + chr(10) +
         f"- 类型: `{updated.get('memory_type', 'general')}`" + chr(10) +
         f"- 重要性: {updated.get('importance', 0.5):.2f}" + chr(10) +

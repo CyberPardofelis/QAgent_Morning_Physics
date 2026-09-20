@@ -1,9 +1,12 @@
 import importlib
-import threading
-import numpy as np
-from config import EMBEDDER_TYPE, OPENAI_EMBEDDING_MODEL, MODEL_PATH, OPENAI_API_KEY, LOCAL_EMBEDDER_NAME
 import os
+import threading
+
+import numpy as np
 import openai
+
+from config import EMBEDDER_TYPE, LOCAL_EMBEDDER_NAME, MODEL_PATH, OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL
+
 
 # 2026-09-05 P0 fix: 改读 Config.get_embedding_enabled() (QSettings) 而非 env EMBEDDING_ENABLED
 # 之前只读 .env, 跟 UI 设置的 QSettings 不同步, 偶发 BGE 在用户禁用后仍被加载
@@ -54,7 +57,7 @@ class Embedder:
                         if os.path.isdir(model_source):
                             print(f"[Embedding] Loading model from local path: {model_source}")
                         else:
-                            print(f"[Embedding] Local path not found, will try to download from Hugging Face: BAAI/bge-large-en-v1.5")
+                            print("[Embedding] Local path not found, will try to download from Hugging Face: BAAI/bge-large-en-v1.5")
                         print(f"[Embedding] Loading model on {device} ...")
                         cls._model = SentenceTransformer(
                             LOCAL_EMBEDDER_NAME,

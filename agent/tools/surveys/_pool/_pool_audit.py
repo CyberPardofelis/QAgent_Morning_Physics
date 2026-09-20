@@ -4,21 +4,24 @@ _pool._pool_audit — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _audit_pool_with_retry
 """
 from __future__ import annotations
-import json
+
 import logging
-import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
+
+from ._arxiv import _arxiv_search
+from ._openalex import _openalex_aps_search, _openalex_iop_search
+from ._relevance_filter import _relevance_filter_pool
 
 logger = logging.getLogger(__name__)
 def _audit_pool_with_retry(
     topic: str,
-    pool_dict: Dict[str, Dict[str, Any]],
+    pool_dict: dict[str, dict[str, Any]],
     min_pool: int,
     max_pool: int,
     relevance_threshold: int,
     print_prefix: str = "[_audit_pool_with_retry]",
     max_retries: int = 2,            # 9-18: 最多 2 次重试 (3 轮 total: initial + 2 retries)
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     strict audit + retry loop (9-18 加).
 
@@ -47,7 +50,7 @@ def _audit_pool_with_retry(
       }
     """
     audit_rounds = []
-    all_kept: Dict[str, Dict[str, Any]] = {}  # dedup by paper_id
+    all_kept: dict[str, dict[str, Any]] = {}  # dedup by paper_id
     seen_ids: set = set()
     # 把当前 pool 里所有 paper 都加进 seen (避免 retry 时再加重复的)
     for pid in pool_dict:
@@ -133,7 +136,7 @@ def _audit_pool_with_retry(
                 flush=True,
             )
             # 多源再拉一次 (跟 _build_candidate_pool 同样套路, 但不再走 summary_items / chroma)
-            new_papers: List[Dict[str, Any]] = []
+            new_papers: list[dict[str, Any]] = []
             try:
                 aps_k = min(retry_k // 2, 30)
                 aps_new = _openalex_aps_search(topic, aps_k)

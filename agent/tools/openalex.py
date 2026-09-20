@@ -24,10 +24,8 @@ agent.tools.openalex — 共享 OpenAlex API 客户端 (2026-09-09 新增)
 - 错误捕获: 网络 / 解析 / 401(需 polite pool email) 都 raise, 调用方决定 fallback
 """
 import logging
-import re
 import time
-from typing import Dict, List, Optional, Iterable
-from urllib.parse import unquote, urlparse
+from collections.abc import Iterable
 
 import requests
 
@@ -50,7 +48,7 @@ logger = logging.getLogger(__name__)
 #   3) 同名但不同 ISSN 的旧/新刊: 保留最新, 旧的丢 (OpenAlex 自己也用最新)
 #
 # APS 期刊 (American Physical Society)
-OPENALEX_APS_SOURCES: Dict[str, Dict[str, str]] = {
+OPENALEX_APS_SOURCES: dict[str, dict[str, str]] = {
     "prl":  {"id": "S24807848",  "name": "Physical Review Letters",        "issn_l": "0031-9007", "publisher": "American Physical Society"},
     "pra":  {"id": "S164566984", "name": "Physical Review A",               "issn_l": "0556-2791", "publisher": "American Physical Society"},
     "prb":  {"id": "S6791298",   "name": "Physical Review B",               "issn_l": "1098-0121", "publisher": "American Physical Society"},
@@ -66,11 +64,11 @@ OPENALEX_APS_SOURCES: Dict[str, Dict[str, str]] = {
 }
 
 # APS 默认 quant-ph 相关期刊集 (user 拍板: 默认 PRL + PRA + PRX Quantum + PRX + RMP, 这些是 quant-ph 主阵地)
-OPENALEX_APS_DEFAULT_QUANT_PH: List[str] = ["prl", "pra", "prxquantum", "prx", "rmp"]
+OPENALEX_APS_DEFAULT_QUANT_PH: list[str] = ["prl", "pra", "prxquantum", "prx", "rmp"]
 
 
 # IOP 期刊 (IOP Publishing)
-OPENALEX_IOP_SOURCES: Dict[str, Dict[str, str]] = {
+OPENALEX_IOP_SOURCES: dict[str, dict[str, str]] = {
     "njp":      {"id": "S148121101", "name": "New Journal of Physics",                              "issn_l": "1367-2630", "publisher": "IOP Publishing"},
     "jphysa":   {"id": "S4210167992","name": "Journal of Physics A: Mathematical and General",     "issn_l": "0305-4470", "publisher": "Institute of Physics"},
     "jphysb":   {"id": "S108417319", "name": "Journal of Physics B: Atomic, Molecular and Optical Physics", "issn_l": "0953-4075", "publisher": "IOP Publishing"},
@@ -81,13 +79,13 @@ OPENALEX_IOP_SOURCES: Dict[str, Dict[str, str]] = {
 }
 
 # IOP 默认 quant-ph 相关期刊集 (NJP + J. Phys. A 是主阵地, J. Phys. B + J. Opt. 是邻域)
-OPENALEX_IOP_DEFAULT_QUANT_PH: List[str] = ["njp", "jphysa", "jphysb", "jopt"]
+OPENALEX_IOP_DEFAULT_QUANT_PH: list[str] = ["njp", "jphysa", "jphysb", "jopt"]
 
 
 # ============================================================
 # DOI / URL 工具
 # ============================================================
-def safe_doi(doi_or_url: Optional[str]) -> str:
+def safe_doi(doi_or_url: str | None) -> str:
     """OpenAlex 的 doi 字段是 'https://doi.org/10.1103/xxx', 转成纯 '10.1103/xxx'"""
     if not doi_or_url:
         return ""
@@ -149,8 +147,8 @@ def _build_session() -> requests.Session:
 
 def resolve_source_ids(
     short_names: Iterable[str],
-    registry: Dict[str, Dict[str, str]],
-) -> List[str]:
+    registry: dict[str, dict[str, str]],
+) -> list[str]:
     """
     把 short_name list -> OpenAlex source ID list.
 
@@ -170,13 +168,13 @@ def resolve_source_ids(
 def openalex_search(
     query: str,
     *,
-    source_ids: Optional[List[str]] = None,
+    source_ids: list[str] | None = None,
     max_results: int = 20,
     from_year: int = 0,
     sort: str = "relevance_score:desc",
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
     caller: str = "openalex_search",     # 9-18 加: 调用方标签 (search_aps/search_iop), 方便控制台追踪
-) -> List[dict]:
+) -> list[dict]:
     """
     OpenAlex works 搜索.
 
@@ -347,7 +345,7 @@ def _format_published(work: dict) -> str:
     return str(y) if y else ""
 
 
-def _extract_pdf_url(work: dict) -> Optional[str]:
+def _extract_pdf_url(work: dict) -> str | None:
     """OA paper: best_oa_location.pdf_url / primary_location.pdf_url"""
     for key in ("best_oa_location", "primary_location"):
         loc = work.get(key) or {}

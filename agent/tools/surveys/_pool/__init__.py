@@ -12,22 +12,25 @@ _pool — 拆分子模块
 - ._openalex.py — ['_openalex_aps_search', '_openalex_iop_search', '_openalex_work_to_pool_entry', '_openalex_aps_search_batch', '_openalex_iop_search_batch']
 """
 
-from ._utils import _arxiv_author_name
-from ._utils import _safe_json_loads_array
-from ._utils import _extract_paper_ids
-from ._utils import _audit_section_paper_ids
-from ._utils import _safe_paper_id
+from ._arxiv import _arxiv_search, _arxiv_search_batch
 from ._build_pool import _build_candidate_pool
-from ._relevance_filter import _relevance_filter_pool
-from ._pool_audit import _audit_pool_with_retry
 from ._facts_review import _review_facts_topic_alignment
-from ._arxiv import _arxiv_search
-from ._arxiv import _arxiv_search_batch
-from ._openalex import _openalex_aps_search
-from ._openalex import _openalex_iop_search
-from ._openalex import _openalex_work_to_pool_entry
-from ._openalex import _openalex_aps_search_batch
-from ._openalex import _openalex_iop_search_batch
+from ._openalex import (
+    _openalex_aps_search,
+    _openalex_aps_search_batch,
+    _openalex_iop_search,
+    _openalex_iop_search_batch,
+    _openalex_work_to_pool_entry,
+)
+from ._pool_audit import _audit_pool_with_retry
+from ._relevance_filter import _relevance_filter_pool
+from ._utils import (
+    _arxiv_author_name,
+    _audit_section_paper_ids,
+    _extract_paper_ids,
+    _safe_json_loads_array,
+    _safe_paper_id,
+)
 
 __all__ = [
     "_arxiv_author_name",

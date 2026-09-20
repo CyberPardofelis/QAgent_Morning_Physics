@@ -17,24 +17,24 @@ import math
 import re
 import sqlite3
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import Any
 
 import numpy as np
 
 from .db_manager import MemoryDBManager
+from .embedder import MemoryEmbedder
 from .extractor import extract as _extractor_extract
 from .vector_store import MemoryVectorStore
-from .embedder import MemoryEmbedder
 
 logger = logging.getLogger(__name__)
 
 
 # 中文停用词（简版；做关键词分词时过滤）
-_STOPWORDS_ZH: Set[str] = {
+_STOPWORDS_ZH: set[str] = {
     "的", "了", "是", "在", "我", "你", "他", "她", "它", "我们", "你们", "他们",
     "这个", "那个", "什么", "怎么", "为什么", "然后", "就是", "可以", "觉得", "认为",
-    "这", "那", "吗", "吧", "呢", "啊", "嗯", "哦", "好", "是", "不", "没",
-    "的", "了", "和", "与", "或", "也", "都", "就", "还", "才",
+    "这", "那", "吗", "吧", "呢", "啊", "嗯", "哦", "好", "不", "没",
+    "和", "与", "或", "也", "都", "就", "还", "才",
 }
 
 
@@ -47,8 +47,8 @@ class MemoryRetriever:
         results = r.retrieve(query="用户偏好 LaTeX 公式", limit=5)
     """
 
-    def __init__(self, db: Optional[MemoryDBManager] = None, vs: Optional[MemoryVectorStore] = None,
-                 embedder: Optional[MemoryEmbedder] = None):
+    def __init__(self, db: MemoryDBManager | None = None, vs: MemoryVectorStore | None = None,
+                 embedder: MemoryEmbedder | None = None):
         self.db = db or MemoryDBManager()
         self.vs = vs or MemoryVectorStore()
         self.embedder = embedder or MemoryEmbedder()
@@ -60,10 +60,10 @@ class MemoryRetriever:
         self,
         query: str,
         limit: int = 5,
-        scope: Optional[str] = None,
-        memory_type: Optional[str] = None,
-        related_paper_id: Optional[str] = None,
-        min_importance: Optional[float] = None,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        related_paper_id: str | None = None,
+        min_importance: float | None = None,
         min_similarity: float = 0.0,
         method: str = "vector",
         importance_weight: float = 0.3,
@@ -71,7 +71,7 @@ class MemoryRetriever:
         mmr_lambda: float = 0.7,
         concept_aware: bool = True,  # 启用概念召回 (query 中的 concept 优先召回)
         concept_bonus: float = 0.2,  # concept 召回的分数加成 (× (1+bonus))
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         检索记忆。
 
@@ -120,7 +120,7 @@ class MemoryRetriever:
 
         if method == "keyword":
             # keyword 也走 concept_recall 加成
-            concept_bonus_ids_kw: Set[str] = set()
+            concept_bonus_ids_kw: set[str] = set()
             if concept_aware:
                 try:
                     cr = self._concept_recall(query, scope=scope, limit=50)
@@ -133,7 +133,7 @@ class MemoryRetriever:
             )
         if method == "hybrid":
             # hybrid 也走 concept_recall 加成
-            concept_bonus_ids_h: Set[str] = set()
+            concept_bonus_ids_h: set[str] = set()
             if concept_aware:
                 try:
                     cr = self._concept_recall(query, scope=scope, limit=50)
@@ -146,7 +146,7 @@ class MemoryRetriever:
                 concept_bonus_ids=concept_bonus_ids_h, concept_bonus=concept_bonus,
             )
         # 默认 vector（v3: 先做 concept_recall 拿 id set, 算分时给这些 id 加 bonus）
-        concept_bonus_ids: Set[str] = set()
+        concept_bonus_ids: set[str] = set()
         if concept_aware:
             try:
                 concept_recalls = self._concept_recall(query, scope=scope, limit=50)
@@ -163,9 +163,9 @@ class MemoryRetriever:
     def _concept_recall(
         self,
         query: str,
-        scope: Optional[str] = None,
+        scope: str | None = None,
         limit: int = 50,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         概念召回: 查该 query 中的 core_concepts 所有记忆.
         依赖 extractor 抽取并检索 metadata.extract.core_concepts.canonical.
@@ -184,8 +184,8 @@ class MemoryRetriever:
         # SQL 查询: metadata 中包含这些 canonical 的记忆
         # 由于 metadata 是 JSON 字箍, 用 LIKE 匹配
         try:
+
             from agent.infra.db import connect
-            import json
             conditions = []
             params = []
             for c in canonicals:
@@ -213,16 +213,16 @@ class MemoryRetriever:
         self,
         query: str,
         limit: int,
-        scope: Optional[str],
-        memory_type: Optional[str],
-        min_importance: Optional[float],
+        scope: str | None,
+        memory_type: str | None,
+        min_importance: float | None,
         min_similarity: float,
         importance_weight: float,
         decay_rate: float,
         mmr_lambda: float = 0.7,
-        concept_bonus_ids: Optional[Set[str]] = None,
+        concept_bonus_ids: set[str] | None = None,
         concept_bonus: float = 0.2,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         # 1) 编码查询
         try:
             q_vec = self.embedder.encode(query)
@@ -249,8 +249,8 @@ class MemoryRetriever:
         # 3) 拿 metadata + 查 SQLite 拿完整信息
         # 同时 reconstruct 向量（MMR 需要）
         candidate_ids = []
-        candidate_sim: Dict[str, float] = {}
-        candidate_vector: Dict[str, np.ndarray] = {}
+        candidate_sim: dict[str, float] = {}
+        candidate_vector: dict[str, np.ndarray] = {}
         for row_idx, sim in hits:
             meta = self.vs.get_metadata(row_idx)
             if not meta:
@@ -271,7 +271,7 @@ class MemoryRetriever:
         memories = self.db.list_by_ids(candidate_ids)
 
         # 4) 应用过滤 + 算分
-        scored: List[Dict[str, Any]] = []
+        scored: list[dict[str, Any]] = []
         for mem in memories:
             mid = mem["id"]
             if scope is not None and mem.get("scope") != scope:
@@ -336,10 +336,10 @@ class MemoryRetriever:
     # ============================================================
     def _mmr_rerank(
         self,
-        candidates: List[Dict[str, Any]],
+        candidates: list[dict[str, Any]],
         top_k: int,
         lambda_param: float = 0.7,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         MMR 重排：在"相关"和"多样"间平衡。
 
@@ -361,7 +361,7 @@ class MemoryRetriever:
 
         # relevance 用 _score（已经结合了 sim + importance + decay）
         # 多样性用 _vector 的余弦相似度
-        selected: List[Dict[str, Any]] = []
+        selected: list[dict[str, Any]] = []
         pool = list(candidates)
 
         # 第一条：直接选 relevance 最高的
@@ -412,18 +412,18 @@ class MemoryRetriever:
         self,
         query: str,
         limit: int,
-        scope: Optional[str],
-        memory_type: Optional[str],
-        min_importance: Optional[float],
-        concept_bonus_ids: Optional[Set[str]] = None,
+        scope: str | None,
+        memory_type: str | None,
+        min_importance: float | None,
+        concept_bonus_ids: set[str] | None = None,
         concept_bonus: float = 0.2,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(query)
         if not keywords:
             keywords = [query[:30]]  # fallback
 
         # 合并结果（多关键词命中加分）
-        id_to_score: Dict[str, float] = {}
+        id_to_score: dict[str, float] = {}
         for kw in keywords[:5]:  # 最多 5 个关键词
             results = self.db.search_keyword(kw, scope=scope, limit=limit * 2)
             for mem in results:
@@ -459,15 +459,15 @@ class MemoryRetriever:
         self,
         query: str,
         limit: int,
-        scope: Optional[str],
-        memory_type: Optional[str],
-        min_importance: Optional[float],
+        scope: str | None,
+        memory_type: str | None,
+        min_importance: float | None,
         importance_weight: float,
         decay_rate: float,
         mmr_lambda: float = 0.7,
-        concept_bonus_ids: Optional[Set[str]] = None,
+        concept_bonus_ids: set[str] | None = None,
         concept_bonus: float = 0.2,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         # 多取一些
         vec_results = self._vector_retrieve(
             query, limit * 2, scope, memory_type, min_importance,
@@ -485,7 +485,7 @@ class MemoryRetriever:
         for m in kw_results:
             kw_scores[m["id"]] = m.get("_score", 0) / max(1.0, max(kw_results and [k.get("_score", 1) for k in kw_results] or [1.0]))
 
-        id_to_mem: Dict[str, Dict[str, Any]] = {}
+        id_to_mem: dict[str, dict[str, Any]] = {}
         for m in vec_results:
             id_to_mem[m["id"]] = m
         for m in kw_results:
@@ -513,20 +513,20 @@ class MemoryRetriever:
     def retrieve_by_type(
         self,
         memory_type: str,
-        scope: Optional[str] = None,
+        scope: str | None = None,
         limit: int = 10,
-        min_importance: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
+        min_importance: float | None = None,
+    ) -> list[dict[str, Any]]:
         return self.db.list_recent(
             scope=scope, memory_type=memory_type, min_importance=min_importance, limit=limit
         )
 
     def retrieve_important(
         self,
-        scope: Optional[str] = None,
+        scope: str | None = None,
         limit: int = 10,
         min_importance: float = 0.7,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         return self.db.list_recent(
             scope=scope, min_importance=min_importance, limit=limit
         )
@@ -534,9 +534,9 @@ class MemoryRetriever:
     def retrieve_for_paper(
         self,
         paper_id: str,
-        scope: Optional[str] = None,
+        scope: str | None = None,
         limit: int = 10,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         return self.db.list_recent(
             scope=scope, related_paper_id=paper_id, limit=limit
         )
@@ -545,7 +545,7 @@ class MemoryRetriever:
     # 辅助
     # ============================================================
     @staticmethod
-    def _extract_keywords(text: str) -> List[str]:
+    def _extract_keywords(text: str) -> list[str]:
         """从文本中提取关键词（过滤停用词 + 短词）。"""
         words = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9_]+", text)
         keywords = [w for w in words if len(w) >= 2 and w not in _STOPWORDS_ZH]

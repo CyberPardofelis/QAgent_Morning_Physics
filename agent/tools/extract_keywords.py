@@ -17,11 +17,10 @@ agent.tools.extract_keywords — LLM 提取论文关键词(2026-09-02 P2.5 协�
 - keywords 提取 / 更新 / 重嵌三步一气呵成,内聚在一处
 """
 import json
-import re
-import time
 import logging
+import re
 import threading
-from typing import Optional
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +139,7 @@ def update_keywords_for_paper_async(
     core_method: str = "",
     core_contrib: str = "",
     in_papers_db: bool = False,
-    analysis_id: Optional[int] = None,
+    analysis_id: int | None = None,
 ) -> None:
     """
     异步: 提关键词 + update summary_item + 重嵌 paper_keywords
@@ -158,7 +157,8 @@ def update_keywords_for_paper_async(
                 keywords = extract_keywords_with_llm(title, abstract)
             # 2. 找对应 summary_item 并更新
             from agent.tools.summary import (
-                get_summary_item_by_paper, update_summary_item_fields,
+                get_summary_item_by_paper,
+                update_summary_item_fields,
             )
             existing = get_summary_item_by_paper(paper_id, source)
             if existing:
@@ -222,7 +222,7 @@ def update_summary_after_analyze(
     core_method: str,
     core_contrib: str,
     in_papers_db: bool = True,
-    analysis_id: Optional[int] = None,
+    analysis_id: int | None = None,
 ) -> bool:
     """
     analyze_paper 完成后调用: 直接用 LLM 提的关键词, 不再调 LLM 提取
@@ -241,8 +241,9 @@ def update_summary_after_analyze(
     """
     try:
         from agent.tools.summary import (
-            get_summary_item_by_paper, update_summary_item_fields,
             embed_summary_item_to_chroma,
+            get_summary_item_by_paper,
+            update_summary_item_fields,
         )
         existing = get_summary_item_by_paper(paper_id, source)
         if not existing:

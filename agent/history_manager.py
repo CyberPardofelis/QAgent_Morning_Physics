@@ -16,7 +16,6 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,7 @@ class Conversation:
         conv_id: str = None,
         title: str = "新对话",
         group_id: str = None,
-        msg_ids: Optional[List[str]] = None,
+        msg_ids: list[str] | None = None,
     ):
         self.conv_id = conv_id or self._generate_id()
         self.title = title
@@ -45,9 +44,9 @@ class Conversation:
         self.created_at = datetime.now().isoformat()
         self.updated_at = self.created_at
         # 消息列表：[{"role": ..., "content": ..., "attachments"?: [...元数据]}, ...]
-        self.messages: List[Dict] = []
+        self.messages: list[dict] = []
         # 稳定 msg_id：每次 add_message 生成一个 UUID；save 时 UPSERT 用
-        self._msg_ids: List[str] = list(msg_ids) if msg_ids else []
+        self._msg_ids: list[str] = list(msg_ids) if msg_ids else []
 
     @staticmethod
     def _generate_id() -> str:
@@ -62,7 +61,7 @@ class Conversation:
         attachments（可选）：[{name, size, path, content?}, ...]
         注意：这里只持久化元数据（name/size/path），content 只在 LLM 调用时临时用
         """
-        msg: Dict = {"role": role, "content": content}
+        msg: dict = {"role": role, "content": content}
         if attachments:
             # 脱敏：丢弃 content 字段，只保留元数据
             sanitized = []
@@ -215,8 +214,8 @@ class HistoryManager:
 
     def _load_cache(self):
         """加载所有分组和对话元数据到内存（用于快速显示）"""
-        self.groups: Dict[str, dict] = {}
-        self.conversations: Dict[str, dict] = {}
+        self.groups: dict[str, dict] = {}
+        self.conversations: dict[str, dict] = {}
 
         with self._get_connection() as conn:
             c = conn.cursor()
@@ -277,7 +276,7 @@ class HistoryManager:
             if meta["group_id"] == group_id:
                 meta["group_id"] = move_to_group_id
 
-    def get_all_groups(self) -> List[dict]:
+    def get_all_groups(self) -> list[dict]:
         return [{"group_id": gid, **info} for gid, info in self.groups.items()]
 
     # ---------- 对话操作 ----------
@@ -371,7 +370,7 @@ class HistoryManager:
             conn.commit()
         self.conversations[conv_id]["group_id"] = target_group_id
 
-    def get_conversation(self, conv_id: str) -> Optional[Conversation]:
+    def get_conversation(self, conv_id: str) -> Conversation | None:
         with self._get_connection() as conn:
             c = conn.cursor()
             c.execute(
@@ -398,8 +397,8 @@ class HistoryManager:
         conv.messages = messages
         return conv
 
-    def get_conversations_by_group(self) -> Dict[Optional[str], List[dict]]:
-        result: Dict[Optional[str], List[dict]] = {}
+    def get_conversations_by_group(self) -> dict[str | None, list[dict]]:
+        result: dict[str | None, list[dict]] = {}
         for conv_id, meta in self.conversations.items():
             group_id = meta["group_id"]
             if not group_id:

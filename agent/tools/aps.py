@@ -1,26 +1,41 @@
+import logging
 import os
 import re
-import logging
+
 import requests
 from bs4 import BeautifulSoup
+
+from agent.tools.browser_pool import get_browser_pool
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
-from agent.tools.utils import JOURNAL_CONFIG
-from agent.tools.registry import register_tool
-from agent.tools.browser_pool import get_browser_pool
-from agent.tools.summary import save_summary_item
-from agent.tools.summary_parser import parse_summary_markdown
+from agent.tools.openalex import (
+    _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
+)
+from agent.tools.openalex import (
+    _RETRY_ON_5XX as _OPENALEX_RETRY,
+)
+from agent.tools.openalex import (
+    OPENALEX_APS_DEFAULT_QUANT_PH as _OPENALEX_APS_DEFAULT_QUANT_PH,
+)
+from agent.tools.openalex import (
+    OPENALEX_APS_SOURCES as _OPENALEX_APS_SOURCES,
+)
+from agent.tools.openalex import (
+    format_paper_markdown as _openalex_format_paper,
+)
+
 # 2026-09-09 P0.6: 走 OpenAlex API 搜 APS (避免 journals.aps.org 403 反爬)
 # 9-18 加: 顺手导入 _DEFAULT_TIMEOUT / _RETRY_ON_5XX, 错误信息能告诉用户具体配置
 from agent.tools.openalex import (
     openalex_search as _openalex_search,
-    format_paper_markdown as _openalex_format_paper,
-    resolve_source_ids as _resolve_openalex_source_ids,
-    OPENALEX_APS_SOURCES as _OPENALEX_APS_SOURCES,
-    OPENALEX_APS_DEFAULT_QUANT_PH as _OPENALEX_APS_DEFAULT_QUANT_PH,
-    _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
-    _RETRY_ON_5XX as _OPENALEX_RETRY,
 )
+from agent.tools.openalex import (
+    resolve_source_ids as _resolve_openalex_source_ids,
+)
+from agent.tools.registry import register_tool
+from agent.tools.summary import save_summary_item
+from agent.tools.summary_parser import parse_summary_markdown
+from agent.tools.utils import JOURNAL_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +71,7 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     print(f"[aps]   url={url}  selector={link_selector}", flush=True)
 
     pool = get_browser_pool()
-    print(f"[aps]   拿 browser_pool, 准备 acquire_page (firefox)...", flush=True)
+    print("[aps]   拿 browser_pool, 准备 acquire_page (firefox)...", flush=True)
     try:
         with pool.acquire_page(
             browser_type="firefox",
@@ -466,9 +481,9 @@ def search_aps(
             )
         if msg.startswith("[conn]"):
             return (
-                f"❌ APS 搜索失败: 网络连不上 OpenAlex\n"
-                f"- 可能是: DNS 失败 / 断网 / 防火墙\n"
-                f"- 建议: 1) 检查网络  2) 试 web_search 兜底"
+                "❌ APS 搜索失败: 网络连不上 OpenAlex\n"
+                "- 可能是: DNS 失败 / 断网 / 防火墙\n"
+                "- 建议: 1) 检查网络  2) 试 web_search 兜底"
             )
         if msg.startswith("[http 4xx]"):
             return (

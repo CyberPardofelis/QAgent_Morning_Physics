@@ -4,13 +4,14 @@ _pool._arxiv — 拆出自原 _pool.py (9-20 体检重构)
 包含函数: _arxiv_search, _arxiv_search_batch
 """
 from __future__ import annotations
-import json
+
 import logging
-import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
+
+from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
-def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+def _arxiv_search(query: str, k: int = 5) -> list[dict[str, Any]]:
     """arxiv API 抓 k 篇, 返回 dict list."""
     import arxiv
     search = arxiv.Search(
@@ -19,7 +20,7 @@ def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
         sort_by=arxiv.SortCriterion.Relevance,
     )
     client = arxiv.Client()
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for r in client.results(search):
         out.append({
             "paper_id": r.entry_id.split("/")[-1].split("v")[0],  # 去 /abs/ 前缀和版本号
@@ -34,7 +35,7 @@ def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
     return out
 
 
-def _arxiv_search_batch(queries: List[str], k_per_query: int = 3) -> List[Dict[str, Any]]:
+def _arxiv_search_batch(queries: list[str], k_per_query: int = 3) -> list[dict[str, Any]]:
     """
     多 query 批量 arxiv 召回 (9-09 user 拍板加).
 
@@ -56,7 +57,7 @@ def _arxiv_search_batch(queries: List[str], k_per_query: int = 3) -> List[Dict[s
         return []
     client = arxiv.Client()
     seen: set = set()
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for q in queries:
         q = (q or "").strip()
         if not q:

@@ -1,9 +1,10 @@
-import json
-import re
 import logging
+import re
+
 import arxiv
 import requests
 from bs4 import BeautifulSoup
+
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
@@ -271,9 +272,9 @@ def search_arxiv(
     except arxiv.UnexpectedEmptyPageError as e:
         print(f"[search_arxiv] ❌ arxiv UnexpectedEmptyPageError: {e}", flush=True)
         return (
-            f"❌ arXiv 搜索失败: 中途返空页\n"
-            f"- 通常是 arxiv 服务短暂不稳  \n"
-            f"- 建议: 1) 稍后重试  2) max_results 调小"
+            "❌ arXiv 搜索失败: 中途返空页\n"
+            "- 通常是 arxiv 服务短暂不稳  \n"
+            "- 建议: 1) 稍后重试  2) max_results 调小"
         )
     except arxiv.ArxivError as e:
         print(f"[search_arxiv] ❌ arxiv ArxivError: {e}", flush=True)

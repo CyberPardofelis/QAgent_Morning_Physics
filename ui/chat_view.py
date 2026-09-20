@@ -8,7 +8,7 @@ ChatView — 抄 SAgent 整段 (2026-09-01)。
 - view.page().setUrl(about:blank) 兼容 (虽然 QTextBrowser 不需要,保留防御性)
 """
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea
+from PySide6.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 
 from ui.message_bubble_1 import MessageBubble
 

@@ -1,12 +1,21 @@
-import json
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QLabel, QTextEdit, QApplication,
-    QTabWidget, QWidget, QHBoxLayout, QPushButton, QMessageBox
-)
 from PySide6.QtGui import QFont
-from ui.styles import get_stylesheet
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
 from agent.tools import update_full_paper, update_paper_comment
+from ui.styles import get_stylesheet
 
 
 class PaperEditDialog(QDialog):

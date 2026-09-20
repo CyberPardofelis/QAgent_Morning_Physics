@@ -4,22 +4,13 @@ knowledge._query — 拆出自原 knowledge.py (9-20 体检重构)
 包含函数: query_knowledge, semantic_search, semantic_search_keywords
 """
 from __future__ import annotations
-import os
-import json
-import re
-import sqlite3
+
 import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+import sqlite3
+from typing import Any
 
-import arxiv
-
-from agent.tools import config as _config
-from agent.tools.config import PAPER_DIR, KNOWLEDGE_DIR  # noqa: F401
-from agent.tools.database import get_db_connection, get_paper_by_id, save_paper_record, deserialize_json_fields
-from agent.tools.pdf_utils import extract_text_from_pdf
-from agent.tools.llm import _call_llm
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
+from agent.tools.database import deserialize_json_fields, get_db_connection
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -183,7 +174,7 @@ def semantic_search(
         return f"❌ 加载向量库失败: {e}。先跑 `scripts/migrate_papers_to_chroma_v2.py` 初始化。"
 
     # 构造 chroma where filter
-    where: Dict[str, Any] = {}
+    where: dict[str, Any] = {}
     if year:
         where["year"] = int(year)
     if journal:
@@ -206,7 +197,7 @@ def semantic_search(
         return f"未找到匹配 '{query}' 的论文 chunk(可放宽过滤条件重试)。"
 
     # 同一论文多个 chunk 合并展示(选距离最小的)
-    by_paper: Dict[str, List[Dict[str, Any]]] = {}
+    by_paper: dict[str, list[dict[str, Any]]] = {}
     for r in results:
         pid = r["metadata"].get("paper_id", "?")
         by_paper.setdefault(pid, []).append(r)
@@ -289,7 +280,7 @@ def semantic_search_keywords(
         Markdown 格式的 summary_item 列表, 每条带 paper_id / title / source / date / distance
     """
     try:
-        from agent.vector_db import get_chroma_client, _make_embedding_function
+        from agent.vector_db import _make_embedding_function, get_chroma_client
     except Exception as e:
         return f"❌ 加载向量库失败: {e}。先跑 `scripts/summary_items_to_chroma.py` 初始化。"
 
@@ -311,7 +302,7 @@ def semantic_search_keywords(
         return f"❌ 拿 collection 失败: {e}"
 
     # 构造 chroma where filter
-    where: Dict[str, Any] = {}
+    where: dict[str, Any] = {}
     if source:
         where["source"] = source
     if since_date:

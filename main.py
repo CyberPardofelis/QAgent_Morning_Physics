@@ -30,17 +30,19 @@ except Exception as e:
     print(f"[main] .env 加载失败: {e}", flush=True)
 
 try:
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import QSettings
     from PySide6.QtGui import QIcon
-    from ui import ChatWindow
-    from config import Config, AppInfo
+    from PySide6.QtWidgets import QApplication
+
     # 提前 import agent.tools,触发所有 @register_tool 装饰器
     import agent.tools  # noqa: F401
+
     # 触发 API key 从 QSettings 一次性迁移到 .api_keys.json
     from agent.infra import api_keys  # noqa: F401
+
     # 注册退出 hook:关闭共享的 Playwright 浏览器实例(懒创建的,shutdown 是幂等的)
     from agent.tools.browser_pool import shutdown_browser_pool
+    from config import Config
+    from ui import ChatWindow
     atexit.register(shutdown_browser_pool)
 except Exception:
     if getattr(sys, 'frozen', False):
@@ -117,7 +119,7 @@ _QTE_PIDS_FILE = os.path.join(
 
 def _read_qte_pids():
     try:
-        with open(_QTE_PIDS_FILE, 'r', encoding='utf-8') as f:
+        with open(_QTE_PIDS_FILE, encoding='utf-8') as f:
             return [int(x) for x in f.read().split() if x.strip().isdigit()]
     except Exception:
         return []
@@ -230,7 +232,7 @@ if __name__ == "__main__":
     # 2026-09-02 加:WAgent 主题系统 — 启动时加载用户自定义主题 + 应用上次保存的主题
     # (必须在 ChatWindow 之前,否则 ChatWindow 会用默认 light 覆盖)
     try:
-        from ui.styles import load_user_themes, apply_current_theme
+        from ui.styles import apply_current_theme, load_user_themes
         load_user_themes()
         apply_current_theme(app)
     except Exception as e:

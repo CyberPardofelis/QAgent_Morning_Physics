@@ -22,7 +22,6 @@ import logging
 import threading
 import weakref
 from contextlib import contextmanager
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class BrowserPool:
     def __init__(self):
         self._playwright = None
         self._browser = None
-        self._owner_thread: Optional[threading.Thread] = None
+        self._owner_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         # GC 兜底:worker thread 退出时,如果 BrowserPool 没显式 shutdown,
         # 至少把 playwright stop 掉,避免 firefox 进程残留。
@@ -106,7 +105,7 @@ class BrowserPool:
         browser_type: str = "chromium",
         user_agent: str = DEFAULT_USER_AGENT,
         accept_downloads: bool = True,
-        viewport: Optional[dict] = None,
+        viewport: dict | None = None,
     ):
         """
         上下文管理器：返回一个新 page。退出时自动关 page + context，browser 保留。
@@ -161,7 +160,7 @@ class BrowserPool:
 # ============================================================
 _local = threading.local()
 _init_lock = threading.Lock()
-_main_pool: Optional[BrowserPool] = None  # 主线程的 pool 引用,atexit 时关
+_main_pool: BrowserPool | None = None  # 主线程的 pool 引用,atexit 时关
 
 
 def get_browser_pool() -> BrowserPool:

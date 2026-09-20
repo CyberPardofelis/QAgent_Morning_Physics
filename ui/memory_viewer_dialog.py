@@ -15,13 +15,27 @@ ui.memory_viewer_dialog — 记忆库查看窗口（v3.1 加主题聚合 tab）
 import json
 import logging
 from collections import defaultdict
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QMessageBox, QLabel,
-    QSpinBox, QStatusBar, QTabWidget, QWidget, QSplitter, QTreeWidget, QTreeWidgetItem,
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ui.styles import get_stylesheet
@@ -236,7 +250,7 @@ class MemoryViewerDialog(QDialog):
             logger.exception("[MemoryViewer] search failed")
             QMessageBox.critical(self, "检索失败", str(e))
 
-    def _display(self, memories: List[Dict[str, Any]], mode: str = "", table: Optional[QTableWidget] = None):
+    def _display(self, memories: list[dict[str, Any]], mode: str = "", table: QTableWidget | None = None):
         """填充表格 + 更新状态栏。"""
         if table is None:
             table = self.result_table
@@ -292,7 +306,7 @@ class MemoryViewerDialog(QDialog):
             return
 
         # canonical -> {category, items: [mem, ...]}
-        groups: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"category": "?", "items": []})
+        groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"category": "?", "items": []})
         no_extract_count = 0
         for m in memories:
             meta_raw = m.get("metadata")

@@ -9,9 +9,10 @@ agent.tools.surveys.survey_audit — 独立审计工具 (L0, 0 LLM)
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any
 
 from agent.tools.registry import register_tool
+
 from ._crud import get_theme, list_sections
 from ._pool import _audit_section_paper_ids
 
@@ -48,7 +49,7 @@ def survey_audit(theme_id: int, topic: str = "") -> str:
         return f"❌ theme_id={theme_id} 没任何 section"
 
     # 3. 找候选池 (从 workspace _pool.json)
-    pool: List[Dict[str, Any]] = []
+    pool: list[dict[str, Any]] = []
     pool_topic = topic or theme.get("name", "")
     if pool_topic:
         from agent.infra.survey_workspace import hash_topic
@@ -101,7 +102,7 @@ def survey_audit(theme_id: int, topic: str = "") -> str:
 
     report.extend([
         "",
-        f"## 总计",
+        "## 总计",
         f"- 唯一 paper_id 引用: {len(all_in_pool)} 个 (候选池内), {len(all_out_pool)} 个 (候选池外, 幻觉风险)",
     ])
 

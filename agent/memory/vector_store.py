@@ -12,12 +12,11 @@ agent.memory.vector_store — faiss-cpu 向量存储（独立于 paper 向量库
 import logging
 import pickle
 import threading
-from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Any, Optional
 
 import numpy as np
 
-from .schemas import MEMORY_FAISS_PATH, MEMORY_META_PATH, DEFAULT_EMBEDDING_DIM
+from .schemas import DEFAULT_EMBEDDING_DIM, MEMORY_FAISS_PATH, MEMORY_META_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,7 @@ class MemoryVectorStore:
     _instance: Optional["MemoryVectorStore"] = None
     _lock = threading.Lock()
 
-    def __new__(cls, dim: Optional[int] = None):
+    def __new__(cls, dim: int | None = None):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -74,8 +73,8 @@ class MemoryVectorStore:
         dim = getattr(self, "_dim_arg", None) or dim
         self.dim = dim
         self._write_lock = threading.Lock()  # 写操作串行化
-        self._meta: List[Dict[str, Any]] = []
-        self._id_to_idx: Dict[str, int] = {}
+        self._meta: list[dict[str, Any]] = []
+        self._id_to_idx: dict[str, int] = {}
 
         # 加载已有索引
         if MEMORY_FAISS_PATH.exists() and MEMORY_META_PATH.exists():
@@ -119,7 +118,7 @@ class MemoryVectorStore:
         self,
         memory_id: str,
         vector: np.ndarray,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> int:
         """
         添加一条向量。
@@ -152,8 +151,8 @@ class MemoryVectorStore:
 
     def add_batch(
         self,
-        items: List[Tuple[str, np.ndarray, Dict[str, Any]]],
-    ) -> List[int]:
+        items: list[tuple[str, np.ndarray, dict[str, Any]]],
+    ) -> list[int]:
         """
         批量添加。items = [(memory_id, vector, metadata), ...]
         """
@@ -191,8 +190,8 @@ class MemoryVectorStore:
         self,
         query_vector: np.ndarray,
         top_k: int = 10,
-        exclude_ids: Optional[List[str]] = None,
-    ) -> List[Tuple[int, float]]:
+        exclude_ids: list[str] | None = None,
+    ) -> list[tuple[int, float]]:
         """
         向量搜索。
 
@@ -211,7 +210,7 @@ class MemoryVectorStore:
         k_search = min(top_k * 2 + len(exclude_ids or []), self.index.ntotal)
         D, I = self.index.search(v, k_search)
 
-        results: List[Tuple[int, float]] = []
+        results: list[tuple[int, float]] = []
         for dist, idx in zip(D[0].tolist(), I[0].tolist()):
             if idx < 0:  # faiss 用 -1 表示无效
                 continue
@@ -223,13 +222,13 @@ class MemoryVectorStore:
                 break
         return results
 
-    def get_metadata(self, row_idx: int) -> Optional[Dict[str, Any]]:
+    def get_metadata(self, row_idx: int) -> dict[str, Any] | None:
         """按 faiss 内部 row idx 拿 metadata。"""
         if 0 <= row_idx < len(self._meta):
             return dict(self._meta[row_idx])
         return None
 
-    def get_vector(self, row_idx: int) -> Optional[np.ndarray]:
+    def get_vector(self, row_idx: int) -> np.ndarray | None:
         """
         拿单条向量的副本（用于 MMR 等需要候选向量的场景）。
         返回 1D ndarray 或 None（row_idx 越界 / 已被 tombstone）。
@@ -243,7 +242,7 @@ class MemoryVectorStore:
             logger.warning("[MemoryVectorStore] reconstruct %d 失败: %s", row_idx, e)
             return None
 
-    def get_row_idx(self, memory_id: str) -> Optional[int]:
+    def get_row_idx(self, memory_id: str) -> int | None:
         """按 memory_id 拿 faiss row idx。"""
         return self._id_to_idx.get(memory_id)
 
@@ -297,7 +296,7 @@ class MemoryVectorStore:
     def is_empty(self) -> bool:
         return self.count() == 0
 
-    def all_active_ids(self) -> List[str]:
+    def all_active_ids(self) -> list[str]:
         """所有活跃 memory_id（用于重索引/调试）。"""
         return [m["id"] for m in self._meta if not m.get("_deleted") and m.get("id")]
 
