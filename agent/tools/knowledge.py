@@ -238,10 +238,43 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     """
     在知识库中搜索匹配的文章。
     返回 Markdown 格式的论文列表。
-    """
-    conn = get_db_connection()
-    c = conn.cursor()
 
+    9-18 加: 控制台 print + 异常友好化.
+    之前: FTS5 query 写错会抛 sqlite3.OperationalError, 直接 stacktrace 给用户看.
+    现在: 4 类异常分别处理 (DB 不存在 / 表 schema 旧 / FTS5 query 错 / 其他).
+    """
+    short_kw = (keyword[:50] + "...") if len(keyword) > 50 else keyword
+    short_topic = (topic[:50] + "...") if len(topic) > 50 else topic
+    short_author = (author[:50] + "...") if len(author) > 50 else author
+    print(
+        f"[query_knowledge] start  keyword={short_kw!r}  topic={short_topic!r}  author={short_author!r}",
+        flush=True,
+    )
+
+    if not (keyword or topic or author):
+        print("[query_knowledge] ⚠ 三个参数都为空, 全表扫描", flush=True)
+        return (
+            "⚠ query_knowledge: keyword / topic / author 至少传一个\n"
+            "- 三个都空 = 全表扫描, 慢且容易超长\n"
+            "- 推荐: keyword (FTS5 全文匹配, 最快) 或 topic (research_topic LIKE) 或 author (authors LIKE)"
+        )
+
+    # 9-18 加: 容错包住 DB 操作, 4 类异常分别给具体建议
+    try:
+        conn = get_db_connection()
+    except sqlite3.DatabaseError as e:
+        msg = str(e)
+        if "no such table" in msg or "unable to open" in msg:
+            print(f"[query_knowledge] ❌ 数据库文件缺失/损坏: {e}", flush=True)
+            return (
+                f"❌ query_knowledge 失败: 知识库 DB 缺失或损坏\n"
+                f"- 详情: {e}\n"
+                f"- 建议: 1) 先跑 scan_local_papers 初始化库  2) 重新分析几篇论文"
+            )
+        print(f"[query_knowledge] ❌ 数据库连接失败: {e}", flush=True)
+        return f"❌ query_knowledge 失败: DB 连接错 ({type(e).__name__}): {e}"
+
+    c = conn.cursor()
     conditions = []
     params = []
 
@@ -261,11 +294,48 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     else:
         where_clause = ""
     sql = base_sql + where_clause
-    rows = c.execute(sql, params).fetchall()
+
+    # 9-18 加: FTS5 query 语法错误单独捕获
+    # (FTS5 对特殊字符很敏感: 含 : / " / ^ 等会抛 OperationalError "fts5: syntax error")
+    try:
+        rows = c.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        conn.close()
+        print(f"[query_knowledge] ❌ SQL 执行失败: {msg}", flush=True)
+        if "fts5" in msg.lower() or "syntax error" in msg.lower():
+            return (
+                f"❌ query_knowledge 失败: FTS5 query 语法错\n"
+                f"- keyword={keyword!r} 触发了 FTS5 解析错误\n"
+                f"- 详情: {msg}\n"
+                f"- 建议: 1) 简化 keyword, 去掉 : / \" / ^ / ( / ) / + / - / \"  "
+                f"2) 改用 topic 或 author 参数 (LIKE 模糊匹配, 不挑字符)"
+            )
+        if "no such column" in msg or "no such table" in msg:
+            return (
+                f"❌ query_knowledge 失败: 表结构不匹配\n"
+                f"- 详情: {msg}\n"
+                f"- 建议: 重新初始化知识库 (跑 scan_local_papers 或 analyze_paper)"
+            )
+        return f"❌ query_knowledge 失败 (SQL): {msg}"
+    except Exception as e:
+        conn.close()
+        print(f"[query_knowledge] ❌ 查询异常: {type(e).__name__}: {e}", flush=True)
+        return f"❌ query_knowledge 失败 ({type(e).__name__}): {e}"
+
     conn.close()
 
     if not rows:
-        return "未找到匹配的论文。"
+        # 9-18 加: 0 结果时给具体建议, 不要直接 "未找到匹配的论文"
+        print(
+            f"[query_knowledge] ⚠ 0 results  keyword={short_kw!r}  topic={short_topic!r}  author={short_author!r}",
+            flush=True,
+        )
+        return (
+            f"未找到匹配论文 (keyword={keyword!r}, topic={topic!r}, author={author!r})\n"
+            f"- 建议: 1) 放宽关键词 (例: 只传一个参数)  2) 用 `query_knowledge(keyword=\"quantum\")` 测试库是否为空  "
+            f"3) 没数据先跑 scan_local_papers / analyze_paper"
+        )
 
     results = [deserialize_json_fields(dict(row)) for row in rows]
 
@@ -289,6 +359,7 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
             lines.append(f"   - 关键词: {keywords_str}")
         lines.append("")
 
+    print(f"[query_knowledge] done  返回 {len(results)} 篇", flush=True)
     return "\n".join(lines)
 
 

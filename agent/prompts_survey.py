@@ -438,6 +438,31 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
     else:
         unused_block = "  (无, 所有候选池 paper 都已被引用)"
 
+    # ============ 9-18 加: pool audit 报告 (audit retry loop 的结论) ============
+    # 9-18 user 拍板: audit 结论要打通到 ReAct 主循环 LLM, 让它知道候选池质量.
+    # - pool_meets_target=False 时, LLM 应该优先 search_more 调方向
+    # - rounds 里能看到每轮审计通过/拒绝了多少, 知道是否还能再扩
+    audit = state.get("pool_audit", {}) or {}
+    audit_block = "  (未跑 audit)"
+    if audit:
+        meets = audit.get("pool_meets_target", False)
+        final = audit.get("final_pool_size", 0)
+        target = audit.get("target_min_pool", 0)
+        rounds = audit.get("rounds", [])
+        max_retries = audit.get("max_retries", 0)
+        rounds_summary = " | ".join(
+            f"round{r.get('round', '?')}: +{r.get('after', 0)}/{r.get('before', 0)} ok={r.get('ok', False)}"
+            for r in rounds
+        ) or "(无)"
+        status = "✅ 满足" if meets else f"⚠️ 不足 (已重试 {max_retries} 次仍只 {final}/{target})"
+        audit_block = (
+            f"  - 状态: {status}\n"
+            f"  - 最终池大小: {final}/{target}\n"
+            f"  - audit 轮次: {rounds_summary}\n"
+            f"  - 提示: 'meets_target=False' 时, 优先 search_more 调整方向 (用更精确的关键词, "
+            f"或传 'sources': ['aps','iop','arxiv'] 跨源)"
+        )
+
     return f"""你是综述生成 ReAct 决策者. 当前状态:
 
 - 主题: {topic}
@@ -450,6 +475,8 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 {gaps_block}
 - ⚠️ 候选池 0 引用 paper ({len(unused_papers)} 篇, 后续章节请尽量引用):
 {unused_block}
+- 🔍 候选池 audit 报告 (9-18 加, _build_candidate_pool 的审核结论):
+{audit_block}
 - 错误数: {error_count}
 - ReAct step: {step}/{max_steps}
 
@@ -457,11 +484,18 @@ def build_react_prompt(state: Dict[str, Any]) -> str:
 {pool_ids_block}
 
 可选 action (选一个, 严格 JSON 输出):
-1. search_more {{"query": "...", "k": 5}} — 扩候选池
+1. search_more {{"query": "...", "k": 5}} — 扩候选池 (默认走 arxiv, 9-18 加: 可传 "sources": ["arxiv","aps","iop"] 多源)
 2. extract_facts {{"paper_ids": ["上面的真 id"]}} — 抽 fact
 3. write_outline {{}} — 生成综述大纲(章节结构), 必须在 write_section 之前
 4. write_section {{"section_idx": <int>}} — 按 outline 写第 section_idx 章(0-based); 0=intro, 1=progress, ...
 5. finish {{}} — 收尾
+
+search_more 多源 (9-18 user 拍板):
+  - {{"query": "...", "k": 5, "sources": ["arxiv"]}} — 默认, 只走 arxiv
+  - {{"query": "...", "k": 5, "sources": ["aps"]}} — 只走 APS (PRL/PRA/PRX Quantum 等, 走 OpenAlex)
+  - {{"query": "...", "k": 5, "sources": ["arxiv","aps","iop"]}} — 跨多源并行 (通用搜索)
+  - {{"query": "...", "k": 5, "source": "all"}} — 字符串简写, 等价 ["arxiv","aps","iop"]
+  - 候选池 < {POOL_MIN} 且扩不出论文时, 优先传 "sources": ["aps","iop","arxiv"] 跨源
 
 【固定候选池规则】(user 9-08 拍板, 硬规则)
 - 候选池 < {POOL_MIN} → 优先 search_more(候选池太小, 综述地基不稳)

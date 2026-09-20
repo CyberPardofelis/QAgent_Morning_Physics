@@ -263,16 +263,30 @@ def web_search(
     fetch_content: bool = True,
     max_content_length: int = 2000,
     provider: str = "auto",
+    summary_only: bool = True,   # 9-18 加: 默认只返 title/link/snippet (截 100 字符), 不返 content 全文
+                                #       防止 LLM 把 2KB 全文 JSON 摆在对话窗口污染 UI
 ) -> str:
     """
     联网搜索 (RAG 场景优化版)。
 
     自动根据 query 中英文选择搜索源 (中文走博查, 英文走 Tavily, 都不可用时降级 DuckDuckGo)。
-    默认返回网页正文摘要, 便于直接喂给 RAG 流程做 chunking 和 embedding。
+
+    Args:
+        query: 搜索关键词
+        num_results: 最多返回几条 (1-20, Tavily 上限 20)
+        fetch_content: 是否抓网页正文 (False 时只返 title/link/snippet, 更快)
+        max_content_length: 抓正文时每篇最多多少字符 (默认 2000)
+        provider: 强制 provider (bocha/tavily/ddg), 默认 auto 自动选
+        summary_only: 9-18 加
+          - True (默认): 只返 title/link/snippet (snippet 截 100 字符), **不返 content 全文**
+          - False: 完整 JSON 含 content 全文 (适合 RAG embedding)
+
+    Returns:
+        JSON 字符串. summary_only=False 时约 ~2KB-50KB, True 时约 ~500 字节/条
     """
     try:
         chosen = _select_provider(query, provider)
-        logger.info("web_search: query=%r provider=%s", query, chosen)
+        logger.info("web_search: query=%r provider=%s summary_only=%s", query, chosen, summary_only)
 
         if chosen == "bocha":
             results = search_bocha(query, num_results, max_content_length)
@@ -282,13 +296,35 @@ def web_search(
             results = search_ddg(query, num_results, fetch_content, max_content_length)
 
         status = _provider_status()
-        return json.dumps({
-            "query": query,
-            "provider": chosen,
-            "count": len(results),
-            "results": results,
-            "providers_available": status,
-        }, ensure_ascii=False, indent=2)
+
+        # 9-18 加: summary_only 模式 - 截短 content, 只返 title/link/snippet
+        if summary_only:
+            compact = []
+            for r in results:
+                compact.append({
+                    "title": r.get("title", ""),
+                    "link": r.get("link", ""),
+                    "snippet": (r.get("snippet") or "")[:200],   # snippet 截 200 字符
+                    "source": r.get("source", ""),
+                })
+            payload = {
+                "query": query,
+                "provider": chosen,
+                "count": len(compact),
+                "results": compact,
+                "providers_available": status,
+                "_truncated": True,
+                "_note": "summary_only=True, content 全文已截断. 想要全文设 fetch_content=True & summary_only=False.",
+            }
+        else:
+            payload = {
+                "query": query,
+                "provider": chosen,
+                "count": len(results),
+                "results": results,
+                "providers_available": status,
+            }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.exception("web_search 失败")
         return json.dumps({"error": f"搜索失败: {e}"}, ensure_ascii=False)

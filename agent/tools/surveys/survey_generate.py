@@ -98,10 +98,13 @@ def survey_generate(
     # 9-08 user 拍板: 加 section_gaps 字段, LLM 写章节时如果觉得还缺文章, 会在 markdown 末尾
     #   标注 `<!-- QAgent: missing_queries=[...] -->`  →  system 解析后存到 section_gaps
     #   → action_finish 看到 section_gaps 不空就拒绝结束, ReAct 回到 search_more 补
+    # 9-18 加: pool_audit 字段, 把 _build_candidate_pool 的 audit 报告塞进 state,
+    #           让 ReAct 主循环 LLM 决策时能看到 (候选池是否够格 / 是否需要 search_more / 是否要换方向)
     state: Dict[str, Any] = {
         "topic": topic,
         "topic_hash": topic_hash,
         "pool": pool,
+        "pool_audit": build_status.get("audit_state", {}),   # 9-18 加
         "facts": [],
         "sections": [],
         "outline": None,                # 综述大纲原始 LLM 输出 (str)
@@ -114,6 +117,25 @@ def survey_generate(
         "finish_requested": False,
         "max_steps": max_steps,
     }
+
+    # 9-18 加: yield audit 报告给用户看 (高层总结, 不污染 UI)
+    audit_summary = state.get("pool_audit", {})
+    if audit_summary:
+        meets = audit_summary.get("pool_meets_target", False)
+        rounds = audit_summary.get("rounds", [])
+        final = audit_summary.get("final_pool_size", 0)
+        target = audit_summary.get("target_min_pool", 0)
+        if meets:
+            yield (
+                f"✅ 候选池审核通过: {final}/{target} 篇, "
+                f"经过 {len(rounds)} 轮 audit\n"
+            )
+        else:
+            yield (
+                f"⚠️ 候选池审核后仍不足: {final}/{target} 篇 "
+                f"(已重试 {len(rounds)-1} 次, 走完所有 audit 轮)\n"
+                f"💡 ReAct 后续 search_more 时建议调整方向\n"
+            )
 
     if dry_run:
         ws.save_audit(

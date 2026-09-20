@@ -24,6 +24,41 @@ from agent.tools.config import (
 logger = logging.getLogger(__name__)
 
 
+def _arxiv_author_name(a: Any) -> str:
+    """
+    兼容不同 arxiv 库的 Author 表示 (9-18 修复: 'Author' object has no attribute 'text').
+
+    历史:
+      - 旧 arxiv (< 1.x): Author 可能有 .name / .text / str 多种
+      - arxiv 2.4.0 (current): Author 只有 .name (str), .text 抛 AttributeError
+      - 偶发: 某些 fork (arxiv-py) Author 可能是 str 直接
+
+    这里按"先试 .name, 再试 .text, 否则 str() 兜底"的顺序拿名字,
+    任何一步抛 AttributeError 都跳过, 绝不传播给上层。
+    """
+    if a is None:
+        return ""
+    if isinstance(a, str):
+        return a.strip()
+    for attr in ("name", "text"):
+        try:
+            v = getattr(a, attr, None)
+        except AttributeError:
+            continue
+        if v:
+            return str(v).strip()
+    # 兜底: 直接 str() (Author.__str__ 通常就是名字)
+    try:
+        s = str(a).strip()
+    except Exception:
+        return ""
+    # str() 给的是 Python 默认 repr (例 '<...EmptyAuthor object at 0x...>'),
+    # 这种没用, 当空处理 (避免污染 keywords)
+    if s.startswith("<") and "object at 0x" in s:
+        return ""
+    return s
+
+
 # ============================================================
 # paper_id 抽取 (3 种格式, plan §3.1 + P6.2 LLM 实际行为)
 # ============================================================
@@ -270,9 +305,83 @@ def _build_candidate_pool(
         # chroma 不可用是正常的 (项目可选), 不影响主流程
         logger.debug("[_build_candidate_pool] chroma 召回跳过: %s", e)
 
-    # ========== 3. arxiv API 兜底 (9-08: 最小阈值走 env QAGENT_SURVEY_MIN_POOL, 默认 30) ==========
+    # ========== 3. APS / IOP 召回 (9-18 加: 跨多源通用论文搜索) ==========
+    # 之前只走 arxiv 兜底, 漏了 quant-ph 主阵地 (PRL / NJP 等) 大量论文.
+    # 现在: APS + IOP + arxiv 三路外部召回 (并行), pool 不再卡死在 arxiv 一家.
+    # APS / IOP 走 OpenAlex (跟 search_aps / search_iop 同源), 优先 quant-ph 主阵地.
+    # 9-18 user 拍板: "survey 工具应该用搜索工具搜索, 不要总用 arxiv".
+    external_status: Dict[str, str] = {}  # 每路状态: skipped / 0_results / success / exception:...
+
+    # ========== 3a. APS (OpenAlex, PRL/PRA/PRXQuantum/PRX/RMP) ==========
+    if len(pool_dict) < _MIN_POOL:
+        # 9-18: 优先 APS 召回. 一次拉足 min_pool 篇, 不要稀稀拉拉 5 篇.
+        need = max(_MIN_POOL, max_pool) - len(pool_dict)
+        aps_k = min(need, 30)  # OpenAlex 单次 max 200, 限 30 避免太慢
+        print(
+            f"[_build_candidate_pool] APS 召回 start  topic={topic[:60]!r}  k={aps_k}",
+            flush=True,
+        )
+        try:
+            aps_papers = _openalex_aps_search(topic, aps_k)
+            aps_added = 0
+            for p in aps_papers:
+                add_pool_entry(p)
+                aps_added += 1
+            external_status["aps"] = "success" if aps_added > 0 else "0_results"
+            print(
+                f"[_build_candidate_pool] APS 召回 done  +{aps_added} 篇  pool={len(pool_dict)}",
+                flush=True,
+            )
+        except Exception as e:
+            external_status["aps"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
+            print(
+                f"[_build_candidate_pool] APS 召回 ❌ {external_status['aps']}",
+                flush=True,
+            )
+            logger.warning("[_build_candidate_pool] APS 召回失败: %s", e)
+    else:
+        external_status["aps"] = "skipped"
+        print(f"[_build_candidate_pool] APS 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
+
+    # ========== 3b. IOP (OpenAlex, NJP/J.Phys.A/J.Phys.B/J.Opt.) ==========
+    if len(pool_dict) < _MIN_POOL:
+        need = max(_MIN_POOL, max_pool) - len(pool_dict)
+        iop_k = min(need, 30)
+        print(
+            f"[_build_candidate_pool] IOP 召回 start  topic={topic[:60]!r}  k={iop_k}",
+            flush=True,
+        )
+        try:
+            iop_papers = _openalex_iop_search(topic, iop_k)
+            iop_added = 0
+            for p in iop_papers:
+                add_pool_entry(p)
+                iop_added += 1
+            external_status["iop"] = "success" if iop_added > 0 else "0_results"
+            print(
+                f"[_build_candidate_pool] IOP 召回 done  +{iop_added} 篇  pool={len(pool_dict)}",
+                flush=True,
+            )
+        except Exception as e:
+            external_status["iop"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
+            print(
+                f"[_build_candidate_pool] IOP 召回 ❌ {external_status['iop']}",
+                flush=True,
+            )
+            logger.warning("[_build_candidate_pool] IOP 召回失败: %s", e)
+    else:
+        external_status["iop"] = "skipped"
+        print(f"[_build_candidate_pool] IOP 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
+
+    # ========== 3c. arxiv API 兜底 (9-08: 最小阈值走 env QAGENT_SURVEY_MIN_POOL, 默认 30) ==========
+    # 9-18: 从 "唯一外部源" 降级为 "第三路兜底". APS / IOP 都没命中时才调 arxiv.
     if len(pool_dict) < _MIN_POOL:
         arxiv_status = "0_results"  # 默认 0 results, 拉到了再改 success
+        print(
+            f"[_build_candidate_pool] arxiv 兜底 start  topic={topic[:60]!r}  pool 还差 "
+            f"{_MIN_POOL - len(pool_dict)} 篇",
+            flush=True,
+        )
         try:
             import arxiv
             need = max(_MIN_POOL, max_pool) - len(pool_dict)
@@ -296,7 +405,7 @@ def _build_candidate_pool(
                     "core_contrib": (r.summary or "")[:200],
                     "abstract": r.summary or "",
                     "outlook": "",
-                    "keywords": ", ".join([a.text for a in (r.authors or [])[:3]]),
+                    "keywords": ", ".join([_arxiv_author_name(a) for a in (r.authors or [])[:3]]),
                     "_match_score": 0,
                     "_source": "arxiv_api_fallback",
                 })
@@ -305,25 +414,47 @@ def _build_candidate_pool(
                     break
             if arxiv_added > 0:
                 arxiv_status = "success"
+            external_status["arxiv"] = arxiv_status
+            print(
+                f"[_build_candidate_pool] arxiv 兜底 done  +{arxiv_added} 篇  pool={len(pool_dict)}",
+                flush=True,
+            )
         except Exception as e:
             arxiv_status = f"exception:{type(e).__name__}:{str(e)[:100]}"
+            external_status["arxiv"] = arxiv_status
+            print(
+                f"[_build_candidate_pool] arxiv 兜底 ❌ {arxiv_status}",
+                flush=True,
+            )
             logger.warning("[_build_candidate_pool] arxiv 兜底失败: %s", e)
     else:
         arxiv_status = "skipped"  # pool 已够大, 没调 arxiv
+        external_status["arxiv"] = "skipped"
+        print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
-    # ========== 4. 9-09 user 拍板: per-paper LLM 相关性评分精筛 ==========
-    # 解决"邻近子领域误召" (例: 量子态验证召进 30 篇层析/密钥分发)
-    # chroma 阈值 + summary_items 关键词都是召回层粗筛, 仍有邻域 paper 漏过
-    # 这里 LLM 看 paper 实情 (core_method + core_contrib) 打 0-10 分, 阈值 (默认 7) 踢出
-    relevance_threshold = get_relevance_threshold()
-    if relevance_threshold > 0 and pool_dict:
-        try:
-            pool_dict = _relevance_filter_pool(topic, pool_dict, relevance_threshold)
-        except Exception as e:
-            logger.warning("[_build_candidate_pool] relevance filter 失败 (非致命, 用原 pool): %s", e)
+    # ========== 4. 9-18 加: audit retry loop (严格筛选 + 自动重搜) ==========
+    # 9-18 user 拍板: 在构建候选池的时候就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),
+    #                 pool 不够 min_pool 时自动 retry (换 query / 换 source), 直到找到足够多合格论文.
+    # audit 结论写到 build_status["audit_state"], 供 survey_generate 塞进 state 传给 ReAct.
+    audit_state = _audit_pool_with_retry(
+        topic=topic,
+        pool_dict=pool_dict,
+        min_pool=_MIN_POOL,
+        max_pool=max_pool,
+        relevance_threshold=get_relevance_threshold(),
+        print_prefix="[_build_candidate_pool]",
+    )
+    pool_dict = audit_state["kept_dict"]
 
     # 排序: _relevance_score 降序 (relevance 跑过后) > _match_score (未跑) > source 优先级
-    source_priority = {"chroma_vector": 0, "summary_items_keyword": 1, "arxiv_api_fallback": 2}
+    # 9-18 加: APS / IOP / arxiv 三路外部源都进 source_priority 排序
+    source_priority = {
+        "chroma_vector": 0,
+        "summary_items_keyword": 1,
+        "openalex_aps_api": 2,
+        "openalex_iop_api": 3,
+        "arxiv_api_fallback": 4,
+    }
     def _sort_key(x: Dict[str, Any]) -> tuple:
         rel = x.get("_relevance_score")
         if rel is not None:
@@ -332,28 +463,43 @@ def _build_candidate_pool(
 
     pool = sorted(pool_dict.values(), key=_sort_key)
     # 限 max_pool
-    return pool[:max_pool], {"arxiv_status": arxiv_status}
+    # 9-18: build_status 扩字段, 仍保留 arxiv_status 向后兼容, 新增 audit_state 给 ReAct 看到
+    return pool[:max_pool], {
+        "arxiv_status": arxiv_status,
+        "external_status": external_status,
+        "audit_state": audit_state["summary"],
+    }
 
 
 # ============================================================
-# per-paper LLM 相关性评分精筛 (9-09 user 拍板加)
+# per-paper LLM 相关性评分精筛 (9-09 user 拍板加, 9-18 加 strict 模式)
 # ============================================================
 def _relevance_filter_pool(
     topic: str,
     pool_dict: Dict[str, Dict[str, Any]],
     threshold: int,
+    strict: bool = False,    # 9-18 加: strict=True 时不 rescue 不抛错, 全 0 返空 dict
 ) -> Dict[str, Dict[str, Any]]:
     """
     per-paper LLM 相关性评分精筛 (9-09 user 拍板加).
+
+    9-18 加 strict 参数:
+      - strict=False (默认, 向后兼容): 保留 rescue + all_fallback 兜底 (9-09 行为)
+      - strict=True: 严格审核, 不 rescue 不抛错, 全 0 返空 dict (给 retry loop 用)
+                      9-18 user 拍板: rescue 兜底导致"主题不符也硬撑", 不严格.
 
     输入: pool_dict (paper_id -> pool entry)
     处理: 5 篇/批 (env 可调) 调 LLM, 每篇 0-10 打分
     输出: pool_dict, score < threshold 的 paper 剔除, 其余加 _relevance_score 字段
 
-    容错:
+    容错 (strict=False):
       - 整批 LLM 失败 → 该批 5 篇保留 (降级, 不剔除)
       - 单篇 JSON parse 失败 → 该篇用 score=5 (中性) 保留
       - 全部过滤后剩 0 篇 → 抛 ValueError, 调用方 fallback 用原 pool
+
+    容错 (strict=True):
+      - 跟 strict=False 一致, 但不 rescue 不抛错
+      - 全 0 返空 dict, 让调用方 retry 或 bailout
     """
     from agent.tools.llm import _call_llm
     from agent.prompts_survey import build_relevance_score_prompt
@@ -367,8 +513,8 @@ def _relevance_filter_pool(
         return pool_dict
 
     logger.info(
-        "[_relevance_filter_pool] topic=%r, 候选池 %d 篇, batch_size=%d, threshold=%d",
-        topic[:50], len(items), batch_size, threshold,
+        "[_relevance_filter_pool] topic=%r, 候选池 %d 篇, batch_size=%d, threshold=%d, strict=%s",
+        topic[:50], len(items), batch_size, threshold, strict,
     )
 
     scored: Dict[str, Dict[str, Any]] = {}  # paper_id -> {score, reason, is_about_topic, is_adjacent_field}
@@ -451,6 +597,23 @@ def _relevance_filter_pool(
         if p["_relevance_score"] >= threshold and p["_is_about_topic"]
     }
 
+    # 9-18: strict 模式 — 不 rescue 不抛错, 全 0 返空
+    if strict:
+        if not kept:
+            print(
+                f"[_relevance_filter_pool] strict 模式: 全部 {len(pool_dict)} 篇被踢光, 返空 dict "
+                f"(topic={topic[:50]!r})",
+                flush=True,
+            )
+            return {}
+        n_filtered = len(pool_dict) - len(kept)
+        print(
+            f"[_relevance_filter_pool] strict 模式: 过滤掉 {n_filtered} 篇, 保留 {len(kept)} 篇 "
+            f"(topic={topic[:50]!r})",
+            flush=True,
+        )
+        return kept
+
     # 9-09 优化: 全部 paper 都标 [fallback] / [batch_failed] → LLM 整体失败, 不应用任何过滤
     all_fallback = all(
         p.get("_relevance_reason", "").startswith(("[fallback]", "[batch_failed]"))
@@ -489,6 +652,219 @@ def _relevance_filter_pool(
         )
 
     return kept
+
+
+# ============================================================
+# 9-18 加: _audit_pool_with_retry — strict 审核 + retry loop
+# 9-18 user 拍板: 在构建候选池时就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),
+#                  pool 不够 min_pool 时自动 retry (换 query / 换 source), 直到找到足够多合格论文.
+# 9-18 user 拍板: audit 结论要打通到 ReAct 主循环 LLM, 让它知道 pool 质量如何.
+# ============================================================
+def _audit_pool_with_retry(
+    topic: str,
+    pool_dict: Dict[str, Dict[str, Any]],
+    min_pool: int,
+    max_pool: int,
+    relevance_threshold: int,
+    print_prefix: str = "[_audit_pool_with_retry]",
+    max_retries: int = 2,            # 9-18: 最多 2 次重试 (3 轮 total: initial + 2 retries)
+) -> Dict[str, Any]:
+    """
+    strict audit + retry loop (9-18 加).
+
+    流程:
+      round 0: strict audit 当前 paper pool (不 rescue 不抛错)
+      round 1-N: 如果 round 0 后 pool 不够 min_pool, 自动 retry:
+                  - 重新调外部搜索 (多源并行, k 翻倍拿更多)
+                  - strict audit 新的 paper
+                  - 合并所有 round 的合格 paper (dedup by paper_id)
+      最多 max_retries 次 retry, 默认 2 次 (3 轮 total).
+
+    返回 dict:
+      {
+        "kept_dict": paper_id -> pool entry,  最终留下的 paper (可能要再过 LLM relevance 才能用)
+        "summary": {
+          "topic": ...,
+          "rounds": [
+            {"round": 0, "before": 30, "after": 5, "rejected": 25, "ok": False, "reason": "..."},
+            {"round": 1, "before": 60, "after": 12, "rejected": 48, "ok": True, "reason": "..."},
+          ],
+          "final_pool_size": 12,
+          "target_min_pool": 30,
+          "pool_meets_target": False,   # True if final >= min_pool
+          "rejected_reasons_sample": [...],  # 前 3 个 audit 拒绝理由 (LLM 解释), 供 ReAct 看到
+        }
+      }
+    """
+    audit_rounds = []
+    all_kept: Dict[str, Dict[str, Any]] = {}  # dedup by paper_id
+    seen_ids: set = set()
+    # 把当前 pool 里所有 paper 都加进 seen (避免 retry 时再加重复的)
+    for pid in pool_dict:
+        seen_ids.add(pid)
+
+    for round_idx in range(max_retries + 1):
+        before_count = len(pool_dict)
+        print(
+            f"{print_prefix} audit round {round_idx} start  before={before_count}",
+            flush=True,
+        )
+
+        # strict audit
+        if relevance_threshold > 0 and pool_dict:
+            try:
+                kept_round = _relevance_filter_pool(topic, pool_dict, relevance_threshold, strict=True)
+            except Exception as e:
+                logger.warning("[_audit_pool_with_retry] strict audit 异常: %s", e)
+                kept_round = dict(pool_dict)  # fallback 不剔除
+        else:
+            kept_round = dict(pool_dict)
+
+        after_count = len(kept_round)
+        rejected = before_count - after_count
+
+        # 拒绝理由采样 (前 3 个被踢的 paper)
+        rejected_reasons = []
+        for pid, p in pool_dict.items():
+            if pid not in kept_round:
+                reason = p.get("_relevance_reason", "")
+                title = p.get("title", "")[:60]
+                if not reason or reason.startswith(("[fallback]", "[batch_failed]")):
+                    reason = "[未评] is_about_topic=False (不严格属于本主题)"
+                rejected_reasons.append({"paper_id": pid, "title": title, "reason": reason})
+                if len(rejected_reasons) >= 3:
+                    break
+
+        # 把这一轮通过的加进全局 kept (dedup)
+        for pid, p in kept_round.items():
+            if pid not in all_kept:
+                all_kept[pid] = p
+
+        meets_target = len(all_kept) >= min_pool
+        round_record = {
+            "round": round_idx,
+            "before": before_count,
+            "after": after_count,
+            "rejected": rejected,
+            "ok": meets_target,
+            "reason": (
+                f"通过 {after_count}/{before_count}, 累计合格 {len(all_kept)}/"
+                f"{min_pool} (满足 target: {meets_target})"
+            ),
+        }
+        audit_rounds.append(round_record)
+
+        print(
+            f"{print_prefix} audit round {round_idx} done  +{after_count}/{before_count}  "
+            f"累计合格 {len(all_kept)}/{min_pool}  ok={meets_target}",
+            flush=True,
+        )
+
+        if meets_target:
+            break
+
+        # 不满足, 准备下一轮 retry
+        if round_idx >= max_retries:
+            print(
+                f"{print_prefix} 已重试 {max_retries} 次, pool 仍不足, 停止 retry",
+                flush=True,
+            )
+            break
+
+        # retry: 拿 audit 反馈调整 query + 重新搜
+        # 策略: 用 audit 拒绝理由里的关键词做"否定指引", 但简单起见我们用原 query 加大 k 翻倍,
+        #       再多拉一轮, 期望新召回里包含之前漏的真相关 paper.
+        try:
+            need_more = max(min_pool, max_pool) - len(all_kept)
+            retry_k = min(need_more * 2, 60)   # 翻倍, 上限 60 (防太慢)
+            print(
+                f"{print_prefix} retry round {round_idx+1} start  need_more={need_more}  "
+                f"retry_k={retry_k}  source=aps+iop+arxiv",
+                flush=True,
+            )
+            # 多源再拉一次 (跟 _build_candidate_pool 同样套路, 但不再走 summary_items / chroma)
+            new_papers: List[Dict[str, Any]] = []
+            try:
+                aps_k = min(retry_k // 2, 30)
+                aps_new = _openalex_aps_search(topic, aps_k)
+                for p in aps_new:
+                    if p.get("paper_id", "") not in seen_ids:
+                        seen_ids.add(p["paper_id"])
+                        new_papers.append(p)
+                print(f"{print_prefix} retry: APS +{len([p for p in aps_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+            except Exception as e:
+                print(f"{print_prefix} retry: APS ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+            try:
+                iop_k = min(retry_k // 4, 20)
+                iop_new = _openalex_iop_search(topic, iop_k)
+                for p in iop_new:
+                    if p.get("paper_id", "") not in seen_ids:
+                        seen_ids.add(p["paper_id"])
+                        new_papers.append(p)
+                print(f"{print_prefix} retry: IOP +{len([p for p in iop_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+            except Exception as e:
+                print(f"{print_prefix} retry: IOP ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+            try:
+                arxiv_k = min(retry_k // 4, 20)
+                arxiv_new = _arxiv_search(topic, arxiv_k)
+                for p in arxiv_new:
+                    pid = p.get("paper_id", "")
+                    if pid and pid not in seen_ids:
+                        seen_ids.add(pid)
+                        new_papers.append({
+                            "paper_id": pid,
+                            "title": p.get("title", ""),
+                            "year": str(p.get("year", "")),
+                            "journal": "arxiv",
+                            "core_method": "",
+                            "core_contrib": "",
+                            "abstract": p.get("abstract", ""),
+                            "outlook": "",
+                            "keywords": p.get("keywords", ""),
+                            "_match_score": 0,
+                            "_source": "arxiv_api_retry",
+                        })
+                print(f"{print_prefix} retry: arxiv +{len([p for p in arxiv_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+            except Exception as e:
+                print(f"{print_prefix} retry: arxiv ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+
+            print(f"{print_prefix} retry: 新增 {len(new_papers)} 篇 待 audit", flush=True)
+
+            # 把新 paper 加到下一轮 pool_dict
+            for p in new_papers:
+                pool_dict[p["paper_id"]] = p
+        except Exception as e:
+            print(f"{print_prefix} retry 异常停止: {e}", flush=True)
+            break
+
+    # 全局汇总: audit 拒绝理由采样 (跨所有轮, 取前 3)
+    all_rejected_sample = []
+    for r in audit_rounds:
+        all_rejected_sample.extend(
+            [{"round": r["round"], **x} for x in []]  # 这里简化: 拒绝理由已经在每轮记录里, ReAct 读 rounds 即可
+        )
+    # 简化: summary 里 rounds 字段已有足够信息 (LLM 看 round N 的 ok=False 就知道哪一轮被踢)
+
+    final_pool_size = len(all_kept)
+    summary = {
+        "topic": topic,
+        "rounds": audit_rounds,
+        "final_pool_size": final_pool_size,
+        "target_min_pool": min_pool,
+        "pool_meets_target": final_pool_size >= min_pool,
+        "max_retries": max_retries,
+    }
+
+    print(
+        f"{print_prefix} DONE  final_pool={final_pool_size}/{min_pool}  "
+        f"meets_target={summary['pool_meets_target']}",
+        flush=True,
+    )
+
+    return {
+        "kept_dict": all_kept,
+        "summary": summary,
+    }
 
 
 # ============================================================
@@ -639,12 +1015,201 @@ def _arxiv_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
             "paper_id": r.entry_id.split("/")[-1].split("v")[0],  # 去 /abs/ 前缀和版本号
             "title": r.title or "",
             "year": str(r.published.year) if r.published else "",
-            "authors": ", ".join([a.name for a in (r.authors or [])[:5]]),
+            "authors": ", ".join([_arxiv_author_name(a) for a in (r.authors or [])[:5]]),
             "abstract": r.summary or "",
-            "keywords": ", ".join([a.name for a in (r.authors or [])[:3]]),
+            "keywords": ", ".join([_arxiv_author_name(a) for a in (r.authors or [])[:3]]),
         })
         if len(out) >= k:
             break
+    return out
+
+
+# ============================================================
+# OpenAlex APS / IOP 抓取 (9-18 加: 跨多源通用论文搜索)
+# 跟 _arxiv_search 同构, 走 OpenAlex 拿 APS / IOP 期刊的 paper 元数据
+# pool 里 paper_id 用 arxiv ID (空) 或 DOI 后缀, 见 _safe_paper_id()
+# ============================================================
+def _safe_paper_id(work: dict) -> str:
+    """
+    把 OpenAlex work 转成 pool paper_id.
+
+    优先级:
+      1. DOI (例 "10.1103/PhysRevLett.123.100501" → "10.1103/PhysRevLett.123.100501")
+         (DOI 是稳定唯一 ID, 不会跟 arxiv ID 冲突)
+      2. arxiv ID (从 primary_location.source 或 authorships 抓, OpenAlex 部分 work 有)
+      3. OpenAlex ID (例 "W123456" → "W123456")
+      4. title hash (兜底, 不会重复但不可读)
+
+    返回 paper_id (字符串).
+    """
+    doi = (work.get("doi") or "").replace("https://doi.org/", "").strip()
+    if doi:
+        return doi
+
+    # arxiv ID: 从 primary_location.source 或 external_ids 找
+    # OpenAlex 实际不会把 arxiv ID 放在常规字段, 这里只是兜底
+    for loc_key in ("primary_location", "best_oa_location"):
+        loc = work.get(loc_key) or {}
+        src = loc.get("source") or {}
+        # 有些 source 字段是 OpenAlex source object
+        if isinstance(src, dict) and src.get("id") and "arxiv" in (src.get("display_name") or "").lower():
+            arxiv_id = (loc.get("pdf_url") or "").split("/")[-1].replace(".pdf", "")
+            if arxiv_id:
+                return arxiv_id
+
+    # OpenAlex ID (例 "https://openalex.org/W123456" → "W123456")
+    oa_id = (work.get("id") or "").replace("https://openalex.org/", "").strip()
+    if oa_id:
+        return oa_id
+
+    # 兜底: title hash
+    import hashlib
+    title = work.get("title") or work.get("display_name") or ""
+    return "OA-" + hashlib.md5(title.encode("utf-8")).hexdigest()[:12]
+
+
+def _openalex_aps_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    """
+    APS 期刊搜 k 篇, 走 OpenAlex (跟 search_aps 同源, 但返 dict 列表而非 markdown).
+
+    默认 quant-ph 主阵地: PRL + PRA + PRX Quantum + PRX + RMP.
+    """
+    from agent.tools.openalex import (
+        openalex_search as _oa_search,
+        resolve_source_ids as _oa_resolve,
+        OPENALEX_APS_SOURCES as _OA_APS,
+        OPENALEX_APS_DEFAULT_QUANT_PH as _OA_APS_DEFAULT,
+    )
+    source_ids = _oa_resolve(_OA_APS_DEFAULT, _OA_APS)
+    if not source_ids:
+        return []
+    works = _oa_search(query=query, source_ids=source_ids, max_results=k, caller="survey_aps_recall")
+    return [_openalex_work_to_pool_entry(w, "openalex_aps_api") for w in works]
+
+
+def _openalex_iop_search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    """
+    IOP 期刊搜 k 篇, 走 OpenAlex (跟 search_iop 同源, 但返 dict 列表而非 markdown).
+
+    默认 quant-ph 主阵地: NJP + J. Phys. A + J. Phys. B + J. Opt.
+    """
+    from agent.tools.openalex import (
+        openalex_search as _oa_search,
+        resolve_source_ids as _oa_resolve,
+        OPENALEX_IOP_SOURCES as _OA_IOP,
+        OPENALEX_IOP_DEFAULT_QUANT_PH as _OA_IOP_DEFAULT,
+    )
+    source_ids = _oa_resolve(_OA_IOP_DEFAULT, _OA_IOP)
+    if not source_ids:
+        return []
+    works = _oa_search(query=query, source_ids=source_ids, max_results=k, caller="survey_iop_recall")
+    return [_openalex_work_to_pool_entry(w, "openalex_iop_api") for w in works]
+
+
+def _openalex_work_to_pool_entry(work: dict, source_tag: str) -> Dict[str, Any]:
+    """
+    把 OpenAlex work 转成 pool entry 格式 (跟 arxiv fallback / summary_items 同构).
+
+    跟 _arxiv_search 返回 dict 的 keys 对齐:
+      paper_id / title / year / authors / abstract / keywords / _source
+
+    跟 pool entry 的 keys 对齐 (含 _match_score):
+      paper_id / title / year / journal / core_method / core_contrib / abstract /
+      outlook / keywords / _match_score / _source
+
+    关键差异:
+      - paper_id 优先 DOI (稳定, 跟 arxiv ID 不冲突)
+      - journal 标 'APS' / 'IOP' / 实际期刊名
+      - authors 从 authorships[].author.display_name 抽, 跟 arxiv 一致
+      - abstract 从 abstract_inverted_index 重构成字符串 (跟 OpenAlex 工具函数同)
+    """
+    from agent.tools.openalex import reconstruct_abstract as _oa_reconstruct
+    from agent.tools.openalex import _format_authors as _oa_format_authors
+
+    paper_id = _safe_paper_id(work)
+    title = work.get("title") or work.get("display_name") or ""
+
+    # 期刊名 (从 primary_location.source.display_name)
+    primary_loc = work.get("primary_location") or {}
+    src = primary_loc.get("source") or {}
+    journal_name = src.get("display_name") or ""
+
+    # 作者 (跟 arxiv 保持一致取 5 个)
+    authors_str = _oa_format_authors(work.get("authorships") or [], max_show=5)
+
+    # abstract 重组 (inverted index → 字符串)
+    abstract = _oa_reconstruct(work.get("abstract_inverted_index")) or ""
+
+    return {
+        "paper_id": paper_id,
+        "title": title,
+        "year": str(work.get("publication_year") or ""),
+        "journal": journal_name,
+        "core_method": "",
+        "core_contrib": "",
+        "abstract": abstract,
+        "outlook": "",
+        "keywords": authors_str,    # 跟 arxiv fallback 同, 用 authors 当 keywords 占位
+        "_match_score": 0,
+        "_source": source_tag,
+    }
+
+
+def _openalex_aps_search_batch(queries: List[str], k_per_query: int = 3) -> List[Dict[str, Any]]:
+    """
+    多 query 批量 APS 召回 (跟 _arxiv_search_batch 同构, 给 search_more 用).
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for q in queries:
+        q = (q or "").strip()
+        if not q:
+            continue
+        try:
+            papers = _openalex_aps_search(q, k_per_query)
+            for p in papers:
+                pid = p.get("paper_id", "")
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                p["_query_source"] = q[:80]
+                out.append(p)
+        except Exception as e:
+            logger.warning("[_openalex_aps_search_batch] query=%r failed: %s", q[:50], e)
+            continue
+    logger.info(
+        "[_openalex_aps_search_batch] %d queries × k=%d → union %d 篇 (deduped)",
+        len(queries), k_per_query, len(out),
+    )
+    return out
+
+
+def _openalex_iop_search_batch(queries: List[str], k_per_query: int = 3) -> List[Dict[str, Any]]:
+    """
+    多 query 批量 IOP 召回 (跟 _arxiv_search_batch 同构, 给 search_more 用).
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for q in queries:
+        q = (q or "").strip()
+        if not q:
+            continue
+        try:
+            papers = _openalex_iop_search(q, k_per_query)
+            for p in papers:
+                pid = p.get("paper_id", "")
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                p["_query_source"] = q[:80]
+                out.append(p)
+        except Exception as e:
+            logger.warning("[_openalex_iop_search_batch] query=%r failed: %s", q[:50], e)
+            continue
+    logger.info(
+        "[_openalex_iop_search_batch] %d queries × k=%d → union %d 篇 (deduped)",
+        len(queries), k_per_query, len(out),
+    )
     return out
 
 

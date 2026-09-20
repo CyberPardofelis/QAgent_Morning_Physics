@@ -12,6 +12,82 @@ from agent.tools.summary_parser import parse_summary_markdown
 
 logger = logging.getLogger(__name__)
 
+
+# 9-18 加: 自定义 User-Agent 防 arxiv 反爬 (406 Not Acceptable).
+# arxiv 库默认 User-Agent 是 "python-requests/2.32.5", 经常被 arxiv 限流拒掉.
+# 实测: 用 Mozilla/5.0 + 标识性 UA 能拿到 200 OK, 默认 UA 拿到 406.
+# arxiv.Client 没有 user_agent 参数, 必须创建后 patch _session.headers
+_ARXIV_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 "
+    "QAgent/1.0 (research; mailto:research@example.com)"   # 标识性 UA + 联系邮箱 (arxiv 推荐)
+)
+
+
+def _make_arxiv_client(num_retries: int = 5, page_size: int = 50, delay_seconds: float = 3.0) -> "arxiv.Client":
+    """
+    创建 arxiv.Client 并 patch User-Agent (9-18 加, 防 arxiv 406 反爬).
+
+    用法:
+        client = _make_arxiv_client()
+        results = list(client.results(arxiv.Search(query=...)))
+    """
+    client = arxiv.Client(
+        page_size=page_size,
+        delay_seconds=delay_seconds,
+        num_retries=num_retries,
+    )
+    # 9-18: arxiv 库没有 user_agent 参数, 必须 patch _session.headers
+    client._session.headers["User-Agent"] = _ARXIV_USER_AGENT
+    return client
+
+
+def _download_pdf_with_fallback(arxiv_id: str, pdf_path) -> bool:
+    """
+    下载 arxiv PDF, 主用 arxiv 库, fallback 到直接 PDF URL.
+
+    9-18 加: arxiv 库的 download_pdf() 经常返 HTTP 406 Not Acceptable
+    (User-Agent 被拒), 这里先 arxiv 库, 失败后用 requests 直接 GET PDF URL.
+
+    Returns:
+        True = 成功, False = 失败 (raise 让上层报)
+    """
+    # 路径 1: arxiv 库
+    try:
+        client = _make_arxiv_client(num_retries=3)
+        paper = next(client.results(arxiv.Search(id_list=[arxiv_id])))
+        paper.download_pdf(filename=str(pdf_path))
+        if pdf_path.exists() and pdf_path.stat().st_size > 1024:   # 至少 1KB (PDF magic number 一般 > 1KB)
+            return True
+    except Exception as e:
+        logger.warning("[download_arxiv_paper] arxiv 库下载失败 (%s): %s", type(e).__name__, e)
+
+    # 路径 2: 直接 GET PDF URL (arxiv.org/pdf/<id>.pdf)
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    try:
+        resp = requests.get(
+            pdf_url,
+            headers={"User-Agent": _ARXIV_USER_AGENT},
+            timeout=60,
+            stream=True,
+        )
+        if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("application/pdf"):
+            with open(pdf_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if pdf_path.exists() and pdf_path.stat().st_size > 1024:
+                print(f"[download_arxiv_paper] fallback PDF URL 下载成功: {pdf_url}", flush=True)
+                return True
+        else:
+            logger.warning(
+                "[download_arxiv_paper] fallback PDF URL 失败: HTTP %s, Content-Type=%s",
+                resp.status_code, resp.headers.get("Content-Type"),
+            )
+    except Exception as e:
+        logger.warning("[download_arxiv_paper] fallback PDF URL 异常: %s", e)
+
+    return False
+
 # ============================================================
 # 2026-09-03 接回 LLM 总结字段落库(用户拍板):
 # 跟 aps.py 同步 — 抓文元数据同步落库,LLM 总结后补 核心贡献/方法/意义/关键词。
@@ -145,42 +221,113 @@ def _format_arxiv_links(text: str) -> str:
 
 # ============================================================
 # search_arxiv: 在 arXiv 上搜索论文
+# 9-18 加: summary_only 参数 (默认 True), 防止 LLM 把完整 markdown 复制贴到 UI 污染对话窗口
 # ============================================================
 @register_tool(name="search_arxiv", is_streaming=False)
-def search_arxiv(query: str, max_results: int = 10) -> str:
-    """搜索 arXiv，返回带 Markdown 链接的文本摘要"""
+def search_arxiv(
+    query: str,
+    max_results: int = 10,
+    summary_only: bool = True,   # 9-18 加: 默认只返简短摘要 (ID/标题/作者/日期), 不含 200 字符摘要全文
+) -> str:
+    """
+    搜索 arXiv。
+
+    Args:
+        query: 关键词, 英文
+        max_results: 1-50, 默认 10
+        summary_only:
+          - True (默认): 只返 ID + 标题 + 作者 + 日期, **不含摘要全文**
+            适合: LLM 只想知道"有哪些论文", 避免 markdown 污染 UI
+          - False: 完整版, 加 200 字符摘要 + 链接
+            适合: LLM 想要摘要内容辅助决策
+
+    返回 Markdown 格式论文列表, LLM 自己决定怎么用.
+    """
+    if not query or not query.strip():
+        print("[search_arxiv] ❌ query 为空", flush=True)
+        return "❌ query 不能为空"
+    query = query.strip()
+    max_results = max(1, min(int(max_results), 50))
+
+    short_query = (query[:60] + "...") if len(query) > 60 else query
+    print(
+        f"[search_arxiv] start  query={short_query!r}  max_results={max_results}  summary_only={summary_only}",
+        flush=True,
+    )
+
+    # 9-18 加: 异常分类 + 友好错误. arxiv 库的常见失败:
     try:
-        client = arxiv.Client(num_retries=5)
+        # 9-18 加: 自定义 User-Agent 防 arxiv 反爬 (406 Not Acceptable).
+        client = _make_arxiv_client(num_retries=5)
         search = arxiv.Search(query=query, max_results=max_results)
         papers = list(client.results(search))
+    except arxiv.HTTPError as e:
+        print(f"[search_arxiv] ❌ arxiv HTTPError: {e}", flush=True)
+        return (
+            f"❌ arXiv 搜索失败 (HTTP 错)\n"
+            f"- 详情: {e}\n"
+            f"- 建议: 1) 检查网络  2) 等几秒重试  3) arxiv 可能临时限流"
+        )
+    except arxiv.UnexpectedEmptyPageError as e:
+        print(f"[search_arxiv] ❌ arxiv UnexpectedEmptyPageError: {e}", flush=True)
+        return (
+            f"❌ arXiv 搜索失败: 中途返空页\n"
+            f"- 通常是 arxiv 服务短暂不稳  \n"
+            f"- 建议: 1) 稍后重试  2) max_results 调小"
+        )
+    except arxiv.ArxivError as e:
+        print(f"[search_arxiv] ❌ arxiv ArxivError: {e}", flush=True)
+        return f"❌ arXiv 搜索失败 (ArxivError): {e}"
     except Exception as e:
-        return f"❌ 搜索 arXiv 失败: {e}"
+        print(f"[search_arxiv] ❌ 异常: {type(e).__name__}: {e}", flush=True)
+        return (
+            f"❌ arXiv 搜索失败 ({type(e).__name__})\n"
+            f"- 详情: {e}\n"
+            f"- 建议: 1) 检查网络  2) query 是不是太复杂, 简化试试"
+        )
 
     if not papers:
-        return "未找到相关论文。"
+        print(f"[search_arxiv] ⚠ 0 results  query={short_query!r}", flush=True)
+        return (
+            f"未找到匹配 '{query}' 的 arxiv 论文\n"
+            f"- 建议: 1) 简化 query  2) 用英文关键词  3) max_results 调大"
+        )
 
+    # 9-18 加: summary_only 模式 - 只返 ID/标题/作者/日期, 不返摘要全文
+    # 防止 LLM 把 200 字符摘要摆出来污染对话窗口
     output = f"找到 {len(papers)} 篇论文：\n\n"
     for idx, paper in enumerate(papers, 1):
         arxiv_id = paper.entry_id.split('/')[-1]
-        title = paper.title
-        authors = [a.name for a in paper.authors[:3]]
-        author_str = ', '.join(authors) + ('等' if len(paper.authors) > 3 else '')
-        published = paper.published.strftime("%Y-%m-%d")
-        summary = paper.summary[:200].replace('\n', ' ') + '...'
-        # 生成 Markdown 链接，点击后会在外部浏览器打开
-        output += f"{idx}. **[**{title}**](https://arxiv.org/abs/{arxiv_id})**\n"
-        output += f"   - 作者: {author_str}\n"
-        output += f"   - 发布日期: {published}\n"
-        output += f"   - 摘要: {summary}\n\n"
+        title = paper.title or "(无标题)"
+        from agent.tools.surveys._pool import _arxiv_author_name
+        authors = [_arxiv_author_name(a) for a in (paper.authors or [])[:3]]
+        authors = [a for a in authors if a]
+        author_str = ', '.join(authors) + ('等' if len(paper.authors) > 3 else '') if authors else '(未知作者)'
+        published = paper.published.strftime("%Y-%m-%d") if paper.published else "(未知日期)"
+
+        if summary_only:
+            # 简短版: 只一行核心信息, 让 LLM 自己组织回复
+            output += f"{idx}. **[{title}**](https://arxiv.org/abs/{arxiv_id}) — `{arxiv_id}`\n"
+            output += f"   - 作者: {author_str}\n"
+            output += f"   - 发布: {published}\n\n"
+        else:
+            # 完整版: 含 200 字符摘要
+            summary = (paper.summary or "")[:200].replace('\n', ' ') + '...'
+            output += f"{idx}. **[**{title}**](https://arxiv.org/abs/{arxiv_id})**\n"
+            output += f"   - 作者: {author_str}\n"
+            output += f"   - 发布日期: {published}\n"
+            output += f"   - 摘要: {summary}\n\n"
+    print(f"[search_arxiv] done  返回 {len(papers)} 篇  summary_only={summary_only}", flush=True)
     return output
 
 
 # ============================================================
 # download_arxiv_paper: 下载 arXiv 论文 PDF
+# 9-18 加: 自定义 User-Agent 防 406, fallback 到直接 PDF URL
 # ============================================================
 @register_tool(name="download_arxiv_paper", is_streaming=False, cost_tier="L0")
 def download_arxiv_paper(arxiv_id: str) -> str:
-    """根据 arXiv ID 下载论文到 PAPER_DIR，返回本地路径"""
+    """根据 arXiv ID 下载论文 PDF 到 PAPER_DIR，返回本地路径"""
     # 2026-09-04 加:容错 — LLM 经常传 "arXiv:2501.12345" 或 "https://arxiv.org/abs/2501.12345" 形式
     # 抽纯 ID
     arxiv_id = arxiv_id.strip()
@@ -192,18 +339,39 @@ def download_arxiv_paper(arxiv_id: str) -> str:
             f"需要类似 '2501.12345' 或 'arXiv:2501.12345' 或 'https://arxiv.org/abs/2501.12345' 的格式"
         )
     arxiv_id = m.group(1)
+    pdf_path = PAPER_DIR / f"{arxiv_id}.pdf"
 
-    try:
-        client = arxiv.Client()
-        paper = next(client.results(arxiv.Search(id_list=[arxiv_id])))
-        pdf_path = PAPER_DIR / f"{arxiv_id}.pdf"
-        paper.download_pdf(filename=str(pdf_path))
+    print(f"[download_arxiv_paper] start  id={arxiv_id}  → {pdf_path}", flush=True)
+
+    # 检查是否已下载
+    if pdf_path.exists() and pdf_path.stat().st_size > 1024:
         size = pdf_path.stat().st_size
-        return f"✅ 已下载:{pdf_path}  ({size} bytes)"
-    except StopIteration:
-        return f"❌ arXiv 上找不到 ID: {arxiv_id}(可能 ID 写错,或论文已被撤稿)"
+        print(f"[download_arxiv_paper] 已存在  {size} bytes, 跳过", flush=True)
+        return f"✅ 已下载(缓存):{pdf_path}  ({size} bytes)"
+
+    # 9-18 加: 先试 arxiv 库, 失败 fallback 到 requests 直 GET PDF URL
+    try:
+        ok = _download_pdf_with_fallback(arxiv_id, pdf_path)
+        if ok:
+            size = pdf_path.stat().st_size
+            print(f"[download_arxiv_paper] done  {size} bytes", flush=True)
+            return f"✅ 已下载:{pdf_path}  ({size} bytes)"
+        # 都失败: 友好提示 + 替代方案
+        print(f"[download_arxiv_paper] ❌ 两条路径都失败  id={arxiv_id}", flush=True)
+        return (
+            f"❌ 下载 arXiv 论文失败: {arxiv_id}\n"
+            f"- 主路径 (arxiv 库) + fallback (PDF URL) 都拒 (可能是 arxiv 反爬 406)\n"
+            f"- 替代方案:\n"
+            f"  - 改用 analyze_paper(arxiv_id='{arxiv_id}'): 不下载 PDF, 走 arxiv API 拉元数据/摘要, 一样能入库\n"
+            f"  - 等几分钟再试 (arxiv 限流有时效)\n"
+            f"  - 手动从 https://arxiv.org/pdf/{arxiv_id}.pdf 浏览器下载, 放到 {PAPER_DIR}"
+        )
     except Exception as e:
-        return f"❌ 下载 arXiv 论文失败: {type(e).__name__}: {e}"
+        print(f"[download_arxiv_paper] ❌ 异常 {type(e).__name__}: {e}", flush=True)
+        return (
+            f"❌ 下载 arXiv 论文失败: {type(e).__name__}: {e}\n"
+            f"- 替代: analyze_paper(arxiv_id='{arxiv_id}') 走 API 拉元数据, 不依赖 PDF"
+        )
 
 
 # ============================================================

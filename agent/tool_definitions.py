@@ -28,12 +28,24 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "search_arxiv",
-            "description": "Search papers about certain topic and not care about time on arXiv by query",
+            "description": (
+                "在 arXiv 上搜索论文, 走 arxiv API. "
+                "返回 Markdown 格式论文列表 (ID/标题/作者/日期, summary_only=True 时不含摘要全文). "
+                "**不要把工具返回的 markdown 完整复制到对话窗口** — 自己组织回复, 只列关键信息."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer", "default": 10}
+                    "query": {"type": "string", "description": "搜索关键词, 英文"},
+                    "max_results": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+                    "summary_only": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "9-18 加: True (默认) 只返 ID/标题/作者/日期, "
+                            "不含 200 字符摘要全文. False 才返完整摘要."
+                        )
+                    }
                 },
                 "required": ["query"]
             }
@@ -47,11 +59,15 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "download_arxiv_paper",
-            "description": "Download an arXiv paper by ID to local folder",
+            "description": (
+                "下载 arXiv 论文 PDF 到本地. "
+                "**注意**: arxiv 反爬严格, 主路径失败会自动 fallback 到 PDF URL, "
+                "两条路径都拒时建议改走 analyze_paper (不下载 PDF, 走 API 拉元数据)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "arxiv_id": {"type": "string"}
+                    "arxiv_id": {"type": "string", "description": "arXiv ID, 支持 '2501.12345' / 'arXiv:2501.12345' / URL"}
                 },
                 "required": ["arxiv_id"]
             }
@@ -304,19 +320,42 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
 
     # ============================================================
-    # query_knowledge: 知识库查询
+    # query_knowledge: 知识库查询 (本地摘要库, 不是搜外网)
     # ============================================================
     "query_knowledge": {
         "type": "function",
         "function": {
             "name": "query_knowledge",
-            "description": "Search the knowledge base by keyword/topic/author (FTS5 全文索引, 精确匹配)",
+            "description": (
+                "在**本地知识库** (papers.db 已分析的论文) 中按 keyword/topic/author 搜索. "
+                "走 SQLite FTS5 全文索引. 返回 Markdown 论文列表 (ID/作者/方向/关键词).\n"
+                "**重要约束**:\n"
+                "  - 三个参数 (keyword/topic/author) 至少传一个, 全空 = 全表扫描会拒\n"
+                "  - **不是搜外网**. 想搜外网用: search_arxiv / search_aps / search_iop / web_search\n"
+                "  - keyword 走 FTS5, 对 : / \" / ^ / ( / + 等字符敏感, 太复杂会报 FTS5 syntax error\n"
+                "  - topic (research_topic LIKE) / author (authors LIKE) 用普通 LIKE, 任意字符都行\n"
+                "  - keyword / topic 都可空, author 也可空\n"
+                "**触发场景**:\n"
+                "  - 用户问 '我之前分析过的 X 论文' / '知识库里有没有 X' / '按作者 Y 找论文'"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string"},
-                    "topic": {"type": "string"},
-                    "author": {"type": "string"}
+                    "keyword": {
+                        "type": "string",
+                        "default": "",
+                        "description": "FTS5 全文匹配, 例 'quantum error correction'. 避免特殊字符 (: \" ( + 等)."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "default": "",
+                        "description": "research_topic LIKE 模糊匹配, 例 'quantum computing'. 任意字符都行."
+                    },
+                    "author": {
+                        "type": "string",
+                        "default": "",
+                        "description": "authors LIKE 模糊匹配, 例 'Bennett'. 任意字符都行."
+                    }
                 }
             }
         }
@@ -632,6 +671,15 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                             "ddg=DuckDuckGo（保底，免 key 但国内常超时）"
                         ),
                         "default": "auto"
+                    },
+                    "summary_only": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "9-18 加: True (默认) 只返 title/link/snippet (snippet 截 200 字符), "
+                            "**不返 content 全文**. 防止 LLM 把 2KB+ 全文 JSON 复制到对话窗口污染 UI. "
+                            "False 才返完整 RAG 友好 JSON (含 content 全文, 适合 embedding/chunking)."
+                        )
                     }
                 },
                 "required": ["query"]

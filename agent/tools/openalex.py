@@ -175,6 +175,7 @@ def openalex_search(
     from_year: int = 0,
     sort: str = "relevance_score:desc",
     session: Optional[requests.Session] = None,
+    caller: str = "openalex_search",     # 9-18 加: 调用方标签 (search_aps/search_iop), 方便控制台追踪
 ) -> List[dict]:
     """
     OpenAlex works 搜索.
@@ -187,12 +188,20 @@ def openalex_search(
         from_year: >= this year (0 = 不过滤)
         sort: relevance_score:desc (默认) | cited_by_count:desc | publication_date:desc
         session: 复用 session (避免每工具都建连接)
+        caller: 调用方标签, 控制台前缀. 默认 'openalex_search'.
 
     Returns:
         list[dict]: OpenAlex works (每个含 id, doi, title, authorships, primary_location, abstract_inverted_index, ...)
 
     Raises:
-        RuntimeError: 网络错误 / 非 2xx / 解析失败
+        ValueError: 入参不合法 (query 空 / sort 不支持)
+        RuntimeError: 网络错误 / 非 2xx / 解析失败. msg 前缀带分类标签:
+          - "[timeout]"     requests Timeout, 网络慢/被墙
+          - "[conn]"        ConnectionError, DNS 失败 / 断网
+          - "[http 4xx]"    query 写错 (字段名错 / 编码问题), 不重试
+          - "[http 5xx]"    OpenAlex 服务端错, 已重试 _RETRY_ON_5XX 次
+          - "[json]"        返回非 JSON
+          - "[unknown]"     兜底
     """
     if not query or not query.strip():
         raise ValueError("query 不能为空")
@@ -232,6 +241,16 @@ def openalex_search(
 
     url = f"{_OPENALEX_BASE}/works"
 
+    # 9-18 加: 入口 print, 关键节点 (URL/参数/命中数) 全部走 stdout (flush=True)
+    # 让用户控制台能直接看到, 不必翻日志
+    short_query = (query[:50] + "...") if len(query) > 50 else query
+    print(
+        f"[{caller}] openalex_search start  query={short_query!r}  "
+        f"source_ids={len(source_ids or [])}个  max_results={max_results}  "
+        f"from_year={from_year or '-'}",
+        flush=True,
+    )
+
     last_err = None
     for attempt in range(_RETRY_ON_5XX + 1):
         try:
@@ -239,26 +258,64 @@ def openalex_search(
             r = sess.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
             dt = time.time() - t0
             if r.status_code >= 500:
-                raise RuntimeError(f"OpenAlex 5xx: HTTP {r.status_code}")
+                print(
+                    f"[{caller}] HTTP {r.status_code} (5xx, attempt={attempt+1}/{_RETRY_ON_5XX+1})  "
+                    f"dt={dt:.1f}s",
+                    flush=True,
+                )
+                raise RuntimeError(f"[http 5xx] OpenAlex HTTP {r.status_code} (attempt {attempt+1})")
             if r.status_code != 200:
                 # 4xx 一般是 query 写错 (例: 字段名错) — 不重试
-                raise RuntimeError(
-                    f"OpenAlex HTTP {r.status_code}: {r.text[:300]}"
+                print(
+                    f"[{caller}] HTTP {r.status_code} (4xx, query 写错?)  "
+                    f"body={r.text[:200]!r}",
+                    flush=True,
                 )
-            data = r.json()
+                raise RuntimeError(
+                    f"[http 4xx] OpenAlex HTTP {r.status_code}: {r.text[:300]}"
+                )
+            try:
+                data = r.json()
+            except ValueError as e:
+                print(f"[{caller}] 返回非 JSON: {r.text[:200]!r}", flush=True)
+                raise RuntimeError(f"[json] OpenAlex 返回非 JSON: {e}") from e
             results = data.get("results") or []
             logger.info(
                 "[openalex] query=%r source_ids=%d results=%d  dt=%.1fs  total=%s",
                 query[:60], len(source_ids or []), len(results), dt,
                 data.get("meta", {}).get("count"),
             )
+            print(
+                f"[{caller}] OK  HTTP 200  dt={dt:.1f}s  "
+                f"results={len(results)}  total={data.get('meta', {}).get('count', '?')}",
+                flush=True,
+            )
             return results
-        except (requests.RequestException, RuntimeError) as e:
+        except requests.Timeout as e:
             last_err = e
+            print(
+                f"[{caller}] timeout (>{_DEFAULT_TIMEOUT}s) attempt={attempt+1}/{_RETRY_ON_5XX+1}",
+                flush=True,
+            )
             if attempt < _RETRY_ON_5XX:
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            raise RuntimeError(f"OpenAlex 搜索失败: {e}") from last_err
+            raise RuntimeError(f"[timeout] OpenAlex 搜索超时 (>{_DEFAULT_TIMEOUT}s, 重试 {_RETRY_ON_5XX} 次): {e}") from last_err
+        except requests.ConnectionError as e:
+            # DNS 失败 / 断网 / 防火墙 — 重试无意义, 直接 raise
+            print(f"[{caller}] connection error: {e}", flush=True)
+            raise RuntimeError(f"[conn] OpenAlex 网络连不上: {e}") from e
+        except RuntimeError as e:
+            # 上面 5xx/4xx/json 抛的 RuntimeError, 区分处理
+            msg = str(e)
+            if msg.startswith("[http 5xx]"):
+                last_err = e
+                if attempt < _RETRY_ON_5XX:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"[http 5xx] OpenAlex 服务端连续错 {_RETRY_ON_5XX+1} 次: {e}") from last_err
+            # 4xx / json — 不重试, 直接上抛
+            raise
 
 
 # ============================================================

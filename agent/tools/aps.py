@@ -11,12 +11,15 @@ from agent.tools.browser_pool import get_browser_pool
 from agent.tools.summary import save_summary_item
 from agent.tools.summary_parser import parse_summary_markdown
 # 2026-09-09 P0.6: 走 OpenAlex API 搜 APS (避免 journals.aps.org 403 反爬)
+# 9-18 加: 顺手导入 _DEFAULT_TIMEOUT / _RETRY_ON_5XX, 错误信息能告诉用户具体配置
 from agent.tools.openalex import (
     openalex_search as _openalex_search,
     format_paper_markdown as _openalex_format_paper,
     resolve_source_ids as _resolve_openalex_source_ids,
     OPENALEX_APS_SOURCES as _OPENALEX_APS_SOURCES,
     OPENALEX_APS_DEFAULT_QUANT_PH as _OPENALEX_APS_DEFAULT_QUANT_PH,
+    _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
+    _RETRY_ON_5XX as _OPENALEX_RETRY,
 )
 
 logger = logging.getLogger(__name__)
@@ -408,6 +411,7 @@ def search_aps(
       - 用户说 "search APS for X" / "find PRL paper on X"
     """
     if not query or not query.strip():
+        print("[search_aps] ❌ query 为空", flush=True)
         return "❌ query 不能为空"
 
     query = query.strip()
@@ -420,22 +424,79 @@ def search_aps(
         wanted = _OPENALEX_APS_DEFAULT_QUANT_PH
     source_ids = _resolve_openalex_source_ids(wanted, _OPENALEX_APS_SOURCES)
     if not source_ids:
-        return f"❌ 没有任何合法期刊 short_name (传入={wanted!r}, 可用={list(_OPENALEX_APS_SOURCES.keys())})"
+        print(f"[search_aps] ❌ 没有任何合法期刊 short_name (传入={wanted!r})", flush=True)
+        return (
+            f"❌ APS 搜索失败: 没有任何合法期刊 short_name\n"
+            f"- 传入: {wanted}\n"
+            f"- 可用 short_name: {list(_OPENALEX_APS_SOURCES.keys())}\n"
+            f"- 提示: 用逗号分隔, 例: 'prl,pra,prxquantum'"
+        )
 
     # 哪些 short_name 落空了 (没匹配到)
     resolved_short = set(_OPENALEX_APS_SOURCES.keys())
     unmatched = [w for w in wanted if w.lower() not in resolved_short]
+
+    short_query = (query[:60] + "...") if len(query) > 60 else query
+    print(
+        f"[search_aps] start  query={short_query!r}  journals={wanted}  "
+        f"max_results={max_results}  source_ids={len(source_ids)}个",
+        flush=True,
+    )
 
     try:
         results = _openalex_search(
             query=query,
             source_ids=source_ids,
             max_results=max_results,
+            caller="search_aps",     # 9-18 加: 控制台标签用 search_aps, 方便追踪
         )
-    except Exception as e:
-        return f"❌ APS 搜索失败 (OpenAlex): {e}"
+    except ValueError as e:
+        # 入参不合法 (query 空/sort 不支持 — 上面已防, 这里兜底)
+        print(f"[search_aps] ❌ 入参错: {e}", flush=True)
+        return f"❌ APS 搜索失败 (入参): {e}"
+    except RuntimeError as e:
+        # 9-18 加: openalex 已经按 [timeout]/[conn]/[http 4xx]/[http 5xx]/[json] 分类了
+        # 这里按分类给用户具体建议
+        msg = str(e)
+        if msg.startswith("[timeout]"):
+            return (
+                f"❌ APS 搜索超时 (OpenAlex)\n"
+                f"- 网络慢或被墙, >{_OPENALEX_TIMEOUT}s 没响应\n"
+                f"- 建议: 1) 检查网络/VPN  2) 稍后重试  3) max_results 调小"
+            )
+        if msg.startswith("[conn]"):
+            return (
+                f"❌ APS 搜索失败: 网络连不上 OpenAlex\n"
+                f"- 可能是: DNS 失败 / 断网 / 防火墙\n"
+                f"- 建议: 1) 检查网络  2) 试 web_search 兜底"
+            )
+        if msg.startswith("[http 4xx]"):
+            return (
+                f"❌ APS 搜索被 OpenAlex 拒绝 (HTTP 4xx)\n"
+                f"- 通常是 query 写法有问题或触发了 OpenAlex 限流\n"
+                f"- 详情: {msg}\n"
+                f"- 建议: 1) 简化 query  2) 去掉特殊字符  3) 等几秒重试"
+            )
+        if msg.startswith("[http 5xx]"):
+            return (
+                f"❌ APS 搜索失败: OpenAlex 服务端连续错 (HTTP 5xx)\n"
+                f"- OpenAlex 自己挂了, 已重试 {_OPENALEX_RETRY} 次\n"
+                f"- 建议: 1) 稍后重试  2) 试 web_search 兜底"
+            )
+        if msg.startswith("[json]"):
+            return (
+                f"❌ APS 搜索失败: OpenAlex 返回非 JSON\n"
+                f"- 服务端可能挂了 / 限流\n"
+                f"- 详情: {msg}"
+            )
+        # 兜底
+        return f"❌ APS 搜索失败 (OpenAlex): {msg}"
 
     if not results:
+        print(
+            f"[search_aps] ⚠ 0 results  query={short_query!r}  journals={wanted}",
+            flush=True,
+        )
         return (
             f"未找到匹配 '{query}' 的 APS 论文\n"
             f"- 搜索范围: {', '.join(wanted)}\n"
@@ -450,5 +511,9 @@ def search_aps(
     footer = ""
     if unmatched:
         footer = f"\n\n⚠ 未识别的 short_name: {unmatched} (可用的: {list(_OPENALEX_APS_SOURCES.keys())})"
+    print(
+        f"[search_aps] done  返回 {len(results)} 篇  journals={wanted}",
+        flush=True,
+    )
     return "\n".join(header_lines) + body + footer
 
