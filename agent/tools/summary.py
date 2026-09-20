@@ -17,9 +17,10 @@ P2.5: paper_keywords 独立 collection,语义检索"找和 X 贡献最像的论�
 - 抓文后自动嵌入(本文件 _bg 线程里)
 - 也可手动跑 scripts/summary_items_to_chroma.py 全量嵌入
 """
-import logging
+import logging  # noqa: F401
 import sqlite3
 import threading
+from contextlib import suppress  # 9-20 ruff SIM105
 from datetime import date
 from typing import Any
 
@@ -522,11 +523,9 @@ def embed_summary_item_to_chroma(
     try:
         # 用 update 而非 add:chromadb 0.4+ 用 update 覆盖
         # 但 update 要求 id 已存在;新条目用 add
-        # 保险做法:delete + add(单条,快)
-        try:
+        # 保险做法:delete + add(单条,快) (9-20 ruff SIM105)  # noqa: F401
+        with suppress(Exception):  # 不存在是正常的
             collection.delete(ids=[cid])
-        except Exception:
-            pass  # 不存在是正常的
         collection.add(ids=[cid], documents=[text], metadatas=[meta])
         logger.info(
             "[summary→chroma] ✓ 嵌入 paper=%s source=%s → paper_keywords (text_len=%d)",

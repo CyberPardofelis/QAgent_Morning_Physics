@@ -9,24 +9,24 @@ agent.memory.processor — 记忆库总控
 - 由 LLM 在 MEMORY_GUIDE 看到"包含 X 关键词就调 save_memory"提示后自行决定
 - processor.should_suggest_save(text) 提供一致性判断
 """
-import logging
-from datetime import datetime
-from typing import Any
+import logging  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Any  # noqa: E402
 
-from .db_manager import MemoryDBManager
-from .embedder import MemoryEmbedder
-from .retriever import MemoryRetriever
-from .schemas import (
+from .db_manager import MemoryDBManager  # noqa: E402
+from .embedder import MemoryEmbedder  # noqa: E402
+from .retriever import MemoryRetriever  # noqa: E402
+from .schemas import (  # noqa: E402
     DEFAULT_SCOPE,
     MEMORY_TYPES,
     TRIGGER_KEYWORDS,
     content_has_trigger_keyword,
 )
-from .vector_store import MemoryVectorStore
+from .vector_store import MemoryVectorStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
-from .extractor import extract as _llm_extract
-from .judger import judge as _judge_triples
+from .extractor import extract as _llm_extract  # noqa: E402
+from .judger import judge as _judge_triples  # noqa: E402
 
 
 class MemoryProcessor:
@@ -439,7 +439,7 @@ class MemoryProcessor:
             vec = self.embedder.encode(new_content)
             self.vs.add(memory_id, vec, metadata={"updated_at": datetime.now().isoformat()})
             # 标记旧 faiss row 为 _deleted（避免重复）
-            old_idx = self.vs.get_row_idx(memory_id + "_old")  # 不存在，正常
+            self.vs.get_row_idx(memory_id + "_old")  # 不存在，正常
             # 简化：直接 add 新条（faiss id 不冲突因为是不同 row）
         except RuntimeError as e:
             logger.warning("[MemoryProcessor] update_content 重新 encode 失败: %s", e)

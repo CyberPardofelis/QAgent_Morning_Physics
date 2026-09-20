@@ -91,10 +91,7 @@ def _review_facts_topic_alignment(
                 if not isinstance(score, (int, float)):
                     score = 5
                 align_raw = r.get("is_topic_aligned")
-                if align_raw is None:
-                    is_aligned = int(score) >= threshold
-                else:
-                    is_aligned = bool(align_raw)
+                is_aligned = int(score) >= threshold if align_raw is None else bool(align_raw)
                 scored[fid] = {
                     "score": int(score),
                     "is_topic_aligned": is_aligned,

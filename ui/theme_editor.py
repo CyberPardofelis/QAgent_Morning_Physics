@@ -74,9 +74,7 @@ def _is_valid_hex(s: str) -> bool:
         s = "#" + s
     if re.match(r"^#[0-9a-fA-F]{6}$", s):
         return True
-    if re.match(r"^#[0-9a-fA-F]{3}$", s):
-        return True
-    return False
+    return bool(re.match(r"^#[0-9a-fA-F]{3}$", s))
 
 
 def _normalize_hex(s: str) -> str:

@@ -58,7 +58,7 @@ def save_memory(
         force_save        强制跳去去重检查直接保存（默认 False）
     """
     try:
-        from agent.memory import get_db_manager
+        from agent.memory import get_db_manager  # noqa: F401
     except ImportError as e:
         return f"❌ 记忆库模块未加载: {e}"
 

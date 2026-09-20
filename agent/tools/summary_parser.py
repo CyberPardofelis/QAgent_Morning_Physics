@@ -183,7 +183,7 @@ def parse_summary_markdown(md_text: str, fetched_papers: list[dict] = None) -> l
         return []
 
     results: list[PaperSummary] = []
-    for i, (start, marker, header_text) in enumerate(blocks):
+    for i, (start, _marker, header_text) in enumerate(blocks):
         # block 内容范围:[start, 下一个 header start 或文末)
         end = blocks[i + 1][0] if i + 1 < len(blocks) else len(md_text)
         block_text = md_text[start:end]
@@ -290,21 +290,21 @@ def _match_paper_by_title(header_title: str, fetched_papers: list[dict]) -> str:
     candidates = []
     for p in fetched_papers:
         pid = p.get("id", "")
-        ptitle = p.get("title", "")
-        if not pid or not ptitle:
+        _ptitle = p.get("title", "")
+        if not pid or not _ptitle:
             continue
-        p_norm = _normalize_title_for_match(ptitle)
+        p_norm = _normalize_title_for_match(_ptitle)
         if not p_norm:
             continue
-        candidates.append((pid, ptitle, p_norm))
+        candidates.append((pid, _ptitle, p_norm))
 
     # 1) 完全相等
-    for pid, ptitle, p_norm in candidates:
+    for pid, _ptitle, p_norm in candidates:
         if h_norm == p_norm:
             return pid
 
     # 2) 子串(双向)
-    for pid, ptitle, p_norm in candidates:
+    for pid, _ptitle, p_norm in candidates:
         if h_norm in p_norm or p_norm in h_norm:
             shorter = min(len(h_norm), len(p_norm))
             if shorter >= 20:
@@ -314,7 +314,7 @@ def _match_paper_by_title(header_title: str, fetched_papers: list[dict]) -> str:
     best_pid = ""
     best_overlap = 0
     h_tokens = set(h_norm.split())
-    for pid, ptitle, p_norm in candidates:
+    for pid, _ptitle, p_norm in candidates:
         p_tokens = set(p_norm.split())
         common = h_tokens & p_tokens
         overlap = sum(len(t) for t in common)

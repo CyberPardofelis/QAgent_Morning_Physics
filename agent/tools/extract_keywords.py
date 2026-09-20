@@ -185,7 +185,7 @@ def update_keywords_for_paper_async(
                     parts.append(abstract[:500])
                 if keywords:
                     parts.append(keywords)
-                embed_text = " | ".join(p for p in parts if p)
+                " | ".join(p for p in parts if p)
                 from agent.tools.summary import embed_summary_item_to_chroma
                 embed_summary_item_to_chroma(
                     paper_id=paper_id,

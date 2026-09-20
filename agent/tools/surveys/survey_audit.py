@@ -6,6 +6,7 @@ agent.tools.surveys.survey_audit — 独立审计工具 (L0, 0 LLM)
 - 对已有 survey 跑覆盖度审计 (不重生成, 0 LLM)
 - 每章节候选池内/外引用 + 0 引用论文列表 + 候选池覆盖度
 """
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -56,10 +57,8 @@ def survey_audit(theme_id: int, topic: str = "") -> str:
         ws_path = Path("data/surveys/working") / hash_topic(pool_topic)
         pool_file = ws_path / "_pool.json"
         if pool_file.exists():
-            try:
+            with contextlib.suppress(Exception):
                 pool = json.loads(pool_file.read_text(encoding="utf-8")).get("papers", [])
-            except Exception:
-                pass
 
     pool_ids = {p["paper_id"] for p in pool}
 

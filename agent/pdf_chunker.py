@@ -144,7 +144,7 @@ def _is_section_title(line: str) -> tuple[bool, str, str]:
         if title.lower() not in _EXCLUDE_TITLES:
             return True, prefix, title
     # 短全大写行(可能没编号)
-    if 4 < len(line) < 80 and line == line.upper() and any(c.isalpha() for c in line):
+    if 4 < len(line) < 80 and line == line.upper() and any(c.isalpha() for c in line):  # noqa: F401
         if line.lower() not in _EXCLUDE_TITLES:
             return True, "", line
     return False, "", ""

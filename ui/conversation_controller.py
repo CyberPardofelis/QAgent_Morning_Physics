@@ -8,23 +8,23 @@ ui.conversation_controller — QAgent 适配 WAgent 对话隔离范式
 4. worker.finished 时触发 bubble_finalize(conv_id) → 通知 UI 调 MessageBubble.finalize()
 5. 用 self.sender() 拿到是哪个 worker 在回调
 """
-import logging
+import logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
-import json
-import time
-from datetime import datetime
+import json  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime  # noqa: E402
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal  # noqa: E402
 
-import config
-from agent.history_manager import HistoryManager
-from agent.prompts import SYSTEM_PROMPT
-from agent.tools import get_paper_by_id, update_paper_llm_summary
-from config.settings import get_settings
-from ui.worker import NEW_BUBBLE, Worker
+import config  # noqa: E402
+from agent.history_manager import HistoryManager  # noqa: E402
+from agent.prompts import SYSTEM_PROMPT  # noqa: E402
+from agent.tools import get_paper_by_id, update_paper_llm_summary  # noqa: E402
+from config.settings import get_settings  # noqa: E402
+from ui.worker import NEW_BUBBLE, Worker  # noqa: E402
 
 
 class ConversationController(QObject):
@@ -328,7 +328,7 @@ class ConversationController(QObject):
             if bubble_list and len(bubble_list) > 1:
                 # 切掉最后一条累积的 assistant 消息（流式累的全文），换成 bubble_list 的多段
                 user_indices = [i for i, m in enumerate(target_conv.messages) if m["role"] == "user"]
-                last_user_idx = user_indices[-1] if user_indices else -1
+                user_indices[-1] if user_indices else -1
                 # 删掉最后一个 assistant（流式累的）
                 while target_conv.messages and target_conv.messages[-1]["role"] == "assistant":
                     target_conv.messages.pop()

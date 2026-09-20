@@ -3,18 +3,18 @@ knowledge._index — 拆出自原 knowledge.py (9-20 体检重构)
 
 包含函数: index_paper_to_chroma, reindex_all, sync_recent_to_chroma
 """
-from __future__ import annotations
+from __future__ import annotations  # noqa: E402
 
-import json
-import logging
-from pathlib import Path
+import json  # noqa: E402
+import logging  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 # ROOT 路径常量 (原 knowledge.py 顶部)
 ROOT = Path(__file__).resolve().parent.parent.parent
 
-from agent.tools import config as _config
-from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
-from agent.tools.registry import register_tool
+from agent.tools import config as _config  # noqa: E402
+from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: E402, F401
+from agent.tools.registry import register_tool  # noqa: E402
 
 logger = logging.getLogger(__name__)
 @register_tool(name="index_paper_to_chroma", is_streaming=False, cost_tier="L0")

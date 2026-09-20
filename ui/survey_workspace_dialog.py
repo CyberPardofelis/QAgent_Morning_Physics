@@ -275,7 +275,7 @@ class SurveyWorkspaceDialog(QDialog):
         if not ok or not name.strip():
             return
         try:
-            tid = create_theme(name.strip())
+            create_theme(name.strip())
             self._refresh_tree()
             self.status_label.setText(f"✓ 已新建主题: {name}")
         except Exception as e:
@@ -297,7 +297,7 @@ class SurveyWorkspaceDialog(QDialog):
         if not ok:
             return
         try:
-            sid = create_section(self.current_theme_id, title.strip(), section_type=stype)
+            create_section(self.current_theme_id, title.strip(), section_type=stype)
             self._refresh_tree()
             self.status_label.setText(f"✓ 已新建章节: {title}")
         except Exception as e:

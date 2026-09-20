@@ -230,10 +230,7 @@ class PaperEditDialog(QDialog):
         """将 ISO 时间格式化为 YYYY-MM-DD HH:MM:SS"""
         if not iso_time:
             return ""
-        if 'T' in iso_time:
-            base = iso_time.replace('T', ' ')
-        else:
-            base = iso_time
+        base = iso_time.replace('T', ' ') if 'T' in iso_time else iso_time
         if '.' in base:
             base = base.split('.')[0]
         return base

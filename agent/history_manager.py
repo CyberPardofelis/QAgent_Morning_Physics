@@ -272,7 +272,7 @@ class HistoryManager:
             conn.commit()
         if group_id in self.groups:
             del self.groups[group_id]
-        for conv_id, meta in self.conversations.items():
+        for _conv_id, meta in self.conversations.items():
             if meta["group_id"] == group_id:
                 meta["group_id"] = move_to_group_id
 
@@ -311,7 +311,7 @@ class HistoryManager:
                 ''', (conv.conv_id, group_id, conv.title, conv.created_at, conv.updated_at))
 
                 # 2. upsert 所有消息
-                for msg, msg_id in zip(conv.messages, conv._msg_ids):
+                for msg, msg_id in zip(conv.messages, conv._msg_ids, strict=False):
                     msg_json = json.dumps(msg, ensure_ascii=False)
                     c.execute('''
                         INSERT INTO messages (conv_id, msg_id, role, content, message_data, created_at)

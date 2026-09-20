@@ -1,3 +1,4 @@
+import contextlib
 import os
 import subprocess
 import tempfile
@@ -44,7 +45,5 @@ def run_python(code: str) -> str:
     except Exception as e:
         return f"❌ 执行失败: {e}"
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(filename)
-        except OSError:
-            pass

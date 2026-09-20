@@ -11,6 +11,7 @@ API Key 存储管理（参考 WAgent 实现）。
 真要防本地读取：上 keyring（系统凭据管理器）或 cryptography.fernet 加密文件。
 但代价是引入新依赖、用户体验更复杂。当前方案对"不在共享机器"的个人用户够用。
 """
+import contextlib
 import json
 import logging
 import threading
@@ -73,10 +74,8 @@ def _save_to_disk(keys: dict[str, str]) -> None:
     except OSError as e:
         logger.error("保存 %s 失败: %s", KEYS_FILE, e)
         if tmp_file.exists():
-            try:
+            with contextlib.suppress(OSError):
                 tmp_file.unlink()
-            except OSError:
-                pass
         raise
 
 

@@ -28,6 +28,7 @@ agent.infra.survey_workspace — 综述生成(P6)工作区管理
 历史:
   - 2026-09-05: P6.2 首版
 """
+import contextlib
 import hashlib
 import json
 import time
@@ -232,19 +233,15 @@ def list_workspaces(root: Path | None = None) -> list[dict[str, Any]]:
         audit_file = sub / "_audit.md"
         pool_size = 0
         if pool_file.exists():
-            try:
+            with contextlib.suppress(Exception):
                 pool_size = json.loads(pool_file.read_text(encoding="utf-8")).get("size", 0)
-            except Exception:
-                pass
         facts_count = 0
         if facts_file.exists():
             facts_count = sum(1 for _ in facts_file.read_text(encoding="utf-8").splitlines() if _.strip())
         sections_count = 0
         if outline_file.exists():
-            try:
+            with contextlib.suppress(Exception):
                 sections_count = len(json.loads(outline_file.read_text(encoding="utf-8")).get("sections", []))
-            except Exception:
-                pass
         # 目录修改时间兜底(没 _status.json 时)
         if not updated_at:
             try:

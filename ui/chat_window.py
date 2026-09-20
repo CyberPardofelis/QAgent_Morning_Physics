@@ -258,9 +258,8 @@ class ChatWindow(QMainWindow):
         # 但 DIRECT_OUTPUT 切多气泡时可能多个未 finalize，统一兜底
         for i in range(self.chat_view.scroll_layout.count() - 1, -1, -1):
             widget = self.chat_view.scroll_layout.itemAt(i).widget()
-            if isinstance(widget, MessageBubble) and widget.role == "assistant":
-                if not widget.is_final:
-                    widget.finalize()
+            if isinstance(widget, MessageBubble) and widget.role == "assistant" and not widget.is_final:
+                widget.finalize()
                 # 继续往前找（DIRECT_OUTPUT 切多气泡场景）
 
     def _add_comparison_chunk(self, conv_id, chunk):

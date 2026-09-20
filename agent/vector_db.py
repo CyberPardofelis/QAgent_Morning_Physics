@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import suppress  # 9-20 ruff SIM105  # noqa: I001, F401
 from pathlib import Path
 from typing import Any
 
@@ -222,7 +223,7 @@ class VectorDB:
         # 幂等：先删同 paper_id 的旧 chunks（避免重复入库）
         # 注意：delete + add 不是原子的，但 chroma collection 加锁，并发场景下
         # 同 paper_id 同时 add 也不会真出问题（后到的会被覆盖）
-        try:
+        try:  # noqa: SIM105
             self.delete_paper(paper_id)
         except Exception:
             pass  # 库里没有这个 paper, 删不动是正常的

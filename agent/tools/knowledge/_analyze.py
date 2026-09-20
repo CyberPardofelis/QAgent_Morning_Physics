@@ -81,7 +81,7 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
     - research_topic: main topic or subject
     - basic_method: Technical methods and innovative points, about 100-400 words
     - main_conclusion: the primary conclusion and mathematical expression, about 100-300 words
-   - citations: list of important citations in the method section. Each citation should be an object with the following fields: 
+   - citations: list of important citations in the method section. Each citation should be an object with the following fields:
         * title: the title of the cited paper
         * authors: list of authors
         * year: publication year (as integer)
@@ -136,15 +136,9 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
             from agent.vector_db import VectorDB
             # 准备 paper 级 metadata
             keywords = result.get("keywords", [])
-            if isinstance(keywords, list):
-                keywords_str = ", ".join(str(k) for k in keywords)
-            else:
-                keywords_str = str(keywords)
+            keywords_str = ", ".join(str(k) for k in keywords) if isinstance(keywords, list) else str(keywords)
             authors_raw = result.get("authors", [])
-            if isinstance(authors_raw, list):
-                authors_str = ", ".join(str(a) for a in authors_raw)
-            else:
-                authors_str = str(authors_raw)
+            authors_str = ", ".join(str(a) for a in authors_raw) if isinstance(authors_raw, list) else str(authors_raw)
             base_meta = {
                 "title": result.get("title", "") or "",
                 "authors": authors_str,
@@ -195,7 +189,6 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
     # 2026-09-02 协同 fix: analyze_paper 完成后, 把 LLM 提的 keywords / core_method / core_contrib
     # 写回 summary_items.db (推断 source), 并重嵌 paper_keywords
     # 让"已分析的论文"也能在 semantic_search_keywords / similar_papers 工具中被召回
-    summary_updated = False
     try:
         from agent.tools.extract_keywords import (
             infer_source_from_paper_id,
@@ -207,7 +200,7 @@ def analyze_paper(paper_id: str, pdf_path: str = "", user_comment: str = "") -> 
         method = result.get("basic_method", "") or ""
         contrib = result.get("main_conclusion", "") or ""
         # analysis_id 暂时不填(没有 papers.id 的 rowid 暴露, 后续可加)
-        summary_updated = update_summary_after_analyze(
+        update_summary_after_analyze(
             paper_id=paper_id,
             source=src,
             keywords=kw_str,

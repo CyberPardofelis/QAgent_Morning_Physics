@@ -30,10 +30,7 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
 
     # 默认抽 state['pool'] 全部; 也可指定 paper_ids 子集
     target_ids = args.get("paper_ids")
-    if target_ids:
-        targets = [p for p in state["pool"] if p["paper_id"] in target_ids]
-    else:
-        targets = list(state["pool"])
+    targets = [p for p in state["pool"] if p["paper_id"] in target_ids] if target_ids else list(state["pool"])
 
     if not targets:
         yield "⚠️ extract_facts: 0 篇目标 (paper_ids 不在 pool 中)\n"
@@ -42,7 +39,7 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
 
     yield f"📝 extract_facts: 抽 {len(targets)} 篇, 调 {_PROVIDER}/{_MODEL}\n"
 
-    for i, paper in enumerate(targets, 1):
+    for _i, paper in enumerate(targets, 1):
         paper_id = paper["paper_id"]
         # 9-08 17:20 user 拍板: 不显示具体 fact_id / 单篇进度
         try:
@@ -108,13 +105,13 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 threshold=fact_threshold,
             )
             # 把审查结果写回每条 fact
-            for i, f in enumerate(state["facts"]):
+            for _i, f in enumerate(state["facts"]):
                 fid = f.get("fact_id")
                 if not fid:
                     # 用同样的回退 key 逻辑
                     pid = f.get("paper_id", "?")
                     claim_hash = hash(str(f.get("claim", ""))[:50]) & 0xFFFF
-                    fid = f"{pid}:{i}:{claim_hash}"
+                    fid = f"{pid}:{_i}:{claim_hash}"
                 s = scored_facts.get(fid, {})
                 f["_topic_alignment_score"] = s.get("score", 5)
                 f["_is_topic_aligned"] = s.get("is_topic_aligned", True)

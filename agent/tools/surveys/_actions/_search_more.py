@@ -118,7 +118,7 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
     # 9-18 修: 用 p["_src"] (召回阶段贴的标签) 准确分类, 不再用 journal 字符串猜
     #   (原来用 "APS" in per_source_journal.get("aps") 全局判断, 永远 True, 导致 IOP paper 被错标成 APS)
     new_pool = []
-    for i, p in enumerate(raw_papers, 1):
+    for _i, p in enumerate(raw_papers, 1):
         paper_id = p["paper_id"]
         # 9-18 修: 用 _src 标签准确判定来源 (召回阶段已贴)
         src_tag = p.get("_src", "")
@@ -163,7 +163,7 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
             try:
                 summary_dict = json.loads(m.group(0))
             except json.JSONDecodeError as e:
-                raise ValueError(f"summarize JSON parse 失败: {e}")
+                raise ValueError(f"summarize JSON parse 失败: {e}") from e
 
             # 写 summary_items.db (source='survey_search', spec §7.2 C)
             save_summary_item(

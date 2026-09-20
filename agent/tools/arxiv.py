@@ -151,7 +151,7 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     papers = []
     dts = new_dl.find_all('dt')
     dds = new_dl.find_all('dd')
-    for dt, dd in zip(dts, dds):
+    for dt, dd in zip(dts, dds, strict=False):
         arxiv_id_tag = dt.find('a', title='Abstract')
         if arxiv_id_tag:
             arxiv_id = arxiv_id_tag['href'].split('/')[-1]

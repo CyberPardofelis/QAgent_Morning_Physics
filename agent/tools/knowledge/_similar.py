@@ -81,7 +81,7 @@ def similar_papers(
         score = 0.0
         matched = []
         # keywords 重合
-        kw_overlap = set(k.lower() for k in src_kw) & set(k.lower() for k in kw2)
+        kw_overlap = {k.lower() for k in src_kw} & {k.lower() for k in kw2}
         if kw_overlap:
             kw_score = float(len(kw_overlap))
             score += kw_score
@@ -136,7 +136,7 @@ def similar_papers(
                 n_fetch = n_semantic + len(field_pids) + 5
                 res = coll.query(query_texts=[query_text], n_results=min(n_fetch, coll.count()))
                 if res and res.get("ids") and res["ids"][0]:
-                    for i, cid in enumerate(res["ids"][0]):
+                    for i, _cid in enumerate(res["ids"][0]):
                         meta = res["metadatas"][0][i] if res.get("metadatas") else {}
                         dist = res["distances"][0][i] if res.get("distances") else None
                         pid2 = meta.get("paper_id", "?")
@@ -152,7 +152,7 @@ def similar_papers(
         except Exception as e:
             logger.warning("similar_papers chroma 召回失败(非致命): %s", e)
     semantic_top = semantic_top[:n_semantic]
-    semantic_pids = {c["paper_id"] for c in semantic_top}
+    {c["paper_id"] for c in semantic_top}
 
     # 4. 合并: 字段匹配优先, 语义补充
     merged = field_top + [c for c in semantic_top if c["paper_id"] not in field_pids]

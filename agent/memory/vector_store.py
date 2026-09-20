@@ -175,7 +175,7 @@ class MemoryVectorStore:
             start_idx = self.index.ntotal
             self.index.add(vectors)
             row_indices = list(range(start_idx, start_idx + len(items)))
-            for (mid, _, meta), row_idx in zip(items, row_indices):
+            for (mid, _, meta), row_idx in zip(items, row_indices, strict=False):
                 m = dict(meta or {})
                 m["id"] = mid
                 self._meta.append(m)
@@ -208,10 +208,10 @@ class MemoryVectorStore:
 
         # 多取一些再 filter
         k_search = min(top_k * 2 + len(exclude_ids or []), self.index.ntotal)
-        D, I = self.index.search(v, k_search)
+        D, indices_ = self.index.search(v, k_search)
 
         results: list[tuple[int, float]] = []
-        for dist, idx in zip(D[0].tolist(), I[0].tolist()):
+        for dist, idx in zip(D[0].tolist(), indices_[0].tolist(), strict=False):
             if idx < 0:  # faiss 用 -1 表示无效
                 continue
             # 检查 exclude

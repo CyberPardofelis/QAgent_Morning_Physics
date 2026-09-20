@@ -92,10 +92,7 @@ def _relevance_filter_pool(
                     score = 5  # 中性 fallback
                 # 9-09 严判: 提取 is_about_topic (跟 score 冗余但更清晰, 缺则从 score 回填)
                 about_raw = r.get("is_about_topic")
-                if about_raw is None:
-                    is_about = int(score) >= 8
-                else:
-                    is_about = bool(about_raw)
+                is_about = int(score) >= 8 if about_raw is None else bool(about_raw)
                 scored[pid] = {
                     "score": int(score),
                     "reason": str(r.get("reason", ""))[:200],

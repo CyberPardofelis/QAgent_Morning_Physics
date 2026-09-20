@@ -188,12 +188,9 @@ class FormulaRenderer:
 
     def _is_valid_png(self, path: Path) -> bool:
         """检查 PNG 文件是否有效(可能上次写入失败/截图为空)"""
-        if not path.exists():
-            return False
-        if path.stat().st_size < 100:  # 太小 = 空白图
-            return False
-        return True
-
+        # 9-20 ruff SIM103: 直接 return 取反条件
+        return path.exists() and path.stat().st_size >= 100
+  # noqa: F401
     def _wait_for_load(self, view: QWebEngineView, timeout_ms: int = 10000) -> bool:
         """同步等待 view load 完成(用 polling,不阻塞 Qt event loop)"""
         import time as _t

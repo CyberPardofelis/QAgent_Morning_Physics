@@ -413,7 +413,6 @@ def build_react_prompt(state: dict[str, Any]) -> str:
     if len(state["pool"]) > min(POOL_MIN, pool_size):
         pool_ids_block += f"\n  ... (共 {pool_size} 篇, 上面是前 {min(POOL_MIN, pool_size)} 个 paper_id)"
     has_outline = bool(state.get("outline_sections"))
-    fact_low = fact_count < 5  # fact 不足的硬阈值
 
     # ============ 9-08 user 拍板: 缺漏反馈 section_gaps ============
     # LLM 写章节时如果觉得还缺文章, 会在 markdown 末尾加

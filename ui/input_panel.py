@@ -304,7 +304,7 @@ class InputPanel(QWidget):
     # ==================== 事件过滤 ====================
     def eventFilter(self, obj, event):
         if obj == self.input_edit and event.type() == QEvent.KeyPress:
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):  # noqa: F401
                 if event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
                     self.input_edit.insertPlainText("\n")
                     return True

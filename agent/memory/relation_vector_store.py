@@ -196,7 +196,7 @@ class RelationVectorStore:
         valid_idx = []
         vectors = []
         metas = []
-        for i, (r, vec) in enumerate(zip(relations, pred_vectors)):
+        for i, (r, vec) in enumerate(zip(relations, pred_vectors, strict=False)):
             if vec is None or vec.ndim != 1 or vec.shape[0] != self.dim:
                 continue
             v = np.asarray(vec, dtype=np.float32)
@@ -223,7 +223,7 @@ class RelationVectorStore:
             vec_matrix = np.stack(vectors)
             self.index.add(vec_matrix)
             row_indices = list(range(start_idx, start_idx + len(vectors)))
-            for m, row_idx in zip(metas, row_indices):
+            for m, row_idx in zip(metas, row_indices, strict=False):
                 self._meta.append(m)
                 self._id_to_idx[m["rid"]] = row_idx
             self._save()
@@ -262,10 +262,10 @@ class RelationVectorStore:
 
         # 多取再 filter
         k_search = min(top_k * 3, self.index.ntotal)
-        D, I = self.index.search(v, k_search)
+        D, indices_ = self.index.search(v, k_search)
 
         results = []
-        for dist, idx in zip(D[0].tolist(), I[0].tolist()):
+        for dist, idx in zip(D[0].tolist(), indices_[0].tolist(), strict=False):
             if idx < 0:
                 continue
             if dist < sim_threshold:

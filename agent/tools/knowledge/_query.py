@@ -70,10 +70,7 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
         params.append(f"%{author}%")
 
     base_sql = "SELECT p.* FROM papers p"
-    if conditions:
-        where_clause = " WHERE " + " AND ".join(conditions)
-    else:
-        where_clause = ""
+    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     sql = base_sql + where_clause
 
     # 9-18 加: FTS5 query 语法错误单独捕获

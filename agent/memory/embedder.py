@@ -17,7 +17,6 @@ from .schemas import DEFAULT_EMBEDDING_DIM
 
 logger = logging.getLogger(__name__)
 
-
 class MemoryEmbedder:
     """
     记忆库专用 embedder（薄包装）。
@@ -85,7 +84,7 @@ class MemoryEmbedder:
         if self._dim is not None:
             return self._dim
         try:
-            from config import LOCAL_EMBEDDER_NAME, OPENAI_EMBEDDING_MODEL
+            from config import LOCAL_EMBEDDER_NAME
             # 启发式：根据 model name 推断维度
             name = (LOCAL_EMBEDDER_NAME or "").lower()
             if "bge-large" in name or "bge_en_large" in name:
@@ -152,7 +151,6 @@ class MemoryEmbedder:
         except Exception as e:
             return {"enabled": False, "error": str(e)}
 
-
 # ============================================================
 # 全局单例 + 便捷函数
 # ============================================================
@@ -160,11 +158,9 @@ def get_embedder() -> MemoryEmbedder:
     """获取全局 MemoryEmbedder 单例。"""
     return MemoryEmbedder()
 
-
 def encode_text(text: str) -> np.ndarray:
     """便捷函数：encode 单条文本。"""
     return get_embedder().encode(text)
-
 
 def encode_texts(texts: list[str]) -> np.ndarray:
     """便捷函数：encode 批量文本。"""

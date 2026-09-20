@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 from datetime import datetime
@@ -60,10 +61,8 @@ def init_db():
     ''')
 
     # 尝试添加 llm_summary 列（如果尚未添加）
-    try:
+    with contextlib.suppress(sqlite3.OperationalError):
         c.execute("ALTER TABLE papers ADD COLUMN llm_summary TEXT")
-    except sqlite3.OperationalError:
-        pass
 
     conn.commit()
     conn.close()

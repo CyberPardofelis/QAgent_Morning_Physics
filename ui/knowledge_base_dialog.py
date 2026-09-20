@@ -78,10 +78,7 @@ class KnowledgeBaseDialog(QDialog):
         if not iso_time:
             return ""
         # 替换 'T' 为空格，并截断小数点及以后
-        if 'T' in iso_time:
-            base = iso_time.replace('T', ' ')
-        else:
-            base = iso_time
+        base = iso_time.replace('T', ' ') if 'T' in iso_time else iso_time
         # 去掉毫秒部分
         if '.' in base:
             base = base.split('.')[0]
@@ -90,7 +87,7 @@ class KnowledgeBaseDialog(QDialog):
     def perform_search(self):
         """执行搜索并更新表格"""
         keyword = self.keyword_edit.text().strip()
-        search_type = self.search_combo.currentText()
+        self.search_combo.currentText()
 
         # 根据搜索类型调用 query_knowledge 函数
         # 你需要根据 search_type 来设置 query_knowledge 的参数

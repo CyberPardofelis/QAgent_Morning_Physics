@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path  # 9-20 加: 让 _themes_file() 函数签名里的 Path 类型注解可用
 
@@ -1041,10 +1042,8 @@ def apply_to_all_windows(app: QApplication, stylesheet: str) -> None:
     """给 app + 所有 topLevelWidgets 设 stylesheet(覆盖 widget 自己的 QSS)"""
     app.setStyleSheet(stylesheet)
     for w in app.topLevelWidgets():
-        try:
+        with contextlib.suppress(Exception):
             w.setStyleSheet(stylesheet)
-        except Exception:
-            pass
 
 
 def apply_current_theme(app: QApplication | None = None) -> None:

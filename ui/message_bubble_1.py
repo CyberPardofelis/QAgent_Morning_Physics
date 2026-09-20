@@ -321,10 +321,7 @@ class MessageBubble(QWidget):
         sizes = " · ".join(
             a.get("size", "") for a in self.attachments if a.get("size")
         )
-        if sizes and sizes.strip(" ·"):
-            suffix = f"> {names}  ({sizes})"
-        else:
-            suffix = f"> {names}"
+        suffix = f"> {names}  ({sizes})" if sizes and sizes.strip(" ·") else f"> {names}"
         if text:
             return f"{text}\n\n{suffix}"
         return suffix
@@ -363,10 +360,7 @@ class MessageBubble(QWidget):
             parent = parent.parent()
         if available_width <= 0:
             window = self.window()
-            if window:
-                available_width = window.width()
-            else:
-                available_width = 800
+            available_width = window.width() if window else 800
 
         max_width = max(40, min(int(available_width * 0.80), 2000))
         if max_width != self._max_width:
@@ -467,9 +461,11 @@ class MessageBubble(QWidget):
         result = []
         for idx, line in enumerate(processed_lines):
             result.append(line)
-            if line.lstrip().startswith('#'):
-                if idx < len(processed_lines)-1 and processed_lines[idx+1].strip():
-                    result.append('')
+            # 9-20 ruff SIM102: 合并 nested if  # noqa: F401
+            if (line.lstrip().startswith('#')
+                    and idx < len(processed_lines) - 1
+                    and processed_lines[idx + 1].strip()):
+                result.append('')
         return '\n'.join(result)
 
     def finalize(self):

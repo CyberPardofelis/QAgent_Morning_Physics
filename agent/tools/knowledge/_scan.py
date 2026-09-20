@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def scan_local_papers() -> str:
     """扫描 PAPER_DIR，分析新出现的 PDF（增量更新）"""
     conn = get_db_connection()
-    existing_ids = set(row['paper_id'] for row in conn.execute("SELECT paper_id FROM papers").fetchall())
+    existing_ids = {row['paper_id'] for row in conn.execute("SELECT paper_id FROM papers").fetchall()}
     conn.close()
 
     new_papers = []

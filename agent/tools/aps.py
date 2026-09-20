@@ -90,7 +90,7 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
             return html
     except Exception as e:
         print(f"[aps] ! 浏览器抓取失败: {e}  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
-        raise Exception(f"浏览器自动化抓取失败: {str(e)}")
+        raise Exception(f"浏览器自动化抓取失败: {str(e)}") from e
 
 
 def parse_aps_papers_from_html(html: str) -> list:
@@ -98,7 +98,7 @@ def parse_aps_papers_from_html(html: str) -> list:
     papers = []
     article_cards = soup.find_all('div', class_='browse-result-card')
 
-    for idx, card in enumerate(article_cards):
+    for _idx, card in enumerate(article_cards):
         try:
             paper = {}
 
