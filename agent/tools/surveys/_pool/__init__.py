@@ -25,6 +25,10 @@ from ._openalex import (
 from ._pool_audit import _audit_pool_with_retry
 from ._relevance_filter import _relevance_filter_pool
 from ._utils import (
+    _PAPER_ID_ARXIV_RE,
+    _PAPER_ID_PAPERS_MD_RE,
+    # 9-20 加: 拆分时漏了 paper_id regex 常量 re-export
+    _PAPER_ID_SIMPLE_RE,
     _arxiv_author_name,
     _audit_section_paper_ids,
     _extract_paper_ids,
@@ -38,6 +42,9 @@ __all__ = [
     "_extract_paper_ids",
     "_audit_section_paper_ids",
     "_safe_paper_id",
+    "_PAPER_ID_SIMPLE_RE",
+    "_PAPER_ID_ARXIV_RE",
+    "_PAPER_ID_PAPERS_MD_RE",
     "_build_candidate_pool",
     "_relevance_filter_pool",
     "_audit_pool_with_retry",

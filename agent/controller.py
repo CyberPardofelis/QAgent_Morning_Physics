@@ -9,30 +9,30 @@ agent.controller — 流式对话与工具调用编排（v3 — 实时流式 + �
 - 2026-09-02 改(抄 SAgent):加 <think>...</think> 标签流式剥离状态机,
   处理 MiniMax M3 把 thinking 直接拼在 content 字段的情况
 """
-import json
-import logging
-import re
-import time
-from collections.abc import Iterator
+import json  # noqa: E402
+import logging  # noqa: E402
+import re  # noqa: E402
+import time  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
 
-from agent.cost_guard import get_cost_guard
-from agent.llm_clients import (
+from agent.cost_guard import get_cost_guard  # noqa: E402
+from agent.llm_clients import (  # noqa: E402
     PROVIDERS,
     LLMClientError,
     classify_llm_error,
     resolve_legacy_model,
 )
-from agent.llm_clients import (
+from agent.llm_clients import (  # noqa: E402
     get_client as _get_client,
 )
-from agent.prompts import SYSTEM_PROMPT
-from agent.tools.registry import ToolRegistry
-from config import Config
+from agent.prompts import SYSTEM_PROMPT  # noqa: E402
+from agent.tools.registry import ToolRegistry  # noqa: E402
+from config import Config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # 触发所有工具模块的 @register_tool 装饰器执行
-import agent.tools  # noqa: F401
+import agent.tools  # noqa: E402, F401
 
 # 直接输出工具：这些工具返回的内容就是最终答案，需要按章节切气泡
 DIRECT_OUTPUT_TOOLS = {"generate_daily_summary_arxiv", "generate_aps_daily_summary"}
@@ -438,12 +438,11 @@ def run_agent_stream(
             if enable_thinking:
                 request_params["extra_body"] = {"thinking": {"type": "enabled"}}
                 request_params["reasoning_effort"] = reasoning_effort
-        elif provider_name == "minimax":
-            if not enable_thinking:
-                # MiniMax M3 默认 adaptive thinking,enable=False 时必须显式关
-                # 否则用户取消"思考模式"对 MiniMax 完全无效,LLM 仍输出 reasoning_content,
-                # 第二轮报 "must be passed back" 错
-                request_params["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif provider_name == "minimax" and not enable_thinking:
+            # MiniMax M3 默认 adaptive thinking,enable=False 时必须显式关
+            # 否则用户取消"思考模式"对 MiniMax 完全无效,LLM 仍输出 reasoning_content,
+            # 第二轮报 "must be passed back" 错
+            request_params["extra_body"] = {"thinking": {"type": "disabled"}}
 
         # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限（部分模型会回 400），
         # 这里只在非 MiniMax 时透传，避免不必要的失败。
