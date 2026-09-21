@@ -386,6 +386,17 @@ def run_agent_stream(
     _think_state = [False, ""]
     while True:
         _round += 1
+        # 9-21 加: 每轮 LLM 调用前 check_and_increment (修复 cost_guard 设计 bug)
+        # 之前只在 run_agent_stream 开头算一次, 实际 LLM 调用 N 次, 完全错位
+        is_ok, guard_msg = cost_guard.check_and_increment()
+        if not is_ok:
+            yield guard_msg
+            yield NEW_BUBBLE
+            return
+        if guard_msg:
+            # 80% 警告: 插到 LLM 输出前面,让用户看到
+            yield guard_msg
+
         # 2026-09-02 P0 fix: 超过 MAX_ROUNDS 强制退出, yield 友好提示给用户
         if _round > MAX_ROUNDS:
             print(f"[controller] ⚠ 工具循环超过 {MAX_ROUNDS} 轮, 强制退出(round={_round})", flush=True)
@@ -655,6 +666,17 @@ def _format_minimax_error(e: Exception) -> str:
 # OpenAI 简单流式
 # ============================================================
 def _stream_openai_simple(client, model, messages, temperature, max_tokens) -> Iterator[str]:
+    # 9-21 加: cost_guard 计数 (之前 OpenAI 模式完全不走 cost_guard)
+    # 这是修复 cost_guard 设计 bug 的一部分
+    cost_guard = get_cost_guard()
+    is_ok, guard_msg = cost_guard.check_and_increment()
+    if not is_ok:
+        yield guard_msg
+        yield NEW_BUBBLE
+        return
+    if guard_msg:
+        yield guard_msg
+
     stream = client.chat.completions.create(
         model=model, messages=messages, stream=True,
         temperature=temperature, max_tokens=max_tokens,
@@ -668,6 +690,15 @@ def _stream_openai_simple(client, model, messages, temperature, max_tokens) -> I
 # 非流式（兼容旧调用）
 # ============================================================
 def call_model(client, model_name, user_input) -> str:
+    # 9-21 加: cost_guard 计数 (之前完全不走 cost_guard)
+    cost_guard = get_cost_guard()
+    is_ok, guard_msg = cost_guard.check_and_increment()
+    if not is_ok:
+        return f"{guard_msg}\n(cost_guard 阻断, 拒绝非流式 LLM 调用)"
+    if guard_msg:
+        # 80% 警告 (非流式只返 string, 警告直接拼到结果里)
+        print(guard_msg, flush=True)
+
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input},

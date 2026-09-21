@@ -21,6 +21,8 @@ data/
 # _archive 目录整体不进 git
 # .qagent_qte_pids / __pycache__ 是运行残留, 不进 git
 tests/__pycache__/
+# 9-21 加: 全局 __pycache__ (各 agent/ / config/ / tools/ 之前都是 untracked, 加根模式)
+__pycache__/
 tests/.qagent_qte_pids
 tests/_archive/
 tests/_archive_debug_regress.py
@@ -46,3 +48,10 @@ ui/mathjax/
 
 # 体检清理暂存区（git rm 前先 mv 到这里，等 user 拍板再永久删）
 _trash_*/
+
+# 9-21 加: 顶层 _archive_*/ (跟 tests/_archive_*/ 同性质, 一次性 demo 暂存, 不进 git)
+_archive_*/
+
+# 9-21 加: 根 logs/ (临时 smoke 脚本 + 运行时日志, 不进 git)
+# 跟 *.log 单文件规则共存, 这里专门忽略整目录
+/logs/
