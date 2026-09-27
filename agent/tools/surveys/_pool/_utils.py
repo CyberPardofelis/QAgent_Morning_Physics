@@ -12,10 +12,27 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# paper_id 抽取用 3 种 regex (原 _pool.py 顶部模块级常量)
+# paper_id 抽取用 regex
+#
+# 9-27 实测修复: 原来 3 条 regex **全都只认 arXiv 格式**, 匹配不到 APS/IOP 的
+# DOI 格式 `10.1103/2401.12345` / `10.1103/RevModPhys.90.035006`。
+# APS 是主要数据源之一, 于是 APS 引用对审计完全不可见:
+#   - in_pool 恒为 0        → 覆盖度审计失真
+#   - 幻觉的 APS 引用抓不到 → 审计形同虚设
+#   - 实测: 一段 10892 字符的章节因误判触发 2 次重写, 被砍到 3075 字符
 _PAPER_ID_SIMPLE_RE = re.compile(r"\[(\d{4,5}\.\d{4,5}|\d{7})\]")
 _PAPER_ID_ARXIV_RE = re.compile(r"arXiv[:\s]+(\d{4,5}\.\d{4,5}|\d{7})")
 _PAPER_ID_PAPERS_MD_RE = re.compile(r"papers/(\d{4,5}\.\d{4,5}|\d{7})\.md")
+# DOI 形式 (APS / IOP 等出版商): 10.NNNN/suffix
+# 后缀允许字母数字和 . - _ / (部分 DOI 后缀含斜杠, 如 10.1088/1367-2630/aad1ea)
+_PAPER_ID_DOI_RE = re.compile(r"\[(10\.\d{4,9}/[^\]\s\)]+)\]")
+# 链接形式: papers/<doi>.md —— 后缀非贪婪, 否则会把 ".md" 一起吞进去
+_PAPER_ID_DOI_LINK_RE = re.compile(r"papers/(10\.\d{4,9}/[^)\s]*?)\.md")
+# 裸 DOI: 结尾必须是词字符, 避免把后面的标点/斜杠也吃进来;
+# 前面不能是 papers/, 否则会把 papers/<doi>.md 里的 ".md" 也当成 id
+_PAPER_ID_DOI_BARE_RE = re.compile(
+    r"(?<!papers/)\b(10\.\d{4,9}/[A-Za-z0-9._/-]*[A-Za-z0-9._-])\b"
+)
 def _arxiv_author_name(a: Any) -> str:
     """
     兼容不同 arxiv 库的 Author 表示 (9-18 修复: 'Author' object has no attribute 'text').
@@ -106,19 +123,30 @@ def _safe_json_loads_array(text: str) -> list | None:
 
 
 def _extract_paper_ids(text: str) -> list[str]:
-    """从 markdown 文本抽所有 paper_id 引用, 3 种格式都识别, 去重保序"""
+    """从 markdown 文本抽所有 paper_id 引用, 各种格式都识别, 去重保序\n\n    9-27: 补上 DOI 形式(APS/IOP)。原来只认 arXiv, 导致 APS 引用对审计\n    完全不可见 —— 实测会把 10892 字符的章节误判触发重写并砍到 3075。"""
     if not text:
         return []
-    seen = set()
-    out = []
-    # 顺序很重要: 简洁形式先 (用户期望), 然后 arXiv: 形式, 然后链接 url
-    for pattern in (_PAPER_ID_SIMPLE_RE, _PAPER_ID_ARXIV_RE, _PAPER_ID_PAPERS_MD_RE):
+    # 9-27: 按**文档出现顺序**返回。原来是逐条 pattern 遍历, 结果按格式分组
+    # (所有 arXiv 排前面, 所有 DOI 排后面), 与 docstring 说的"保序"不符,
+    # 覆盖度报告里读起来也乱。改成收集 (位置, id) 后统一按位置排序。
+    hits: list[tuple[int, str]] = []
+    for pattern in (
+        _PAPER_ID_SIMPLE_RE,
+        _PAPER_ID_DOI_RE,
+        _PAPER_ID_ARXIV_RE,
+        _PAPER_ID_PAPERS_MD_RE,
+        _PAPER_ID_DOI_LINK_RE,
+        _PAPER_ID_DOI_BARE_RE,
+    ):
         for m in pattern.finditer(text):
-            pid = m.group(1)
-            if pid in seen:
-                continue
-            seen.add(pid)
-            out.append(pid)
+            hits.append((m.start(), m.group(1)))
+    seen: set[str] = set()
+    out: list[str] = []
+    for _pos, pid in sorted(hits, key=lambda t: t[0]):
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
     return out
 
 
