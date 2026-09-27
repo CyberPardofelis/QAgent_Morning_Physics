@@ -379,10 +379,28 @@ def run_agent_stream(
     # 9-27: 计费守卫在这里取一次, 循环里每轮 charge。
     # 预扣(循环外)已删除 —— 每次 charge 都对应一次真实 LLM 请求, 不多扣。
     cost_guard = get_cost_guard()
+    # 9-27: turn 级 deadline。之前只有单次调用的 timeout, 工具执行无超时,
+    # 整个 turn 的墙上时间没有上界。详见 Config.get_turn_deadline_seconds。
+    _deadline = time.monotonic() + Config.get_turn_deadline_seconds()
     # 2026-09-02 加(抄 SAgent):跨 chunk 持续的状态盒,用于剥离 <think> 标签
     _think_state = [False, ""]
     while True:
         _round += 1
+
+        # 9-27: turn 级预算检查。放在 MAX_ROUNDS 之后、计费之前 ——
+        # 超预算时不该再扣费, 也不该再发请求。
+        _remaining = _deadline - time.monotonic()
+        if _remaining <= 0:
+            elapsed = Config.get_turn_deadline_seconds()
+            print(f"[controller] ⚠ 超过 turn 预算 {elapsed}s, 优雅收尾(round={_round})", flush=True)
+            logger.warning("[controller] turn 预算耗尽, 中止 (round=%d)", _round)
+            yield (
+                f"\n\n[已停止: 超过单次对话的时间预算 {elapsed}s]\n"
+                f"已完成 {_round - 1} 轮。\n"
+                f"可以在设置里调大 'turn_deadline_seconds'。\n"
+            )
+            yield NEW_BUBBLE
+            return
 
         # 2026-09-02 P0 fix: 超过 MAX_ROUNDS 强制退出, yield 友好提示给用户
         # 9-27 fix: 这个检查必须排在 cost_guard 计费**之前**。
@@ -427,6 +445,14 @@ def run_agent_stream(
         _harmonize_assistant_reasoning(messages, provider_name, enable_thinking)
 
         print(f"[controller] LLM round {_round} start  mode={provider_name} model={actual_model} messages={len(messages)}", flush=True)
+        # 9-27: 把单次调用的 timeout 压到"剩余预算"以内。
+        # 否则 timeout=600 的一次调用可能直接吃光整个 turn 预算,
+        # 导致上面的预算检查在下一轮才发现超期, 用户白等 10 分钟。
+        # 留 5s 余量给流式收尾/工具派发。
+        _effective_timeout = timeout
+        _budget_left = int(_deadline - time.monotonic()) - 5
+        if _budget_left > 0:
+            _effective_timeout = min(timeout, max(_budget_left, 10))
         request_params = {
             "model": actual_model,
             "messages": messages,
@@ -438,7 +464,7 @@ def run_agent_stream(
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
             "max_tokens": max_tokens,
-            "timeout": timeout,
+            "timeout": _effective_timeout,
         }
         # 2026-08-31 修(从 SAgent 照搬):用 provider 显式分支代替通用 enable_thinking
         # 之前 `if enable_thinking:` 一刀切,对 minimax/local_qwen 都不准确。

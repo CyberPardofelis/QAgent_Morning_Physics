@@ -144,3 +144,38 @@ class Config:
         if v < 1:
             v = 1
         Config._settings().setValue("cost_ceiling_daily", v)
+
+    # ---------- turn 级 deadline (9-27 加) ----------
+    @staticmethod
+    def get_turn_deadline_seconds() -> int:
+        """
+        单次用户对话(一个 turn)的总时间上限, 默认 1800s (30 分钟)。
+
+        为什么需要 (9-27 P0):
+        之前只有**单次** LLM 调用的 timeout(controller 默认 600s),
+        工具执行则完全没有超时。于是最坏情况的墙上时间没有上界 ——
+        综述工具 max_pool=200 时, extract_facts 会串行发 200 次 LLM,
+        每次 timeout=180s, 全部发生在**一个** controller 轮次里,
+        合计可达数小时, 期间 UI 只能干等, 也无法中断。
+
+        语义: 这是"预算", 不是"每步超时"。controller 每轮开始前检查
+        是否超预算, 超了就优雅收尾; 传给 LLM 的 timeout 也会被压到
+        剩余预算以内, 保证单次调用不会把整个预算吃完。
+        """
+        v = Config._settings().value("turn_deadline_seconds", 1800)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 1800
+        # 至少给 60s, 否则单次长 prompt 都不够
+        return v if v >= 60 else 60
+
+    @staticmethod
+    def set_turn_deadline_seconds(value: int) -> None:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            v = 1800
+        if v < 60:
+            v = 60
+        Config._settings().setValue("turn_deadline_seconds", v)
