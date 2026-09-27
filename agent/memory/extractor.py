@@ -99,6 +99,14 @@ def _call_llm_extract(content: str) -> dict[str, Any] | None:
         logger.warning("[MemoryExtractor] \u62ff\u4e0d\u5230 deepseek client: %s", e)
         return None
     try:
+        # 9-27 P0 fix: 记忆抽取的 LLM 调用之前完全不走 cost_guard。
+        # check_duplicate + save(_enrich_with_extract) 一次保存会抽 2 次,
+        # 单用户一天下来就是几百次未计费的请求。
+        from agent.cost_guard import charge as _charge
+        _is_ok, _guard_msg = _charge()
+        if not _is_ok:
+            logger.warning("[MemoryExtractor] cost_guard 阻断, 跳过抽取")
+            return None
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[

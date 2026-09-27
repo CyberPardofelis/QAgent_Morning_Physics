@@ -20,6 +20,7 @@
 """
 import logging
 
+from agent.cost_guard import charge as cost_guard_charge
 from agent.llm_clients import (
     PROVIDERS,
     classify_llm_error,
@@ -212,6 +213,17 @@ def _call_llm(
         import time as _t
         _t0 = _t.time()
         print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符 timeout={timeout}s", flush=True)
+        # 9-27 P0 fix: 工具内部的 LLM 调用之前完全不走 cost_guard。
+        # survey_generate 一次运行会在 _call_llm 里发 100+ 次请求 (每篇论文抽 fact /
+        # 相关性评分 / 写章节 ...), 守卫却只看见 controller 那 ~50 次 —— ceiling
+        # 完全约束不住真实开销。计费收口到这里。
+        _is_ok, _guard_msg = cost_guard_charge()
+        if not _is_ok:
+            print(f"[llm] _call_llm 被 cost_guard 阻断: {_guard_msg}", flush=True)
+            return f"❌ {_guard_msg.strip()}\n(cost_guard 阻断, 未发出 LLM 请求)"
+        if _guard_msg:
+            print(f"[llm] cost_guard: {_guard_msg.strip()}", flush=True)
+
         resp = client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         out = msg.content

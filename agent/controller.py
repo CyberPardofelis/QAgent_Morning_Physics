@@ -341,16 +341,10 @@ def run_agent_stream(
         cost_tier, len(tools), len(ToolRegistry.list_schemas()),
     )
 
-    # CostGuard: 进入 LLM 前 check + increment,100% 阻断
-    cost_guard = get_cost_guard()
-    is_ok, guard_msg = cost_guard.check_and_increment()
-    if not is_ok:
-        yield guard_msg
-        yield NEW_BUBBLE
-        return
-    if guard_msg:
-        # 80% 警告: 插到 LLM 输出前面,让用户看到
-        yield guard_msg
+    # 9-27 fix: 删掉这里的预扣。
+    # 之前在 run_agent_stream 开头 charge 一次, while 循环里每轮又 charge 一次,
+    # 第一轮被重复计费。而且 openai 早 return 路径会走 _stream_openai_simple
+    # (那里自己 charge), 于是这条预扣是纯浪费。计费现在只发生在真正发请求的地方。
 
     # 2026-09-04 P0 fix:DeepSeek thinking 模式下 messages 里所有 assistant 必须有
     # reasoning_content 字段。之前的 v3 修法在 run_agent_stream 开头跑一次,
@@ -382,22 +376,17 @@ def run_agent_stream(
     # DeepSeek 模式：思考 + 工具调用循环
     # MiniMax 模式：走同一路径（MiniMax OpenAI 兼容接口支持工具调用 + thinking extra_body）
     _round = 0
+    # 9-27: 计费守卫在这里取一次, 循环里每轮 charge。
+    # 预扣(循环外)已删除 —— 每次 charge 都对应一次真实 LLM 请求, 不多扣。
+    cost_guard = get_cost_guard()
     # 2026-09-02 加(抄 SAgent):跨 chunk 持续的状态盒,用于剥离 <think> 标签
     _think_state = [False, ""]
     while True:
         _round += 1
-        # 9-21 加: 每轮 LLM 调用前 check_and_increment (修复 cost_guard 设计 bug)
-        # 之前只在 run_agent_stream 开头算一次, 实际 LLM 调用 N 次, 完全错位
-        is_ok, guard_msg = cost_guard.check_and_increment()
-        if not is_ok:
-            yield guard_msg
-            yield NEW_BUBBLE
-            return
-        if guard_msg:
-            # 80% 警告: 插到 LLM 输出前面,让用户看到
-            yield guard_msg
 
         # 2026-09-02 P0 fix: 超过 MAX_ROUNDS 强制退出, yield 友好提示给用户
+        # 9-27 fix: 这个检查必须排在 cost_guard 计费**之前**。
+        # 之前顺序反了 —— 第 51 轮先扣费再被 MAX_ROUNDS 拦下, 白扣一次。
         if _round > MAX_ROUNDS:
             print(f"[controller] ⚠ 工具循环超过 {MAX_ROUNDS} 轮, 强制退出(round={_round})", flush=True)
             logger.warning(
@@ -413,6 +402,20 @@ def run_agent_stream(
                 f"已自动终止,避免内存/费用爆。如需继续,请重新提问。"
             )
             yield NEW_BUBBLE
+            return
+
+        # 9-21 加: 每轮 LLM 调用前 charge (修复 cost_guard 设计 bug)
+        # 9-27: 工具内部的 LLM 调用 (agent/tools/llm.py 的 _call_llm) 也各自计费,
+        #       所以一次用户对话可能是 50 次 controller 调用 + 上百次工具调用
+        is_ok, guard_msg = cost_guard.check_and_increment()
+        if not is_ok:
+            yield guard_msg
+            yield NEW_BUBBLE
+            return
+        if guard_msg:
+            # 80% 警告: 插到 LLM 输出前面,让用户看到
+            yield guard_msg
+
             return
 
         # 2026-09-04 P0 fix:每轮都补 reasoning_content

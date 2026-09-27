@@ -159,3 +159,29 @@ def get_cost_guard() -> CostGuard:
             if _guard_instance is None:
                 _guard_instance = CostGuard()
     return _guard_instance
+
+
+# ============================================================
+# 计费收口 (9-27 P0)
+# ============================================================
+# 全项目**每一个真实 LLM 请求**都必须先过一次这里。
+#
+# 之前的漏洞:
+#   - 只有 controller 的 4 个 call site 计费, agent/tools/llm.py 的 _call_llm
+#     (所有工具内部的 LLM 调用) 和 memory/extractor.py 的抽取调用完全不经过计费
+#   - controller.py 还在 run_agent_stream 开头预扣了一次, 第一轮被重复计费
+#
+# 实际影响: survey_generate 一次运行内部发 100+ 次 LLM, 守卫只看见约 50 次,
+# ceiling 完全约束不住真实开销。
+
+
+def charge(ceiling: int | None = None) -> tuple[bool, str]:
+    """记一次 LLM 调用。返回 (is_ok, message)。
+
+    - (True, "")  → 放行
+    - (True, "⚠…") → 放行 + 80% 警告(调用方决定怎么呈现)
+    - (False, "❌…") → 已达上限, 调用方**不应**再发请求
+
+    每个发起 LLM 请求的地方都应该在请求前调它, 阻断时直接返回错误信息。
+    """
+    return get_cost_guard().check_and_increment(ceiling)
