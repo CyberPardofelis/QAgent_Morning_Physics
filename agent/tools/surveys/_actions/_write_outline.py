@@ -11,6 +11,7 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
+from .._outline import normalize_outline_sections
 from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
@@ -103,120 +104,11 @@ def action_write_outline(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
         yield "  ❌ 大纲 JSON parse 失败, 下一轮重试\n"
         return
 
-    # 规范化 sections
-    # 9-08 17:00 user 拍板: section_type 容错 + 至少 5 段
-    #   - LLM 偶尔拼写错: "Method-Compare" / "GAP" / "out look" → 强制 normalize 到 5 段合法值
-    #   - LLM 偷懒只返 2 段 → 补到 5 段 (intro/progress/method_compare/gap/outlook)
-    VALID_TYPES = {"intro", "progress", "method_compare", "gap", "outlook"}
-
-    def _normalize_sec_type(raw: str) -> str | None:
-        """拼写/分隔符容错, 返回合法 section_type 或 None"""
-        s = (raw or "").strip().lower().replace("-", "_").replace(" ", "_")
-        if not s:                          # 9-08 修: 空字符串不参与匹配 (避免 "" in "outlook" 误命中)
-            return None
-        # 直接命中
-        if s in VALID_TYPES:
-            return s
-        # 模糊匹配
-        for v in VALID_TYPES:
-            if v in s or s in v:
-                return v
-        # 关键词 fallback
-        if "intro" in s or "background" in s or "introduction" in s:
-            return "intro"
-        if "progress" in s or "timeline" in s or "milestone" in s:
-            return "progress"
-        if "method" in s or "compare" in s or "comparison" in s:
-            return "method_compare"
-        if "gap" in s or "limit" in s or "challenge" in s:
-            return "gap"
-        if "outlook" in s or "future" in s or "direction" in s:
-            return "outlook"
-        return None
-
-    normalized = []
-    seen_types: set = set()
-    for sec in parsed["sections"]:
-        if not isinstance(sec, dict):
-            continue
-        title = (sec.get("title") or "").strip()
-        sec_type = _normalize_sec_type(sec.get("section_type", ""))
-        if not title or not sec_type:
-            continue  # 跳过非法 section (避免污染 outline)
-        # 9-08 防重复: 同一 section_type 出现多次, 只保留第一个, 后续的去重
-        if sec_type in seen_types:
-            continue
-        seen_types.add(sec_type)
-        sub_points = sec.get("sub_points") or []
-        if not isinstance(sub_points, list):
-            sub_points = [str(sub_points)]
-        sub_points = [str(sp).strip() for sp in sub_points if str(sp).strip()]
-        if not sub_points:
-            sub_points = ["(待定)"]
-        is_transition = str(sec.get("is_transition", "no")).strip().lower()
-        normalized.append({
-            "title": title,
-            "section_type": sec_type,
-            "sub_points": sub_points,
-            "is_transition": "yes" if is_transition in ("yes", "true", "1") else "no",
-        })
-
-    # 9-08 17:00 user 拍板: LLM 偷懒只返 < 5 段时, 用 default 补足到 5 段
-    # 9-08 23:50 user 拍板: 升级到 claim-centric 视角, sub_points 从 3 个涨到 5-8 个,
-    # 每个 sub_point 用完整判断式陈述句 (跟 SURVEY_OUTLINE_PROMPT 措辞对齐)
-    DEFAULT_OUTLINE = [
-        {"title": "引言", "sec_type": "intro", "sub_points": [
-            "本领域的研究背景和核心科学/工程问题",
-            "已有综述覆盖的范围和本综述的差异化定位",
-            "本综述采用的分类法和分析框架",
-            "本综述的覆盖范围和时间窗口",
-            "全文组织结构",
-        ], "is_transition": "yes"},
-        {"title": "关键进展时间线", "sec_type": "progress", "sub_points": [
-            "领域的早期奠基工作和初始共识",
-            "第一次方法论突破及其驱动力",
-            "中期关键优化和性能提升",
-            "近期(2015-2020)的方法论转变",
-            "当前主流共识(2020-2025)",
-            "演化的内在驱动力: 为什么会有这些转折",
-            "未解决的科学/工程问题",
-        ], "is_transition": "no"},
-        {"title": "方法分类与对比", "sec_type": "method_compare", "sub_points": [
-            "按机制维度的分类法和命名规范",
-            "按性能维度的对比和基准测试结果",
-            "按适用场景的对比和工程取舍",
-            "各类方法的核心 trade-off",
-            "混合方法/组合方法的最新进展",
-            "不同分类法之间的等价性讨论",
-        ], "is_transition": "no"},
-        {"title": "研究空白与不足", "sec_type": "gap", "sub_points": [
-            "技术瓶颈: 当前方法在 X 场景无法扩展",
-            "实验限制: 已有 benchmark 的覆盖盲区",
-            "理论未解: 基础理论未能解释的现象",
-            "跨领域迁移失败的反例",
-            "为什么这些问题长期未解决(方法论或生态原因)",
-        ], "is_transition": "no"},
-        {"title": "未来方向与展望", "sec_type": "outlook", "sub_points": [
-            "短期可做方向(1-2 年内可见成果)",
-            "长期研究方向(5 年+的开放问题)",
-            "跨领域迁移机会(A 领域方法到 B 领域)",
-            "标准化展望(基准/评测/复现规范)",
-        ], "is_transition": "no"},
-    ]
-    if len(normalized) < 5:
-        existing = {s["section_type"] for s in normalized}
-        for default in DEFAULT_OUTLINE:
-            if default["sec_type"] not in existing:
-                normalized.append({
-                    "title": default["title"],
-                    "section_type": default["sec_type"],
-                    "sub_points": default["sub_points"],
-                    "is_transition": default["is_transition"],
-                })
-                existing.add(default["sec_type"])
-                if len(normalized) >= 5:
-                    break
-        # 9-08 17:25 删: 补足信息是 internal, 不 yield
+    # 9-27: 规范化逻辑抽到 _outline.normalize_outline_sections, 与"用户手改大纲"
+    # 共用同一套校验 —— 否则会出现"LLM 拼写错误被容错、用户拼写错误不被容错"。
+    normalized, warnings = normalize_outline_sections(parsed["sections"], fill_to_five=True)
+    for w in warnings:
+        logger.info("[write_outline] %s", w)
 
     if not normalized:
         state["errors"].append({

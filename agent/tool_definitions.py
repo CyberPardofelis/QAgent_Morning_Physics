@@ -870,6 +870,25 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "default": 10,
                         "description": "预留 P4 ReAct 共享接口, 本轮未使用"
                     },
+                    "phase": {
+                        "type": "string",
+                        "enum": ["all", "plan", "write"],
+                        "default": "all",
+                        "description": (
+                            "执行阶段。all=一次跑完(默认)。"
+                            "plan=只生成大纲就停(候选池→fact→大纲), 之后可用 survey_outline 改大纲。"
+                            "write=从 workspace 读回 pool/fact/大纲(可含用户改动)只写章节正文, "
+                            "不重复跑 Phase A 和 fact 抽取, 省掉几十次 LLM 调用。"
+                        )
+                    },
+                    "section_idx": {
+                        "type": "integer",
+                        "default": -1,
+                        "description": (
+                            "配合 phase=\"write\": >=0 时只写第 section_idx 章(单章重写), "
+                            "其余章节不动。-1(默认)=写全部。"
+                        )
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "default": False,
@@ -884,6 +903,65 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     # ============================================================
     # survey_audit: 对已有 survey 跑覆盖度审计(P6.4, L0 档, 0 LLM)
     # ============================================================
+    # ============================================================
+    # survey_outline / survey_outline_export: 大纲查看与编辑 (L0, 0 LLM)
+    # ============================================================
+    "survey_outline": {
+        "type": "function",
+        "function": {
+            "name": "survey_outline",
+            "description": (
+                "查看/修改某主题的综述大纲(0 LLM 调用, 纯本地)。"
+                "典型流程: survey_generate(phase=\"plan\") 生成大纲 → survey_outline(action=\"view\") "
+                "给用户看 → survey_outline(action=\"update\", sections=...) 改 → "
+                "survey_generate(phase=\"write\") 按改后的大纲写正文。"
+                "用户说\"看看大纲\"/\"改一下大纲\"/\"第3章标题改成X\"/\"加一章XX\"时用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "综述主题, 必须与生成时完全一致(大纲按 topic hash 定位)"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["view", "update"],
+                        "default": "view",
+                        "description": "view=查看当前大纲; update=用 sections 覆盖更新"
+                    },
+                    "sections": {
+                        "type": "string",
+                        "description": (
+                            "action=\"update\" 时必填。JSON 字符串, 形如 "
+                            "{\"sections\":[{\"title\":\"...\",\"section_type\":\"intro\","
+                            "\"sub_points\":[\"...\"],\"is_transition\":\"no\"}]}; "
+                            "也接受顶层直接是数组。section_type 可用 5 段保底类型"
+                            "(intro/progress/method_compare/gap/outlook) 或 custom。"
+                            "先 view 拿到现版, 改完整体传回来(未提及的章节会丢, 所以要传全量)。"
+                        )
+                    }
+                },
+                "required": ["topic"]
+            }
+        }
+    },
+
+    "survey_outline_export": {
+        "type": "function",
+        "function": {
+            "name": "survey_outline_export",
+            "description": "导出某主题大纲的可编辑 JSON 模板(0 LLM)。用户想把大纲拿到外部编辑器改时用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "综述主题"}
+                },
+                "required": ["topic"]
+            }
+        }
+    },
+
     "survey_audit": {
         "type": "function",
         "function": {

@@ -36,20 +36,30 @@ def survey_generate(
     max_steps: int = 20,
     max_pool: int = 50,                # 9-08 17:00 加: 候选池上限, 默认 50 (LLM 可显式传更大值)
     dry_run: bool = False,
+    phase: str = "all",
+    section_idx: int = -1,
 ) -> Iterator[str]:
     """
     生成综述 (P6.5 ReAct 改写) — L2 档, 流式 yield 进度 + 章节内容.
 
-    ReAct 主循环:
-      Step 0: 初始候选池 (Phase A, 0 LLM)
-      Step 1..max_steps: LLM 观察 state → 决策 action → 派发 → yield obs
-        action: search_more / extract_facts / write_section / finish
-      收尾: theme + sections 落 surveys.db, _audit.md, 最终 markdown
-
     Args:
         topic: 综述主题, 例 "量子纠缠度量计算"
-        max_steps: ReAct 循环上限 (默认 20, spec §7.1)
+        max_steps: ReAct 循环上限 (默认 20)
         dry_run: True = 不调 LLM, 只走 Phase A 候选池构建
+        phase: "all" (默认, 一次跑完) / "plan" / "write" — 见下
+        section_idx: >=0 时只写第 section_idx 章 (单章重写), 配合 phase="write"
+
+    phase 拆分 (9-27, 为"大纲可编辑"而加):
+        "plan"  — 只跑到大纲: 候选池 → fact → 大纲, 然后**停住**。
+                   产物落 workspace/_pool.json, _facts.jsonl, _outline.json。
+                   之后可以用 survey_outline(action="view"/"update") 改大纲。
+        "write" — 从 workspace 读回 pool/facts/大纲(可以是用户改过的),
+                   只写章节正文 + 收尾审计。不重复跑 Phase A / fact 抽取。
+        "all"   — plan + write 一次跑完(向后兼容的默认行为)。
+
+    单章重写:
+        phase="write", section_idx=k → 只重写第 k 章, 其余章节不动。
+        已有正文会被新正文替换(同一 section 记录被覆盖, 不追加)。
 
     Yields:
         流式进度 + 章节内容, chat stream_chunk signal 消费
@@ -60,12 +70,20 @@ def survey_generate(
         return
 
     topic = topic.strip()
+    phase = (phase or "all").strip().lower()
+    if phase not in ("all", "plan", "write"):
+        yield f"❌ phase 只能是 'all' / 'plan' / 'write', 收到 {phase!r}\n"
+        return
 
     # 0. workspace 准备
     topic_hash = hash_topic(topic)
     ws = SurveyWorkspace(topic_hash, topic=topic)
-    ws.set_status("init", 0, 0, f"topic={topic}")
 
+    if phase == "write":
+        yield from _run_write_phase(topic, ws, section_idx=section_idx, max_steps=max_steps)
+        return
+
+    ws.set_status("init", 0, 0, f"topic={topic}")
     yield f"🔍 开始综述: {topic}\n"
 
     # 1. Step 0: Phase A 初始候选池 (0 LLM, summary_items.db + chroma + arxiv fallback, 9-08 多源召回)
@@ -187,5 +205,174 @@ def survey_generate(
         })
 
     # 3. 收尾 (step 1 stub — 后续 step 5 落 surveys.db + audit + 最终 markdown)
+    if phase == "plan":
+        yield from _yield_plan_summary(state, ws, topic)
+        return
     final = _finalize_survey(state, ws)
     yield final
+
+
+# ============================================================
+# phase="plan": 跑到大纲就停 (9-27)
+# ============================================================
+
+def _yield_plan_summary(state: dict[str, Any], ws, topic: str):
+    """plan 阶段收尾: 汇报大纲, 告诉用户下一步怎么走。"""
+    from ._outline import render_outline_md
+
+    outline = state.get("outline_sections") or []
+    ws.set_status("planned", 0, len(outline), "大纲已生成, 等待用户确认/编辑")
+
+    yield (
+        f"\n## ✋ 大纲已生成, 已停在这里等你过目\n\n"
+        f"- 候选池: {len(state.get('pool', []))} 篇\n"
+        f"- 原子 fact: {len(state.get('facts', []))} 条\n"
+        f"- 大纲: {len(outline)} 章\n"
+        f"- workspace: `{ws.path}`\n"
+    )
+    if outline:
+        yield render_outline_md(outline) + "\n"
+    yield (
+        f"---\n"
+        f"接下来你可以:\n"
+        f"  1. **直接开写**: `survey_generate(topic=\"{topic}\", phase=\"write\")`\n"
+        f"  2. **先改大纲**: `survey_outline(topic=\"{topic}\", action=\"view\")` 看详情,\n"
+        f"     改完 `survey_outline(..., action=\"update\", sections=...)`,\n"
+        f"     再 `survey_generate(..., phase=\"write\")`\n"
+        f"  3. **只重写某一章**: `survey_generate(topic=\"{topic}\", phase=\"write\", section_idx=2)`\n"
+    )
+
+
+# ============================================================
+# phase="write": 从 workspace 读回产物, 只写章节 (9-27)
+# ============================================================
+
+def _run_write_phase(topic: str, ws, section_idx: int = -1, max_steps: int = 20):
+    """
+    写作阶段: pool / facts / 大纲 全部从 workspace 读回(可能是用户改过的)。
+
+    好处:
+      - 不重复跑 Phase A / fact 抽取(省掉几十次 LLM 调用)
+      - 用户改完大纲后, 直接重写正文, 不用把整个 pipeline 重来一遍
+      - section_idx >= 0 时只写那一章(单章重写), 其余章节不动
+    """
+    pool = ws.load_pool()
+    outline_raw = ws.load_outline() or {}
+    outline_sections = outline_raw.get("sections") or []
+    facts = ws.load_facts()
+
+    if not pool:
+        yield (
+            f"❌ 主题「{topic}」的 workspace 里没有候选池。\n"
+            f"先跑 `survey_generate(topic=\"{topic}\", phase=\"plan\")` 生成大纲。\n"
+            f"(workspace: `{ws.path}`)\n"
+        )
+        return
+    if not outline_sections:
+        yield (
+            f"❌ 主题「{topic}」还没有大纲。\n"
+            f"先跑 `survey_generate(topic=\"{topic}\", phase=\"plan\")`。\n"
+            f"(workspace: `{ws.path}`)\n"
+        )
+        return
+
+    # fact 里的对齐标记在 _facts.jsonl 里(旧 run 可能没有), 过滤交给渲染层兜底
+    if isinstance(section_idx, int) and 0 <= section_idx < len(outline_sections):
+        target_desc = f"第 {section_idx} 章 [{outline_sections[section_idx].get('section_type')}]"
+        outline_sections = [outline_sections[section_idx]]
+        yield (
+            f"✍️ 单章模式: 只写 {target_desc} "
+            f"{outline_sections[0].get('title', '')}\n"
+            f"📚 从 workspace 读回: pool {len(pool)} 篇 / fact {len(facts)} 条 / 大纲原 {len(outline_raw.get('sections') or [])} 章\n\n"
+        )
+    else:
+        yield (
+            f"✍️ 写作阶段\n"
+            f"📚 从 workspace 读回: pool {len(pool)} 篇 / fact {len(facts)} 条 / 大纲 {len(outline_sections)} 章"
+            f"{'(用户已编辑)' if outline_raw.get('edited') else ''}\n\n"
+        )
+
+    edited = outline_raw.get("edited", False)
+    state: dict[str, Any] = {
+        "topic": topic,
+        "topic_hash": ws.topic_hash,
+        "pool": pool,
+        "pool_audit": {},          # plan 阶段的 audit 不再重跑
+        "facts": facts,
+        "sections": [],
+        "outline": outline_raw.get("raw", ""),
+        "outline_sections": outline_sections,
+        "outline_edited": edited,
+        "section_gaps": [],
+        "unused_pool_papers": [],
+        "errors": [],
+        "step": 0,
+        "finish_requested": False,
+        "max_steps": max_steps if section_idx < 0 else 1,
+    }
+
+    # 找到该主题已有的 theme_id, 避免每章都新建一个 theme
+    state["theme_id"] = _find_or_create_theme(topic, edited)
+
+    if section_idx >= 0:
+        # 单章重写: 先删掉旧章节, 让 write_section 重新落一条(否则会重复追加)
+        _drop_existing_section(state["theme_id"], outline_sections[0])
+
+    while state["step"] < state["max_steps"] and not state["finish_requested"]:
+        state["step"] += 1
+        decision = _decide_action(state)
+        yield f"➡️ 调用工具: {decision['action']}\n"
+        try:
+            for chunk in _dispatch_action(decision, state, ws):
+                if chunk:
+                    yield chunk
+        except Exception as e:
+            from ._actions import _friendly_error
+            friendly = _friendly_error(e, decision["action"])
+            state["errors"].append({
+                "step": state["step"], "action": decision["action"], "msg": friendly,
+            })
+            yield f"👁️ 观察: ❌ {friendly}\n"
+        _append_react_trace(ws, {
+            "step": state["step"],
+            "thought": decision["thought"],
+            "action": decision["action"],
+            "args": decision.get("args", {}),
+            "n_errors": len(state["errors"]),
+        })
+
+    # 单章重写不做覆盖度审计(只写了一章, 审计统计会误导)
+    if section_idx >= 0:
+        for r in state.get("sections", []):
+            yield (
+                f"\n✅ 第 {section_idx} 章重写完成 "
+                f"(section_id={r.get('section_id')}, 引用 {len(r.get('in_pool', []))} 篇)\n"
+            )
+        ws.set_status("done", 1, 1, f"单章重写 section_idx={section_idx}")
+        return
+
+    yield _finalize_survey(state, ws)
+
+
+def _find_or_create_theme(topic: str, edited: bool) -> int:
+    """找该 topic 已有的 theme, 找不到才新建 (phase 续跑时避免重复 theme)。"""
+    from ._crud import create_theme, list_themes
+    for t in list_themes():
+        if (t.get("name") or "").strip() == topic:
+            return t["id"]
+    return create_theme(
+        name=topic,
+        description=f"survey_generate 自动创建 at {__import__('datetime').datetime.now().isoformat(timespec='seconds')}"
+        + (" (用户编辑过大纲)" if edited else ""),
+    )
+
+
+def _drop_existing_section(theme_id: int, outline_sec: dict[str, Any]) -> int:
+    """单章重写前删掉同标题的旧章节, 避免重写后出现两份。"""
+    from ._crud import delete_section, list_sections
+    n = 0
+    for sec in list_sections(theme_id):
+        if (sec.get("title") or "").strip() == (outline_sec.get("title") or "").strip():
+            delete_section(sec["id"])
+            n += 1
+    return n
