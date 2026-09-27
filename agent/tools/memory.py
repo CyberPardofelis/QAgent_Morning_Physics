@@ -178,6 +178,7 @@ def recall_memories(
     related_paper_id: str = "",
     min_importance: float = 0.0,
     method: str = "vector",
+    concept_aware: bool = False,
 ) -> str:
     """
     从记忆库检索相关记忆。
@@ -194,6 +195,11 @@ def recall_memories(
         related_paper_id   限定关联论文（可空；如果填了就走精确匹配不走向量）
         min_importance     最低重要性 0-1（默认 0）
         method             检索方法: vector / keyword / hybrid（默认 vector）
+        concept_aware      概念召回开关（默认 False）。
+                           ⚠️ 开启会额外发 **1 次 LLM 请求** 抽 query 的 concept ——
+                           默认关闭以保持本工具的 L0（0 次 LLM）语义。
+                           一般不需要开；只有在用户明确提到某个概念/术语
+                           （"上次说的那个 Gilbert 测度"）且向量召回不准时才值得开。
 
     返回:
         Markdown 格式的记忆列表
@@ -229,6 +235,7 @@ def recall_memories(
             related_paper_id=related_paper_id.strip() if related_paper_id else None,
             min_importance=mi if mi > 0 else None,
             method=method,
+            concept_aware=bool(concept_aware),
         )
     except Exception as e:
         logger.exception("[recall_memories] failed")

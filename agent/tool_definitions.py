@@ -817,6 +817,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "enum": ["vector", "keyword", "hybrid"],
                         "default": "vector",
                         "description": "检索方法: vector(默认，语义) / keyword(关键词) / hybrid(混合)"
+                    },
+                    "concept_aware": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "概念召回开关，默认关闭。开启会额外发 1 次 LLM 请求抽 query 的概念，"
+                            "默认关闭以保证本工具 0 次 LLM 调用（L0 档）。"
+                            "仅在用户明确提到某个概念/术语且向量召回不准时才开启。"
+                        )
                     }
                 },
                 "required": ["query"]

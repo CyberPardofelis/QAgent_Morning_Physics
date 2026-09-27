@@ -460,9 +460,13 @@ class MemoryProcessor:
         related_paper_id: str | None = None,
         min_importance: float | None = None,
         method: str = "vector",
+        concept_aware: bool = False,
     ) -> list[dict[str, Any]]:
         """
         检索记忆。委托给 retriever。
+
+        concept_aware 默认 False —— 见 retriever.retrieve 的说明:
+        开启会先调一次 LLM 抽 concept, 与 recall_memories 的 L0 档语义冲突。
         """
         return self.retriever.retrieve(
             query=query,
@@ -472,6 +476,7 @@ class MemoryProcessor:
             related_paper_id=related_paper_id,
             min_importance=min_importance,
             method=method,
+            concept_aware=concept_aware,
         )
 
     def recall_for_paper(self, paper_id: str, limit: int = 10) -> list[dict[str, Any]]:

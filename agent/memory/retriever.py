@@ -69,8 +69,12 @@ class MemoryRetriever:
         importance_weight: float = 0.3,
         decay_rate: float = 0.0,
         mmr_lambda: float = 0.7,
-        concept_aware: bool = True,  # 启用概念召回 (query 中的 concept 优先召回)
-        concept_bonus: float = 0.2,  # concept 召回的分数加成 (× (1+bonus))
+        # 9-27 改: 默认 False。之前默认 True, 而 concept_recall 会先调一次完整 LLM
+        # 抽取 (extractor.extract), 于是 retrieve 表面是纯检索, 实际每次都发 LLM 请求
+        # —— 而 recall_memories 这个工具是按 cost_tier="L0"(0 次 LLM) 注册的, 属于虚标。
+        # 想要 concept 召回加成必须显式开启。
+        concept_aware: bool = False,
+        concept_bonus: float = 0.2,
     ) -> list[dict[str, Any]]:
         """
         检索记忆。
@@ -87,11 +91,14 @@ class MemoryRetriever:
             mmr_lambda      MMR 重排系数（仅 method=vector/hybrid 有效）
                             1.0=纯相关性, 0.0=纯多样性, 默认 0.7=偏相关
                             调成 0.5 + 调大 limit 可同时获得相关和多样的结果
-            concept_aware   是否启用概念召回（v3 新增，默认 True）
+            concept_aware   是否启用概念召回（默认 **False**）
+                            ⚠️ True 会先调一次完整 LLM 抽取 concept（extractor.extract），
+                            也就是 1 次 LLM 请求 + 一次 encode，不是纯本地检索。
+                            默认关闭以保持本函数 0-LLM 语义（recall_memories 注册为 L0 档）。
                             True  → 用 query 抽 concept，SQL LIKE 拿相关 id，
                                     这些 id 在算分时叠 × (1+concept_bonus) 的加成
-                            False → 纯向量检索 (回退 v2 行为)
-            concept_bonus   概念召回的分数加成，默认 0.2（即 ×1.2）
+                            False → 纯向量检索
+            concept_bonus   概念召回的分数加成，默认 0.2（即 ×1.2），仅 concept_aware=True 时生效
 
         返回：
             记忆列表（带 _score 字段），按分数降序
