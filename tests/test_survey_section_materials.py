@@ -169,12 +169,13 @@ def test_abstract_available_when_no_facts_for_paper():
         "paper_id": "pZ", "title": "T", "year": "2020", "journal": "arxiv",
         "core_method": "M", "core_contrib": "C", "abstract": "这是一个很具体的摘要内容用于验证",
     }]
-    out = format_papers_with_facts(papers, {})
+    out, dropped = format_papers_with_facts(papers, {})
     assert "这是一个很具体的摘要内容用于验证" in out
+    assert dropped == 0
 
 
 def test_fact_rendering_includes_type_and_quote():
-    out = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [FACTS[0]]})
+    out, _ = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [FACTS[0]]})
     assert "[result]" in out
     assert "10x threshold improvement" in out
     assert "10x improvement in the threshold" in out
@@ -183,16 +184,18 @@ def test_fact_rendering_includes_type_and_quote():
 def test_fact_rendering_caps_facts_per_paper():
     many = [{"paper_id": "pA", "fact_type": "result", "claim": f"claim {i}", "support_quote": ""}
             for i in range(20)]
-    out = format_papers_with_facts(RELEVANT_PAPERS, {"pA": many}, max_facts_per_paper=3)
+    out, _ = format_papers_with_facts(RELEVANT_PAPERS, {"pA": many}, max_facts_per_paper=3)
     assert out.count("[result]") == 3
 
 
 def test_fact_rendering_empty_papers():
-    assert format_papers_with_facts([], {}) == "(空候选池)"
+    out, dropped = format_papers_with_facts([], {})
+    assert out == "(空候选池)"
+    assert dropped == 0
 
 
 def test_fact_rendering_skips_blank_claims():
-    out = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [{"claim": "   ", "fact_type": "x"}]})
+    out, _ = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [{"claim": "   ", "fact_type": "x"}]})
     assert "·" not in out.split("\n")[1]  # 该论文不应渲染出空的 fact 行
 
 
@@ -304,3 +307,56 @@ def test_pool_note_states_selection():
     prompt = _build(_pool(30), facts=None, limit=10)
     assert "选出的 10 篇" in prompt
     assert "共 30 篇" in prompt
+
+
+# ============================================================
+# fact 主题对齐标记必须真正生效
+# ============================================================
+# 背景: _review_facts_topic_alignment 每次综述要花 20+ 次 LLM, 把
+# `_is_topic_aligned=False` 打在邻近子领域的 fact 上 (action_extract_facts 写回)。
+# 之前这个标记只进审计报告, 写作阶段照单全收 —— 那 20+ 次调用完全白花。
+# 现在渲染层会剔除 misaligned fact。
+
+MIXED_FACTS = [
+    {**FACTS[0], "_is_topic_aligned": True, "_topic_alignment_score": 9},
+    {**FACTS[1], "_is_topic_aligned": False, "_topic_alignment_score": 2},
+]
+
+
+def test_misaligned_fact_is_excluded_from_prompt():
+    out, dropped = format_papers_with_facts(RELEVANT_PAPERS, {"pA": MIXED_FACTS})
+    assert "10x threshold improvement" in out, "对齐 fact 应保留"
+    assert "reduce the overhead by three times" not in out, "misaligned fact 应被剔除"
+    assert dropped == 1
+
+
+def test_misaligned_count_appears_in_pool_note():
+    prompt = _build(RELEVANT_PAPERS, facts=MIXED_FACTS)
+    assert "1 条邻近子领域 fact 已剔除" in prompt
+
+
+def test_paper_with_only_misaligned_facts_gets_warning():
+    """全部 fact 被判邻近的论文, 保留条目但标警告(而不是悄悄给 fact)。"""
+    only_bad = [{**FACTS[1], "_is_topic_aligned": False}]
+    out, dropped = format_papers_with_facts(RELEVANT_PAPERS, {"pB": only_bad})
+    assert "邻近子领域, 谨慎引用" in out
+    assert "reduce the overhead by three times" not in out
+    assert dropped == 1
+
+
+def test_facts_without_alignment_flag_are_kept():
+    """
+    审查关闭时 (get_fact_review_threshold()==0) 不写 _is_topic_aligned 字段,
+    此时行为应与之前完全一致 —— 不能因为缺字段就误删。
+    """
+    out, dropped = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [FACTS[0]]})
+    assert "10x threshold improvement" in out
+    assert dropped == 0
+
+
+def test_alignment_score_alone_does_not_filter():
+    """只有 _is_topic_aligned 决定去留, _topic_alignment_score 仅供审计。"""
+    fact = {**FACTS[0], "_is_topic_aligned": True, "_topic_alignment_score": 1}
+    out, dropped = format_papers_with_facts(RELEVANT_PAPERS, {"pA": [fact]})
+    assert "10x threshold improvement" in out
+    assert dropped == 0

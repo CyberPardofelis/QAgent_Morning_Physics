@@ -171,11 +171,25 @@ def select_relevant_papers(
     return [p for _s, _i, p in scored[:limit]]
 
 
+def _is_usable_fact(f: dict[str, Any]) -> bool:
+    """
+    fact 能不能进写作素材。
+
+    9-27: action_extract_facts 的 fact 主题对齐审查 (_review_facts_topic_alignment)
+    会把 `_is_topic_aligned=False` 打在邻近子领域的 fact 上。之前这个标记只进
+    审计报告, 写作阶段照单全收 —— 等于那 20+ 次 LLM 调用白花了。
+
+    审查关闭时 (get_fact_review_threshold()==0) 不写这个字段, 视为可用,
+    行为与之前一致。
+    """
+    return f.get("_is_topic_aligned", True) is not False
+
+
 def format_papers_with_facts(
     papers: list[dict[str, Any]],
     facts_by_paper: dict[str, list[dict[str, Any]]] | None = None,
     max_facts_per_paper: int = 4,
-) -> str:
+) -> tuple[str, int]:
     """
     渲染"论文 + 它被精读出的 fact"。
 
@@ -183,11 +197,15 @@ def format_papers_with_facts(
     比之前 260 字符的书目卡片表信息量高一个数量级, 且能直接支撑"带 [paper_id]
     的事实性陈述"这个硬约束。
 
-    没有 fact 的论文退化为带 abstract 截断的普通条目(比之前多给摘要)。
+    没有可用 fact 的论文退化为带 abstract 截断的普通条目(比之前多给摘要);
+    如果它被 fact 审查判为邻近子领域, 会额外标注提醒谨慎引用。
+
+    返回 (渲染文本, 被丢弃的 misaligned fact 条数)。
     """
     if not papers:
-        return "(空候选池)"
+        return "(空候选池)", 0
     facts_by_paper = facts_by_paper or {}
+    dropped = 0
 
     def trunc(s: str, n: int) -> str:
         s = (s or "").strip()
@@ -201,7 +219,10 @@ def format_papers_with_facts(
         journal = p.get("journal") or ""
         head = f"- {pid} ({year}" + (f", {journal}" if journal else "") + f"): {title}"
 
-        facts = facts_by_paper.get(pid) or []
+        all_facts = facts_by_paper.get(pid) or []
+        facts = [f for f in all_facts if _is_usable_fact(f)]
+        dropped += len(all_facts) - len(facts)
+
         if facts:
             lines.append(head)
             for f in facts[:max_facts_per_paper]:
@@ -220,10 +241,13 @@ def format_papers_with_facts(
             abstract = trunc((p.get("abstract") or "").strip().replace("\n", " "), 300)
             extra = f" | method: {method}" if method else ""
             extra += f" | contrib: {contrib}" if contrib else ""
+            if all_facts and not facts:
+                # 全部 fact 都被判为邻近子领域
+                extra += "  ⚠ 邻近子领域, 谨慎引用"
             lines.append(head + extra)
             if abstract:
                 lines.append(f"    · 摘要: {abstract}")
-    return "\n".join(lines)
+    return "\n".join(lines), dropped
 
 
 # ============================================================
@@ -534,10 +558,11 @@ def build_section_prompt(
         selected = select_relevant_papers(
             papers, query, facts_by_paper, limit=papers_limit,
         )
-        pool_text = format_papers_with_facts(selected, facts_by_paper)
+        pool_text, dropped = format_papers_with_facts(selected, facts_by_paper)
+        drop_note = f",另有 {dropped} 条邻近子领域 fact 已剔除" if dropped else ""
         pool_note = (
             f"共 {len(papers)} 篇,下面是按本章节相关度选出的 {len(selected)} 篇"
-            f"(含每篇预抽的原子 fact)"
+            f"(含每篇预抽的原子 fact{drop_note})"
         )
     else:
         selected = select_relevant_papers(
