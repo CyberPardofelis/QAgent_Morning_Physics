@@ -17,7 +17,7 @@ import logging
 from collections import defaultdict
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -41,6 +41,40 @@ from PySide6.QtWidgets import (
 from ui.styles import get_stylesheet
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 异步查询: 把 DB 查询 / embedding 挪出 GUI 线程 (9-27 P0)
+# ============================================================
+# 问题: load_all / perform_search / load_concept_groups 之前都在 GUI 线程直接调
+# processor。perform_search 会走 retriever._vector_retrieve -> embedder.encode,
+# 也就是 BGE-large 的 CPU 推理 (几百 ms ~ 数秒), 期间整个窗口无响应。
+# 聊天路径有 ui/worker.py 的 QThread 保护, 记忆查看器一直没有。
+
+
+class _TaskSignals(QObject):
+    """worker 线程 → GUI 线程的唯一通道。"""
+    done = Signal(object, object)   # (task_key, result)
+    failed = Signal(object, object)  # (task_key, error message str)
+
+
+class _QueryTask(QRunnable):
+    """在 QThreadPool 的线程里跑一个阻塞函数, 完成后发信号回主线程。"""
+
+    def __init__(self, key: str, fn):
+        super().__init__()
+        self.key = key
+        self.fn = fn
+        self.signals = _TaskSignals()
+
+    def run(self):
+        try:
+            result = self.fn()
+        except Exception as e:  # noqa: BLE001 - 错误要回主线程展示
+            logger.exception("[MemoryViewer] task %s failed", self.key)
+            self.signals.failed.emit(self.key, str(e))
+            return
+        self.signals.done.emit(self.key, result)
 
 
 # ============================================================
@@ -74,6 +108,11 @@ class MemoryViewerDialog(QDialog):
         # 2026-09-02 改:用 get_stylesheet() 跟主题(切主题时刷新)
         self.setStyleSheet(get_stylesheet())
         self._processor = None  # lazy
+        # 9-27: 异步查询基础设施（见文件头 _QueryTask 说明）
+        self._pool = QThreadPool(self)
+        self._tasks: dict[str, _QueryTask] = {}   # 保活, 防 QRunnable 被 GC
+        self._generation = 0                       # 防止过期结果覆盖新结果
+        self._backend_info: dict[str, Any] = {}    # worker 侧带回, 避免主线程碰 embedder
 
         # ============================================================
         # 顶部：QTabWidget (全部 / 主题聚合)
@@ -223,10 +262,60 @@ class MemoryViewerDialog(QDialog):
             self._processor = MemoryProcessor()
         return self._processor
 
+    # ------------------------------------------------------------
+    # 9-27: 异步查询封装
+    # ------------------------------------------------------------
+    def _run_async(self, key: str, fn, on_ok, on_err=None):
+        """
+        把一个阻塞函数丢到线程池跑, 完成后回到主线程执行 on_ok。
+
+        key 用于丢弃过期任务: 同一个 key 重复触发时, 只有最后一次的结果会被应用。
+        """
+        self._generation += 1
+        gen = self._generation
+        task = _QueryTask(key, fn)
+        self._tasks[key] = task
+
+        def _done(_key, result):
+            if gen != self._generation:
+                return  # 已经有更新的查询了, 丢弃这份过期结果
+            on_ok(result)
+
+        def _failed(_key, msg):
+            if gen != self._generation:
+                return
+            logger.exception("[MemoryViewer] async %s failed", key)
+            if on_err is not None:
+                on_err(msg)
+            else:
+                QMessageBox.critical(self, "加载失败", msg)
+
+        task.signals.done.connect(_done)
+        task.signals.failed.connect(_failed)
+        self._pool.start(task)
+
+    def _query_with_backend(self, fn):
+        """worker 侧: 跑查询 + 拿 embedder 后端信息（主线程不再碰 embedder）。"""
+        p = self._get_processor()
+        memories = fn(p)
+        try:
+            backend = p.embedder.get_backend_info()
+        except Exception:
+            backend = {}
+        return {"memories": memories, "backend": backend}
+
     def load_all(self):
         """加载所有记忆（按 importance 排序）。"""
-        memories = self._get_processor().list_all(limit=500)
-        self._display(memories, mode="all", table=self.result_table)
+        self.status.showMessage("  正在加载...")
+        self._run_async(
+            "load_all",
+            lambda: self._query_with_backend(lambda p: p.list_all(limit=500)),
+            self._on_loaded,
+        )
+
+    def _on_loaded(self, payload):
+        self._backend_info = payload.get("backend") or {}
+        self._display(payload["memories"], mode="all", table=self.result_table)
 
     def perform_search(self):
         """按 query / type / min_imp 搜索。"""
@@ -234,21 +323,36 @@ class MemoryViewerDialog(QDialog):
         mtype = self.type_combo.currentData() or None
         min_imp = self.min_imp_spin.value() / 100.0 if self.min_imp_spin.value() > 0 else None
 
-        try:
-            if query:
-                memories = self._get_processor().recall(
-                    query=query, limit=200,
-                    memory_type=mtype, min_importance=min_imp,
-                )
-                self._display(memories, mode=f"search:{query[:30]}", table=self.result_table)
-            else:
-                memories = self._get_processor().list_all(
-                    memory_type=mtype, min_importance=min_imp, limit=200,
-                )
-                self._display(memories, mode=f"filter:type={mtype or '*'},imp>={min_imp or 0}", table=self.result_table)
-        except Exception as e:
-            logger.exception("[MemoryViewer] search failed")
-            QMessageBox.critical(self, "检索失败", str(e))
+        if not query:
+            self._run_async(
+                "search:filter",
+                lambda: self._query_with_backend(
+                    lambda p: p.list_all(memory_type=mtype, min_importance=min_imp, limit=200)
+                ),
+                self._on_loaded_filtered,
+            )
+            return
+
+        self.status.showMessage(f"  正在搜索「{query[:30]}」...")
+        self._run_async(
+            "search:q",
+            lambda: self._query_with_backend(
+                lambda p: p.recall(query=query, limit=200,
+                                   memory_type=mtype, min_importance=min_imp)
+            ),
+            self._on_loaded_filtered,
+        )
+
+    def _on_loaded_filtered(self, payload):
+        self._backend_info = payload.get("backend") or {}
+        mtype = self.type_combo.currentData() or None
+        min_imp = self.min_imp_spin.value() / 100.0 if self.min_imp_spin.value() > 0 else None
+        query = self.query_edit.text().strip()
+        mode = (
+            f"search:{query[:30]}" if query
+            else f"filter:type={mtype or '*'},imp>={min_imp or 0}"
+        )
+        self._display(payload["memories"], mode=mode, table=self.result_table)
 
     def _display(self, memories: list[dict[str, Any]], mode: str = "", table: QTableWidget | None = None):
         """填充表格 + 更新状态栏。"""
@@ -283,9 +387,9 @@ class MemoryViewerDialog(QDialog):
         table.setSortingEnabled(True)
 
         # 状态栏 (只在主表刷新时更新)
+        # 9-27: backend info 由 worker 线程带回并缓存, 主线程不再构造 embedder
         if table is self.result_table:
-            embedder = self._get_processor().embedder
-            backend = embedder.get_backend_info()
+            backend = self._backend_info or {}
             mode_str = "vector" if backend.get("enabled") else "keyword-only"
             dim = backend.get("dim", "?")
             self.status.showMessage(
@@ -297,13 +401,23 @@ class MemoryViewerDialog(QDialog):
     # 主题聚合: 构建概念树
     # ============================================================
     def load_concept_groups(self):
-        """遍历所有记忆, 按 metadata.extract.core_concepts[0].canonical 分组."""
-        try:
-            memories = self._get_processor().list_all(limit=1000)
-        except Exception as e:
-            logger.exception("[MemoryViewer] list_all failed")
-            QMessageBox.critical(self, "加载失败", str(e))
-            return
+        """遍历所有记忆, 按 metadata.extract.core_concepts[0].canonical 分组（异步）。"""
+        self._run_async(
+            "concept_groups",
+            self._compute_concept_groups,
+            self._on_concept_groups,
+        )
+
+    @staticmethod
+    def _compute_concept_groups():
+        """
+        在 worker 线程跑: 拉全部记忆 + 按主 concept 分组。
+
+        只做数据计算, 不碰任何 Qt widget —— 分组结果回主线程后再填 TreeWidget。
+        """
+        from agent.memory.processor import MemoryProcessor
+        processor = MemoryProcessor()
+        memories = processor.list_all(limit=1000)
 
         # canonical -> {category, items: [mem, ...]}
         groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"category": "?", "items": []})
@@ -336,6 +450,12 @@ class MemoryViewerDialog(QDialog):
             category = primary.get("category") or "?"
             groups[canonical]["category"] = category
             groups[canonical]["items"].append(m)
+
+        return {"groups": groups, "no_extract_count": no_extract_count}
+
+    def _on_concept_groups(self, payload):
+        groups = payload["groups"]
+        no_extract_count = payload["no_extract_count"]
 
         # 填 TreeWidget
         self.concept_tree.clear()
@@ -395,27 +515,53 @@ class MemoryViewerDialog(QDialog):
         if reply != QMessageBox.Yes:
             return
 
-        try:
-            memories = self._get_processor().list_all(limit=500)
-            full_id = None
-            for m in memories:
-                if m.get("id", "").startswith(short_id):
-                    full_id = m["id"]
-                    break
-            if not full_id:
-                QMessageBox.warning(self, "删除失败", f"找不到 id={short_id} 的完整记录")
-                return
-            self._get_processor().delete(full_id)
-            self.status.showMessage(f"  已删除 {short_id}...", 3000)
-            # 刷新两个 tab
-            if table is self.result_table:
-                if self.query_edit.text().strip():
-                    self.perform_search()
-                else:
-                    self.load_all()
+        # 9-27: list_all + delete 都是阻塞 IO, 挪到 worker 线程
+        self.status.showMessage(f"  正在删除 {short_id}...")
+        self._run_async(
+            "delete",
+            lambda: self._delete_by_short_id(short_id),
+            lambda found: self._after_delete(table, short_id, found),
+            on_err=lambda msg: QMessageBox.critical(self, "删除失败", msg),
+        )
+
+    @staticmethod
+    def _delete_by_short_id(short_id: str):
+        """worker 侧: 短 id → 完整 id → 删除。返回是否找到。"""
+        from agent.memory.processor import MemoryProcessor
+        processor = MemoryProcessor()
+        memories = processor.list_all(limit=500)
+        full_id = None
+        for m in memories:
+            if m.get("id", "").startswith(short_id):
+                full_id = m["id"]
+                break
+        if not full_id:
+            return False
+        processor.delete(full_id)
+        return True
+
+    def _after_delete(self, table, short_id: str, found: bool):
+        if not found:
+            QMessageBox.warning(self, "删除失败", f"找不到 id={short_id} 的完整记录")
+            return
+        self.status.showMessage(f"  已删除 {short_id}...", 3000)
+        # 刷新对应 tab
+        if table is self.result_table:
+            if self.query_edit.text().strip():
+                self.perform_search()
             else:
-                # 主题聚合 tab: 刷新树 + 右边表
-                self.load_concept_groups()
-        except Exception as e:
-            logger.exception("[MemoryViewer] delete failed")
-            QMessageBox.critical(self, "删除失败", str(e))
+                self.load_all()
+        else:
+            # 主题聚合 tab: 刷新树 + 右边表
+            self.load_concept_groups()
+
+    def closeEvent(self, event):
+        """关窗时收掉线程池, 避免 QThreadPool 析构阻塞在未完成的任务上。"""
+        self._generation += 1          # 让在途结果全部失效
+        self._tasks.clear()
+        try:
+            self._pool.clear()          # 丢弃排队中的任务
+            self._pool.waitForDone(3000)  # 给在跑的最多 3 秒
+        except Exception:
+            logger.debug("[MemoryViewer] thread pool shutdown failed", exc_info=True)
+        super().closeEvent(event)
