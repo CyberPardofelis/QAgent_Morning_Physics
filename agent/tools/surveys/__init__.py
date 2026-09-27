@@ -94,6 +94,7 @@ from .survey_audit import survey_audit
 # ============================================================
 from .survey_generate import survey_generate
 from .survey_outline import survey_outline, survey_outline_export
+from .survey_rewrite_paragraphs import survey_rewrite_paragraphs
 
 __all__ = [
     # 公共 API (UI / 工具调用方用)
@@ -103,6 +104,7 @@ __all__ = [
     "delete_section", "reorder_section",
     "health_check",
     "survey_generate", "survey_audit", "survey_outline", "survey_outline_export",
+    "survey_rewrite_paragraphs",
     # 内部 API (下划线开头, 旧测试可能直接 import)
     "_safe_json_loads_array", "_extract_paper_ids", "_audit_section_paper_ids",
     "_build_candidate_pool", "_relevance_filter_pool", "_review_facts_topic_alignment",

@@ -906,6 +906,50 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     # ============================================================
     # survey_outline / survey_outline_export: 大纲查看与编辑 (L0, 0 LLM)
     # ============================================================
+    "survey_rewrite_paragraphs": {
+        "type": "function",
+        "function": {
+            "name": "survey_rewrite_paragraphs",
+            "description": (
+                "重写已生成综述里某一章的指定段落, 其余段落保持原样(L2)。"
+                "整章重写要 20000 tokens 全部重来, 只改一段时用这个更省。"
+                "用户说\"第3章第2段太空了补一下\"/\"gap那章最后一段没给反例\"时用。"
+                "建议先用 dry_run=True 看清段落编号再动手。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "综述主题, 必须与生成时完全一致"
+                    },
+                    "section_idx": {
+                        "type": "integer",
+                        "description": "章节序号(0-based, 对应大纲里的 [i] 标号)"
+                    },
+                    "para_indices": {
+                        "type": "string",
+                        "description": (
+                            "要重写的段号, 逗号分隔, 如 \"1\" 或 \"0,2,3\"。"
+                            "不传则重写整章的所有正文段(不含标题)。"
+                            "先用 dry_run=True 看本章有哪几段。"
+                        )
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "额外要求, 如 \"补一个2023年后的反例\"/\"语气收紧\"/\"更具体一些\""
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "True=只切分并展示段落结构, 不调 LLM 不落库(0 token, 用来试参数)"
+                    }
+                },
+                "required": ["topic", "section_idx"]
+            }
+        }
+    },
+
     "survey_outline": {
         "type": "function",
         "function": {

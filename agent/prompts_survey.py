@@ -993,3 +993,93 @@ if __name__ == "__main__":
     print()
     print("=== build_fact_prompt ===")
     print(build_fact_prompt(paper_id="2401.12345", title="Surface code", core_method="XZZX")[:300], "...")
+
+
+# ============================================================
+# 单段重写 prompt (9-27)
+# ============================================================
+SURVEY_PARAGRAPH_REWRITE_PROMPT = """你是综述章节的**局部重写**助手。
+
+用户对已写好的某一章不满意, 但只要求重写其中 {n_target} 段, 其余段落保持原样。
+
+【综述主题】: {topic}
+【本章节类型】: {section_type}
+【本章节标题】: {section_title}
+【本章节大纲】(这一章要覆盖的 sub_point):
+{outline_section}
+
+【当前章节全文】(用 [第 N 段] 标注了每段, 标了"要重写"的是目标段)
+{current_structure}
+
+【本次只重写这些段】: 第 {target_list} 段
+
+【可用素材】(从候选池预抽的原子 fact, 带 claim 和原文出处)
+{pool_text}
+
+【上下文】(目标段的前后段落, 保持不变 —— 新写的段落必须与它们衔接)
+{context}
+
+【任务】
+1. 只输出**第 {target_list} 段**的替换正文, 不要输出其它段落, 不要输出解释。
+2. 多个目标段时, 按段号顺序输出, 每个目标段独立成一块, 块之间空一行。
+3. 新段落必须**无缝衔接**上下文: 承接上一段的论述, 并为下一段铺垫。
+4. 事实性陈述必须挂 [paper_id], 优先使用上面素材里的 fact claim 与数字。
+5. **不要输出 markdown 标题**(## ...), 也不要输出 [第 N 段] 这类标记。
+6. 保持与上下文相同的语言(中文)和文体。
+
+【输出】(直接给替换段落正文, 不要前缀"以下是...",不要代码块包裹)
+"""
+
+
+def build_paragraph_rewrite_prompt(
+    topic: str,
+    section_type: str,
+    section_title: str,
+    outline_section: str,
+    current_structure: str,
+    context: str,
+    target_idxs: list[int],
+    papers: list[dict[str, Any]],
+    facts: list[dict[str, Any]] | None = None,
+    user_instruction: str = "",
+    papers_limit: int = 16,
+) -> str:
+    """构造单段重写 prompt。素材选取范围比整章小(默认 16 篇), 因为只写几段。"""
+    safe_type = (section_type or "intro").strip().lower()
+    if safe_type not in SECTION_REF_QUOTAS:
+        safe_type = "intro"
+
+    facts_by_paper: dict[str, list[dict[str, Any]]] = {}
+    for f in facts or []:
+        pid = f.get("paper_id")
+        if pid:
+            facts_by_paper.setdefault(pid, []).append(f)
+
+    if facts:
+        query = f"{section_title or ''}\n{outline_section or ''}"
+        selected = select_relevant_papers(
+            papers, query, facts_by_paper, limit=papers_limit,
+        )
+        pool_text, dropped = format_papers_with_facts(selected, facts_by_paper)
+        drop_note = f"(另有 {dropped} 条邻近子领域 fact 已剔除)" if dropped else ""
+        pool_text = f"(共 {len(papers)} 篇候选池, 下面是按本段相关度选出的 {len(selected)} 篇{drop_note})\n{pool_text}"
+    else:
+        selected = select_relevant_papers(
+            papers, f"{section_title or ''}\n{outline_section or ''}", limit=papers_limit,
+        )
+        pool_text = f"(共 {len(papers)} 篇候选池, 下面 {len(selected)} 篇)\n{format_pool(selected)}"
+
+    target_list = ", ".join(str(i) for i in target_idxs)
+    instr = f"\n【用户额外要求】\n{user_instruction.strip()}\n" if user_instruction.strip() else ""
+
+    return SURVEY_PARAGRAPH_REWRITE_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        section_type=safe_type,
+        section_title=section_title or "(无标题)",
+        outline_section=outline_section or "(无大纲)",
+        current_structure=current_structure,
+        context=context or "(无上下文, 这是本章开头或结尾)",
+        target_list=target_list,
+        n_target=len(target_idxs),
+        pool_text=pool_text,
+    ) + instr
