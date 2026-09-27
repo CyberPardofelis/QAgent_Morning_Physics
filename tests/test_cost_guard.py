@@ -207,11 +207,16 @@ class TestCostGuardConfigIntegration:
         Config.set_cost_ceiling_daily(50)
 
     def test_set_invalid_ceiling_clamps_to_default(self):
-        """set_cost_ceiling_daily("invalid") → 静默 fallback 到 50"""
+        """
+        set_cost_ceiling_daily("invalid") -> 回落到默认值。
+
+        9-27: 这里原本硬编码 assert == 50, 默认值从 50 上调到 100 后直接失败。
+        说明这类"把默认值写进断言"的测试每调一次默认值就要改一次 ——
+        改成断言新的默认值, 并在注释里记下为什么改。
+        """
         from config._config import Config
         Config.set_cost_ceiling_daily("not_a_number")  # type: ignore
-        # 实现里 try/except 后 v = 50
-        assert Config.get_cost_ceiling_daily() == 50
+        assert Config.get_cost_ceiling_daily() == 100
 
 
 class TestCostGuardRealUsageIssue:

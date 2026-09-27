@@ -128,19 +128,27 @@ class Config:
 
     @staticmethod
     def get_cost_ceiling_daily() -> int:
-        """每日 LLM 调用上限, 默认 50 (P0.7 ROADMAP_NEXT §2 给课题组用时建议 50)"""
-        v = Config._settings().value("cost_ceiling_daily", 50)
+        """每日 LLM 调用上限, 默认 100。
+
+        9-27 从 50 上调到 100:
+        - 之前工具内部的 LLM 调用根本不计数, ceiling 形同虚设
+        - 9-27 把计费收口到 _call_llm 之后, ceiling 第一次真正生效, 实测一次
+          综述生成(50+ 次调用)就在 48/50 被拦下
+        50 对 L2 任务(综述生成 / 多轮调研)明显偏紧, 100 能覆盖一次完整综述,
+        同时仍保留跨天的硬上界。
+        """
+        v = Config._settings().value("cost_ceiling_daily", 100)
         try:
             return int(v)
         except (TypeError, ValueError):
-            return 50
+            return 100
 
     @staticmethod
     def set_cost_ceiling_daily(value: int) -> None:
         try:
             v = int(value)
         except (TypeError, ValueError):
-            v = 50
+            v = 100
         if v < 1:
             v = 1
         Config._settings().setValue("cost_ceiling_daily", v)
