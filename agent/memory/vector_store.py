@@ -91,22 +91,29 @@ class MemoryVectorStore:
                 else:
                     self._meta = []
                 # 重建 id_to_idx（如果 meta 已加载但 map 缺失）
+                # 9-27 修: 跳过 tombstone 行, 否则被删/被替换的 id 仍会指向死行
                 if not self._id_to_idx:
                     for i, m in enumerate(self._meta):
                         mid = m.get("id")
-                        if mid:
+                        if mid and not m.get("_deleted"):
                             self._id_to_idx[mid] = i
+                # 9-27 新增: tombstone 计数, 供 search() 放大检索窗口
+                self._deleted_count = sum(
+                    1 for m in self._meta if m.get("_deleted")
+                )
                 logger.info(
-                    "[MemoryVectorStore] 加载完成: %d 条记忆, dim=%d",
-                    self.index.ntotal, self.dim
+                    "[MemoryVectorStore] 加载完成: %d 条记忆 (tombstone %d), dim=%d",
+                    self.index.ntotal, self._deleted_count, self.dim
                 )
             except Exception as e:
                 logger.warning("[MemoryVectorStore] 加载失败，从空开始: %s", e)
                 self.index = faiss.IndexFlatIP(dim)
                 self._meta = []
                 self._id_to_idx = {}
+                self._deleted_count = 0
         else:
             self.index = faiss.IndexFlatIP(dim)
+            self._deleted_count = 0
             logger.info("[MemoryVectorStore] 新建索引, dim=%d", self.dim)
 
         self._initialized = True
@@ -114,6 +121,22 @@ class MemoryVectorStore:
     # ============================================================
     # 写
     # ============================================================
+    def _normalize(self, memory_id: str, vector: np.ndarray) -> np.ndarray:
+        """校验并归一化成 (1, dim) float32, 供 add / add_batch / replace 复用。"""
+        if vector.ndim != 1:
+            raise ValueError(f"vector 必须是 1D, 实际 shape={vector.shape}")
+        if vector.shape[0] != self.dim:
+            raise ValueError(
+                f"vector dim={vector.shape[0]} 与 index dim={self.dim} 不匹配。"
+                f"如果换 embedding model 了，需要 delete data/vector_store/memories.* 重建。"
+            )
+        v = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+        # 归一化（IndexFlatIP 当向量都归一化时 = 余弦相似度）
+        norm = np.linalg.norm(v)
+        if norm > 1e-9:
+            v = v / norm
+        return v
+
     def add(
         self,
         memory_id: str,
@@ -125,21 +148,44 @@ class MemoryVectorStore:
 
         返回 faiss 内部 row idx。
         """
-        if vector.ndim != 1:
-            raise ValueError(f"vector 必须是 1D, 实际 shape={vector.shape}")
-        if vector.shape[0] != self.dim:
-            raise ValueError(
-                f"vector dim={vector.shape[0]} 与 index dim={self.dim} 不匹配。"
-                f"如果换 embedding model 了，需要 delete data/vector_store/memories.* 重建。"
-            )
-
-        v = np.asarray(vector, dtype=np.float32).reshape(1, -1)
-        # 归一化（IndexFlatIP 当向量都归一化时 = 余弦相似度）
-        norm = np.linalg.norm(v)
-        if norm > 1e-9:
-            v = v / norm
+        v = self._normalize(memory_id, vector)
 
         with self._write_lock:
+            row_idx = self.index.ntotal
+            self.index.add(v)
+            meta = dict(metadata or {})
+            meta["id"] = memory_id
+            self._meta.append(meta)
+            self._id_to_idx[memory_id] = row_idx
+            self._save()
+            return row_idx
+
+    def replace(
+        self,
+        memory_id: str,
+        vector: np.ndarray,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        原地替换某条 memory 的向量（9-27 新增）。
+
+        旧 row 打 _deleted tombstone + 追加新 row，持一次锁、落一次盘。
+        直接调 add() 会留下孤儿副本: 旧 row 仍在 faiss 里可被 search 命中,
+        而 _id_to_idx 已被新 row 覆盖 —— 同一个 memory_id 对应两行,
+        检索时旧内容会挤掉新内容。
+
+        返回新 row idx。
+        """
+        v = self._normalize(memory_id, vector)
+
+        with self._write_lock:
+            old_idx = self._id_to_idx.get(memory_id)
+            if old_idx is not None and 0 <= old_idx < len(self._meta):
+                self._meta[old_idx]["_deleted"] = True
+                self._deleted_count = getattr(self, "_deleted_count", 0) + 1
+                # 旧 row 已 tombstone, 从 id_map 摘掉（search 会跳过 tombstone）
+                self._id_to_idx.pop(memory_id, None)
+
             row_idx = self.index.ntotal
             self.index.add(v)
             meta = dict(metadata or {})
@@ -206,13 +252,25 @@ class MemoryVectorStore:
         if norm > 1e-9:
             v = v / norm
 
-        # 多取一些再 filter
-        k_search = min(top_k * 2 + len(exclude_ids or []), self.index.ntotal)
+        # 9-27: tombstone 会被过滤掉, 检索窗口必须相应放大, 否则 top_k 填不满
+        n_deleted = getattr(self, "_deleted_count", 0)
+        k_search = min(
+            max(top_k * 2, top_k + n_deleted) + len(exclude_ids or []),
+            self.index.ntotal,
+        )
         D, indices_ = self.index.search(v, k_search)
 
         results: list[tuple[int, float]] = []
         for dist, idx in zip(D[0].tolist(), indices_[0].tolist(), strict=False):
             if idx < 0:  # faiss 用 -1 表示无效
+                continue
+            # 9-27 修: 越界保护（load 失败会从空索引重建, _meta 与 index 可能不同步）
+            if idx >= len(self._meta):
+                logger.warning("[MemoryVectorStore] search 命中越界 row %d (meta len=%d), 跳过", idx, len(self._meta))
+                continue
+            # 9-27 修: 跳过 tombstone。remove()/replace() 只打 _deleted 不动 faiss,
+            # 之前 search 完全不看这个标记, 导致被删/被替换的旧行照样返回。
+            if self._meta[idx].get("_deleted"):
                 continue
             # 检查 exclude
             if exclude_ids and self._meta[idx].get("id") in exclude_ids:
@@ -258,29 +316,52 @@ class MemoryVectorStore:
             if row_idx is None:
                 return False
             if 0 <= row_idx < len(self._meta):
-                self._meta[row_idx]["_deleted"] = True
+                if not self._meta[row_idx].get("_deleted"):
+                    self._meta[row_idx]["_deleted"] = True
+                    self._deleted_count = getattr(self, "_deleted_count", 0) + 1
             self._save()
             return True
 
     def purge_deleted(self) -> int:
         """
         真正从 faiss 索引里清掉标记 _deleted 的（重建 index）。
-        默认不主动调，由用户/管理命令触发。
+
+        9-27 修: 旧实现建了一个**空** IndexFlatIP 却保留 alive_meta ——
+        meta 与 index 彻底失同步, get_vector/search 全部返回垃圾。
+        IndexFlatIP 支持 reconstruct(n) 取回原始向量, 所以可以正确重建而无需重新 encode。
+
+        返回被清掉的行数（0 = 无可清理）。
         """
         with self._write_lock:
-            alive_meta = [m for m in self._meta if not m.get("_deleted")]
-            if len(alive_meta) == len(self._meta):
+            alive_idx = [i for i, m in enumerate(self._meta) if not m.get("_deleted")]
+            n_deleted = len(self._meta) - len(alive_idx)
+            if n_deleted == 0:
                 return 0  # 无可清理
 
-            # 重建 faiss index（没有原始 vector，只能重新 encode 或接受清空）
-            # 简化：清空索引，meta 留着待 reindex（不主动 encode，避免大块 IO）
-            # 调用方负责 reindex
-            new_index = faiss.IndexFlatIP(self.dim)
-            self.index = new_index
-            self._meta = alive_meta
-            self._id_to_idx = {m["id"]: i for i, m in enumerate(alive_meta) if m.get("id")}
+            # 用 reconstruct 取回存活行的向量, 重建索引（不重新 encode, 不做额外 IO）
+            vectors = np.zeros((len(alive_idx), self.dim), dtype=np.float32)
+            new_meta: list[dict[str, Any]] = []
+            for new_i, old_i in enumerate(alive_idx):
+                try:
+                    vectors[new_i] = self.index.reconstruct(old_i)
+                except Exception as e:  # 某一行损坏就整行丢弃, 不能让 purge 失败
+                    logger.warning(
+                        "[MemoryVectorStore] purge_deleted reconstruct(%d) 失败, 丢弃该行: %s",
+                        old_i, e,
+                    )
+                    continue
+                new_meta.append(self._meta[old_i])
+
+            self.index = faiss.IndexFlatIP(self.dim)
+            if new_meta:
+                self.index.add(vectors[: len(new_meta)])
+            self._meta = new_meta
+            self._id_to_idx = {
+                m["id"]: i for i, m in enumerate(new_meta) if m.get("id")
+            }
+            self._deleted_count = 0
             self._save()
-            return len(self._meta)
+            return n_deleted
 
     # ============================================================
     # 状态

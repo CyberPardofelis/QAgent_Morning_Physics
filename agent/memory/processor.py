@@ -428,19 +428,24 @@ class MemoryProcessor:
     def update_content(self, memory_id: str, new_content: str) -> bool:
         """
         更新 content。**重要**：这会改变语义向量，所以必须重新 encode + 重建 faiss。
-        简化：删除旧 faiss 记录 + 重新添加。
+
+        9-27 修: 之前直接调 vs.add() —— add() 只追加新 row 并覆盖 _id_to_idx,
+        旧 row 留在 faiss 里照样可被 search 命中, 同一个 memory_id 对应两行,
+        检索时旧内容会挤掉新内容（孤儿副本）。现在改用 vs.replace():
+        旧 row 打 tombstone + search 跳过 tombstone, 保证一个 id 只有一条有效向量。
+
+        之前那行 self.vs.get_row_idx(memory_id + "_old") 是死代码（结果被丢弃，
+        那个 id 不可能存在），一并删掉。
         """
         if not self.db.update_content(memory_id, new_content):
             return False
         try:
-            # 重新 encode + 加回 faiss（旧的会被 _deleted 标记，purge 时清掉）
             vec = self.embedder.encode(new_content)
-            self.vs.add(memory_id, vec, metadata={"updated_at": datetime.now().isoformat()})
-            # 标记旧 faiss row 为 _deleted（避免重复）
-            self.vs.get_row_idx(memory_id + "_old")  # 不存在，正常
-            # 简化：直接 add 新条（faiss id 不冲突因为是不同 row）
+            self.vs.replace(memory_id, vec, metadata={"updated_at": datetime.now().isoformat()})
         except RuntimeError as e:
             logger.warning("[MemoryProcessor] update_content 重新 encode 失败: %s", e)
+            # encode 失败: DB 已更新但向量还是旧的 —— 这条记忆的检索结果会过期,
+            # 属于已知的降级路径(向量缺失/过期), 不阻断内容更新
         return True
 
     # ============================================================
