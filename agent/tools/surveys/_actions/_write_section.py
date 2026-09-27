@@ -84,6 +84,11 @@ def action_write_section(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
     MAX_REWRITE = 2
     sec_md = ""
     bucket = {"in_pool": [], "out_of_pool": [], "total_cites": 0}
+    # 9-27 fix: 把 state["facts"] 传进 prompt —— 之前 extract_facts 花 N 次 LLM
+    # 抽出的原子 fact(含 support_quote 原文) 根本没进写作阶段, 写作模型只拿到
+    # 260 字符/篇的书目卡片表, 却被要求写 5-8 个领域判断 + 每点 2-4 个引用。
+    # 输入信息量和输出要求差两个数量级 —— 这就是"综述显得傻"的根因。
+    section_facts = list(state.get("facts") or [])
     for rewrite_i in range(MAX_REWRITE + 1):
         try:
             section_prompt = build_section_prompt(
@@ -92,6 +97,7 @@ def action_write_section(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 section_title=title,
                 outline_section=outline_section_md,
                 papers=state["pool"],
+                facts=section_facts,
             )
             if rewrite_i > 0:
                 # 重写时加约束: 只能用候选池内 paper_id (silent, 9-08 17:25 删了 🔁 重写 yield)

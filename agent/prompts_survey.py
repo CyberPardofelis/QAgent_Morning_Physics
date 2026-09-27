@@ -11,6 +11,18 @@ agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
   4. 不得编造方法/数字/实验结果
   5. 行内 markdown 链接格式: [作者 年份, arXiv:xxxx.xxxxx](papers/xxxx.xxxxx.md)
 
+9-27 重要修正 — 写作阶段必须拿到**真实素材**:
+    之前 build_section_prompt 只接收 papers, format_pool 把每篇压成
+    "title[:100] | method[:80] | contrib[:80]" 约 260 字符, **abstract 被整个丢掉**。
+    而 extract_facts 对每篇论文花了 1 次 LLM 抽出的原子 fact
+    (含 support_quote 原文摘录) 根本没进写作阶段 —— 全仓只有审计报告读它。
+    等于"花 50+ 次 LLM 精读, 然后只把书目卡片表喂给写作模型",
+    而 prompt 却要求它写出 5-8 个领域判断 + 每点 2-4 个引用 + 1500-2500 字。
+    输入信息量和输出要求差两个数量级, 模型只能编或写空话 —— 这就是"显得傻"的根因。
+
+    现在: 章节写作优先使用 state["facts"], 并按 sub_point 做相关度选取,
+    只把最相关的论文连同其 fact 送进 prompt（信息量大幅提升, token 反而可控）。
+
 不依赖外部 LLM 客户端,本模块只负责"prompt 文本构造",不调 API。
 调用方(P6.2 survey_generate 工具)负责:
   1. 调 _call_llm(prompt)
@@ -20,6 +32,7 @@ agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
 历史:
   - 2026-09-05: 3 个 prompt 模板首版(P6.0 阶段)
 """
+import re
 from typing import Any
 
 
@@ -71,6 +84,145 @@ def format_pool(papers: list[dict[str, Any]]) -> str:
             f"{prefix}: {trunc(title, 100)} | method: {trunc(method, 80)} | "
             f"contrib: {trunc(contrib, 80)}"
         )
+    return "\n".join(lines)
+
+
+# ============================================================
+# 相关度选取 + 带 fact 的渲染 (9-27)
+# ============================================================
+# 纯 L0 实现（不调 LLM），用词面重叠把最相关的论文挑出来。
+# 目的是: 章节 prompt 不再把整个 50 篇候选池无差别倒给模型,
+# 而是给"这一章真正相关的 N 篇 + 它们被精读出的 fact"。
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _tokenize(text: str) -> set[str]:
+    """
+    中英混合分词: 英文/数字按词, 中文按字。
+
+    中文没有空格, 按词切需要词典; 这里退化成"单字 + 相邻字对",
+    对"表面码/阈值"这类术语的重合判定已经足够用。
+    """
+    if not text:
+        return set()
+    low = text.lower()
+    tokens = set(_TOKEN_RE.findall(low))
+    cjk = _CJK_RE.findall(low)
+    tokens.update(cjk)
+    tokens.update(a + b for a, b in zip(cjk, cjk[1:], strict=False))
+    return tokens
+
+
+def _paper_text(p: dict[str, Any], facts: list[dict[str, Any]] | None) -> str:
+    """一篇论文用于相关度比对的全部文本。"""
+    parts = [
+        p.get("title", "") or "",
+        p.get("core_method", "") or "",
+        p.get("core_contrib", "") or "",
+        p.get("keywords", "") or "",
+    ]
+    for f in facts or []:
+        parts.append(f.get("claim", "") or "")
+        parts.append(f.get("support_quote", "") or "")
+    return " ".join(parts)
+
+
+def select_relevant_papers(
+    papers: list[dict[str, Any]],
+    query_text: str,
+    facts_by_paper: dict[str, list[dict[str, Any]]] | None = None,
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    """
+    按 query_text(章节标题 + sub_points) 对论文做词面相关度排序, 取前 limit 篇。
+
+    打分 = 交集大小 / sqrt(len(论文 token 数)) —— 轻度惩罚长文,
+    避免一篇摘要特别长的 paper 光靠词多就挤掉更相关的。
+
+    没有 facts_by_paper 时也能用(退化成只按 title/method/contrib 匹配)。
+
+    返回 [(paper, score), ...] 按分数降序, 分数相同时保持原候选池顺序
+    (候选池本身已按 _relevance_score 排过, 稳定排序能保住那个优先级)。
+    """
+    if not papers:
+        return []
+    if len(papers) <= limit:
+        return list(papers)
+
+    facts_by_paper = facts_by_paper or {}
+    q_tokens = _tokenize(query_text)
+    if not q_tokens:
+        return list(papers[:limit])
+
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for idx, p in enumerate(papers):
+        p_tokens = _tokenize(_paper_text(p, facts_by_paper.get(p.get("paper_id"))))
+        if not p_tokens:
+            score = 0.0
+        else:
+            overlap = len(q_tokens & p_tokens)
+            score = overlap / (len(p_tokens) ** 0.5) if overlap else 0.0
+        scored.append((score, idx, p))
+
+    # 分数降序; 同分按原顺序(稳定)
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [p for _s, _i, p in scored[:limit]]
+
+
+def format_papers_with_facts(
+    papers: list[dict[str, Any]],
+    facts_by_paper: dict[str, list[dict[str, Any]]] | None = None,
+    max_facts_per_paper: int = 4,
+) -> str:
+    """
+    渲染"论文 + 它被精读出的 fact"。
+
+    这是写作阶段真正该看到的东西: 每条 fact 带 claim 和 support_quote 原文摘录,
+    比之前 260 字符的书目卡片表信息量高一个数量级, 且能直接支撑"带 [paper_id]
+    的事实性陈述"这个硬约束。
+
+    没有 fact 的论文退化为带 abstract 截断的普通条目(比之前多给摘要)。
+    """
+    if not papers:
+        return "(空候选池)"
+    facts_by_paper = facts_by_paper or {}
+
+    def trunc(s: str, n: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    lines: list[str] = []
+    for p in papers:
+        pid = p.get("paper_id", "?")
+        title = trunc((p.get("title") or "").strip().replace("|", "/"), 120)
+        year = p.get("year") or "?"
+        journal = p.get("journal") or ""
+        head = f"- {pid} ({year}" + (f", {journal}" if journal else "") + f"): {title}"
+
+        facts = facts_by_paper.get(pid) or []
+        if facts:
+            lines.append(head)
+            for f in facts[:max_facts_per_paper]:
+                ftype = f.get("fact_type", "fact")
+                claim = trunc((f.get("claim") or "").strip().replace("\n", " "), 220)
+                quote = trunc((f.get("support_quote") or "").strip().replace("\n", " "), 160)
+                if not claim:
+                    continue
+                line = f"    · [{ftype}] {claim}"
+                if quote:
+                    line += f"  (原文: {quote})"
+                lines.append(line)
+        else:
+            method = trunc((p.get("core_method") or "").strip().replace("|", "/"), 100)
+            contrib = trunc((p.get("core_contrib") or "").strip().replace("|", "/"), 100)
+            abstract = trunc((p.get("abstract") or "").strip().replace("\n", " "), 300)
+            extra = f" | method: {method}" if method else ""
+            extra += f" | contrib: {contrib}" if contrib else ""
+            lines.append(head + extra)
+            if abstract:
+                lines.append(f"    · 摘要: {abstract}")
     return "\n".join(lines)
 
 
@@ -195,12 +347,23 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
      "Y 在大规模系统中遭遇性能瓶颈, 主要因为 Z 开销随节点数线性增长"
      "跨领域迁移方面, A 领域的 W 技术有可能解决 B 领域长期未解的 V 问题"
 
+【9-22 user 拍板 — pool 是采样,不是领域全集】(RAG 局部最优防御, 跟"基线宽度 vs 质量门"独立)
+- 候选池是从外部检索系统按相关性排序取的 {pool_size} 篇,**是检索采样,不是领域全部论文**
+- 你写任何"领域判断"前,先问自己:这个判断是基于 **pool 内统计**, 还是基于 **领域共识**?
+  - 基于 pool 内统计 → 写"在本综述检索范围内, X 算法占主导" (前置 pool 数量 + 引用佐证)
+  - 基于领域共识 → **必须**有 ≥ K (K=5) 篇 pool 内 paper + 多源(arxiv+APS+IOP)+ 时间窗口覆盖;否则改写为 pool 内统计表述
+- ❌ 反例 (user 9-22): pool 含 30 篇 Gilbert + 2 篇 Hamilton → "Gilbert 已成为本领域主流算法" 错;
+- ✅ 改写: "在本综述检索的 32 篇 paper 中, Gilbert 路径占 30 篇 (94%), Hamilton/变分/Path Integral 等方向各有 1-2 篇相关工作, 本综述受检索覆盖限制未充分展开 — 主流判断应保留给领域共识层 (教科书/综述)"
+- claim 范围限定: 凡是"主流/共识/领域普遍/已成定式"的措辞, 必须有"基于 {pool_size} 篇 paper 的检索"或"在本综述范围内"前置; 直接说"X 是主流"会被审计标 ⚠️ RAG 局部最优
+- sub_point 措辞同理: 避免"X 是领域普遍现象", 写"在本综述检索范围内, X 表现出..."
+
 【强制约束】
 1. 必须**严格按上面 5 段顺序**输出,不能合并章节,不能改顺序
 2. paper_id 只能从候选池里选,不能编造
 3. 引用配额按"章节类型"软约束:超过上下限会被审计标 ⚠️
 4. method_compare 的 sub_points 应该按"机制/性能/场景"维度组织,不要按时间组织(时间组织是 progress 的事)
 5. **sub_points 数量 5-8 个**: 大纲生成后会被审计, < 5 个 sub_point 的章节会在 action_finish 被拒
+6. (9-22 收尾) 大纲生成后, **不允许**直接给"X 算法是本领域主流"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim
 
 【输出格式】(严格 JSON 对象,不要 markdown 代码块包裹,不要解释)
 {{
@@ -237,10 +400,18 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 【本章节大纲】(含 5-8 个 sub_point 宏观判断, 必须逐条展开):
 {outline_section}
 
-【候选池】(共 {pool_size} 篇,paper_id 唯一):
+【候选池】({pool_note}, paper_id 唯一):
 {pool_text}
 
-【9-08 23:50 user 拍板 写作风格 — claim-centric (最关键)】
+【怎么用上面的素材】(重要)
+- 每条 `·` 开头的是从该论文里**预抽出来的原子 fact**,带 `claim`(结论) 和 `原文:`(support_quote 出处)。
+- 写事实性陈述时, **优先直接使用这些 fact 的 claim**, 并在句末挂上该行的 paper_id。
+  这样既满足"事实性陈述必须带 [paper_id]"的硬约束, 又不会凭空编造数字/结果。
+- `原文:` 括号里是论文原句, 可据此判断该 fact 的可信度。
+- 论文行末的 `摘要:` 只在**没有**预抽 fact 时出现, 仅作背景参考, 不要从中编造数字。
+- **没在上面出现的论文, 不要引用它的 paper_id** —— 你没看到它的内容, 引用即幻觉。
+
+【写作风格 — claim-centric (最关键)】
 1. **章节是讲"领域判断/分类/趋势",不是讲"哪些 paper 各自做了啥"**
    - ❌ 错误 (paper-centric 罗列): 每段以 paper 为单位, "...A 提出了 X [paper1]...B 提出了 Y [paper2]...C 改进了 Z [paper3]" — 这是罗列 paper 摘要
    - ✅ 正确 (claim-centric 论述): 每段**先抛出该段的领域判断/分类/趋势 (claim)**, 再用 2-4 个 paper_id 佐证
@@ -259,6 +430,16 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 4. **每个 sub_point 至少配 2-4 个 paper_id 引用** (关键事实/数字/结果 处必带), 引用的 paper 是"佐证", 不是"中心"
 5. **不要复述 paper 摘要**: 不要写 "A 提出了 X, 它的核心方法是 Y", 写 "X 已成为主流路径 (A [p1], B [p2], C [p3] 都在此方向), 关键改进点在于 ..."
 
+【9-22 user 拍板 — pool 是采样,不是领域全集】(RAG 局部最优防御, 跟"基线宽度 vs 质量门"独立)
+- 候选池是从外部检索系统按相关性排序取的 {pool_size} 篇,**是检索采样,不是领域全部论文**
+- 写任何"领域判断"前,先问自己:这个判断是基于 **pool 内统计**, 还是基于 **领域共识**?
+  - 基于 pool 内统计 → 写"在本综述检索范围内, X 算法占主导" (前置 pool 数量 + 引用佐证)
+  - 基于领域共识 → **必须**有 ≥ K (K=5) 篇 pool 内 paper + 多源(arxiv+APS+IOP)+ 时间窗口覆盖;否则改写为 pool 内统计表述
+- ❌ 反例 (user 9-22): pool 含 30 篇 Gilbert + 2 篇 Hamilton → "Gilbert 已成为本领域主流算法" 错;
+- ✅ 改写: "在本综述检索的 32 篇 paper 中, Gilbert 路径占 30 篇 (94%), Hamilton/变分/Path Integral 等方向各有 1-2 篇相关工作, 本综述受检索覆盖限制未充分展开 — 主流判断应保留给领域共识层 (教科书/综述)"
+- claim 范围限定: 凡是"主流/共识/领域普遍/已成定式"的措辞, 必须有"基于 {pool_size} 篇 paper 的检索"或"在本综述范围内"前置; 直接说"X 是主流"会被审计标 ⚠️ RAG 局部最优
+- 章节段落写法同理: 避免"X 是领域普遍现象", 写"在本综述检索范围内, X 表现出..."
+
 【强制约束】(违反会被自动审计标 ❌,请严格遵守)
 1. 事实性陈述句末尾**必须**带 [paper_id] 简洁形式, 格式: "...发现 X 提升了 Y% [paper_id]"
    ⚠️ **关键**: 简洁 [paper_id] 形式必带, 完整 markdown 链接 `[作者 年份, arXiv:xxx](papers/xxx.md)` 是**补充**, 不能替代
@@ -270,6 +451,7 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 6. 简洁 [paper_id] + 完整链接**同时写**最理想, 例: "Bombin 2006 提出拓扑码 [0607734](papers/0607734.md) [Bombin 2006, arXiv:0607734](papers/0607734.md) 中被提出"
 7. 不带引用 [paper_id] 的行内链接不要写(纯链接没意义)
 8. markdown 格式: 标题用 ##, 列表用 -, 不嵌套列表超过 2 层
+9. (9-22 收尾) **禁止**直接给"X 算法是本领域主流 / Y 是领域共识"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim, 否则审计标 ⚠️ RAG 局部最优
 
 【P6.3 自动重写机制】
 - 每个章节生成后, 自动审计会检测候选池外引用 (out_of_pool)
@@ -322,22 +504,57 @@ def build_section_prompt(
     outline_section: str,
     papers: list[dict[str, Any]],
     section_type_safe: str | None = None,
+    facts: list[dict[str, Any]] | None = None,
+    papers_limit: int = 24,
 ) -> str:
     """
     构造单章生成 prompt。
 
     section_type_safe: 强校验后的小写 section_type;若不传则用 section_type.lower()。
+
+    facts (9-27): extract_facts 抽出的原子 fact。这是写作阶段真正该用的素材 ——
+        之前它根本没进来, 写作模型只看到 260 字符/篇的书目卡片表, 却要写
+        5-8 个领域判断 + 每点 2-4 个引用。传了就走"带 fact 的渲染 + 相关度选取"。
+
+    papers_limit: 送给模型的论文条数上限(按 sub_point 相关度选取)。
+        不传 facts 时也生效, 避免把 50 篇无差别倒进 prompt。
     """
     safe_type = (section_type_safe or section_type or "").strip().lower()
     if safe_type not in SECTION_REF_QUOTAS:
         safe_type = "intro"  # 兜底,不让 LLM 看到陌生章节类型
+
+    # 有 fact → 新路径: 按本章标题 + sub_points 选相关论文, 连同 fact 渲染
+    if facts:
+        facts_by_paper: dict[str, list[dict[str, Any]]] = {}
+        for f in facts:
+            pid = f.get("paper_id")
+            if pid:
+                facts_by_paper.setdefault(pid, []).append(f)
+        query = f"{section_title or ''}\n{outline_section or ''}"
+        selected = select_relevant_papers(
+            papers, query, facts_by_paper, limit=papers_limit,
+        )
+        pool_text = format_papers_with_facts(selected, facts_by_paper)
+        pool_note = (
+            f"共 {len(papers)} 篇,下面是按本章节相关度选出的 {len(selected)} 篇"
+            f"(含每篇预抽的原子 fact)"
+        )
+    else:
+        selected = select_relevant_papers(
+            papers, f"{section_title or ''}\n{outline_section or ''}",
+            limit=papers_limit,
+        )
+        pool_text = format_pool(selected)
+        pool_note = f"共 {len(papers)} 篇,下面是按本章节相关度选出的 {len(selected)} 篇"
+
     return SURVEY_SECTION_PROMPT.format(
         topic=topic or "(未指定主题)",
         section_type=safe_type,
         section_title=section_title or "(无标题)",
         outline_section=outline_section or "(无大纲)",
         pool_size=len(papers),
-        pool_text=format_pool(papers),
+        pool_text=pool_text,
+        pool_note=pool_note,
         ref_quota=SECTION_REF_QUOTAS[safe_type],
     )
 
