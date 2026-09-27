@@ -21,7 +21,7 @@ from PySide6.QtCore import QObject, Signal  # noqa: E402
 
 import config  # noqa: E402
 from agent.history_manager import HistoryManager  # noqa: E402
-from agent.prompts import SYSTEM_PROMPT  # noqa: E402
+from agent.prompts import SYSTEM_PROMPT, build_system_prompt  # noqa: E402
 from agent.tools import get_paper_by_id, update_paper_llm_summary  # noqa: E402
 from config.settings import get_settings  # noqa: E402
 from ui.worker import NEW_BUBBLE, Worker  # noqa: E402
@@ -86,13 +86,31 @@ class ConversationController(QObject):
     # 工具
     # ============================================================
     def _get_current_system_prompt(self):
+        """
+        组装最终 system prompt (9-27 接上 build_system_prompt)。
+
+        之前这里直接返回裸的 SYSTEM_PROMPT —— agent/prompts.py 里的
+        build_system_prompt / BASE_RULES / TOOL_GUIDE 全都没有调用点, 是个死函数。
+        后果是: <think> 标签协议、"DIRECT_OUTPUT 工具不要输出 prose"、
+        save_memory 触发词表、工具选择决策树 —— 一条都没进过 prompt。
+        controller 里那套 DIRECT_OUTPUT 散文丢弃 hack 正是为了绕开这个缺失。
+
+        现在的结构 (跟 build_system_prompt 的契约一致):
+            当前时间 + 基础 prompt(用户在设置里可改) + BASE_RULES + TOOL_GUIDE
+            + 分组额外指令
+        """
+        group_rules = ""
         if self.current_conversation and self.current_conversation.group_id:
             group_id = self.current_conversation.group_id
             settings = get_settings()
             group_prompt = settings.value(f"group_system_prompt/{group_id}")
             if group_prompt:
-                return group_prompt
-        return self.default_system_prompt
+                # 9-27 改: 分组 prompt 现在是"额外指令"而非整体替换。
+                # 之前返回它会顶掉整个 default_system_prompt, 用户一设分组
+                # 就丢掉所有默认规则(含 <think> 协议)。这与 build_system_prompt
+                # 里 group_rules 的既定语义也不一致。
+                group_rules = group_prompt
+        return build_system_prompt(base=self.default_system_prompt, group_rules=group_rules)
 
     def _clean_messages_for_api(self, messages):
         # 2026-09-04 加:对 assistant 消息的 content 跑一次 <think> 标签剥离

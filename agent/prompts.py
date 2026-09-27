@@ -73,7 +73,7 @@ TOOL_GUIDE = """【可用工具指南】
 ### 知识库查询 (本地兜底)
 - `query_knowledge(keyword?, topic?, author?)` — 查询知识库(全文 / 主题 / 作者)
 - `get_recent_papers(limit=15)` — 获取最近分析的论文
-- `semantic_search_keywords(query, top_k=10, year?, journal?, section?, topic_keyword?)` — 语义检索(走 paper_keywords collection, **9-09 改: 只返总数, 不返 paper_id / title / 摘要**, 需要单篇详情改调 `query_knowledge(paper_id)`)
+- `semantic_search_keywords(query, top_k=10, source?, since_date?, in_papers_db_only?)` — 语义检索(走 paper_keywords collection, **只返总数, 不返 paper_id / title / 摘要**)
 - `similar_papers(paper_id, top_k=5)` — 找相似论文
 
 ### 联网搜索 (末位工具, 默认不用)
@@ -103,7 +103,7 @@ TOOL_GUIDE = """【可用工具指南】
 
 ### 记忆库
 - `save_memory(content, memory_type, importance?, related_paper_id?, metadata_json?)` — 保存一条长期记忆
-- `recall_memories(query, limit?, memory_type?, related_paper_id?, min_importance?, method?)` — 检索相关记忆
+- `recall_memories(query, limit?, memory_type?, related_paper_id?, min_importance?, method?, concept_aware?)` — 检索相关记忆
 
 【重要：何时调 save_memory】
 当用户说以下词或表达了**对自己有长期价值**的信息时，**必须**调 `save_memory`：
@@ -130,15 +130,16 @@ TOOL_GUIDE = """【可用工具指南】
 - 0.5：普通事实/临时笔记
 
 【重要：save_memory 自动去重 + 看到提示要怎么处理】
-save_memory 在保存前会做**相似度去重检测**（基于 embedding 向量）：
-- **sim >= 0.95**（高度相似）→ save_memory 不会直接保存，会返回"已存在相似记忆 #xxx"信息，**你必须**：
+save_memory 在保存前会做**相似度去重检测**（基于 embedding 向量）。
+⚠️ 具体阈值以 `save_memory` 工具实际返回的提示为准，不要自己按数字预判：
+- 返回"已存在高度相似记忆"→ **你必须**：
   1. 调 `update_memory(memory_id=xxx, new_content=新内容)` **合并**到旧条目（覆盖旧内容）
   2. **或**调 `save_memory(..., force_save=True)` 强制新建（如果确实是新主题）
   3. **或**告诉用户"这条已记过"
-- **sim 0.75-0.95**（类似）→ save_memory 会返回"发现类似记忆"提示，**你必须判断**：
+- 返回"发现类似记忆"→ **你必须判断**：
   - 合并 → `update_memory(...)`
   - 真的新内容 → `save_memory(..., force_save=True)`
-- **sim < 0.75**（不重复）→ 直接保存成功
+- 直接返回"已保存"→ 无需后续动作
 
 【重要：update_memory 用法】
 当 save_memory 返回"已存在相似记忆"时，**优先用 update_memory 合并**而不是新建。update_memory 参数:
@@ -157,7 +158,11 @@ save_memory 在保存前会做**相似度去重检测**（基于 embedding 向�
 【重要：recall_memories 的多样性】
 recall_memories 默认用 **MMR (Maximal Marginal Relevance)** 重排，λ=0.7（偏向相关）：
 - 同主题重复时，给出多样性结果（避免被重复条目淹没其他重要记忆）
-- 如果你**确认想要更广覆盖**，传 `mmr_lambda=0.5` + `limit=10`（更多样但松散相关）
+- **如果你确认想要更广覆盖，就把 `limit` 调大**（例如 `limit=10`）。
+  ⚠️ 没有 `mmr_lambda` 参数 —— 传了会直接报参数错误。
+- `concept_aware` 默认关闭（不额外花 LLM 调用）；只有在用户明确提到某个
+  概念/术语（"上次说的那个 Gilbert 测度"）且召回不准时，才传 `concept_aware=true`。
+  开启会多发 1 次 LLM 请求，请谨慎使用。
 - 默认参数（λ=0.7, limit=5）适合绝大多数场景
 
 【重要：何时调 recall_memories】
