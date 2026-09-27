@@ -252,17 +252,36 @@ class MemoryDBManager:
 
     def touch(self, memory_id: str) -> None:
         """更新 last_accessed + access_count += 1。"""
+        self.touch_batch([memory_id])
+
+    def touch_batch(self, memory_ids: list[str]) -> int:
+        """
+        批量更新 last_accessed + access_count += 1（9-27 新增）。
+
+        读路径的 N+1 修复: 之前 _vector_retrieve 对每条结果调一次 touch(),
+        而 touch() 每次 connect() 都开一条新连接 —— limit=200 就是 200 连接
+        + 200 次 commit, 全在读路径上, 且持有 WAL 写锁跟 worker 线程的写冲突。
+
+        改成单连接 + executemany, 一次事务提交。返回实际更新的行数。
+        """
+        if not memory_ids:
+            return 0
         now = datetime.now().isoformat()
+        # 去重但保持顺序, 避免同一 id 重复计 access_count
+        uniq = list(dict.fromkeys(mid for mid in memory_ids if mid))
+        if not uniq:
+            return 0
         from agent.infra.db import connect
         with connect("memory") as conn:
-            conn.execute(
+            cursor = conn.executemany(
                 """
                 UPDATE memories
                 SET last_accessed = ?, access_count = access_count + 1
                 WHERE id = ?
                 """,
-                (now, memory_id),
+                [(now, mid) for mid in uniq],
             )
+            return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(uniq)
 
     def delete(self, memory_id: str) -> bool:
         """硬删除。"""

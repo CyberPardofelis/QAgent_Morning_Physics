@@ -323,11 +323,14 @@ class MemoryRetriever:
             results = candidates[:limit]
 
         # 6) 更新访问记录
-        for mem in results:
+        # 9-27 修: 之前逐条 touch() —— 每条开一条新连接 + 一次 commit (limit=200 就是
+        # 200 连接), 在读路径上持有 WAL 写锁, 跟 worker 线程的写互相阻塞 (busy_timeout 30s)。
+        # 改成单连接批量提交。
+        if results:
             try:
-                self.db.touch(mem["id"])
+                self.db.touch_batch([mem["id"] for mem in results])
             except Exception as e:
-                logger.debug("[MemoryRetriever] touch 失败: %s", e)
+                logger.debug("[MemoryRetriever] touch_batch 失败: %s", e)
 
         return results
 
