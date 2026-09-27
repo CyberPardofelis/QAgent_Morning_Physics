@@ -85,7 +85,7 @@ class ConversationController(QObject):
     # ============================================================
     # 工具
     # ============================================================
-    def _get_current_system_prompt(self):
+    def _get_current_system_prompt(self, mode: str | None = None):
         """
         组装最终 system prompt (9-27 接上 build_system_prompt)。
 
@@ -95,9 +95,13 @@ class ConversationController(QObject):
         save_memory 触发词表、工具选择决策树 —— 一条都没进过 prompt。
         controller 里那套 DIRECT_OUTPUT 散文丢弃 hack 正是为了绕开这个缺失。
 
-        现在的结构 (跟 build_system_prompt 的契约一致):
-            当前时间 + 基础 prompt(用户在设置里可改) + BASE_RULES + TOOL_GUIDE
-            + 分组额外指令
+        mode 决定 thinking 规则那一段:
+          - minimax-*      → 它的 thinking 混在 content 里, 需要 <think> 标签协议
+          - deepseek-*/openai → 走原生 reasoning 字段, 明确禁止输出字面量标签
+          - custom         → 只说"不需要标记", 不臆测协议
+
+        9-27 修正: 之前把 <think> 协议无条件拼进去了 —— 那对 deepseek/openai
+        是错的(它们的推理根本不走 content), 会白白多吐几千 token 的字面量标签。
         """
         group_rules = ""
         if self.current_conversation and self.current_conversation.group_id:
@@ -107,10 +111,14 @@ class ConversationController(QObject):
             if group_prompt:
                 # 9-27 改: 分组 prompt 现在是"额外指令"而非整体替换。
                 # 之前返回它会顶掉整个 default_system_prompt, 用户一设分组
-                # 就丢掉所有默认规则(含 <think> 协议)。这与 build_system_prompt
+                # 就丢掉所有默认规则(含 thinking 协议)。这与 build_system_prompt
                 # 里 group_rules 的既定语义也不一致。
                 group_rules = group_prompt
-        return build_system_prompt(base=self.default_system_prompt, group_rules=group_rules)
+        return build_system_prompt(
+            base=self.default_system_prompt,
+            group_rules=group_rules,
+            mode=mode,
+        )
 
     def _clean_messages_for_api(self, messages):
         # 2026-09-04 加:对 assistant 消息的 content 跑一次 <think> 标签剥离
@@ -242,7 +250,7 @@ class ConversationController(QObject):
         self.current_conversation.add_message("assistant", "")
         self.new_bubble.emit(conv_id)
 
-        system_prompt = self._get_current_system_prompt()
+        system_prompt = self._get_current_system_prompt(mode)
         messages = [{"role": "system", "content": system_prompt}]
         # ★ 拼 user 消息时把附件 content 临时展开（不入库，content 只走 LLM 路径）
         for i, msg in enumerate(self.current_conversation.messages):
@@ -536,7 +544,7 @@ class ConversationController(QObject):
         conv.add_message("assistant", "")
         self.new_bubble.emit(conv_id)
 
-        system_prompt = self._get_current_system_prompt()
+        system_prompt = self._get_current_system_prompt(mode)
         messages = [{"role": "system", "content": system_prompt}]
         for msg in conv.messages:
             messages.append(msg.copy())

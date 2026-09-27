@@ -2,14 +2,31 @@
 agent.prompts — 系统提示词（重构版）
 
 设计：
-- BASE_RULES：硬性功能规则（始终拼到 system prompt 末尾）
+- BASE_RULES：硬性功能规则（**provider 无关**，始终拼到 system prompt 末尾）
+- THINK_TAG_RULE：<think> 标签协议 —— **仅 MiniMax 需要**（见下）
+- REASONING_NATIVE_NOTE：给有原生 reasoning 通道的 provider 用
 - TOOL_GUIDE：所有可用工具的触发条件（LLM 需要知道什么时候调哪个）
 - SYSTEM_PROMPT：默认完整 prompt（兼容旧 import）
+
+⚠️ 2026-27 重要修正: <think> 协议是 **MiniMax 特有** 的, 不是通用协议。
+
+QAgent 的 thinking 有两条完全不同的通道:
+  1. 原生 reasoning 字段 (deepseek / openai / 大多数 OpenAI 兼容端点):
+     API 把推理放在 `reasoning_content` 字段里, 与 `content` 分开。
+     controller 的流式循环静默累加它、**从不 yield 给 UI** —— 所以推理
+     天然不会污染气泡, 模型完全不需要做任何事。
+  2. 混入 content (只有 MiniMax M3):
+     模型把 thinking 直接拼在 `delta.content` 里, 且用字面量 `<think>`
+     标签包起来。controller 靠 `_strip_think_tags` 状态机实时剥离。
+
+如果对所有 provider 都要求"用 <think> 标签包起来", 会让 deepseek/openai
+白白多吐几千 token 的字面量标签, 徒增成本且语义上错误 —— 它们的推理
+根本不走 content。
 """
 from datetime import datetime
 
 # ============================================================
-# 基础硬性规则
+# 基础硬性规则（provider 无关）
 # ============================================================
 BASE_RULES = """【硬性操作规则】
 - 必须使用中文回复（除非用户明确要求其他语言）。
@@ -17,18 +34,57 @@ BASE_RULES = """【硬性操作规则】
 - 尊重用户的原始意图，除非用户明确要求全盘重写。
 - 当调用工具时，严格按照工具返回的结果进行回应。
 - 工具结果会用 Markdown 返回，请直接引用其中的数据，不要说"我没看到内容"。
+"""
 
-【关键：思考模式输出格式】
-- 当**思考模式**开启时(用户勾选了"思考模式"或 chat mode=deepseek-v4-pro 等带 reasoning 的),你所有的**内部推理/计划/草稿/自我提醒**必须包在 `<think>...</think>` 标签里。
+
+# ============================================================
+# thinking 协议 —— 按 provider 分发
+# ============================================================
+
+# 仅 MiniMax：模型把 thinking 混在 content 里，必须靠标签 + 状态机剥离
+THINK_TAG_RULE = """【关键：思考模式输出格式】
+- 当**思考模式**开启时，你所有的**内部推理/计划/草稿/自我提醒**必须包在 `<think>...</think>` 标签里。
   - 正确: `<think>让我先分类这 20 篇 paper...</think>\n好的,以下是分类结果...`
   - 错误: `让我先分类这 20 篇 paper...好的,以下是分类结果...`(思考直接裸露)
-- `<think>` 标签**只包内部思考**,最终给用户看的答案**必须放在 `</think>` 之后**。
-- 为什么:MiniMax M3 等模型默认 thinking 不会自动包 `<think>` 标签,controller 有
-  `_strip_think_tags` 状态机会按标签剥离 thinking。如果不包标签,thinking 段会直接
-  显示在气泡里污染用户视图。
-- 即使模型自身"觉得"thinking 不需要过滤,也要包 — 这是 QAgent 的硬性协议,违反会导致
+- `<think>` 标签**只包内部思考**，最终给用户看的答案**必须放在 `</think>` 之后**。
+- 为什么:你的 thinking 会直接混在正文里输出,系统靠 `_strip_think_tags` 状态机
+  按标签实时剥离。不包标签,thinking 段会直接显示在气泡里污染用户视图。
+- 即使模型自身"觉得"thinking 不需要过滤,也要包 —— 这是硬性协议,违反会导致
   用户看到满屏 "Let me first..." / "I need to..." / "I'll..." 这类元推理。
 """
+
+# 原生 reasoning 通道的 provider：明确告诉模型不要模仿 <think> 标签
+REASONING_NATIVE_NOTE = """【关于思考过程】
+- 你的内部推理走**独立的 reasoning 通道**,系统会自动隐藏它,**不需要**你做任何标记。
+- ⚠️ **不要**输出字面量的 `<think>` / `</think>` 标签 —— 那只对把思考混在正文里
+  输出的模型有意义,对你只会变成多余的噪声字符。
+- 直接给出面向用户的答案即可。
+"""
+
+# 未知 / 自定义端点：保持沉默，不要臆测协议
+REASONING_UNKNOWN_NOTE = """【关于思考过程】
+- 你的内部推理系统会自动处理并隐藏,**不需要**输出 `<think>` 标签。
+- 直接给出面向用户的答案即可。
+"""
+
+
+# 需要 <think> 标签协议的 provider（thinking 混在 content 里）
+_TAG_NEEDED_PROVIDERS = frozenset({"minimax"})
+
+
+def _thinking_rule_for(provider: str | None) -> str:
+    """
+    按 provider 返回对应的 thinking 规则段。
+
+    - minimax        → 需要 <think> 标签协议（它的 thinking 混在 content 里）
+    - deepseek/openai → 原生 reasoning 通道, 明确禁止输出字面量标签
+    - 其它 / None     → 保守起见只说"不需要标记", 不臆测协议
+    """
+    if provider in _TAG_NEEDED_PROVIDERS:
+        return THINK_TAG_RULE
+    if provider in ("deepseek", "openai"):
+        return REASONING_NATIVE_NOTE
+    return REASONING_UNKNOWN_NOTE
 
 
 # ============================================================
@@ -206,22 +262,49 @@ Rules:
 # ============================================================
 # 核心合成函数（参考 WAgent 设计）
 # ============================================================
-def build_system_prompt(base: str = None, group_rules: str = "") -> str:
+def _provider_of_mode(mode: str | None) -> str | None:
+    """
+    chat mode → provider。故意不 import controller —— prompts.py 被 controller
+    间接依赖, 顶层 import 会成环。失败一律按"未知 provider"处理。
+    """
+    if not mode:
+        return None
+    try:
+        from agent.controller import MODE_TO_PROVIDER_MODEL
+        return MODE_TO_PROVIDER_MODEL.get(mode, ("custom", None))[0]
+    except Exception:
+        return None
+
+
+def build_system_prompt(
+    base: str = None,
+    group_rules: str = "",
+    mode: str | None = None,
+    provider: str | None = None,
+) -> str:
     """
     合成最终的系统提示词：
     - 基础 prompt（用户可在设置中改）
     - + 当前时间
-    - + BASE_RULES
+    - + BASE_RULES（provider 无关）
+    - + thinking 规则（**按 provider 分发**, 见模块 docstring）
     - + TOOL_GUIDE
     - + 分组额外指令（如果有）
+
+    参数:
+        mode:      chat mode（如 "minimax-m3" / "deepseek-v4-pro"），内部映射到 provider
+        provider:  直接指定 provider，优先于 mode（测试/脚本用）
     """
     now = datetime.now()
     current_time = now.strftime("%Y年%m月%d日 %A %H:%M:%S")
+
+    resolved = provider if provider else _provider_of_mode(mode)
 
     parts = [f"当前系统时间：{current_time}。"]
     if base:
         parts.append(base)
     parts.append(BASE_RULES)
+    parts.append(_thinking_rule_for(resolved))
     parts.append(TOOL_GUIDE)
     if group_rules and group_rules.strip():
         parts.append(f"【当前分组额外指令】\n{group_rules.strip()}")

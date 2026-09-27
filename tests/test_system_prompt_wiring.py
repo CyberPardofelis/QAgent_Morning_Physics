@@ -28,8 +28,12 @@ import pytest
 
 from agent.prompts import (
     BASE_RULES,
+    REASONING_NATIVE_NOTE,
+    REASONING_UNKNOWN_NOTE,
     SYSTEM_PROMPT,
+    THINK_TAG_RULE,
     TOOL_GUIDE,
+    _thinking_rule_for,
     build_system_prompt,
 )
 from agent.tool_definitions import TOOL_SCHEMAS
@@ -40,9 +44,10 @@ from agent.tool_definitions import TOOL_SCHEMAS
 # ============================================================
 
 def test_build_system_prompt_contains_all_parts():
-    out = build_system_prompt(base="MY-BASE", group_rules="MY-GROUP")
+    out = build_system_prompt(base="MY-BASE", group_rules="MY-GROUP", mode="minimax-m3")
     assert "MY-BASE" in out
     assert BASE_RULES in out
+    assert THINK_TAG_RULE in out
     assert TOOL_GUIDE in out
     assert "MY-GROUP" in out
     assert "当前分组额外指令" in out
@@ -158,13 +163,116 @@ def test_no_group_prompt_still_gets_rules(monkeypatch):
 # ============================================================
 
 @pytest.mark.parametrize("needle", [
-    "<think>",                 # 整个流式层的 <think> 剥离协议依赖它
     "save_memory",             # 记忆写入触发
     "DIRECT_OUTPUT",           # 每日总结工具的输出规则
 ])
 def test_critical_rules_are_present(needle):
     out = build_system_prompt(base=SYSTEM_PROMPT)
     assert needle in out, f"关键规则 {needle!r} 应出现在 system prompt 里"
+
+
+# ============================================================
+# thinking 协议必须按 provider 分发 (9-27 修正)
+# ============================================================
+# 背景: QAgent 的 thinking 有两条通道 —
+#   1. 原生 reasoning 字段 (deepseek/openai/多数 OpenAI 兼容端点):
+#      API 把推理放 reasoning_content, 与 content 分开。controller 静默累加、
+#      从不 yield 给 UI, 所以模型什么都不用做。
+#   2. 混入 content (只有 MiniMax M3): 靠 <think> 标签 + 状态机剥离。
+#
+# 如果对所有 provider 都要求 <think> 标签, deepseek/openai 会白白多吐几千
+# token 的字面量标签 —— 它们的推理根本不走 content。
+
+def test_minimax_gets_think_tag_protocol():
+    """MiniMax 的 thinking 混在 content 里, 必须要求 <think> 标签。"""
+    out = build_system_prompt(base="x", mode="minimax-m3")
+    assert THINK_TAG_RULE in out
+    assert "必须包在" in out
+
+
+@pytest.mark.parametrize("mode", ["deepseek-v4-pro", "deepseek-v4-flash", "openai"])
+def test_native_reasoning_providers_must_not_be_asked_for_tags(mode):
+    """
+    回归: 原生 reasoning 通道的 provider 不能被要求输出 <think> 标签。
+    它们应该被明确告知"不需要标记"。
+    """
+    out = build_system_prompt(base="x", mode=mode)
+    assert THINK_TAG_RULE not in out, f"{mode} 不该收到 <think> 标签协议"
+    assert REASONING_NATIVE_NOTE in out
+    assert "不要**输出字面量" in out, "应明确禁止输出字面量 <think> 标签"
+
+
+@pytest.mark.parametrize("mode", ["custom", None])
+def test_unknown_provider_gets_neutral_note(mode):
+    """未知端点不臆测协议, 只说"不需要标记"。"""
+    out = build_system_prompt(base="x", mode=mode)
+    assert THINK_TAG_RULE not in out
+    assert REASONING_NATIVE_NOTE not in out
+    assert REASONING_UNKNOWN_NOTE in out
+
+
+def test_base_rules_are_provider_neutral():
+    """BASE_RULES 本身不应含任何 provider 特定的 thinking 指令。"""
+    assert "<think>" not in BASE_RULES
+    assert "MiniMax" not in BASE_RULES
+    assert "deepseek" not in BASE_RULES.lower()
+
+
+@pytest.mark.parametrize("provider,expected", [
+    ("minimax", THINK_TAG_RULE),
+    ("deepseek", REASONING_NATIVE_NOTE),
+    ("openai", REASONING_NATIVE_NOTE),
+    ("local_qwen", REASONING_UNKNOWN_NOTE),
+    (None, REASONING_UNKNOWN_NOTE),
+])
+def test_thinking_rule_dispatch(provider, expected):
+    assert _thinking_rule_for(provider) == expected
+
+
+def test_explicit_provider_overrides_mode():
+    """provider 显式传参时优先于 mode。"""
+    out = build_system_prompt(base="x", mode="deepseek-v4-pro", provider="minimax")
+    assert THINK_TAG_RULE in out
+
+
+def test_only_minimax_modes_map_to_tag_protocol():
+    """
+    遍历 controller 里所有已注册的 mode, 确保只有 minimax 系拿到标签协议。
+    这是防止以后新增 mode 时静默拿错规则的护栏。
+    """
+    from agent.controller import MODE_TO_PROVIDER_MODEL
+
+    for mode in MODE_TO_PROVIDER_MODEL:
+        out = build_system_prompt(base="x", mode=mode)
+        provider = MODE_TO_PROVIDER_MODEL[mode][0]
+        if provider == "minimax":
+            assert THINK_TAG_RULE in out, f"{mode} (minimax) 应收到 <think> 协议"
+        else:
+            assert THINK_TAG_RULE not in out, f"{mode} ({provider}) 不应收到 <think> 协议"
+
+
+def test_conversation_controller_passes_mode_to_builder():
+    """两个调用点都必须把 mode 传下去, 否则全部退化成"未知 provider"。"""
+    from ui import conversation_controller as cc
+
+    src = cc.ConversationController._get_current_system_prompt.__doc__ or ""
+    assert "mode" in src
+
+    import ast
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    tree = ast.parse((repo / "ui/conversation_controller.py").read_text(encoding="utf-8"))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_get_current_system_prompt"
+    ]
+    assert calls, "找不到 _get_current_system_prompt 调用点"
+    for call in calls:
+        args = {a.id for a in call.args if isinstance(a, ast.Name)}
+        assert "mode" in args, "调用 _get_current_system_prompt 时必须传 mode"
 
 
 # ============================================================
