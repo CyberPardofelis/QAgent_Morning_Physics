@@ -35,6 +35,23 @@ agent.prompts_survey — 综述生成(P6)专用 LLM prompt 模板
 import re
 from typing import Any
 
+# ============================================================
+# 共享 prompt 片段
+# ============================================================
+# 9-27: 这段"pool 是采样,不是领域全集"(RAG 局部最优防御)之前在
+# SURVEY_OUTLINE_PROMPT 和 SURVEY_SECTION_PROMPT 里**逐字重复了 710 字符**。
+# 重复的代价: 改一处忘另一处 → 两边规则悄悄漂移; 且每次请求多烧一遍 token。
+# 现在抽成常量, 由两个 build_*_prompt 注入 —— 单一真相来源。
+
+POOL_SAMPLING_RULE = """【候选池是采样, 不是领域全集】(RAG 局部最优防御)
+- 候选池是从外部检索系统按相关性排序取的 {pool_size} 篇, **是检索采样, 不是领域全部论文**
+- 你写任何"领域判断"前, 先问自己: 这个判断是基于 **pool 内统计**, 还是基于 **领域共识**?
+  - 基于 pool 内统计 → 写"在本综述检索范围内, X 算法占主导" (前置 pool 数量 + 引用佐证)
+  - 基于领域共识 → **必须**有 ≥ K (K=5) 篇 pool 内 paper + 多源(arxiv+APS+IOP)+ 时间窗口覆盖; 否则改写为 pool 内统计表述
+- ❌ 反例: pool 含 30 篇 Gilbert + 2 篇 Hamilton → "Gilbert 已成为本领域主流算法" 错;
+- ✅ 改写: "在本综述检索的 {pool_size} 篇 paper 中, Gilbert 路径占 30 篇 (94%), Hamilton/变分/Path Integral 等方向各有 1-2 篇相关工作, 本综述受检索覆盖限制未充分展开 — 主流判断应保留给领域共识层 (教科书/综述)"
+- claim 范围限定: 凡是"主流/共识/领域普遍/已成定式"的措辞, 必须有"基于 {pool_size} 篇 paper 的检索"或"在本综述范围内"前置; 直接说"X 是主流"会被审计标 ⚠️ RAG 局部最优"""
+
 
 def _get_min_pool() -> int:
     """
@@ -331,7 +348,7 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
 【候选池】(共 {pool_size} 篇,paper_id 唯一):
 {pool_text}
 
-【9-08 23:50 user 拍板 — claim-centric 视角】
+【写作视角 — claim-centric】
 **综述的核心是"领域判断/分类/趋势",不是"罗列 paper 摘要"。**
 - 每个 sub_point = 1 个**领域宏观判断/分类/趋势/分类法**, 用完整陈述句表达, 不是"问题清单"
 - 后续章节写作时, paper 是"佐证", 是"判断的证据", 不是"段落的主角"
@@ -344,7 +361,7 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
   4. gap: 当前研究空白 / 不足 / 反例(3-5 引用)
   5. outlook: 未来方向 / 开放问题 / 跨领域迁移(0-2 引用,基于 gap 推断)
 
-【每章应包含的"宏观内容类型"】(9-08 23:50 user 拍板, 5 段各有侧重)
+【每章应包含的"宏观内容类型"】(5 段各有侧重)
   - intro:    研究背景 / 已有综述覆盖范围 / 本综述的切入角度 / 全文组织结构
   - progress: 历史脉络(早期→中期→近期) / 转折点(为什么 X 替代了 Y) / 当前共识 / 演化的内在驱动力
   - method_compare: 分类法(按 X 维度怎么分) / 各类的 trade-off 对比 / 适用场景 / 性能/复杂度对比
@@ -356,12 +373,12 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
 - section_type: 5 选 1(intro / progress / method_compare / gap / outlook)
 - sub_points: **5-8 个宏观要点**,每个要点是 1 句完整的"领域判断/分类/趋势"陈述句
   ⚠️ 字段名严格用 sub_points(复数),任何 chapter 都不能写成 sub_point(单数)
-  ⚠️ sub_point 数量必须 5-8 个, 这是章节展开度的硬下限 (user 9-08 23:50 拍板, 防 LLM 偷懒)
+  ⚠️ sub_point 数量必须 5-8 个, 这是章节展开度的硬下限 (防模型偷懒)
 - is_transition: yes / no
     - yes = 该章主要是铺垫/过渡,不强求引用(给 intro 的部分子节)
     - no = 该章必须有事实引用(给 progress / method_compare / gap / outlook)
 
-【sub_point 措辞示例】(user 9-08 23:50 拍板, 错误写法会让 LLM 偷懒)
+【sub_point 措辞示例】(错误写法会让模型敷衍)
   ❌ 错误 (问题式, 让 LLM 想敷衍):
      "X 方法的工作原理"
      "Y 方法有什么优点"
@@ -371,14 +388,7 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
      "Y 在大规模系统中遭遇性能瓶颈, 主要因为 Z 开销随节点数线性增长"
      "跨领域迁移方面, A 领域的 W 技术有可能解决 B 领域长期未解的 V 问题"
 
-【9-22 user 拍板 — pool 是采样,不是领域全集】(RAG 局部最优防御, 跟"基线宽度 vs 质量门"独立)
-- 候选池是从外部检索系统按相关性排序取的 {pool_size} 篇,**是检索采样,不是领域全部论文**
-- 你写任何"领域判断"前,先问自己:这个判断是基于 **pool 内统计**, 还是基于 **领域共识**?
-  - 基于 pool 内统计 → 写"在本综述检索范围内, X 算法占主导" (前置 pool 数量 + 引用佐证)
-  - 基于领域共识 → **必须**有 ≥ K (K=5) 篇 pool 内 paper + 多源(arxiv+APS+IOP)+ 时间窗口覆盖;否则改写为 pool 内统计表述
-- ❌ 反例 (user 9-22): pool 含 30 篇 Gilbert + 2 篇 Hamilton → "Gilbert 已成为本领域主流算法" 错;
-- ✅ 改写: "在本综述检索的 32 篇 paper 中, Gilbert 路径占 30 篇 (94%), Hamilton/变分/Path Integral 等方向各有 1-2 篇相关工作, 本综述受检索覆盖限制未充分展开 — 主流判断应保留给领域共识层 (教科书/综述)"
-- claim 范围限定: 凡是"主流/共识/领域普遍/已成定式"的措辞, 必须有"基于 {pool_size} 篇 paper 的检索"或"在本综述范围内"前置; 直接说"X 是主流"会被审计标 ⚠️ RAG 局部最优
+{pool_sampling_rule}
 - sub_point 措辞同理: 避免"X 是领域普遍现象", 写"在本综述检索范围内, X 表现出..."
 
 【强制约束】
@@ -387,7 +397,7 @@ SURVEY_OUTLINE_PROMPT = """你是综述章节规划助手,任务:基于候选池
 3. 引用配额按"章节类型"软约束:超过上下限会被审计标 ⚠️
 4. method_compare 的 sub_points 应该按"机制/性能/场景"维度组织,不要按时间组织(时间组织是 progress 的事)
 5. **sub_points 数量 5-8 个**: 大纲生成后会被审计, < 5 个 sub_point 的章节会在 action_finish 被拒
-6. (9-22 收尾) 大纲生成后, **不允许**直接给"X 算法是本领域主流"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim
+6. 大纲生成后, **不允许**直接给"X 算法是本领域主流"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim
 
 【输出格式】(严格 JSON 对象,不要 markdown 代码块包裹,不要解释)
 {{
@@ -410,6 +420,7 @@ def build_outline_prompt(topic: str, papers: list[dict[str, Any]]) -> str:
         topic=topic or "(未指定主题)",
         pool_size=len(papers),
         pool_text=format_pool(papers),
+        pool_sampling_rule=POOL_SAMPLING_RULE.format(pool_size=len(papers)),
     )
 
 
@@ -448,20 +459,13 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
      - 段中: 解释该判断的依据/机制/数据
      - 段末: 挂 2-4 个 paper_id, 注明哪几篇贡献了哪个具体点/数字/结果
    - 收尾 1 段: 本章宏观判断总结 + 跟下一章的衔接
-3. **长度要求** (9-08 23:50 user 拍板, 10000→20000 max_tokens 后放宽):
+3. **长度要求**:
    - 单章 markdown **1500-2500 字** (sub_points × 3-4 段/子点, 每段平均 200-300 字)
    - 5-8 个 sub_point 决定章节下界 1500 字; 写得再短会被审计标 ⚠️
 4. **每个 sub_point 至少配 2-4 个 paper_id 引用** (关键事实/数字/结果 处必带), 引用的 paper 是"佐证", 不是"中心"
 5. **不要复述 paper 摘要**: 不要写 "A 提出了 X, 它的核心方法是 Y", 写 "X 已成为主流路径 (A [p1], B [p2], C [p3] 都在此方向), 关键改进点在于 ..."
 
-【9-22 user 拍板 — pool 是采样,不是领域全集】(RAG 局部最优防御, 跟"基线宽度 vs 质量门"独立)
-- 候选池是从外部检索系统按相关性排序取的 {pool_size} 篇,**是检索采样,不是领域全部论文**
-- 写任何"领域判断"前,先问自己:这个判断是基于 **pool 内统计**, 还是基于 **领域共识**?
-  - 基于 pool 内统计 → 写"在本综述检索范围内, X 算法占主导" (前置 pool 数量 + 引用佐证)
-  - 基于领域共识 → **必须**有 ≥ K (K=5) 篇 pool 内 paper + 多源(arxiv+APS+IOP)+ 时间窗口覆盖;否则改写为 pool 内统计表述
-- ❌ 反例 (user 9-22): pool 含 30 篇 Gilbert + 2 篇 Hamilton → "Gilbert 已成为本领域主流算法" 错;
-- ✅ 改写: "在本综述检索的 32 篇 paper 中, Gilbert 路径占 30 篇 (94%), Hamilton/变分/Path Integral 等方向各有 1-2 篇相关工作, 本综述受检索覆盖限制未充分展开 — 主流判断应保留给领域共识层 (教科书/综述)"
-- claim 范围限定: 凡是"主流/共识/领域普遍/已成定式"的措辞, 必须有"基于 {pool_size} 篇 paper 的检索"或"在本综述范围内"前置; 直接说"X 是主流"会被审计标 ⚠️ RAG 局部最优
+{pool_sampling_rule}
 - 章节段落写法同理: 避免"X 是领域普遍现象", 写"在本综述检索范围内, X 表现出..."
 
 【强制约束】(违反会被自动审计标 ❌,请严格遵守)
@@ -475,14 +479,14 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 6. 简洁 [paper_id] + 完整链接**同时写**最理想, 例: "Bombin 2006 提出拓扑码 [0607734](papers/0607734.md) [Bombin 2006, arXiv:0607734](papers/0607734.md) 中被提出"
 7. 不带引用 [paper_id] 的行内链接不要写(纯链接没意义)
 8. markdown 格式: 标题用 ##, 列表用 -, 不嵌套列表超过 2 层
-9. (9-22 收尾) **禁止**直接给"X 算法是本领域主流 / Y 是领域共识"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim, 否则审计标 ⚠️ RAG 局部最优
+9. **禁止**直接给"X 算法是本领域主流 / Y 是领域共识"这种无前置的判断; 必须按 §pool-采样 改写为有前置限定的 claim, 否则审计标 ⚠️ RAG 局部最优
 
 【P6.3 自动重写机制】
 - 每个章节生成后, 自动审计会检测候选池外引用 (out_of_pool)
 - 如果 out_of_pool > 0, 系统会自动用"只允许候选池内 paper_id"作为额外约束重写该章节 (最多 2 次)
 - 第 2 次重写后仍 out_of_pool > 0, 接受并落库 (覆盖度审计报告里标 ⚠️)
 
-【"claim-centric 视角 vs paper 罗列" 对比示例】(9-08 23:50 视角升级)
+【"claim-centric 视角 vs paper 罗列" 对比示例】
 
   ❌ paper 罗列 (错误, paper 是主角):
     "A 提出了表面码 [p1]。B 改进了表面码 [p2]。C 提出了 XZZX 码 [p3]。D 比较了多种码 [p4]。"
@@ -495,7 +499,7 @@ SURVEY_SECTION_PROMPT = """你是综述章节写作助手,任务:基于候选池
 【本章节引用配额】(软约束, 超过会被审计标 ⚠️)
   {ref_quota}
 
-【9-08 23:50 user 拍板 — 缺漏反馈机制】(关键, 加强版)
+【缺漏反馈机制】(关键)
 - 写完本章节后, **主动扫一遍 sub_points, 看哪个 sub_point 的引用支撑偏少 (< 2 个 paper_id)**:
   - 如果发现某些 sub_point 引用不足或缺方向性文献, 必须在 markdown 末尾加 HTML 注释标注, **系统会自动捕获并回到 search_more 循环补文章**:
     `<!-- QAgent: missing_queries=["BB84 原始协议", "MDI-QKD 实验", "诱骗态方法"] -->`
@@ -580,6 +584,7 @@ def build_section_prompt(
         pool_size=len(papers),
         pool_text=pool_text,
         pool_note=pool_note,
+        pool_sampling_rule=POOL_SAMPLING_RULE.format(pool_size=len(papers)),
         ref_quota=SECTION_REF_QUOTAS[safe_type],
     )
 
@@ -779,7 +784,7 @@ SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
 
 【任务】: 对下面 {batch_size} 篇论文, **每篇独立打分** (0-10, 整数), 评估"该论文核心贡献是不是 X 本身 (而不是邻近子领域)"。
 
-【打分尺度 - 9-09 严判版】(user 拍板)
+【打分尺度 — 严判】
   10 = 完美命中, 论文核心就是 X
   9  = 核心, 论文专门讲 X
   8  = 强相关, X 是论文主方向之一 (但论文还有其他方向)
@@ -789,7 +794,7 @@ SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
   1-2 = 完全不相关
   0   = 无关 (无 abstract / 完全无关)
 
-【特别注意 - 9-09 严判, user 拍板】
+【特别注意 — 严判】
 **"是 X 的子方向" 跟 "是 X 本身" 要严格区分**:
   - "X 的子方向" (score 7-8): 论文仍在 X 大伞下, 但有自己独立内容
   - "邻近子领域" (score 5-6): 论文不在 X 大伞下, 只是共享术语/方法
@@ -804,7 +809,7 @@ SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
     → BERT paper 核心是预训练, 不是架构, score 应 <= 6
 不要因为 title/abstract 含主题词就给高分 — 必须看 core_method + core_contrib 的实质内容。
 
-【关键字段 - is_about_topic】(9-09 严判新增)
+【关键字段 - is_about_topic】(严判新增)
 新增 is_about_topic 字段 (bool), 判定规则:
   - is_about_topic = true: score >= 8 (论文核心就是 X 本身, 综述主引)
   - is_about_topic = false: score <= 7 (论文只是 X 的子方向或邻近子领域, 不应作为综述主引)
@@ -883,7 +888,7 @@ SURVEY_FACT_REVIEW_PROMPT = """你是综述 fact 主题对齐审核助手。
 
 【任务】: 对每条 fact, 判断"该 fact 是否直接服务于综述主题 X 本身 (而不是邻近子领域)"。
 
-【打分尺度 - 9-09 严判版】(user 拍板, 跟 paper 严判对齐)
+【打分尺度 — 严判】(跟 paper 严判对齐)
   10 = fact 直接讲 X 本身, 必引
   9  = fact 强相关 X 的关键子方向/方法
   7-8 = fact 是 X 的扩展/应用/对比 (但仍可作为综述引用)
@@ -897,7 +902,7 @@ SURVEY_FACT_REVIEW_PROMPT = """你是综述 fact 主题对齐审核助手。
 - "X 的方法在 Y 领域的应用" 算 7-8 (应用/对比, 仍可引)
 - "Y 领域自己的方法, 跟 X 仅共享术语" 算 3-4 (邻近, 不应引)
 
-【关键字段 - is_topic_aligned】(9-09 新增)
+【关键字段 - is_topic_aligned】(新增)
 新增 is_topic_aligned 字段 (bool), 判定规则:
   - is_topic_aligned = true: score >= 5 (fact 跟 X 直接相关, 综述可引)
   - is_topic_aligned = false: score <= 4 (fact 邻近子领域, audit 标 ❌)
