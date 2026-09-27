@@ -28,7 +28,6 @@ from pathlib import Path
 
 import pytest
 
-from agent import controller as ctrl_mod
 from agent import cost_guard as cg_mod
 from agent.tools import llm as tools_llm
 
