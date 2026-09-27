@@ -216,8 +216,12 @@ class MemoryProcessor:
                 logger.warning("[MemoryProcessor] check_duplicate concept_recall 失败: %s", e)
 
         # Step 3: judger 逐个判断
+        # 9-27 修: 记录"实际被判 same_fact/opposite 的那条", 供 top_match 使用。
+        # 之前直接返回 all_matches[0]（embedding 相似度最高的那条）, 跟 judge 结论不是同一条,
+        # 会把 LLM 导向错误的 update_memory 目标。
         judge_verdict = "unrelated"
         judge_reason = ""
+        judged_match: dict[str, Any] | None = None
         for match in all_matches:
             existing_extract = (match["memory"].get("metadata") or {}).get("extract") or {}
             if not existing_extract:
@@ -231,21 +235,15 @@ class MemoryProcessor:
             if verdict in ("same_fact", "opposite"):
                 judge_verdict = verdict
                 judge_reason = reason
+                judged_match = match
                 break
 
         # Step 4: 综合 verdict
-        if judge_verdict == "same_fact":
+        if judge_verdict in ("same_fact", "opposite"):
             return {
-                "verdict": "duplicate",
-                "top_match": all_matches[0] if all_matches else None,
-                "all_matches": all_matches,
-                "judge_verdict": judge_verdict,
-                "judge_reason": judge_reason,
-            }
-        if judge_verdict == "opposite":
-            return {
-                "verdict": "opposite",
-                "top_match": all_matches[0] if all_matches else None,
+                "verdict": "duplicate" if judge_verdict == "same_fact" else "opposite",
+                # top_match = 真正被 judge 判定的条目（不是相似度最高的那条）
+                "top_match": judged_match,
                 "all_matches": all_matches,
                 "judge_verdict": judge_verdict,
                 "judge_reason": judge_reason,
