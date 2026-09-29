@@ -273,3 +273,31 @@ def test_edit_dialog_returns_result(kb, qapp):
     finally:
         d.close()
         d.deleteLater()
+
+
+# ============================================================
+# 列宽 (9-29 用户反馈: 更新时间太宽 / 核心对象太窄)
+# ============================================================
+
+@pytest.mark.ui
+def test_column_widths_give_space_to_content_not_timestamp(kb, qapp):
+    """
+    回归: 原来 setStretchLastSection(True) 把剩余空间全给了"更新时间"列,
+    真正需要空间的"内容"被挤扁。改成短列自适应 + 内容列拉伸。
+    """
+    from PySide6.QtWidgets import QHeaderView
+    from ui.fact_kb_dialog import FactKBDialog
+    d = FactKBDialog()
+    try:
+        h = d.table.horizontalHeader()
+        assert h.sectionResizeMode(3) == QHeaderView.Stretch, "内容列应拉伸"
+        assert h.sectionResizeMode(4) == QHeaderView.ResizeToContents, (
+            "更新时间应按内容自适应, 不该抢空间"
+        )
+        assert h.sectionResizeMode(2) != QHeaderView.Stretch, (
+            "核心对象不该拉伸(会把内容挤扁), 用 Interactive 给固定宽度"
+        )
+        assert d.table.columnWidth(2) >= 150, "核心对象列应有可用的默认宽度"
+    finally:
+        d.close()
+        d.deleteLater()

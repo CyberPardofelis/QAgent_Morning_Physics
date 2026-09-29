@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -241,7 +242,17 @@ class FactKBDialog(QDialog):
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # 9-29 修列宽: 原来 setStretchLastSection(True) 把剩余空间全给了"更新时间"
+        # (一列时间戳), 而真正需要横向空间的"内容"和"核心对象"被挤扁。
+        # 改成: 短列按内容自适应, "内容"拉伸, "核心对象"给一个够用的默认宽度。
+        _hdr = self.table.horizontalHeader()
+        _hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # 出处数
+        _hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)   # 类型
+        _hdr.setSectionResizeMode(2, QHeaderView.Interactive)        # 核心对象
+        _hdr.setSectionResizeMode(3, QHeaderView.Stretch)            # 内容
+        _hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # 更新时间
+        self.table.setColumnWidth(2, 170)
+        self.table.setColumnWidth(4, 150)
         self.table.itemSelectionChanged.connect(self._on_select)
         self.table.itemDoubleClicked.connect(self._on_edit)
         split.addWidget(self.table)
