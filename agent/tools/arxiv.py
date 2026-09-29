@@ -13,6 +13,8 @@ from agent.tools.summary_parser import parse_summary_markdown
 
 logger = logging.getLogger(__name__)
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
+
 
 # 9-18 加: 自定义 User-Agent 防 arxiv 反爬 (406 Not Acceptable).
 # arxiv 库默认 User-Agent 是 "python-requests/2.32.5", 经常被 arxiv 限流拒掉.
@@ -77,7 +79,7 @@ def _download_pdf_with_fallback(arxiv_id: str, pdf_path) -> bool:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
             if pdf_path.exists() and pdf_path.stat().st_size > 1024:
-                print(f"[download_arxiv_paper] fallback PDF URL 下载成功: {pdf_url}", flush=True)
+                safe_print(f"[download_arxiv_paper] fallback PDF URL 下载成功: {pdf_url}", flush=True)
                 return True
         else:
             logger.warning(
@@ -130,9 +132,9 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     """
     import time as _t
     _t0 = _t.time()
-    print(f"[arxiv] _fetch_arxiv_listing start: url={_ARXIV_LISTING_URL} include_authors={include_authors}", flush=True)
+    safe_print(f"[arxiv] _fetch_arxiv_listing start: url={_ARXIV_LISTING_URL} include_authors={include_authors}", flush=True)
     response = requests.get(_ARXIV_LISTING_URL, timeout=30)
-    print(f"[arxiv]   requests.get 状态码={response.status_code} 耗时 {_t.time()-_t0:.1f}s, 解析 HTML ({len(response.text)} 字符)", flush=True)
+    safe_print(f"[arxiv]   requests.get 状态码={response.status_code} 耗时 {_t.time()-_t0:.1f}s, 解析 HTML ({len(response.text)} 字符)", flush=True)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
 
@@ -185,7 +187,7 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
                 paper['authors'] = "未知"
 
         papers.append(paper)
-    print(
+    safe_print(
         f"[arxiv] 解析到 {len(papers)} 篇 (new) + 跳过 cross={cross_count} + replacement={repl_count}  累计耗时 {_t.time()-_t0:.1f}s",
         flush=True,
     )
@@ -245,13 +247,13 @@ def search_arxiv(
     返回 Markdown 格式论文列表, LLM 自己决定怎么用.
     """
     if not query or not query.strip():
-        print("[search_arxiv] ❌ query 为空", flush=True)
+        safe_print("[search_arxiv] ❌ query 为空", flush=True)
         return "❌ query 不能为空"
     query = query.strip()
     max_results = max(1, min(int(max_results), 50))
 
     short_query = (query[:60] + "...") if len(query) > 60 else query
-    print(
+    safe_print(
         f"[search_arxiv] start  query={short_query!r}  max_results={max_results}  summary_only={summary_only}",
         flush=True,
     )
@@ -263,24 +265,24 @@ def search_arxiv(
         search = arxiv.Search(query=query, max_results=max_results)
         papers = list(client.results(search))
     except arxiv.HTTPError as e:
-        print(f"[search_arxiv] ❌ arxiv HTTPError: {e}", flush=True)
+        safe_print(f"[search_arxiv] ❌ arxiv HTTPError: {e}", flush=True)
         return (
             f"❌ arXiv 搜索失败 (HTTP 错)\n"
             f"- 详情: {e}\n"
             f"- 建议: 1) 检查网络  2) 等几秒重试  3) arxiv 可能临时限流"
         )
     except arxiv.UnexpectedEmptyPageError as e:
-        print(f"[search_arxiv] ❌ arxiv UnexpectedEmptyPageError: {e}", flush=True)
+        safe_print(f"[search_arxiv] ❌ arxiv UnexpectedEmptyPageError: {e}", flush=True)
         return (
             "❌ arXiv 搜索失败: 中途返空页\n"
             "- 通常是 arxiv 服务短暂不稳  \n"
             "- 建议: 1) 稍后重试  2) max_results 调小"
         )
     except arxiv.ArxivError as e:
-        print(f"[search_arxiv] ❌ arxiv ArxivError: {e}", flush=True)
+        safe_print(f"[search_arxiv] ❌ arxiv ArxivError: {e}", flush=True)
         return f"❌ arXiv 搜索失败 (ArxivError): {e}"
     except Exception as e:
-        print(f"[search_arxiv] ❌ 异常: {type(e).__name__}: {e}", flush=True)
+        safe_print(f"[search_arxiv] ❌ 异常: {type(e).__name__}: {e}", flush=True)
         return (
             f"❌ arXiv 搜索失败 ({type(e).__name__})\n"
             f"- 详情: {e}\n"
@@ -288,7 +290,7 @@ def search_arxiv(
         )
 
     if not papers:
-        print(f"[search_arxiv] ⚠ 0 results  query={short_query!r}", flush=True)
+        safe_print(f"[search_arxiv] ⚠ 0 results  query={short_query!r}", flush=True)
         return (
             f"未找到匹配 '{query}' 的 arxiv 论文\n"
             f"- 建议: 1) 简化 query  2) 用英文关键词  3) max_results 调大"
@@ -318,7 +320,7 @@ def search_arxiv(
             output += f"   - 作者: {author_str}\n"
             output += f"   - 发布日期: {published}\n"
             output += f"   - 摘要: {summary}\n\n"
-    print(f"[search_arxiv] done  返回 {len(papers)} 篇  summary_only={summary_only}", flush=True)
+    safe_print(f"[search_arxiv] done  返回 {len(papers)} 篇  summary_only={summary_only}", flush=True)
     return output
 
 
@@ -342,12 +344,12 @@ def download_arxiv_paper(arxiv_id: str) -> str:
     arxiv_id = m.group(1)
     pdf_path = PAPER_DIR / f"{arxiv_id}.pdf"
 
-    print(f"[download_arxiv_paper] start  id={arxiv_id}  → {pdf_path}", flush=True)
+    safe_print(f"[download_arxiv_paper] start  id={arxiv_id}  → {pdf_path}", flush=True)
 
     # 检查是否已下载
     if pdf_path.exists() and pdf_path.stat().st_size > 1024:
         size = pdf_path.stat().st_size
-        print(f"[download_arxiv_paper] 已存在  {size} bytes, 跳过", flush=True)
+        safe_print(f"[download_arxiv_paper] 已存在  {size} bytes, 跳过", flush=True)
         return f"✅ 已下载(缓存):{pdf_path}  ({size} bytes)"
 
     # 9-18 加: 先试 arxiv 库, 失败 fallback 到 requests 直 GET PDF URL
@@ -355,10 +357,10 @@ def download_arxiv_paper(arxiv_id: str) -> str:
         ok = _download_pdf_with_fallback(arxiv_id, pdf_path)
         if ok:
             size = pdf_path.stat().st_size
-            print(f"[download_arxiv_paper] done  {size} bytes", flush=True)
+            safe_print(f"[download_arxiv_paper] done  {size} bytes", flush=True)
             return f"✅ 已下载:{pdf_path}  ({size} bytes)"
         # 都失败: 友好提示 + 替代方案
-        print(f"[download_arxiv_paper] ❌ 两条路径都失败  id={arxiv_id}", flush=True)
+        safe_print(f"[download_arxiv_paper] ❌ 两条路径都失败  id={arxiv_id}", flush=True)
         return (
             f"❌ 下载 arXiv 论文失败: {arxiv_id}\n"
             f"- 主路径 (arxiv 库) + fallback (PDF URL) 都拒 (可能是 arxiv 反爬 406)\n"
@@ -368,7 +370,7 @@ def download_arxiv_paper(arxiv_id: str) -> str:
             f"  - 手动从 https://arxiv.org/pdf/{arxiv_id}.pdf 浏览器下载, 放到 {PAPER_DIR}"
         )
     except Exception as e:
-        print(f"[download_arxiv_paper] ❌ 异常 {type(e).__name__}: {e}", flush=True)
+        safe_print(f"[download_arxiv_paper] ❌ 异常 {type(e).__name__}: {e}", flush=True)
         return (
             f"❌ 下载 arXiv 论文失败: {type(e).__name__}: {e}\n"
             f"- 替代: analyze_paper(arxiv_id='{arxiv_id}') 走 API 拉元数据, 不依赖 PDF"
@@ -500,7 +502,7 @@ def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> No
     except Exception as e:
         logger.warning("[arxiv→db] 批 UPDATE 失败(已吞): %s", e)
     if saved:
-        print(f"[arxiv→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
+        safe_print(f"[arxiv→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
 
 
 # ============================================================

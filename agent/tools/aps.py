@@ -39,6 +39,8 @@ from agent.tools.utils import JOURNAL_CONFIG
 
 logger = logging.getLogger(__name__)
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
+
 # ============================================================
 # 2026-09-03 接回 LLM 总结字段落库(用户拍板):
 # 之前 2026-09-02 P0.9 彻底回退只走了"抓文 + LLM 总结 return 文本",没存任何 LLM 产出。
@@ -59,19 +61,19 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     """
     import time as _t
     _t0 = _t.time()
-    print(f"[aps] fetch_aps_page_via_browser start: journal={journal}", flush=True)
+    safe_print(f"[aps] fetch_aps_page_via_browser start: journal={journal}", flush=True)
 
     config = JOURNAL_CONFIG.get(journal)
     if not config:
-        print(f"[aps] ! 不支持的期刊: {journal} 耗时 {_t.time()-_t0:.1f}s", flush=True)
+        safe_print(f"[aps] ! 不支持的期刊: {journal} 耗时 {_t.time()-_t0:.1f}s", flush=True)
         raise ValueError(f"不支持的期刊: {journal}")
 
     url = config['url_template'].format(journal=journal, section=config['section'])
     link_selector = config['link_selector']
-    print(f"[aps]   url={url}  selector={link_selector}", flush=True)
+    safe_print(f"[aps]   url={url}  selector={link_selector}", flush=True)
 
     pool = get_browser_pool()
-    print("[aps]   拿 browser_pool, 准备 acquire_page (firefox)...", flush=True)
+    safe_print("[aps]   拿 browser_pool, 准备 acquire_page (firefox)...", flush=True)
     try:
         with pool.acquire_page(
             browser_type="firefox",
@@ -79,17 +81,17 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/120.0.0.0 Safari/537.36",
         ) as page:
-            print(f"[aps]   acquire_page ok 耗时 {_t.time()-_t0:.1f}s, 开始 goto", flush=True)
+            safe_print(f"[aps]   acquire_page ok 耗时 {_t.time()-_t0:.1f}s, 开始 goto", flush=True)
             page.set_default_timeout(60000)
             page.goto(url, wait_until="domcontentloaded")
-            print(f"[aps]   goto ok 耗时 {_t.time()-_t0:.1f}s, 准备 wait_for_selector({link_selector}, 15s)", flush=True)
+            safe_print(f"[aps]   goto ok 耗时 {_t.time()-_t0:.1f}s, 准备 wait_for_selector({link_selector}, 15s)", flush=True)
             page.wait_for_selector(link_selector, timeout=15000)
-            print(f"[aps]   wait_for_selector ok 耗时 {_t.time()-_t0:.1f}s, 拿 page.content()", flush=True)
+            safe_print(f"[aps]   wait_for_selector ok 耗时 {_t.time()-_t0:.1f}s, 拿 page.content()", flush=True)
             html = page.content()
-            print(f"[aps]   page.content() 完成 ({len(html)} 字符)  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
+            safe_print(f"[aps]   page.content() 完成 ({len(html)} 字符)  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
             return html
     except Exception as e:
-        print(f"[aps] ! 浏览器抓取失败: {e}  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
+        safe_print(f"[aps] ! 浏览器抓取失败: {e}  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
         raise Exception(f"浏览器自动化抓取失败: {str(e)}") from e
 
 
@@ -157,7 +159,7 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
     try:
         html = fetch_aps_page_via_browser(journal)
         papers = parse_aps_papers_from_html(html)
-        print(f"[aps] 解析到 {len(papers)} 篇 papers", flush=True)
+        safe_print(f"[aps] 解析到 {len(papers)} 篇 papers", flush=True)
         if not papers:
             return f"未找到 {config['name']} 论文列表，请稍后重试。"
 
@@ -275,7 +277,7 @@ def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> No
     except Exception as e:
         logger.warning("[aps→db] 批 UPDATE 失败(已吞): %s", e)
     if saved:
-        print(f"[aps→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
+        safe_print(f"[aps→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
 
 
 def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
@@ -309,7 +311,7 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         elif not doi.startswith("10.1103/"):
             # 看起来像短 DOI(prefix 漏了),自动补
             doi = f"10.1103/{doi}"
-    print(f"[aps-dl] 处理后的 DOI: {doi!r}", flush=True)
+    safe_print(f"[aps-dl] 处理后的 DOI: {doi!r}", flush=True)
 
     # 1) 走 doi.org 拿真实 journal + final url
     abs_url = f"https://doi.org/{doi}"
@@ -320,10 +322,10 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         ),
         "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8",
     }
-    print(f"[aps-dl] GET {abs_url}", flush=True)
+    safe_print(f"[aps-dl] GET {abs_url}", flush=True)
     r0 = requests.get(abs_url, allow_redirects=True, timeout=30, headers=headers)
     final_url = r0.url
-    print(f"[aps-dl] final URL: {final_url}  status={r0.status_code}", flush=True)
+    safe_print(f"[aps-dl] final URL: {final_url}  status={r0.status_code}", flush=True)
     if r0.status_code != 200:
         raise RuntimeError(
             f"无法访问 DOI 页面(可能是无效 DOI): HTTP {r0.status_code} ({final_url})"
@@ -341,9 +343,9 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
     # 2) GET PDF
     pdf_headers = dict(headers)
     pdf_headers["Referer"] = final_url
-    print(f"[aps-dl] GET {pdf_url}", flush=True)
+    safe_print(f"[aps-dl] GET {pdf_url}", flush=True)
     r1 = requests.get(pdf_url, allow_redirects=True, timeout=60, headers=pdf_headers)
-    print(
+    safe_print(
         f"[aps-dl] PDF status={r1.status_code}  "
         f"Content-Type={r1.headers.get('content-type')}  "
         f"size={len(r1.content)} bytes",
@@ -426,7 +428,7 @@ def search_aps(
       - 用户说 "search APS for X" / "find PRL paper on X"
     """
     if not query or not query.strip():
-        print("[search_aps] ❌ query 为空", flush=True)
+        safe_print("[search_aps] ❌ query 为空", flush=True)
         return "❌ query 不能为空"
 
     query = query.strip()
@@ -439,7 +441,7 @@ def search_aps(
         wanted = _OPENALEX_APS_DEFAULT_QUANT_PH
     source_ids = _resolve_openalex_source_ids(wanted, _OPENALEX_APS_SOURCES)
     if not source_ids:
-        print(f"[search_aps] ❌ 没有任何合法期刊 short_name (传入={wanted!r})", flush=True)
+        safe_print(f"[search_aps] ❌ 没有任何合法期刊 short_name (传入={wanted!r})", flush=True)
         return (
             f"❌ APS 搜索失败: 没有任何合法期刊 short_name\n"
             f"- 传入: {wanted}\n"
@@ -452,7 +454,7 @@ def search_aps(
     unmatched = [w for w in wanted if w.lower() not in resolved_short]
 
     short_query = (query[:60] + "...") if len(query) > 60 else query
-    print(
+    safe_print(
         f"[search_aps] start  query={short_query!r}  journals={wanted}  "
         f"max_results={max_results}  source_ids={len(source_ids)}个",
         flush=True,
@@ -467,7 +469,7 @@ def search_aps(
         )
     except ValueError as e:
         # 入参不合法 (query 空/sort 不支持 — 上面已防, 这里兜底)
-        print(f"[search_aps] ❌ 入参错: {e}", flush=True)
+        safe_print(f"[search_aps] ❌ 入参错: {e}", flush=True)
         return f"❌ APS 搜索失败 (入参): {e}"
     except RuntimeError as e:
         # 9-18 加: openalex 已经按 [timeout]/[conn]/[http 4xx]/[http 5xx]/[json] 分类了
@@ -508,7 +510,7 @@ def search_aps(
         return f"❌ APS 搜索失败 (OpenAlex): {msg}"
 
     if not results:
-        print(
+        safe_print(
             f"[search_aps] ⚠ 0 results  query={short_query!r}  journals={wanted}",
             flush=True,
         )
@@ -526,7 +528,7 @@ def search_aps(
     footer = ""
     if unmatched:
         footer = f"\n\n⚠ 未识别的 short_name: {unmatched} (可用的: {list(_OPENALEX_APS_SOURCES.keys())})"
-    print(
+    safe_print(
         f"[search_aps] done  返回 {len(results)} 篇  journals={wanted}",
         flush=True,
     )

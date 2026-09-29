@@ -48,6 +48,8 @@ from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
+
 
 # ============================================================
 # search_iop: IOP 期刊关键词搜索
@@ -77,7 +79,7 @@ def search_iop(
       - 用户说 "search IOP for X" / "find NJP paper on X"
     """
     if not query or not query.strip():
-        print("[search_iop] ❌ query 为空", flush=True)
+        safe_print("[search_iop] ❌ query 为空", flush=True)
         return "❌ query 不能为空"
 
     query = query.strip()
@@ -90,7 +92,7 @@ def search_iop(
         wanted = _OPENALEX_IOP_DEFAULT_QUANT_PH
     source_ids = _resolve_openalex_source_ids(wanted, _OPENALEX_IOP_SOURCES)
     if not source_ids:
-        print(f"[search_iop] ❌ 没有任何合法期刊 short_name (传入={wanted!r})", flush=True)
+        safe_print(f"[search_iop] ❌ 没有任何合法期刊 short_name (传入={wanted!r})", flush=True)
         return (
             f"❌ IOP 搜索失败: 没有任何合法期刊 short_name\n"
             f"- 传入: {wanted}\n"
@@ -103,7 +105,7 @@ def search_iop(
     unmatched = [w for w in wanted if w.lower() not in resolved_short]
 
     short_query = (query[:60] + "...") if len(query) > 60 else query
-    print(
+    safe_print(
         f"[search_iop] start  query={short_query!r}  journals={wanted}  "
         f"max_results={max_results}  source_ids={len(source_ids)}个",
         flush=True,
@@ -117,7 +119,7 @@ def search_iop(
             caller="search_iop",     # 9-18 加: 控制台标签用 search_iop
         )
     except ValueError as e:
-        print(f"[search_iop] ❌ 入参错: {e}", flush=True)
+        safe_print(f"[search_iop] ❌ 入参错: {e}", flush=True)
         return f"❌ IOP 搜索失败 (入参): {e}"
     except RuntimeError as e:
         msg = str(e)
@@ -155,7 +157,7 @@ def search_iop(
         return f"❌ IOP 搜索失败 (OpenAlex): {msg}"
 
     if not results:
-        print(
+        safe_print(
             f"[search_iop] ⚠ 0 results  query={short_query!r}  journals={wanted}",
             flush=True,
         )
@@ -173,7 +175,7 @@ def search_iop(
     footer = ""
     if unmatched:
         footer = f"\n\n⚠ 未识别的 short_name: {unmatched} (可用的: {list(_OPENALEX_IOP_SOURCES.keys())})"
-    print(
+    safe_print(
         f"[search_iop] done  返回 {len(results)} 篇  journals={wanted}",
         flush=True,
     )

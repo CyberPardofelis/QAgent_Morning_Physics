@@ -20,6 +20,8 @@ from ._pool_audit import _audit_pool_with_retry
 from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
+
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 def _build_candidate_pool(
     topic: str,
     max_pool: int = 50,
@@ -174,7 +176,7 @@ def _build_candidate_pool(
         # 9-18: 优先 APS 召回. 一次拉足 min_pool 篇, 不要稀稀拉拉 5 篇.
         need = max(_MIN_POOL, max_pool) - len(pool_dict)
         aps_k = min(need, 30)  # OpenAlex 单次 max 200, 限 30 避免太慢
-        print(
+        safe_print(
             f"[_build_candidate_pool] APS 召回 start  topic={topic[:60]!r}  k={aps_k}",
             flush=True,
         )
@@ -185,26 +187,26 @@ def _build_candidate_pool(
                 add_pool_entry(p)
                 aps_added += 1
             external_status["aps"] = "success" if aps_added > 0 else "0_results"
-            print(
+            safe_print(
                 f"[_build_candidate_pool] APS 召回 done  +{aps_added} 篇  pool={len(pool_dict)}",
                 flush=True,
             )
         except Exception as e:
             external_status["aps"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
-            print(
+            safe_print(
                 f"[_build_candidate_pool] APS 召回 ❌ {external_status['aps']}",
                 flush=True,
             )
             logger.warning("[_build_candidate_pool] APS 召回失败: %s", e)
     else:
         external_status["aps"] = "skipped"
-        print(f"[_build_candidate_pool] APS 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
+        safe_print(f"[_build_candidate_pool] APS 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
     # ========== 3b. IOP (OpenAlex, NJP/J.Phys.A/J.Phys.B/J.Opt.) ==========
     if len(pool_dict) < _MIN_POOL:
         need = max(_MIN_POOL, max_pool) - len(pool_dict)
         iop_k = min(need, 30)
-        print(
+        safe_print(
             f"[_build_candidate_pool] IOP 召回 start  topic={topic[:60]!r}  k={iop_k}",
             flush=True,
         )
@@ -215,26 +217,26 @@ def _build_candidate_pool(
                 add_pool_entry(p)
                 iop_added += 1
             external_status["iop"] = "success" if iop_added > 0 else "0_results"
-            print(
+            safe_print(
                 f"[_build_candidate_pool] IOP 召回 done  +{iop_added} 篇  pool={len(pool_dict)}",
                 flush=True,
             )
         except Exception as e:
             external_status["iop"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
-            print(
+            safe_print(
                 f"[_build_candidate_pool] IOP 召回 ❌ {external_status['iop']}",
                 flush=True,
             )
             logger.warning("[_build_candidate_pool] IOP 召回失败: %s", e)
     else:
         external_status["iop"] = "skipped"
-        print(f"[_build_candidate_pool] IOP 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
+        safe_print(f"[_build_candidate_pool] IOP 召回 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
     # ========== 3c. arxiv API 兜底 (9-08: 最小阈值走 env QAGENT_SURVEY_MIN_POOL, 默认 30) ==========
     # 9-18: 从 "唯一外部源" 降级为 "第三路兜底". APS / IOP 都没命中时才调 arxiv.
     if len(pool_dict) < _MIN_POOL:
         arxiv_status = "0_results"  # 默认 0 results, 拉到了再改 success
-        print(
+        safe_print(
             f"[_build_candidate_pool] arxiv 兜底 start  topic={topic[:60]!r}  pool 还差 "
             f"{_MIN_POOL - len(pool_dict)} 篇",
             flush=True,
@@ -272,14 +274,14 @@ def _build_candidate_pool(
             if arxiv_added > 0:
                 arxiv_status = "success"
             external_status["arxiv"] = arxiv_status
-            print(
+            safe_print(
                 f"[_build_candidate_pool] arxiv 兜底 done  +{arxiv_added} 篇  pool={len(pool_dict)}",
                 flush=True,
             )
         except Exception as e:
             arxiv_status = f"exception:{type(e).__name__}:{str(e)[:100]}"
             external_status["arxiv"] = arxiv_status
-            print(
+            safe_print(
                 f"[_build_candidate_pool] arxiv 兜底 ❌ {arxiv_status}",
                 flush=True,
             )
@@ -287,7 +289,7 @@ def _build_candidate_pool(
     else:
         arxiv_status = "skipped"  # pool 已够大, 没调 arxiv
         external_status["arxiv"] = "skipped"
-        print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
+        safe_print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
     # ========== 4. 9-18 加: audit retry loop (严格筛选 + 自动重搜) ==========
     # 9-18 user 拍板: 在构建候选池的时候就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),

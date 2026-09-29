@@ -14,6 +14,8 @@ from agent.tools.database import deserialize_json_fields, get_db_connection
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
+
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 @register_tool(name="query_knowledge", is_streaming=False, cost_tier="L0")
 def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str:
     """
@@ -27,13 +29,13 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     short_kw = (keyword[:50] + "...") if len(keyword) > 50 else keyword
     short_topic = (topic[:50] + "...") if len(topic) > 50 else topic
     short_author = (author[:50] + "...") if len(author) > 50 else author
-    print(
+    safe_print(
         f"[query_knowledge] start  keyword={short_kw!r}  topic={short_topic!r}  author={short_author!r}",
         flush=True,
     )
 
     if not (keyword or topic or author):
-        print("[query_knowledge] ⚠ 三个参数都为空, 全表扫描", flush=True)
+        safe_print("[query_knowledge] ⚠ 三个参数都为空, 全表扫描", flush=True)
         return (
             "⚠ query_knowledge: keyword / topic / author 至少传一个\n"
             "- 三个都空 = 全表扫描, 慢且容易超长\n"
@@ -46,13 +48,13 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     except sqlite3.DatabaseError as e:
         msg = str(e)
         if "no such table" in msg or "unable to open" in msg:
-            print(f"[query_knowledge] ❌ 数据库文件缺失/损坏: {e}", flush=True)
+            safe_print(f"[query_knowledge] ❌ 数据库文件缺失/损坏: {e}", flush=True)
             return (
                 f"❌ query_knowledge 失败: 知识库 DB 缺失或损坏\n"
                 f"- 详情: {e}\n"
                 f"- 建议: 1) 先跑 scan_local_papers 初始化库  2) 重新分析几篇论文"
             )
-        print(f"[query_knowledge] ❌ 数据库连接失败: {e}", flush=True)
+        safe_print(f"[query_knowledge] ❌ 数据库连接失败: {e}", flush=True)
         return f"❌ query_knowledge 失败: DB 连接错 ({type(e).__name__}): {e}"
 
     c = conn.cursor()
@@ -80,7 +82,7 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     except sqlite3.OperationalError as e:
         msg = str(e)
         conn.close()
-        print(f"[query_knowledge] ❌ SQL 执行失败: {msg}", flush=True)
+        safe_print(f"[query_knowledge] ❌ SQL 执行失败: {msg}", flush=True)
         if "fts5" in msg.lower() or "syntax error" in msg.lower():
             return (
                 f"❌ query_knowledge 失败: FTS5 query 语法错\n"
@@ -98,14 +100,14 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
         return f"❌ query_knowledge 失败 (SQL): {msg}"
     except Exception as e:
         conn.close()
-        print(f"[query_knowledge] ❌ 查询异常: {type(e).__name__}: {e}", flush=True)
+        safe_print(f"[query_knowledge] ❌ 查询异常: {type(e).__name__}: {e}", flush=True)
         return f"❌ query_knowledge 失败 ({type(e).__name__}): {e}"
 
     conn.close()
 
     if not rows:
         # 9-18 加: 0 结果时给具体建议, 不要直接 "未找到匹配的论文"
-        print(
+        safe_print(
             f"[query_knowledge] ⚠ 0 results  keyword={short_kw!r}  topic={short_topic!r}  author={short_author!r}",
             flush=True,
         )
@@ -137,7 +139,7 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
             lines.append(f"   - 关键词: {keywords_str}")
         lines.append("")
 
-    print(f"[query_knowledge] done  返回 {len(results)} 篇", flush=True)
+    safe_print(f"[query_knowledge] done  返回 {len(results)} 篇", flush=True)
     return "\n".join(lines)
 
 
@@ -332,7 +334,7 @@ def semantic_search_keywords(
         return f"未找到匹配 '{query}' 的 summary_item(可放宽过滤条件重试)。"
 
     # 9-09 user 拍板: 只返总数, 不贴 paper_id / title / snippet / 相似度 等具体结果
-    # 完整信息: 内部 res 变量仍有 (调试时 print(res) 可见), 但不返给 LLM/用户
+    # 完整信息: 内部 res 变量仍有 (调试时 safe_print(res) 可见), 但不返给 LLM/用户
     # LLM 需要详情时, 调 `query_knowledge(paper_id)` 按 id 单篇查; 不在 search 工具里展开
     count = len(res["ids"][0])
     return f"{res_note}找到 {count} 条相关 summary_item(query='{query}')。"

@@ -13,6 +13,8 @@ from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._relevance_filter import _relevance_filter_pool
 
 logger = logging.getLogger(__name__)
+
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 def _audit_pool_with_retry(
     topic: str,
     pool_dict: dict[str, dict[str, Any]],
@@ -58,7 +60,7 @@ def _audit_pool_with_retry(
 
     for round_idx in range(max_retries + 1):
         before_count = len(pool_dict)
-        print(
+        safe_print(
             f"{print_prefix} audit round {round_idx} start  before={before_count}",
             flush=True,
         )
@@ -107,7 +109,7 @@ def _audit_pool_with_retry(
         }
         audit_rounds.append(round_record)
 
-        print(
+        safe_print(
             f"{print_prefix} audit round {round_idx} done  +{after_count}/{before_count}  "
             f"累计合格 {len(all_kept)}/{min_pool}  ok={meets_target}",
             flush=True,
@@ -118,7 +120,7 @@ def _audit_pool_with_retry(
 
         # 不满足, 准备下一轮 retry
         if round_idx >= max_retries:
-            print(
+            safe_print(
                 f"{print_prefix} 已重试 {max_retries} 次, pool 仍不足, 停止 retry",
                 flush=True,
             )
@@ -130,7 +132,7 @@ def _audit_pool_with_retry(
         try:
             need_more = max(min_pool, max_pool) - len(all_kept)
             retry_k = min(need_more * 2, 60)   # 翻倍, 上限 60 (防太慢)
-            print(
+            safe_print(
                 f"{print_prefix} retry round {round_idx+1} start  need_more={need_more}  "
                 f"retry_k={retry_k}  source=aps+iop+arxiv",
                 flush=True,
@@ -144,9 +146,9 @@ def _audit_pool_with_retry(
                     if p.get("paper_id", "") not in seen_ids:
                         seen_ids.add(p["paper_id"])
                         new_papers.append(p)
-                print(f"{print_prefix} retry: APS +{len([p for p in aps_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+                safe_print(f"{print_prefix} retry: APS +{len([p for p in aps_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
             except Exception as e:
-                print(f"{print_prefix} retry: APS ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+                safe_print(f"{print_prefix} retry: APS ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
             try:
                 iop_k = min(retry_k // 4, 20)
                 iop_new = _openalex_iop_search(topic, iop_k)
@@ -154,9 +156,9 @@ def _audit_pool_with_retry(
                     if p.get("paper_id", "") not in seen_ids:
                         seen_ids.add(p["paper_id"])
                         new_papers.append(p)
-                print(f"{print_prefix} retry: IOP +{len([p for p in iop_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+                safe_print(f"{print_prefix} retry: IOP +{len([p for p in iop_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
             except Exception as e:
-                print(f"{print_prefix} retry: IOP ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+                safe_print(f"{print_prefix} retry: IOP ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
             try:
                 arxiv_k = min(retry_k // 4, 20)
                 arxiv_new = _arxiv_search(topic, arxiv_k)
@@ -177,17 +179,17 @@ def _audit_pool_with_retry(
                             "_match_score": 0,
                             "_source": "arxiv_api_retry",
                         })
-                print(f"{print_prefix} retry: arxiv +{len([p for p in arxiv_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
+                safe_print(f"{print_prefix} retry: arxiv +{len([p for p in arxiv_new if p.get('paper_id', '') in seen_ids])} 篇", flush=True)
             except Exception as e:
-                print(f"{print_prefix} retry: arxiv ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
+                safe_print(f"{print_prefix} retry: arxiv ❌ {type(e).__name__}: {str(e)[:60]}", flush=True)
 
-            print(f"{print_prefix} retry: 新增 {len(new_papers)} 篇 待 audit", flush=True)
+            safe_print(f"{print_prefix} retry: 新增 {len(new_papers)} 篇 待 audit", flush=True)
 
             # 把新 paper 加到下一轮 pool_dict
             for p in new_papers:
                 pool_dict[p["paper_id"]] = p
         except Exception as e:
-            print(f"{print_prefix} retry 异常停止: {e}", flush=True)
+            safe_print(f"{print_prefix} retry 异常停止: {e}", flush=True)
             break
 
     # 全局汇总: audit 拒绝理由采样 (跨所有轮, 取前 3)
@@ -208,7 +210,7 @@ def _audit_pool_with_retry(
         "max_retries": max_retries,
     }
 
-    print(
+    safe_print(
         f"{print_prefix} DONE  final_pool={final_pool_size}/{min_pool}  "
         f"meets_target={summary['pool_meets_target']}",
         flush=True,

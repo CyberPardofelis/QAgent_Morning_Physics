@@ -14,6 +14,15 @@ import sys
 import traceback
 from datetime import datetime
 
+# 2026-09-29 P0: 控制台编码兜底。
+# 项目里大量 print("... ❌ ...") 这类带 emoji 的进度输出, 而 Windows 默认控制台
+# 是 cp936, 编不了 ✅❌⚠️ 等字符 —— print 上去就是 UnicodeEncodeError,
+# **直接把业务流程打断**。实测 survey_generate 在 APS 召回失败时就崩在
+# _build_pool.py 的一行 print 上。
+# 这里把 stdout/stderr 换成"编不出来的字符替换掉"而不是抛异常。
+from agent.infra.console import install as _harden_console
+_harden_console()
+
 # 2026-09-05 P0 紧急: 显式 load_dotenv, 让 .env 里的 DISABLE_FORMULA_RENDERER=1 /
 # EMBEDDING_ENABLED=false 启动时生效
 # 之前 config/__init__.py 读 os.getenv 但 process env 不会自动从 .env 加载,
