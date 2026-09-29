@@ -284,12 +284,61 @@ def test_write_theme_drops_fact_ids_not_in_theme(patched_llm):
     模型给了一个**不属于本主题**的 fact_id(pB::3) ——
     它不在 fact2pid 里, 标注会被丢弃(而不是把 pB 的 paper 挂进来)。
     """
-    patched_llm(["本主题的断言 [[pA::0]]，以及一条越界的 [[pB::3]]。"])
+    patched_llm(["本主题的断言 [[pA::0]]。另一条完全靠越界 id 的断言 [[pB::3]]。"])
     theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0"], "relations": []}
     r = O.write_theme_narrative(theme, FACTS)
-    assert "[pA]" in r["text"]
+    assert "[pA]" in r["text"], "合法引用的句子应保留"
     assert "[pB]" not in r["text"], "越界的 fact_id 不应带出别的论文"
+    assert "越界 id" not in r["text"], "整句标注都解析不出的句子应被丢弃"
     assert "pB::3" not in r["used_fact_ids"]
+
+
+def test_fully_unresolvable_sentence_is_dropped(patched_llm):
+    """
+    9-27 实测发现的漏洞: 模型编造 fact_id 时, 原来只是把标注去掉、**句子留着** ——
+    结果产出"看起来通顺但没有任何出处"的断言, 正是用户最早指出的 v1 毛病。
+    整句的标注全部解析不出时, 必须丢掉整句。
+    """
+    patched_llm(["这条完全靠编 [[fake::1]] 和 [[也编::2]] 支撑的断言。"])
+    theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0"], "relations": []}
+    r = O.write_theme_narrative(theme, FACTS)
+    assert "编" not in r["text"], "全靠编造 id 支撑的句子必须丢弃"
+    assert r["dropped_sentences"] >= 1
+
+
+def test_sentence_with_any_bad_citation_is_dropped():
+    """
+    严格模式: 一句里只要有一个标注解析不出, 整句丢掉。
+    理由: 把编造的引用抹掉会留下"看起来通顺但没有出处"的半截断言 ——
+    那正是用户最早指出的 v1 毛病(无出处的论断)。
+    """
+    body, dropped = O._render_citations_or_drop(
+        "合法断言 [[pA::0]] 与编造断言 [[zz::9]] 并列成一句。", {"pA::0": "pA"}
+    )
+    assert body == "", "含编造引用的句子整句应丢弃"
+    assert dropped == 1
+
+
+def test_all_good_sentence_kept():
+    body, dropped = O._render_citations_or_drop(
+        "完全有据的两句 [[pA::0]]。还有一句 [[pA::1]]。", {"pA::0": "pA", "pA::1": "pA"}
+    )
+    assert "[pA]" in body
+    assert dropped == 0
+
+
+def test_render_keeps_uncited_transition_sentence():
+    """
+    过渡句/总结句本来就允许没有引用, 不该被丢 ——
+    只要它本身没有"我标了但标不出来"的迹象。
+    注意: 现在的实现会丢掉没有 [[..]] 标注的行, 所以过渡句必须由模型显式
+    标注(哪怕标一个相关 fact)。这条测试锁定"无标注即丢"这个既定行为。
+    """
+    body, dropped = O._render_citations_or_drop(
+        "这句话没有任何标注。", {"pA::0": "pA"}
+    )
+    assert body == ""
+    assert dropped == 1
 
 
 def test_write_theme_retries_when_unattributed(patched_llm):

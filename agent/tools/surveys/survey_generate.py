@@ -291,12 +291,23 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50):
     # ---- Phase 2: fact 抽取 ----
     yield "\n📝 抽取原子 fact...\n"
     from ._actions import action_extract_facts
+    # 9-27 修: state 必须带 topic —— action_extract_facts 末尾的**主题对齐审查**
+    # 要用它。漏了会 KeyError('topic'), 那套审查静默降级(实测踩到, 日志里
+    # 表现为 "fact 审查失败 (KeyError: 'topic'), 跳过")。
+    extract_state = {
+        "topic": topic,          # 主题对齐审查要用; 缺了就静默失败
+        "pool": pool,
+        "facts": [],
+        "errors": [],
+        "step": 0,
+        "finish_requested": False,
+        "max_steps": 1,
+    }
     for chunk in action_extract_facts({"paper_ids": [p["paper_id"] for p in pool]},
-                                      {"pool": pool, "facts": [], "errors": [],
-                                       "step": 0, "unresolved": []}, ws):
+                                      extract_state, ws):
         if chunk:
             yield chunk
-    facts = ws.load_facts()
+    facts = extract_state["facts"] or ws.load_facts()
     usable = [f for f in facts if _fact_is_usable(f)]
     ws.set_status("facts", len(usable), len(facts), "fact 抽取完成")
     if not usable:

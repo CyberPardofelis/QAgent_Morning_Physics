@@ -546,6 +546,81 @@ def _drop_unattributed(text: str) -> tuple[str, int]:
     return "\n\n".join(kept), dropped
 
 
+# 句子切分 —— 9-27 实测修正
+# 原来要求句末标点后必须有空白("(?<=[。!?；;])\s+")。但**中文句号后面没有空格**,
+# 于是这个正则对中文文本**从来没真正分过句** —— 整个段落被当成一句,
+# 结果是"含一个编造引用 → 整段全丢"。
+# 现在不要求空白, 但排除右引号/右括号, 避免把「……。」切断。
+_SENT_SPLIT = re.compile(r"(?<=[。！？!?；;])(?![」』”’\"'\)\]】》])")
+_ANNOT_RE = re.compile(r"\[\[([^[\]]+)\]\]")
+
+
+def _render_citations_or_drop(text: str, fact2pid: dict[str, str]) -> tuple[str, int]:
+    """
+    fact_id → paper_id 机械映射; **引不出出处的句子直接丢掉**。
+
+    9-27 实测发现的漏洞: 原来模型编造 fact_id 时, 标注被去掉但**句子留下了** ——
+    结果就是"看起来通顺但没有任何出处的断言", 正是用户最早指出的 v1 毛病。
+    现在只要一段里的标注**全部解析不出来**, 整段视为无出处, 丢弃。
+
+    Returns: (保留的文本, 被丢弃的句子数)
+    """
+    def _resolve(raw: str) -> tuple[str, bool]:
+        """返回 (替换成的引用串, 是否全部解析失败)"""
+        pids, unresolved = [], 0
+        for part in raw.split(","):
+            fid = part.strip()
+            pid = fact2pid.get(fid)
+            if pid and pid not in pids:
+                pids.append(pid)
+            else:
+                unresolved += 1
+        return "".join(f"[{p}]" for p in pids), unresolved > 0 and not pids
+
+    kept_paras, dropped = [], 0
+    for para in text.split("\n\n"):
+        kept_lines = []
+        for line in para.split("\n"):
+            if not line.strip():
+                kept_lines.append(line)
+                continue
+            # 句子级处理: 一句里可能既有合法引用又有编造的 id,
+            # 只要**至少一个**标注能解析就保留(把解析不出的部分丢掉即可);
+            # 全部解析不出才丢整句。
+            kept_sents = []
+            for sent in _SENT_SPLIT.split(line):
+                if not sent.strip():
+                    continue
+                if not _ANNOT_RE.search(sent):
+                    dropped += 1          # 本来就没标注(过渡句也走这里)
+                    continue
+                resolved_any = [False]
+                all_good = [True]
+
+                def _sub(m, _ok=resolved_any, _all=all_good):
+                    rep, all_bad = _resolve(m.group(1))
+                    _ok[0] = _ok[0] or not all_bad
+                    if all_bad:
+                        _all[0] = False
+                    return rep
+                new_sent = _ANNOT_RE.sub(_sub, sent)
+                # 严格: 只要有一个标注解析不出, 整句就不可信 —— 因为把编造的
+                # 引用抹掉会留下"看起來通顺但没有出处"的半截断言, 那正是要避免的
+                if not resolved_any[0] or not all_good[0]:
+                    dropped += 1
+                    continue
+                kept_sents.append(new_sent)
+            if kept_sents:
+                kept_lines.append(" ".join(kept_sents))
+        cleaned = "\n".join(kept_lines).strip()
+        if cleaned:
+            kept_paras.append(cleaned)
+    body = "\n\n".join(kept_paras)
+    body = re.sub(r"\[\s*\]", "", body)
+    body = re.sub(r"(\[[^\]\s]+\])(?:\s*\1)+", r"\1", body)   # 合并连续重复引用
+    return re.sub(r"[ \t]{2,}", " ", body).strip(), dropped
+
+
 def write_theme_narrative(
     theme: dict[str, Any],
     facts: list[dict[str, Any]],
@@ -634,11 +709,12 @@ def write_theme_narrative(
             continue
 
         kept, dropped = _drop_unattributed(out)
-        dropped_total += dropped
-        if kept:
-            paras.append(_render_citations(kept, fact2pid))
+        body, unresolved_dropped = _render_citations_or_drop(kept, fact2pid)
+        dropped_total += dropped + unresolved_dropped
+        if body:
+            paras.append(body)
         all_used.extend(
-            x.strip() for m in re.findall(r"\[\[([^[\]]+)\]\]", kept)
+            x.strip() for m in _ANNOT_RE.findall(kept)
             for x in m.split(",") if x.strip() in fact2pid
         )
 
