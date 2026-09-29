@@ -1,0 +1,401 @@
+"""
+tests/test_survey_organize.py — fact 优先的综述组织 (Phase B + Phase C)
+
+9-29 新增。
+
+核心不变量(按重要性):
+    1. 模型**只能输出 fact_id**, 永远拿不到 paper_id;
+       编造的 fact_id 被丢弃, 不会被换算成假引用。
+    2. 引用由 fact_id → paper_id 机械映射生成。
+    3. 无 fact 标注的句子被剔除(无出处的断言不发布)。
+    4. Phase B 的 fact_id 覆盖情况要如实报告, 不静默。
+    5. 允许分析(关系/对照), 禁止凭空补充经验内容 —— 体现在 prompt 上。
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from agent.tools.surveys import _organize as O
+
+
+def _fact(i, pid="pA", ftype="result", claim=None):
+    return {
+        "fact_id": f"{pid}::{i}",
+        "paper_id": pid,
+        "fact_type": ftype,
+        "claim": claim or f"结论 {i}",
+        "support_quote": f"quote for {i}",
+    }
+
+
+FACTS = [
+    _fact(0, "pA", "method", "提出快照算子把状态重构化为线性反演"),
+    _fact(1, "pA", "result", "快照样本复杂度随被估计量规模对数增长"),
+    _fact(2, "pB", "method", "最大似然层析在中等规模多体系统给出满意结果"),
+    _fact(3, "pB", "limitation", "最大似然在噪声下解不唯一, 需物理正则"),
+    _fact(4, "pC", "result", "置换不变表示下 20 比特态可在数分钟内重构"),
+    _fact(5, "pC", "conclusion", "结构化先验是突破维度瓶颈的主要途径"),
+    _fact(6, "pD", "result", "局域测量即可完成态验证, 拷贝数远少于层析"),
+    _fact(7, "pD", "method", "设备无关验证仅需极少量测量即可判定保真度"),
+]
+
+
+# ============================================================
+# Phase B: 主题地图
+# ============================================================
+
+class _FakeLLM:
+    """可编排的 LLM 替身: 按调用次序返回预设响应。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.prompts = []
+
+    def __call__(self, prompt, **_kw):
+        self.prompts.append(prompt)
+        return self.responses.pop(0) if self.responses else ""
+
+
+@pytest.fixture
+def patched_llm(monkeypatch):
+    def _set(responses):
+        fake = _FakeLLM(responses)
+        import agent.tools.llm as lm
+        monkeypatch.setattr(lm, "_call_llm", fake)
+        return fake
+    return _set
+
+
+THEME_JSON = json.dumps({
+    "themes": [
+        {
+            "name": "随机测量与快照",
+            "statement": "本领域已从完整重建转向只需部分信息的任务导向表征。",
+            "fact_ids": ["pA::0", "pA::1"],
+            "notes": "快照把重构化为线性反演, 样本复杂度对数增长。",
+            "relations": [
+                {"to": "数值重构方法", "type": "contrast", "note": "前者先验解析, 后者先验数值"},
+            ],
+        },
+        {
+            "name": "数值重构方法",
+            "statement": "在带噪条件下最大似然成为标配, 但依赖物理正则。",
+            "fact_ids": ["pB::2", "pB::3", "pC::4", "pC::5"],
+            "notes": "结构化先验显著压缩问题维度。",
+            "relations": [
+                {"to": "随机测量与快照", "type": "support", "note": "两者共同降低采样成本"},
+            ],
+        },
+    ],
+    "narrative_arc": ["数值重构方法", "随机测量与快照"],
+    "gaps": ["态验证的实验验证案例偏少"],
+})
+
+
+def test_organize_produces_themes(patched_llm):
+    patched_llm([f"```json\n{THEME_JSON}\n```"])
+    m = O.organize_facts_into_themes(FACTS)
+    assert len(m["themes"]) == 2
+    assert m["themes"][0]["name"] == "随机测量与快照"
+    assert m["narrative_arc"] == ["数值重构方法", "随机测量与快照"]
+    assert m["gaps"] == ["态验证的实验验证案例偏少"]
+
+
+def test_organize_keeps_model_thinking_stripped(patched_llm):
+    patched_llm(["<think>模型自述</think>" + THEME_JSON])
+    m = O.organize_facts_into_themes(FACTS)
+    assert len(m["themes"]) == 2, "think 标签应被剥掉再 parse"
+
+
+def test_organize_drops_invented_fact_ids(patched_llm):
+    """
+    核心: 模型编造的 fact_id 必须被丢弃, 且如实报告。
+    这里 'pZ::9' 和 'made_up' 都不在 fact 集合里。
+    """
+    bad = json.dumps({
+        "themes": [{
+            "name": "T", "statement": "s",
+            "fact_ids": ["pA::0", "pZ::9", "made_up", "pA::1"],
+            "notes": "", "relations": [],
+        }],
+        "narrative_arc": ["T"], "gaps": [],
+    })
+    patched_llm([bad])
+    m = O.organize_facts_into_themes(FACTS)
+    assert m["themes"][0]["fact_ids"] == ["pA::0", "pA::1"]
+    assert any("无效 fact_id" in w for w in m["warnings"])
+
+
+def test_organize_reports_uncovered_facts(patched_llm):
+    """没被任何主题覆盖的 fact 要如实报告 —— 不静默丢。"""
+    patched_llm([THEME_JSON])
+    m = O.organize_facts_into_themes(FACTS)
+    assert any("未被任何主题覆盖" in w for w in m["warnings"])
+
+
+def test_organize_skips_theme_without_valid_facts(patched_llm):
+    d = json.dumps({
+        "themes": [{"name": "空主题", "statement": "s", "fact_ids": ["nope"],
+                    "notes": "", "relations": []}],
+        "narrative_arc": [], "gaps": [],
+    })
+    patched_llm([d])
+    m = O.organize_facts_into_themes(FACTS)
+    assert m["themes"] == []
+
+
+def test_organize_dedups_theme_names(patched_llm):
+    d = json.dumps({
+        "themes": [
+            {"name": "T", "statement": "a", "fact_ids": ["pA::0"], "notes": "", "relations": []},
+            {"name": "T", "statement": "b", "fact_ids": ["pA::1"], "notes": "", "relations": []},
+        ],
+        "narrative_arc": [], "gaps": [],
+    })
+    patched_llm([d])
+    m = O.organize_facts_into_themes(FACTS)
+    assert len(m["themes"]) == 1
+    assert any("重复" in w for w in m["warnings"])
+
+
+def test_organize_respects_max_themes(patched_llm):
+    themes = [{"name": f"T{i}", "statement": "s", "fact_ids": ["pA::0"],
+               "notes": "", "relations": []} for i in range(12)]
+    patched_llm([json.dumps({"themes": themes, "narrative_arc": [], "gaps": []})])
+    m = O.organize_facts_into_themes(FACTS, max_themes=5)
+    assert len(m["themes"]) == 5
+    assert any("上限" in w for w in m["warnings"])
+
+
+def test_organize_handles_empty_facts():
+    m = O.organize_facts_into_themes([])
+    assert m["themes"] == [] and m["warnings"]
+
+
+def test_organize_reports_json_failure(patched_llm):
+    patched_llm(["完全不是 JSON"])
+    m = O.organize_facts_into_themes(FACTS)
+    assert m["themes"] == []
+    assert any("解析失败" in w for w in m["warnings"])
+
+
+def test_organize_prompt_has_no_paper_reference_list(patched_llm):
+    """
+    关键: Phase B 的 prompt 只给 fact, **不给** 参考文献表/论文标题/可引用的 id 清单。
+
+    注意 fact_id 形如 `{paper_id}::{序号}`, 所以 paper_id 字符串必然出现在 fact_id 里
+    (这是可调试性的代价, 可接受)。真正要保证的是: 没有一份独立的"可以引用哪些论文"
+    的清单交给模型 —— 那样它就能自由挑引用。paper_titles 传了也不应被渲染进 prompt。
+    """
+    fake = patched_llm([THEME_JSON])
+    O.organize_facts_into_themes(FACTS, paper_titles={"pA": "SOME PAPER TITLE"})
+    p = fake.prompts[0]
+    assert "SOME PAPER TITLE" not in p, "论文标题不应进 Phase B 的 prompt"
+    assert "pA::0" in p, "但 fact_id 必须在"
+    for marker in ("paper_id", "paper_ids", "可引用", "参考文献"):
+        assert marker not in p, f"prompt 不应含 {marker!r} 这类可自由选引用的线索"
+
+
+# ============================================================
+# Phase C: 引用映射
+# ============================================================
+
+def test_render_citations_maps_fact_id_to_paper_id():
+    text = "快照把重构化为线性反演 [[pA::0]]，样本复杂度对数增长 [[pA::1]]。"
+    out = O._render_citations(text, {"pA::0": "2401.12345", "pA::1": "2401.12345"})
+    assert "[[" not in out
+    assert out.count("[2401.12345]") == 2
+
+
+def test_render_citations_drops_invented_fact_id():
+    text = "真实断言 [[pA::0]]，编造的 [[fake::1]]。"
+    out = O._render_citations(text, {"pA::0": "2401.12345"})
+    assert "[2401.12345]" in out
+    assert "fake" not in out
+    assert "[]" not in out
+
+
+def test_render_citations_handles_combined():
+    out = O._render_citations("一条断言 [[pA::0, pB::1]]。", {"pA::0": "2401.1", "pB::1": "2401.2"})
+    assert "[2401.1]" in out and "[2401.2]" in out
+
+
+def test_render_citations_merges_adjacent_same_paper():
+    """相邻的同一篇引用要合并(连着标三次 [X] 很丑)。非相邻的保留。"""
+    out = O._render_citations("同一篇 [[pA::0]] [[pA::1]]。", {"pA::0": "X", "pA::1": "X"})
+    assert out.count("[X]") == 1, "相邻重复应合并"
+
+    out2 = O._render_citations("同一篇 [[pA::0]] 中间隔一句 [[pA::1]]。", {"pA::0": "X", "pA::1": "X"})
+    assert out2.count("[X]") == 2, "非相邻的引用应保留(每处都是独立佐证)"
+
+
+def test_render_citations_never_emits_empty_brackets():
+    out = O._render_citations("无标注断言。 [[unknown]]", {})
+    assert "[]" not in out and "[[" not in out
+
+
+# ============================================================
+# Phase C: 句子级过滤
+# ============================================================
+
+def test_drop_unattributed_keeps_tagged_only():
+    text = "第一句有标注 [[pA::0]]。\n无标注的断言。\n第三句也有 [[pA::1]]。"
+    kept, dropped = O._drop_unattributed(text)
+    assert dropped == 1
+    assert "无标注的断言" not in kept
+    assert "第一句" in kept and "第三句" in kept
+
+
+def test_drop_unattributed_keeps_paragraph_structure():
+    text = "甲 [[pA::0]]。\n\n乙无标注。\n\n丙 [[pA::1]]。"
+    kept, dropped = O._drop_unattributed(text)
+    assert dropped == 1
+    assert "乙" not in kept
+    assert len(kept.split("\n\n")) == 2
+
+
+# ============================================================
+# Phase C: 写主题叙述
+# ============================================================
+
+def test_write_theme_returns_cited_prose(patched_llm):
+    patched_llm([
+        "随机测量把状态重构化为线性反演问题 [[pA::0]]。"
+        "其样本复杂度随被估计量规模对数增长 [[pA::1]]。"
+    ])
+    theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0", "pA::1"],
+             "relations": []}
+    r = O.write_theme_narrative(theme, FACTS)
+    assert "[[" not in r["text"]
+    assert r["text"].count("[pA]") == 2
+    assert set(r["used_fact_ids"]) == {"pA::0", "pA::1"}
+
+
+def test_write_theme_drops_fact_ids_not_in_theme(patched_llm):
+    """
+    模型给了一个**不属于本主题**的 fact_id(pB::3) ——
+    它不在 fact2pid 里, 标注会被丢弃(而不是把 pB 的 paper 挂进来)。
+    """
+    patched_llm(["本主题的断言 [[pA::0]]，以及一条越界的 [[pB::3]]。"])
+    theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0"], "relations": []}
+    r = O.write_theme_narrative(theme, FACTS)
+    assert "[pA]" in r["text"]
+    assert "[pB]" not in r["text"], "越界的 fact_id 不应带出别的论文"
+    assert "pB::3" not in r["used_fact_ids"]
+
+
+def test_write_theme_retries_when_unattributed(patched_llm):
+    patched_llm([
+        "完全没有标注的一大段流畅文字,没有任何出处。",     # 第一次: 无标注
+        "这次有标注了 [[pA::0]]。",                          # 重试
+    ])
+    theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0"], "relations": []}
+    r = O.write_theme_narrative(theme, FACTS)
+    assert r["text"], "重试后应产出内容"
+    assert "没有任何出处" not in r["text"]
+
+
+def test_write_theme_gives_up_after_max_retry(patched_llm):
+    patched_llm(["无标注 A", "无标注 B", "无标注 C"])
+    theme = {"name": "T", "statement": "s", "notes": "", "fact_ids": ["pA::0"], "relations": []}
+    r = O.write_theme_narrative(theme, FACTS)
+    assert r["text"] == "" or "无标注" not in r["text"]
+    assert any("未能建立 fact 对应" in w for w in r["warnings"])
+
+
+def test_write_theme_handles_missing_facts(patched_llm):
+    r = O.write_theme_narrative(
+        {"name": "T", "fact_ids": ["pZ::9"]}, FACTS,
+    )
+    assert r["text"] == ""
+    assert r["warnings"]
+
+
+# ============================================================
+# prompt 纪律
+# ============================================================
+
+def test_write_prompt_forbids_fabricated_empirical_content():
+    p = O.THEME_WRITE_PROMPT.format(
+        theme_name="T", theme_statement="s", theme_notes="n",
+        theme_relations="r", facts_block="[pA::0] c", n_para=3,
+    )
+    assert "禁止" in p and "经验内容" in p
+    assert "装置平台" in p or "平台" in p
+
+
+def test_write_prompt_requires_analysis():
+    """综述区别于论文摘要的地方 —— 必须要求做分析, 不能一起禁掉。"""
+    p = O.THEME_WRITE_PROMPT.format(
+        theme_name="T", theme_statement="s", theme_notes="n",
+        theme_relations="r", facts_block="[pA::0] c", n_para=3,
+    )
+    assert "必须做" in p
+    assert "支持" in p and "相反" in p or "条件" in p
+    assert "摘要" in p, "应点明综述 vs 摘要的区别"
+
+
+def test_write_prompt_contains_no_paper_id():
+    p = O.THEME_WRITE_PROMPT.format(
+        theme_name="T", theme_statement="s", theme_notes="n",
+        theme_relations="r", facts_block="[pA::0] c", n_para=3,
+    )
+    assert "[pA]" not in p
+    assert "[pA::0]" in p
+
+
+def test_theme_map_prompt_forbids_paper_listing():
+    p = O.THEME_MAP_PROMPT.format(facts_block="[pA::0] c")
+    assert "论文列举" in p
+    assert "领域判断" in p
+
+
+# ============================================================
+# 组装
+# ============================================================
+
+def test_render_survey_orders_by_arc():
+    tm = {
+        "themes": [
+            {"name": "A", "statement": "sa", "fact_ids": ["pA::0"], "notes": "", "relations": []},
+            {"name": "B", "statement": "sb", "fact_ids": ["pA::1"], "notes": "", "relations": []},
+        ],
+        "narrative_arc": ["B", "A"],
+        "gaps": ["缺实验验证"],
+    }
+    nar = {"A": {"text": "AA [[pA::0]]。"}, "B": {"text": "BB [[pA::1]]。"}}
+    md = O.render_survey(tm, nar, title="综述")
+    assert md.index("## B") < md.index("## A"), "应按 narrative_arc 排序"
+    assert "# 综述" in md
+    assert "## 文献覆盖的不足" in md
+
+
+def test_render_survey_skips_empty_narratives():
+    tm = {"themes": [{"name": "A", "statement": "", "fact_ids": [], "notes": "", "relations": []}],
+          "narrative_arc": [], "gaps": []}
+    md = O.render_survey(tm, {"A": {"text": ""}})
+    assert "## A" not in md
+
+
+# ============================================================
+# 落盘
+# ============================================================
+
+def test_thematic_map_roundtrip(tmp_path):
+    from agent.infra.survey_workspace import SurveyWorkspace
+    ws = SurveyWorkspace("deadbeef1234", root=tmp_path, topic="t")
+    tm = {"themes": [{"name": "A", "statement": "s", "fact_ids": ["pA::0"],
+                      "notes": "", "relations": []}], "narrative_arc": ["A"], "gaps": []}
+    O.save_thematic_map(ws, tm)
+    back = O.load_thematic_map(ws)
+    assert back["themes"][0]["name"] == "A"
+    assert "_saved_at" in back
+    assert (ws.path / "_thematic_map.json").exists()
+
+
+def test_load_thematic_map_missing(tmp_path):
+    from agent.infra.survey_workspace import SurveyWorkspace
+    ws = SurveyWorkspace("feedface9999", root=tmp_path, topic="t")
+    assert O.load_thematic_map(ws) is None
