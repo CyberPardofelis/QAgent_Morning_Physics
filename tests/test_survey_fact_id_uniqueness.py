@@ -35,11 +35,16 @@ REPO = Path(__file__).resolve().parent.parent
 # ============================================================
 
 def test_extract_facts_reassigns_fact_id():
+    """
+    9-29: 编号逻辑已移进 clean_fact(顺带去 paper_id 标注 + 质检),
+    这里锁"抽取路径必须经过 clean_fact"这个不变量, 而不是某一行具体写法。
+    """
     src = inspect.getsource(ef.action_extract_facts)
-    assert 'f["fact_id"] = f"{paper_id}::{_i}"' in src, (
-        "抽取时必须按 {paper_id}::{序号} 重编 fact_id"
-    )
-    assert 'f["local_fact_id"]' in src, "LLM 原始 id 应保留到 local_fact_id"
+    assert "clean_fact(" in src, "抽取必须经过 clean_fact 规范化(重编 id + 去标注 + 质检)"
+    # clean_fact 内部才该做重编
+    from agent.prompts_survey import clean_fact
+    csrc = inspect.getsource(clean_fact)
+    assert 'f"{paper_id}::{idx}"' in csrc, "clean_fact 必须按 {paper_id}::{序号} 重编 fact_id"
 
 
 def test_extract_facts_source_has_no_bare_append_of_llm_fact_id():

@@ -20,6 +20,7 @@ IOP 是 quant-ph 第二大主阵地 (仅次于 APS):
 """
 import logging
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 from agent.tools.openalex import (
     _DEFAULT_TIMEOUT as _OPENALEX_TIMEOUT,
 )
@@ -47,9 +48,6 @@ from agent.tools.openalex import (
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
-
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
-
 
 # ============================================================
 # search_iop: IOP 期刊关键词搜索

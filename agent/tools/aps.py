@@ -5,6 +5,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 from agent.tools.browser_pool import get_browser_pool
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
@@ -39,8 +40,6 @@ from agent.tools.utils import JOURNAL_CONFIG
 
 logger = logging.getLogger(__name__)
 
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
-
 # ============================================================
 # 2026-09-03 接回 LLM 总结字段落库(用户拍板):
 # 之前 2026-09-02 P0.9 彻底回退只走了"抓文 + LLM 总结 return 文本",没存任何 LLM 产出。
@@ -51,7 +50,6 @@ from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji �
 #   - **不调嵌入**:LLM 总结只入 summary_items.db,不入 chromadb
 #     (chroma P0.5 嵌入仍由 analyze_paper 走 section-aware chunk 那条线,跟这条解耦)
 # ============================================================
-
 
 def fetch_aps_page_via_browser(journal: str = 'prl'):
     """
@@ -93,7 +91,6 @@ def fetch_aps_page_via_browser(journal: str = 'prl'):
     except Exception as e:
         safe_print(f"[aps] ! 浏览器抓取失败: {e}  累计耗时 {_t.time()-_t0:.1f}s", flush=True)
         raise Exception(f"浏览器自动化抓取失败: {str(e)}") from e
-
 
 def parse_aps_papers_from_html(html: str) -> list:
     soup = BeautifulSoup(html, 'html.parser')
@@ -140,7 +137,6 @@ def parse_aps_papers_from_html(html: str) -> list:
             continue
 
     return papers
-
 
 @register_tool(name="generate_aps_daily_summary", is_streaming=False)
 def generate_aps_daily_summary(journal: str = 'prl') -> str:
@@ -231,7 +227,6 @@ def generate_aps_daily_summary(journal: str = 'prl') -> str:
     except Exception as e:
         return f"❌ 抓取或总结失败: {str(e)}"
 
-
 def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> None:
     """2026-09-03: 把解析出的 LLM 字段同步 UPDATE 到 summary_item 已存在的行
 
@@ -278,7 +273,6 @@ def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> No
         logger.warning("[aps→db] 批 UPDATE 失败(已吞): %s", e)
     if saved:
         safe_print(f"[aps→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
-
 
 def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> str:
     """
@@ -386,7 +380,6 @@ def _download_with_playwright(doi: str, save_dir: str, filename: str = None) -> 
         f.write(r1.content)
     return filepath
 
-
 @register_tool(name="download_aps_paper", is_streaming=False, cost_tier="L0")
 def download_aps_paper(doi: str) -> str:
     """下载 APS 期刊论文 PDF 到 PAPER_DIR，返回本地路径"""
@@ -397,7 +390,6 @@ def download_aps_paper(doi: str) -> str:
         return f"✅ 已下载：{path}  ({os.path.getsize(path)} bytes)"
     except Exception as e:
         return f"❌ 下载失败: {str(e)}"
-
 
 # ============================================================
 # 2026-09-09 P0.6: search_aps — APS 期刊关键词搜索

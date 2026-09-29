@@ -9,13 +9,13 @@ import logging
 import sqlite3
 from typing import Any
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 from agent.tools.config import KNOWLEDGE_DIR, PAPER_DIR  # noqa: F401
 from agent.tools.database import deserialize_json_fields, get_db_connection
 from agent.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
 
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 @register_tool(name="query_knowledge", is_streaming=False, cost_tier="L0")
 def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str:
     """
@@ -142,7 +142,6 @@ def query_knowledge(keyword: str = "", topic: str = "", author: str = "") -> str
     safe_print(f"[query_knowledge] done  返回 {len(results)} 篇", flush=True)
     return "\n".join(lines)
 
-
 @register_tool(name="semantic_search", is_streaming=False, cost_tier="L0")
 def semantic_search(
     query: str,
@@ -250,7 +249,6 @@ def semantic_search(
         lines.append("")
 
     return "\n".join(lines)
-
 
 @register_tool(name="semantic_search_keywords", is_streaming=False, cost_tier="L0")
 def semantic_search_keywords(

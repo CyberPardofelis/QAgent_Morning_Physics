@@ -9,6 +9,7 @@ import logging
 import re
 from typing import Any
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 from agent.tools.config import (
     get_chroma_sim_threshold,
     get_min_pool_papers,
@@ -21,7 +22,6 @@ from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
 
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 def _build_candidate_pool(
     topic: str,
     max_pool: int = 50,

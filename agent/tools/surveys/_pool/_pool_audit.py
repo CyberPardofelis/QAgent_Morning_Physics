@@ -8,13 +8,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
+
 from ._arxiv import _arxiv_search
 from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._relevance_filter import _relevance_filter_pool
 
 logger = logging.getLogger(__name__)
 
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 def _audit_pool_with_retry(
     topic: str,
     pool_dict: dict[str, dict[str, Any]],

@@ -5,6 +5,7 @@ import arxiv
 import requests
 from bs4 import BeautifulSoup
 
+from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
 from agent.tools.config import PAPER_DIR
 from agent.tools.llm import _call_llm
 from agent.tools.registry import register_tool
@@ -12,9 +13,6 @@ from agent.tools.summary import save_summary_item
 from agent.tools.summary_parser import parse_summary_markdown
 
 logger = logging.getLogger(__name__)
-
-from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
-
 
 # 9-18 加: 自定义 User-Agent 防 arxiv 反爬 (406 Not Acceptable).
 # arxiv 库默认 User-Agent 是 "python-requests/2.32.5", 经常被 arxiv 限流拒掉.
@@ -25,7 +23,6 @@ _ARXIV_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 "
     "QAgent/1.0 (research; mailto:research@example.com)"   # 标识性 UA + 联系邮箱 (arxiv 推荐)
 )
-
 
 def _make_arxiv_client(num_retries: int = 5, page_size: int = 50, delay_seconds: float = 3.0) -> "arxiv.Client":
     """
@@ -43,7 +40,6 @@ def _make_arxiv_client(num_retries: int = 5, page_size: int = 50, delay_seconds:
     # 9-18: arxiv 库没有 user_agent 参数, 必须 patch _session.headers
     client._session.headers["User-Agent"] = _ARXIV_USER_AGENT
     return client
-
 
 def _download_pdf_with_fallback(arxiv_id: str, pdf_path) -> bool:
     """
@@ -106,12 +102,10 @@ def _download_pdf_with_fallback(arxiv_id: str, pdf_path) -> bool:
 #       + 限流,得不偿失,listing 页一行 HTTP 就够
 # ============================================================
 
-
 # ============================================================
 # 内部：抓取并解析 arXiv "今日新论文" 列表
 # ============================================================
 _ARXIV_LISTING_URL = "https://arxiv.org/list/quant-ph/new"
-
 
 def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     """
@@ -193,7 +187,6 @@ def _fetch_arxiv_listing(include_authors: bool = True) -> list:
     )
     return papers
 
-
 def _find_section_dl(soup, section_label: str):
     """2026-09-04 加:在 listing 页里找 h3 文本以 section_label 开头的那个 h3 所标注的 dl
 
@@ -214,13 +207,11 @@ def _find_section_dl(soup, section_label: str):
             return h3.find_previous('dl')
     return None
 
-
 def _format_arxiv_links(text: str) -> str:
     """把 LLM 总结里的 arXiv:NNNN.NNNNN / (NNNN.NNNNN) 转成 Markdown 超链接"""
     text = re.sub(r'arXiv:\s*(\d{4}\.\d{4,5}(?:v\d+)?)', r'arXiv:[\1](https://arxiv.org/abs/\1)', text)
     text = re.sub(r'\((\d{4}\.\d{4,5}(?:v\d+)?)\)', r'([\1](https://arxiv.org/abs/\1))', text)
     return text
-
 
 # ============================================================
 # search_arxiv: 在 arXiv 上搜索论文
@@ -323,7 +314,6 @@ def search_arxiv(
     safe_print(f"[search_arxiv] done  返回 {len(papers)} 篇  summary_only={summary_only}", flush=True)
     return output
 
-
 # ============================================================
 # download_arxiv_paper: 下载 arXiv 论文 PDF
 # 9-18 加: 自定义 User-Agent 防 406, fallback 到直接 PDF URL
@@ -375,7 +365,6 @@ def download_arxiv_paper(arxiv_id: str) -> str:
             f"❌ 下载 arXiv 论文失败: {type(e).__name__}: {e}\n"
             f"- 替代: analyze_paper(arxiv_id='{arxiv_id}') 走 API 拉元数据, 不依赖 PDF"
         )
-
 
 # ============================================================
 # generate_daily_summary_arxiv: arXiv 量子物理每日总结
@@ -464,7 +453,6 @@ def generate_daily_summary_arxiv() -> str:
     except Exception as e:
         return f"❌ 生成总结失败: {e}"
 
-
 def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> None:
     """2026-09-03: 把 LLM 解析出的字段 UPDATE 到已存在的 summary_item 行
 
@@ -503,7 +491,6 @@ def _persist_parsed_summary_fields(parsed, source: str, summary_date: str) -> No
         logger.warning("[arxiv→db] 批 UPDATE 失败(已吞): %s", e)
     if saved:
         safe_print(f"[arxiv→db] ✓ 补 LLM 字段完成: {saved}/{len(valid)} 条", flush=True)
-
 
 # ============================================================
 # analyze_today_topic_arxiv: arXiv 某主题详细分析
