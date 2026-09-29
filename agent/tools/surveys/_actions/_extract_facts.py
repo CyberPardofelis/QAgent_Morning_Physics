@@ -73,10 +73,19 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             if facts is None:
                 raise ValueError(f"JSON parse 失败 (含容错): {(out or '')[:200]}")
             # 落 _facts.jsonl
-            for f in facts:
+            for _i, f in enumerate(facts):
                 if not isinstance(f, dict):
                     continue
                 f.setdefault("paper_id", paper_id)
+                # 9-29 修 P0: fact_id 必须是**全局唯一**的。
+                # 之前直接用 LLM 返回的 fact_id, 而 build_fact_prompt 的输出示例
+                # 就是 "f1"/"f2" —— 于是每篇论文的第一条 fact 都叫 f1。
+                # 实测 181 条 fact 只有 5 个唯一 id(f1..f5), fid->paper_id 映射
+                # 97% 指向错误的论文, 引用整体错配却看不出来(同领域论文都"像")。
+                # 现在按 {paper_id}::{序号} 重编, 原文的 local_fact_id 保留备查。
+                local_id = f.get("fact_id")
+                f["local_fact_id"] = local_id
+                f["fact_id"] = f"{paper_id}::{_i}"
                 ws.append_fact(f)
                 state["facts"].append(f)
         except Exception as e:
