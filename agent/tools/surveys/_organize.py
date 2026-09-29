@@ -45,11 +45,77 @@ logger = logging.getLogger(__name__)
 # Phase B: 主题地图
 # ============================================================
 
+def cluster_by_subject(
+    facts: list[dict[str, Any]],
+    min_count: int = 2,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """
+    按 subject 把 fact 聚成簇。
+
+    为什么这一步有用 (9-29):
+        Phase B 原来把**全部** fact 平铺给 LLM 让它自己归纳主题。那是"让模型
+        凭印象总结语料结构", 换个时间跑结果就会飘。
+
+        先按 subject 聚簇, 等于先给出一个**客观的语料分布** —— 哪些对象被
+        反复讨论、各有多少条 fact。LLM 是在真实分布上归纳, 不是凭印象。
+        而且 subject 来自 fact 抽取阶段, 跨论文对齐过(同一对象用同一字符串),
+        所以"这个领域分成哪几块"这件事本身就成了可复用的资产,
+        下次写同主题综述不用重新归纳。
+
+        **subject 是提示, 不是硬约束** —— LLM 仍可跨 subject 组合主题
+        (真实的领域结构经常横跨几个对象), 只是不被单点分布带偏。
+
+    Returns: [(subject, facts), ...] 按簇大小降序; 少于 min_count 的并入 "其他"。
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    no_subject: list[dict[str, Any]] = []
+    for f in facts:
+        subj = (f.get("subject") or "").strip()
+        if not subj:
+            no_subject.append(f)
+            continue
+        buckets.setdefault(subj, []).append(f)
+
+    if not buckets:
+        return [("其他/未归类", list(facts))] if facts else []
+
+    big = [(s, fs) for s, fs in buckets.items() if len(fs) >= min_count]
+    small = [f for s, fs in buckets.items() if len(fs) < min_count for f in fs]
+    big.sort(key=lambda t: (-len(t[1]), t[0]))
+    # 9-29: 没有 subject 的 fact 也要进"其他", 否则 histogram 的总数
+    # 跟实际 fact 数对不上, LLM 会困惑("你说 39 条, 我看到 65 条")
+    small.extend(no_subject)
+    if small:
+        big.append(("其他/未归类", small))
+    return big
+
+
+def _subject_histogram(clusters) -> str:
+    """把 subject 聚类渲染成给 LLM 看的分布表。"""
+    if not clusters:
+        return "(fact 没有 subject 字段, 无法按对象聚类)"
+    lines = []
+    total = sum(len(fs) for _s, fs in clusters)
+    for subj, fs in clusters:
+        n_papers = len({f.get("paper_id") for f in fs})
+        lines.append(f"- {subj}: {len(fs)} 条 fact, 来自 {n_papers} 篇不同论文")
+    lines.append(f"(共 {total} 条 fact, {len(clusters)} 个对象簇)")
+    return "\n".join(lines)
+
+
 THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**后, 整理领域结构。
 
 下面是从文献中抽取的原子事实笔记(每条带一个 fact_id)。你的任务**不是**总结这些
 论文, 而是把这些事实**组织成一个领域的结构** —— 也就是回答: "这个领域由哪几个
 子问题构成, 它们之间是什么关系"。
+
+【语料分布 — 客观数据, 先看这个】
+下面的簇是按 fact 的 `subject`(核心对象)自动聚的, 反映了这批文献**实际**在讨论什么。
+{n_subject_histogram}
+
+**这是提示, 不是硬约束**: 真实的领域结构经常横跨几个对象(比如"随机测量"和
+"快照"常被合在一起讨论), 你可以跨簇组合主题。但它比"凭印象总结"可靠 ——
+如果你归纳出的主题和这个分布严重脱节, 说明你漏读了材料。
 
 【铁律】
 1. **只能使用下面给出的 fact_id**。不要发明 id。
@@ -80,6 +146,7 @@ THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**
 }}
 
 只输出 JSON。"""
+
 
 
 def _facts_block(facts: list[dict[str, Any]], paper_titles: dict[str, str]) -> str:
@@ -170,7 +237,13 @@ def organize_facts_into_themes(
         return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["没有 fact"]}
 
     valid_ids = {f.get("fact_id") for f in facts if f.get("fact_id")}
-    prompt = THEME_MAP_PROMPT.format(facts_block=_facts_block(facts, paper_titles))
+    # 9-29: 先按 subject 聚簇, 把客观分布给 LLM 做归纳的锚。
+    # 比"平铺全部 fact 让模型自己总结"稳 —— 那是凭印象, 换次跑就飘。
+    clusters = cluster_by_subject(facts)
+    prompt = THEME_MAP_PROMPT.format(
+        n_subject_histogram=_subject_histogram(clusters),
+        facts_block=_facts_block(facts, paper_titles),
+    )
 
     # 9-29 实测: MiniMax 即使 enable_thinking=False 也会输出大段 <think>,
     # 那部分**照样吃 max_tokens**。8000 会被思考吃光, JSON 答案被截断 -> 解析失败。
@@ -363,7 +436,12 @@ def write_theme_narrative(
         for f in batch:
             claim = (f.get("claim") or "").strip()
             quote = (f.get("support_quote") or "").strip()
-            lines.append(f"[{f['fact_id']}] ({f.get('fact_type','?')}) {claim}")
+            subj = (f.get("subject") or "").strip()
+            head = f"[{f['fact_id']}]"
+            if subj:
+                head += f" <对象: {subj}>"
+            head += f" ({f.get('fact_type','?')})"
+            lines.append(head + " " + claim)
             if quote:
                 lines.append(f"    原文: {quote[:180]}")
         facts_block = "\n".join(lines)

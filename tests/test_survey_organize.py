@@ -353,7 +353,7 @@ def test_write_prompt_contains_no_paper_id():
 
 
 def test_theme_map_prompt_forbids_paper_listing():
-    p = O.THEME_MAP_PROMPT.format(facts_block="[pA::0] c")
+    p = O.THEME_MAP_PROMPT.format(facts_block="[pA::0] c", n_subject_histogram="(无)")
     assert "论文列举" in p
     assert "领域判断" in p
 
@@ -527,3 +527,116 @@ def test_organize_audit_covers_fact_usage():
     assert "未被引用: 1 条" in md
     assert "缺 X" in md
     assert "2 句因无出处剔除" in md
+
+
+# ============================================================
+# subject 聚类作为 Phase B 的归纳锚 (9-29)
+# ============================================================
+
+def _sf(fid, subject, pid="pA"):
+    return {"fact_id": fid, "paper_id": pid, "subject": subject, "claim": "c",
+            "fact_type": "method", "support_quote": "q"}
+
+
+def test_cluster_by_subject_groups_and_sorts():
+    facts = [
+        _sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照"), _sf("a::2", "随机测量快照"),
+        _sf("b::0", "SIC-POVM 态层析"), _sf("b::1", "SIC-POVM 态层析"),
+        _sf("c::0", "张量网络"),
+    ]
+    got = O.cluster_by_subject(facts)
+    names = [s for s, _ in got]
+    assert names[0] == "随机测量快照", "最大的簇应排最前"
+    assert names[1] == "SIC-POVM 态层析"
+    assert "其他/未归类" in names, "只出现 1 次的 subject 应并入其他"
+
+
+def test_cluster_by_subject_all_without_subject():
+    """全都没有 subject 时应归成一个桶, 不是返回空。"""
+    got = O.cluster_by_subject([{"fact_id": "a::0", "claim": "c"}])
+    assert len(got) == 1 and got[0][0] == "其他/未归类"
+
+
+def test_cluster_by_subject_empty_input():
+    assert O.cluster_by_subject([]) == []
+
+
+def test_cluster_totals_match_input():
+    """
+    护栏: histogram 的总数必须等于 fact 总数。
+    否则 LLM 会看到"你说 39 条, 我这有 65 条"这种对不上的数字。
+    (9-29 实测踩到: 没 subject 的 fact 被静默丢掉)
+    """
+    facts = [
+        _sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照"),
+        _sf("b::0", "SIC-POVM"), _sf("b::1", "SIC-POVM"),
+        _sf("c::0", ""),            # 空 subject
+        {"fact_id": "d::0", "claim": "c"},   # 根本没有 subject 键
+    ]
+    cl = O.cluster_by_subject(facts)
+    assert sum(len(fs) for _s, fs in cl) == len(facts)
+    assert any(s == "其他/未归类" for s, _ in cl)
+    h = O._subject_histogram(cl)
+    assert f"共 {len(facts)} 条 fact" in h
+
+
+def test_subject_histogram_renders_counts():
+    facts = [
+        _sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照", pid="pB"),
+        _sf("b::0", "SIC-POVM 态层析"), _sf("b::1", "SIC-POVM 态层析", pid="pB"),
+    ]
+    h = O._subject_histogram(O.cluster_by_subject(facts))
+    assert "随机测量快照: 2 条 fact, 来自 2 篇不同论文" in h
+    assert "SIC-POVM 态层析: 2 条 fact, 来自 2 篇不同论文" in h
+    assert "2 个对象簇" in h
+
+
+def test_subject_histogram_handles_missing():
+    assert "无法按对象聚类" in O._subject_histogram([])
+
+
+def test_theme_map_prompt_includes_histogram_slot():
+    """护栏: Phase B 的 prompt 必须带语料分布槽位, 并说明它是提示不是硬约束。"""
+    assert "{n_subject_histogram}" in O.THEME_MAP_PROMPT
+    assert "这是提示, 不是硬约束" in O.THEME_MAP_PROMPT
+    assert "客观数据" in O.THEME_MAP_PROMPT
+
+
+def test_organize_passes_histogram_to_llm(patched_llm):
+    fake = patched_llm([THEME_JSON])
+    facts = [
+        _sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照"),
+        _sf("b::0", "SIC-POVM 态层析"), _sf("b::1", "SIC-POVM 态层析"),
+    ]
+    O.organize_facts_into_themes(facts)
+    p = fake.prompts[0]
+    assert "随机测量快照: 2 条 fact" in p, "LLM 应看到 subject 分布"
+    assert "SIC-POVM 态层析: 2 条 fact" in p
+
+
+def test_write_prompt_shows_subject_per_fact(monkeypatch):
+    """写作时也要看到每条 fact 的核心对象。"""
+    fake = _FakeLLM(["断言 [[a::0]]。"])
+    import agent.tools.llm as lm
+    monkeypatch.setattr(lm, "_call_llm", fake)
+    theme = {"name": "T", "statement": "s", "notes": "",
+             "fact_ids": ["a::0"], "relations": []}
+    O.write_theme_narrative(theme, [_sf("a::0", "随机测量快照")])
+    assert "<对象: 随机测量快照>" in fake.prompts[0]
+
+
+def test_fact_prompt_asks_for_subject():
+    """fact 抽取必须问 subject, 否则库里这列永远是空的。"""
+    from agent.prompts_survey import SURVEY_FACT_PROMPT
+    assert '"subject"' in SURVEY_FACT_PROMPT
+    assert "可跨论文对齐" in SURVEY_FACT_PROMPT
+    assert "同一个对象" in SURVEY_FACT_PROMPT, "应说明同一对象必须用同一字符串"
+
+
+def test_clean_fact_keeps_subject():
+    from agent.prompts_survey import clean_fact
+    f = clean_fact({"subject": "  随机测量快照  ", "claim": "c",
+                    "support_quote": "q"}, "pA", 0)
+    assert f["subject"] == "随机测量快照"
+    g = clean_fact({"claim": "c", "support_quote": "q"}, "pA", 1)
+    assert g["subject"] == ""

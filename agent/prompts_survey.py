@@ -184,6 +184,9 @@ def clean_fact(f: dict[str, Any], paper_id: str, idx: int) -> dict[str, Any]:
     f = dict(f)
     f.setdefault("paper_id", paper_id)
     f["fact_id"] = f"{paper_id}::{idx}"
+    # subject: 这条 fact 讨论的核心对象(跨论文对齐用, Phase B 聚类的依据)
+    subj = (f.get("subject") or "").strip()
+    f["subject"] = subj[:60]
     f["local_fact_id"] = f.pop("fact_id_local", None) or f.get("local_fact_id")
     claim = strip_paper_id_from_claim(f.get("claim", "") or "")
     f["claim"] = claim
@@ -371,9 +374,21 @@ SURVEY_FACT_PROMPT = """你是文献综述的事实抽取器, 任务:对**单篇
   - limitation:  局限/不足/未解决问题
   - hypothesis:  假设/猜想
 
+【subject 字段 — 很重要】
+subject = 这条事实讨论的**核心对象**(方法名/概念/现象), 用**可跨论文对齐的短形式**,
+2-6 个词, 尽量用领域通用叫法而不是本文的自造术语。
+  ✅ "SIC-POVM 态层析" / "随机测量快照" / "经典阴影" / "张量网络态层析"
+  ❌ "本文方法一" / "该框架" / "我们提出的技术"
+理由: 系统会按 subject 把来自不同论文的 fact 聚成簇, 再据此归纳综述的主题结构。
+subject 越对齐, 跨论文的聚类越准 —— 这直接决定综述的章节划分质量。
+如果两条 fact 讲的是同一个对象, subject 必须写成**同一个字符串**。
+
 【输出格式】严格 JSON 数组, 不要 markdown 代码块包裹, 不要解释:
 [
-  {{"fact_type": "method", "claim": "<去语境化、自足、只在原文出现过的陈述>", "support_quote": "<原文完整相关句>"}}
+  {{"subject": "<核心对象, 2-6 词, 可跨论文对齐>",
+   "fact_type": "method",
+   "claim": "<去语境化、自足、只在原文出现过的陈述>",
+   "support_quote": "<原文完整相关句>"}}
 ]
 
 只输出 JSON。"""
