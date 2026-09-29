@@ -129,6 +129,28 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             })
             yield f"👁️ 审查失败 ({friendly}), 沿用原 fact\n"
 
+    # ========== 9-29: 写入跨来源 fact 库 ==========
+    # 一次抽取不再是"用完即弃": 通过审查的 fact 进 facts.db, 带出处。
+    # 同一命题从不同论文抽出时, 内容哈希会让它们收敛成**一条 fact + 多个出处**,
+    # 引用时就能看出"几个独立工作都这么说"。
+    if state.get("facts"):
+        try:
+            from agent.tools.facts import add_facts_from_extraction
+            fst = add_facts_from_extraction(state["facts"], source_type="paper_abstract")
+            yield (
+                f"📚 已入 fact 库: 新增 {fst['new_facts']} 条, "
+                f"并入已有 fact 的新出处 {fst['multi_source']} 个"
+                + (f", 未过审跳过 {fst['ungrounded']} 条" if fst["ungrounded"] else "")
+                + "\n"
+            )
+        except Exception as e:
+            friendly = _friendly_error(e, "fact_store")
+            state["errors"].append({
+                "step": state["step"], "action": "fact_store",
+                "msg": friendly,
+            })
+            yield f"⚠ fact 库写入失败 ({friendly}), 不影响本次综述\n"
+
     # ========== 9-09 user 拍板: pre-outline fact 主题对齐审查 (mechanism B) ==========
     # 跟 _relevance_filter_pool (mechanism A) 配套 — paper 严判只过滤 pool,
     # 但 pool 内的 fact 仍可能是从邻近子领域 paper 抽出来的"挂羊头卖狗肉" 内容

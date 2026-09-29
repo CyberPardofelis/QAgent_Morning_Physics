@@ -37,6 +37,10 @@ DB_FILES: dict[str, str] = {
     # 2026-09-02 加:surveys 综述库(主题 + 章节树状结构 + 内容 markdown)
     # ROADMAP_NEXT §9.2 schema 简化版(暂不接 ReAct,UI 先建空库,等 P6 自动填)
     "surveys":       "knowledge/surveys.db",             # 综述库(主题/章节/正文)
+    # 2026-09-29 加:facts 事实库(跨来源的知识底座)
+    # ADR: fact 与 source 分表 —— 一条 fact 可有多个出处(论文A/论文B/对话…),
+    # 这一点是 fact 作为"知识型数据库"的核心价值(合并证据), 单表做不到。
+    "facts":         "knowledge/facts.db",               # 原子事实 + 多来源出处
 }
 
 
