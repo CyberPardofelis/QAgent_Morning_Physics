@@ -534,8 +534,12 @@ def test_organize_audit_covers_fact_usage():
 # ============================================================
 
 def _sf(fid, subject, pid="pA"):
-    return {"fact_id": fid, "paper_id": pid, "subject": subject, "claim": "c",
-            "fact_type": "method", "support_quote": "q"}
+    """模拟 clean_fact 产出的 fact(带 subject 校验标记)。"""
+    from agent.prompts_survey import _check_subject
+    f = {"fact_id": fid, "paper_id": pid, "subject": subject, "claim": "c",
+         "fact_type": "method", "support_quote": "q"}
+    f.update(_check_subject(subject))
+    return f
 
 
 def test_cluster_by_subject_groups_and_sorts():
@@ -640,3 +644,102 @@ def test_clean_fact_keeps_subject():
     assert f["subject"] == "随机测量快照"
     g = clean_fact({"claim": "c", "support_quote": "q"}, "pA", 1)
     assert g["subject"] == ""
+
+
+# ============================================================
+# subject 校验 + 变体检测 (9-27)
+# ============================================================
+
+def test_subject_check_flags_self_reference():
+    from agent.prompts_survey import _check_subject
+    r = _check_subject("本文方法")
+    assert r["_subject_ok"] is False
+    assert any("自指" in x for x in r["_subject_issues"])
+    r2 = _check_subject("our method")
+    assert r2["_subject_ok"] is False
+
+
+def test_subject_check_flags_empty_and_length():
+    from agent.prompts_survey import _check_subject
+    assert _check_subject("")["_subject_ok"] is False
+    assert _check_subject("X")["_subject_ok"] is False            # 过短
+    long_s = "a" * 60
+    assert _check_subject(long_s)["_subject_ok"] is False         # 过长
+    assert _check_subject("随机测量快照")["_subject_ok"] is True
+
+
+def test_subject_check_flags_trailing_punct():
+    from agent.prompts_survey import _check_subject
+    assert _check_subject("随机测量快照。")["_subject_ok"] is False
+
+
+def test_clean_fact_attaches_subject_check():
+    from agent.prompts_survey import clean_fact
+    f = clean_fact({"subject": "本文方法", "claim": "c", "support_quote": "q"}, "pA", 0)
+    assert f["_subject_ok"] is False
+    assert f["_subject_issues"]
+    g = clean_fact({"subject": "随机测量快照", "claim": "c", "support_quote": "q"}, "pA", 1)
+    assert g["_subject_ok"] is True
+
+
+def test_cluster_excludes_bad_subjects():
+    """subject 不合格的不能当聚类键, 否则污染分布。"""
+    good = [_sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照"),
+            _sf("a::2", "随机测量快照")]
+    bad = [_sf("b::0", "本文方法"), _sf("b::1", "本文方法")]
+    cl = O.cluster_by_subject(good + bad)
+    assert sum(len(fs) for _s, fs in cl) == 5, "总数必须守恒"
+    other = next(fs for s, fs in cl if s == "其他/未归类")
+    assert len(other) == 2
+
+
+def test_subject_variant_detection():
+    """同一对象的多种叫法要能被标记出来(但不合并)。"""
+    # "经典阴影层析" 是 "经典阴影" 的子串 -> 应被判为变体
+    # "张量网络态层析" 与它们 token 不重叠 -> 不该被拉进来
+    facts = [
+        _sf("a::0", "经典阴影"), _sf("a::1", "经典阴影"),
+        _sf("b::0", "经典阴影层析"), _sf("b::1", "经典阴影层析"),
+        _sf("c::0", "张量网络态层析"), _sf("c::1", "张量网络态层析"),
+    ]
+    groups = O.flag_subject_variants(facts)
+    assert groups, "应发现变体组"
+    members = {m["subject"] for m in groups[0]["members"]}
+    assert "经典阴影" in members and "经典阴影层析" in members, (
+        "子串关系的两个 subject 应在同一组"
+    )
+    # 打了标记但没真合并
+    assert len({f["subject"] for f in facts}) == 3
+    # 打了标记但没合并
+    assert len({f["subject"] for f in facts}) == 3, "不该真的合并"
+
+
+def test_subject_variant_substring_case():
+    """子串关系("经典阴影" vs "经典阴影层析")应判为可能同一对象。"""
+    facts = [_sf("a::0", "经典阴影"), _sf("b::0", "经典阴影层析")]
+    groups = O.flag_subject_variants(facts)
+    assert groups and "经典阴影" in {m["subject"] for m in groups[0]["members"]}
+
+
+def test_short_subject_excluded_from_variant_detection():
+    """
+    过短的 subject(如"阴影")本身不可靠, 不该参与变体判定 ——
+    否则一个没意义的短串会把两个不相干的对象"合并"成一组。
+    """
+    facts = [_sf("a::0", "阴影"), _sf("b::0", "随机测量")]
+    assert O.flag_subject_variants(facts) == []
+
+
+def test_subject_variant_unrelated_not_flagged():
+    facts = [_sf("a::0", "随机测量"), _sf("b::0", "张量网络态层析")]
+    assert O.flag_subject_variants(facts) == []
+
+
+def test_subject_variant_skips_bad_subjects():
+    facts = [_sf("a::0", "本文方法"), _sf("b::0", "该方法")]
+    assert O.flag_subject_variants(facts) == [], "自指 subject 不参与变体判定"
+
+
+def test_subject_variant_empty_input():
+    assert O.flag_subject_variants([]) == []
+    assert O.flag_subject_variants([_sf("a::0", "快照")]) == []

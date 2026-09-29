@@ -172,14 +172,58 @@ def strip_paper_id_from_claim(claim: str) -> str:
     return re.sub(r"\s{2,}", " ", s).strip(" ，,;；")
 
 
+# ============================================================
+# subject 校验 (9-29)
+# ============================================================
+# subject 是 Phase B 聚类的依据, 一旦被自指词/超长句/空值污染,
+# "跨论文对齐"就失效, 聚类会碎成一堆没意义的簇。
+# 这里做**确定性**检查(不调 LLM): 打标记, 不自动改写 ——
+# 改写 subject 等于替模型做判断, 出错很难回溯。
+
+_SUBJECT_GENERIC = (
+    "本文", "该文", "该方法", "该工作", "该研究", "该论文", "本工作", "方法一", "方法二",
+    "我们", "作者", "本文方法", "此方法", "上述方法", "提出的方法", "新方法",
+    "the method", "this method", "our method", "the approach", "this work",
+)
+_SUBJECT_TOO_SHORT = 3
+_SUBJECT_TOO_LONG = 40
+
+
+def _check_subject(subject: str) -> dict[str, Any]:
+    """
+    检查 subject 是否可用于跨论文对齐。
+
+    返回 {"_subject_ok": bool, "_subject_issues": [str, ...]}
+    """
+    issues: list[str] = []
+    s = (subject or "").strip()
+    if not s:
+        issues.append("subject 为空 —— 聚类时会落进'其他', 失去区分度")
+    else:
+        low = s.lower()
+        for g in _SUBJECT_GENERIC:
+            if g in low:
+                issues.append(f"含自指/泛指词 {g!r} —— 跨论文无法对齐")
+                break
+        # 长度按"字符"算: 英文 3 词大概 10+ 字符, 中文 2-6 词约 6-20 字符
+        if len(s) < _SUBJECT_TOO_SHORT:
+            issues.append(f"过短({len(s)} 字符) —— 大概率不是完整对象名")
+        if len(s) > _SUBJECT_TOO_LONG:
+            issues.append(f"过长({len(s)} 字符) —— 应该是句子而不是对象名")
+        if s.endswith(("。", ".", "，", ",", "；", ";")):
+            issues.append("以标点结尾 —— 不是干净的���象名")
+    return {"_subject_ok": not issues, "_subject_issues": issues}
+
+
 def clean_fact(f: dict[str, Any], paper_id: str, idx: int) -> dict[str, Any]:
     """
-    规范化一条抽取结果: 去 paper_id 标注 + 加质检标记。
+    规范化一条抽取结果: 去 paper_id 标注 + 加质检标记 + 校验 subject。
 
     标记:
-        _grounded  术语都在 support_quote 里(通过)
-        _unsupported_terms  超出原文的术语(写作时应回避)
-        _self_referential  claim 带"本文/该工作/作者"等自指(去语境化失败)
+        _grounded            落地审查是否通过(默认 True, 由 _fact_audit 覆盖)
+        _unsupported_terms   超出原文的术语(写作时应回避)
+        _self_referential    claim 带"本文/该工作/作者"等自指(去语境化失败)
+        _subject_ok/_subject_issues  subject 是否可用于跨论文对齐
     """
     f = dict(f)
     f.setdefault("paper_id", paper_id)
@@ -187,6 +231,7 @@ def clean_fact(f: dict[str, Any], paper_id: str, idx: int) -> dict[str, Any]:
     # subject: 这条 fact 讨论的核心对象(跨论文对齐用, Phase B 聚类的依据)
     subj = (f.get("subject") or "").strip()
     f["subject"] = subj[:60]
+    f.update(_check_subject(f["subject"]))
     f["local_fact_id"] = f.pop("fact_id_local", None) or f.get("local_fact_id")
     claim = strip_paper_id_from_claim(f.get("claim", "") or "")
     f["claim"] = claim

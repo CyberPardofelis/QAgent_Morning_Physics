@@ -38,6 +38,8 @@ import logging
 import re
 from typing import Any
 
+from agent.prompts_survey import _tokenize
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,10 +71,16 @@ def cluster_by_subject(
     """
     buckets: dict[str, list[dict[str, Any]]] = {}
     no_subject: list[dict[str, Any]] = []
+    bad_subject: list[dict[str, Any]] = []
     for f in facts:
         subj = (f.get("subject") or "").strip()
         if not subj:
             no_subject.append(f)
+            continue
+        # 9-27: subject 校验不通过的(自指/超长/过短)不适合当聚类键 ——
+        # 放进簇里会污染分布, 单独归一类并标出来
+        if f.get("_subject_ok", True) is False:
+            bad_subject.append(f)
             continue
         buckets.setdefault(subj, []).append(f)
 
@@ -82,9 +90,10 @@ def cluster_by_subject(
     big = [(s, fs) for s, fs in buckets.items() if len(fs) >= min_count]
     small = [f for s, fs in buckets.items() if len(fs) < min_count for f in fs]
     big.sort(key=lambda t: (-len(t[1]), t[0]))
-    # 9-29: 没有 subject 的 fact 也要进"其他", 否则 histogram 的总数
+    # 9-27: 没有 subject / subject 不合格的都要进"其他", 否则 histogram 的总数
     # 跟实际 fact 数对不上, LLM 会困惑("你说 39 条, 我看到 65 条")
     small.extend(no_subject)
+    small.extend(bad_subject)
     if small:
         big.append(("其他/未归类", small))
     return big
@@ -147,6 +156,97 @@ THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**
 
 只输出 JSON。"""
 
+
+
+def flag_subject_variants(
+    facts: list[dict[str, Any]],
+    min_overlap: float = 0.6,
+) -> list[dict[str, Any]]:
+    """
+    找出**可能**是同一个对象的 subject 变体, 打标记但**不合并**。
+
+    背景 (9-29):
+        subject 靠 LLM 在抽取时自己填, 没有跨篇校验。结果就是同一对象出现
+        多种叫法 —— "快照" / "classical shadow" / "经典阴影" / "阴影层析"
+        会被 `cluster_by_subject` 拆成 4 个簇, Phase B 看到的是虚假的分布。
+
+        确定性手段抓不全(同义是语义问题), 但能抓明显的:
+        token 重叠高 / 一方是另一方的子串。抓到的**只报告不合并** ——
+        与 fact 库"只追加不合并"一致, 合并判断错了不可逆。
+
+    在每条 fact 上写:
+        _subject_variant_group  组 id(同一组共用), 无变体则不写
+        _subject_canonical      组内最长的那个 subject(作为"看起来最规范"的代表)
+
+    Returns: [{group, canonical, members: [{subject, n_facts}]}, ...]
+    """
+    buckets: dict[str, list[dict]] = {}
+    for f in facts:
+        s = (f.get("subject") or "").strip()
+        if s and f.get("_subject_ok", True):
+            buckets.setdefault(s, []).append(f)
+    if len(buckets) < 2:
+        return []
+
+    names = list(buckets.keys())
+    # 并查集: 把"可能同一对象"的 subject 归到一组
+    parent: dict[str, str] = {n: n for n in names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if _subjects_may_be_same(a, b, min_overlap):
+                union(a, b)
+
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        groups.setdefault(find(n), []).append(n)
+
+    out: list[dict[str, Any]] = []
+    for _root, members in groups.items():
+        if len(members) < 2:
+            continue
+        out.append({
+            "group": _root,
+            "canonical": max(members, key=len),   # 最长的通常最规范
+            "members": [{"subject": m, "n_facts": len(buckets[m])} for m in members],
+            "note": "疑似同一对象的多种叫法, 建议统一后再聚类",
+        })
+    # 稳定排序: 按组大小+名字, 避免 union-find 的 root 顺序影响输出顺序
+    out.sort(key=lambda g: (-len(g["members"]), g["group"]))
+    # 组 id 重编号成稳定序号, **并把 fact 上的标记同步改成新 id**
+    for i, g in enumerate(out):
+        g["group"] = f"subjvar_{i}"
+        canon = g["canonical"]
+        for m in [x["subject"] for x in g["members"]]:
+            for f in buckets[m]:
+                f["_subject_variant_group"] = g["group"]
+                f["_subject_canonical"] = canon
+    return out
+
+
+def _subjects_may_be_same(a: str, b: str, min_overlap: float) -> bool:
+    """两个 subject 是否可能是同一对象(子串 或 token 高重叠)。"""
+    al, bl = a.lower(), b.lower()
+    if al == bl:
+        return False          # 已经在同一个桶里, 不算变体
+    if al in bl or bl in al:
+        return True
+    ta, tb = _tokenize(a), _tokenize(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    return inter / min(len(ta), len(tb)) >= min_overlap
 
 
 def _facts_block(facts: list[dict[str, Any]], paper_titles: dict[str, str]) -> str:
