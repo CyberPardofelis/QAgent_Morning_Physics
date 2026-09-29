@@ -405,7 +405,8 @@ def test_survey_generate_schema_exposes_phase_and_section_idx():
     from agent.tool_definitions import TOOL_SCHEMAS
     props = TOOL_SCHEMAS["survey_generate"]["function"]["parameters"]["properties"]
     assert "phase" in props
-    assert props["phase"]["enum"] == ["all", "plan", "write"]
+    # 9-29 增加了 "organize" 一档(主题驱动路线), 旧的 all/plan/write 仍在
+    assert props["phase"]["enum"] == ["all", "plan", "write", "organize"]
     assert "section_idx" in props
 
 

@@ -870,9 +870,19 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "default": 10,
                         "description": "预留 P4 ReAct 共享接口, 本轮未使用"
                     },
+                    "organize": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "走**主题驱动**路线: 先从 fact 内容归纳出领域主题地图, "
+                            "再围绕主题写叙述。章节结构由文献决定而非预设模板, "
+                            "写出来更像综述(关系/对比/推论占比高得多), 引文也不会编造。"
+                            "默认 False = 旧的 5 段模板路线(保留, 可对照回退)。"
+                        )
+                    },
                     "phase": {
                         "type": "string",
-                        "enum": ["all", "plan", "write"],
+                        "enum": ["all", "plan", "write", "organize"],
                         "default": "all",
                         "description": (
                             "执行阶段。all=一次跑完(默认)。"

@@ -17,7 +17,13 @@ import json
 
 import pytest
 
+import importlib  # noqa: E402
+
 from agent.tools.surveys import _organize as O
+
+# surveys/__init__.py 把 survey_generate 这个**函数**重导出到包命名空间, 会遮蔽同名
+# **模块**属性 —— 拿函数去 inspect._run_organize_phase 会 AttributeError。
+SG_MOD = importlib.import_module("agent.tools.surveys.survey_generate")
 
 
 def _fact(i, pid="pA", ftype="result", claim=None):
@@ -444,3 +450,80 @@ def test_parse_rejects_non_map():
     assert O._parse_theme_json('{"themes": []}') is None   # 空主题不算成功
     assert O._parse_theme_json("完全不是 JSON") is None
     assert O._parse_theme_json("") is None
+
+
+# ============================================================
+# 接入 survey_generate (9-29)
+# ============================================================
+
+def test_survey_generate_exposes_organize():
+    """旧路线必须保留 —— organize 是新增的一档, 不是替换。"""
+    from agent.tool_definitions import TOOL_SCHEMAS
+    import inspect as _i
+    props = TOOL_SCHEMAS["survey_generate"]["function"]["parameters"]["properties"]
+    assert "organize" in props, "schema 要暴露 organize 开关"
+    assert props["organize"]["default"] is False, "默认必须仍是旧路线"
+    assert props["phase"]["enum"] == ["all", "plan", "write", "organize"]
+    sig = _i.signature(SG_MOD.survey_generate)
+    assert sig.parameters["organize"].default is False
+    assert sig.parameters["phase"].default == "all"
+
+
+def test_old_route_still_default():
+    """phase 默认 all + organize 默认 False = 行为完全不变。"""
+    from agent.tool_definitions import TOOL_SCHEMAS
+    props = TOOL_SCHEMAS["survey_generate"]["function"]["parameters"]["properties"]
+    assert props["phase"]["default"] == "all"
+
+
+def test_organize_phase_routes_to_organize_phase():
+    import inspect as _i
+    src = _i.getsource(SG_MOD.survey_generate)
+    assert "_run_organize_phase" in src
+    assert 'phase == "organize" or organize' in src
+
+
+def test_organize_phase_shares_pool_and_facts_with_old_route():
+    """
+    主题驱动只替换 3/4(主题地图+主题叙述), Phase A 候选池和 fact 抽取必须复用 ——
+    否则两条路线不可对照, 而且重复造轮子。
+    """
+    import inspect as _i
+    src = _i.getsource(SG_MOD._run_organize_phase)
+    assert "_build_candidate_pool" in src, "必须复用 Phase A 候选池"
+    assert "action_extract_facts" in src, "必须复用 fact 抽取"
+    assert "organize_facts_into_themes" in src, "Phase B 主题地图"
+    assert "write_theme_narrative" in src, "Phase C 主题叙述"
+    assert "create_section" in src, "章节落 surveys.db"
+
+
+def test_organize_phase_filters_ungrounded_facts():
+    """未通过落地审查的 fact 不能进主题地图 —— 否则审查形同虚设。"""
+    import inspect as _i
+    src = _i.getsource(SG_MOD._run_organize_phase)
+    assert "usable" in src
+    assert "_fact_is_usable" in src, "必须先过滤不可用 fact"
+    # 传给 Phase B 的必须是 usable 而不是 facts
+    assert "organize_facts_into_themes(usable" in src
+
+
+def test_organize_writes_thematic_map_to_workspace():
+    import inspect as _i
+    src = _i.getsource(SG_MOD._run_organize_phase)
+    assert "save_thematic_map" in src, "主题地图要落盘(可编辑复用)"
+
+
+def test_organize_audit_covers_fact_usage():
+    """审计要报 fact 使用率 —— 哪些 fact 没被用上, 是文献覆盖的信号。"""
+    _organize_audit = SG_MOD._organize_audit
+    tm = {"themes": [{"name": "T", "statement": "s", "fact_ids": ["a::0", "a::1"],
+                      "notes": "", "relations": []}],
+          "gaps": ["缺 X"]}
+    nar = {"T": {"text": "正文", "used_fact_ids": ["a::0"], "dropped_sentences": 2,
+                 "warnings": []}}
+    facts = [{"fact_id": "a::0"}, {"fact_id": "a::1"}]
+    md = _organize_audit(tm, nar, facts)
+    assert "fact 使用率" in md
+    assert "未被引用: 1 条" in md
+    assert "缺 X" in md
+    assert "2 句因无出处剔除" in md
