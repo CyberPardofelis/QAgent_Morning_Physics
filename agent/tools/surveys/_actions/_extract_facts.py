@@ -73,19 +73,15 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             if facts is None:
                 raise ValueError(f"JSON parse 失败 (含容错): {(out or '')[:200]}")
             # 落 _facts.jsonl
-            for _i, f in enumerate(facts):
-                if not isinstance(f, dict):
+            from agent.prompts_survey import clean_fact
+            for _i, raw in enumerate(facts):
+                if not isinstance(raw, dict):
                     continue
-                f.setdefault("paper_id", paper_id)
-                # 9-29 修 P0: fact_id 必须是**全局唯一**的。
-                # 之前直接用 LLM 返回的 fact_id, 而 build_fact_prompt 的输出示例
-                # 就是 "f1"/"f2" —— 于是每篇论文的第一条 fact 都叫 f1。
-                # 实测 181 条 fact 只有 5 个唯一 id(f1..f5), fid->paper_id 映射
-                # 97% 指向错误的论文, 引用整体错配却看不出来(同领域论文都"像")。
-                # 现在按 {paper_id}::{序号} 重编, 原文的 local_fact_id 保留备查。
-                local_id = f.get("fact_id")
-                f["local_fact_id"] = local_id
-                f["fact_id"] = f"{paper_id}::{_i}"
+                # 9-29: 规范化 —— 去模型自写的 [paper_id] 标注、重编全局唯一 id、
+                # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
+                # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
+                # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
+                f = clean_fact(raw, paper_id, _i)
                 ws.append_fact(f)
                 state["facts"].append(f)
         except Exception as e:
@@ -97,6 +93,41 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
 
     # 9-08 17:20 user 拍板: 只显示"抽了 N 条 fact" 高层
     yield f"👁️ 抽完 {len(targets)} 篇, 累计 {len(state['facts'])} 条 fact\n"
+
+    # ========== 9-29: fact 落地审查 ==========
+    # 编造的源头在抽取阶段(实测"离子内附加能级"原文没有, 抽取器自行补全),
+    # 写作阶段只是照抄。这里对抽出的 fact 做一次语义审查, 超纲的打 _grounded=False,
+    # 写作阶段会据此剔除。
+    if state["facts"]:
+        from agent.tools.surveys._fact_audit import audit_fact_grounding
+        pool = state.get("pool") or []
+        src = {
+            p.get("paper_id", ""): " ".join([
+                p.get("title", "") or "", p.get("abstract", "") or "",
+                p.get("core_method", "") or "", p.get("core_contrib", "") or "",
+            ])
+            for p in pool
+        }
+        yield "🔎 fact 落地审查中(核对 claim 有没有超出原文)...\n"
+        try:
+            st = audit_fact_grounding(state["facts"], src)
+            failed_note = f" / 未能判定 {st['failed']}" if st["failed"] else ""
+            yield (
+                f"👁️ 审查: 通过 {st['grounded']} / 超纲 {st['ungrounded']}{failed_note}"
+                f" (共 {len(state['facts'])} 条)\n"
+            )
+            if st["ungrounded"]:
+                state["errors"].append({
+                    "step": state["step"], "action": "fact_grounding_audit",
+                    "msg": f"{st['ungrounded']} 条 fact 的 claim 超出原文, 写作时会剔除",
+                })
+        except Exception as e:
+            friendly = _friendly_error(e, "fact_audit")
+            state["errors"].append({
+                "step": state["step"], "action": "fact_grounding_audit",
+                "msg": friendly,
+            })
+            yield f"👁️ 审查失败 ({friendly}), 沿用原 fact\n"
 
     # ========== 9-09 user 拍板: pre-outline fact 主题对齐审查 (mechanism B) ==========
     # 跟 _relevance_filter_pool (mechanism A) 配套 — paper 严判只过滤 pool,

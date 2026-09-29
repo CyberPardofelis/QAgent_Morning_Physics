@@ -146,6 +146,57 @@ def _paper_text(p: dict[str, Any], facts: list[dict[str, Any]] | None) -> str:
     return " ".join(parts)
 
 
+# ============================================================
+# fact 规范化 (9-29)
+# ============================================================
+# 注意: 这里**不做**"claim 术语是否出现在 support_quote"的确定性检查。
+# 实测 181 条真实 fact 的 claim 是中文、原文是英文, token 覆盖率中位数 0.021,
+# 这种检查跨语言根本不成立(改查英文术语则被残留标注污染, 且中文编造细节看不见)。
+# 语义层面的"有没有超出原文"由 _fact_audit.audit_fact_grounding 负责(LLM, 分批)。
+# 本文件只做**确定无争议**的清理: 去掉模型自写的 paper_id 标注。
+
+
+def strip_paper_id_from_claim(claim: str) -> str:
+    """
+    去掉 claim 里模型自写的 [paper_id] / [paper_id: xxx] / [2209.02093] 之类标注。
+
+    9-29: paper_id 现在由 fact_id 机械映射, claim 里再带一份既是冗余,
+    也是污染源 —— 实测 91% 的 claim 内嵌了这种标注, 且格式五花八门
+    ([2209.02093] / [paper_id: 10.1103/xxx]), 抽取器根本解析不出来。
+    """
+    if not claim:
+        return ""
+    s = re.sub(r"\[\s*paper_id\s*[:：]\s*[^\]]*\]", "", claim, flags=re.I)
+    s = re.sub(r"\[(?:\d{4}\.\d{4,5}(?:v\d+)?|\d{7})\]", "", s)
+    s = re.sub(r"\[10\.\d{4,9}/[^\]]*\]", "", s)
+    return re.sub(r"\s{2,}", " ", s).strip(" ，,;；")
+
+
+def clean_fact(f: dict[str, Any], paper_id: str, idx: int) -> dict[str, Any]:
+    """
+    规范化一条抽取结果: 去 paper_id 标注 + 加质检标记。
+
+    标记:
+        _grounded  术语都在 support_quote 里(通过)
+        _unsupported_terms  超出原文的术语(写作时应回避)
+        _self_referential  claim 带"本文/该工作/作者"等自指(去语境化失败)
+    """
+    f = dict(f)
+    f.setdefault("paper_id", paper_id)
+    f["fact_id"] = f"{paper_id}::{idx}"
+    f["local_fact_id"] = f.pop("fact_id_local", None) or f.get("local_fact_id")
+    claim = strip_paper_id_from_claim(f.get("claim", "") or "")
+    f["claim"] = claim
+    # _grounded 默认 True; 由 _fact_audit.audit_fact_grounding 事后覆盖。
+    # (确定性词表检查在跨语言下不成立, 已移除 — 见上方注释)
+    f.setdefault("_unsupported_terms", [])
+    f.setdefault("_grounded", True)
+    f["_self_referential"] = any(
+        s in claim for s in ("本文", "该工作", "该文", "该研究", "该论文", "本工作", "作者", "我们")
+    )
+    return f
+
+
 def select_relevant_papers(
     papers: list[dict[str, Any]],
     query_text: str,
@@ -198,8 +249,16 @@ def _is_usable_fact(f: dict[str, Any]) -> bool:
 
     审查关闭时 (get_fact_review_threshold()==0) 不写这个字段, 视为可用,
     行为与之前一致。
+    9-29 再加一层: `_grounded=False` —— 确定性质检(fact_grounding_problems)
+    判定 claim 里的术语没出现在 support_quote 中, 即该 claim 超出原文。
+    实测"离子阱/离子附加能级/避免辅助离子"就属此类 —— 论文摘要只提了
+    ion trap 和 nonorthogonal, 抽取器自行补全成完整机制。这类 fact 是
+    **编造的**, 绝不能进写作素材。
     """
-    return f.get("_is_topic_aligned", True) is not False
+    return not (
+        f.get("_is_topic_aligned", True) is False
+        or f.get("_grounded", True) is False
+    )
 
 
 def format_papers_with_facts(
@@ -270,43 +329,40 @@ def format_papers_with_facts(
 # ============================================================
 # 1. SURVEY_FACT_PROMPT — 从单篇 paper 提 3-5 个 fact(Phase C)
 # ============================================================
-SURVEY_FACT_PROMPT = """你是文献综述助手,任务:对**单篇论文**做事实提取,产出一组原子 fact。
+SURVEY_FACT_PROMPT = """你是文献综述的事实抽取器, 任务:对**单篇论文**做原子事实抽取。
 
-【输入论文】
-- paper_id: {paper_id}
-- title: {title}
-- authors: {authors}
-- year: {year}
-- journal: {journal}
-- abstract: {abstract}
-- core_method: {core_method}
-- core_contrib: {core_contrib}
-- outlook: {outlook}
+【你的产出会被放进综述正文, 在那里"本文/该工作/作者"会失去指代对象】
+所以每条事实必须是**自足**的、去语境化的陈述。
 
-【任务】
-从上述论文中提取 **3-5 个** 原子 fact(每条 fact 是 1 句事实性陈述),用于后续综述章节生成引用。
+【铁律 — 违反即为错误】
+1. **只允许复述【论文原文】里出现过的内容**。
+   禁止"补充"你觉得合理但原文没写的细节 —— 尤其是:
+   - 实验平台/装置(离子阱、超导、NMR、光晶格、中性原子…)。原文没写平台就不要写。
+   - 具体机制("利用 X 的附加能级实现 Y"、"通过 Z 消除 W")。原文没写机制就不要写。
+   - 数字、年份、人名。原文没有的不要出现。
+   看到摘要里出现两个相关词就自行补全成一条因果链, 是最严重的错误。
+2. **claim 的主语必须是方法/概念/现象本身**, 不是"本文/该工作/作者/我们"。
+   ❌ "本文提出稳定化解析延拓框架"        (读者不知道谁提出的)
+   ✅ "稳定化解析延拓(SAC)框架从多项式估计中重构密度矩阵的非多项式解析函数"
+3. **claim 里不要写 [paper_id]、不要写编号**。出处由系统按 fact_id 机械关联, 不需要你写。
+   写错反而会污染引用。
+4. **support_quote 必须是原文的完整相关句**(可以多句), 且必须**包含 claim 的关键术语**。
+   support_quote 用来核对 claim 有没有超出原文 —— 如果它撑不起 claim, 说明 claim 编了。
+5. 信息不足就**少提**。3 条可靠的 fact 远好过 5 条混着编造的。
 
-【fact 类型】(每条 fact 必须标一个):
-  - method: 用了什么方法/算法/框架
-  - result: 实验/理论结果(数字 / 性能 / 复杂度)
-  - conclusion: 核心结论(该论文最想说的)
-  - limitation: 局限/不足/未解决问题
-  - hypothesis: 假设/猜想(论文里"假设 X 成立"那种)
+【fact 类型】(每条必须标一个)
+  - method:      用了什么方法/算法/框架
+  - result:      实验/理论结果(数字、性能、复杂度)
+  - conclusion:  核心结论
+  - limitation:  局限/不足/未解决问题
+  - hypothesis:  假设/猜想
 
-【强制约束】
-1. 数量: 3-5 条,不多不少(中位数 4,根据信息密度自行调整)
-2. claim 末尾**必须**带 [paper_id](用上面给的 paper_id,不要编)
-3. support_quote 必须是**原文摘录**(可短可拼接),**不要改写或意译**;找不到原文就降级到 abstract 原句
-4. 不要编造方法/数字/实验结果,信息不够就少提,不要凑数
-5. 不输出论文的"复述",只提取"可被引用的原子事实"
-
-【输出格式】(严格 JSON 数组,不要 markdown 代码块包裹,不要解释)
+【输出格式】严格 JSON 数组, 不要 markdown 代码块包裹, 不要解释:
 [
-  {{"fact_id": "f1", "fact_type": "method", "claim": "Smith 等提出用 surface code 做容错, [paper_id]", "support_quote": "We propose a surface code architecture for fault-tolerant quantum computation, [paper_id]"}},
-  {{"fact_id": "f2", "fact_type": "result", "claim": "...", "support_quote": "..."}}
+  {{"fact_type": "method", "claim": "<去语境化、自足、只在原文出现过的陈述>", "support_quote": "<原文完整相关句>"}}
 ]
 
-只输出 JSON,不要前缀解释,不要后缀总结。"""
+只输出 JSON。"""
 
 
 def build_fact_prompt(
