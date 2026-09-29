@@ -139,6 +139,7 @@ class ChatWindow(QMainWindow):
         #   - 论文摘要知识库: summary_items.db(粒度细, 抓文级 + LLM 关键词)
         #   - 论文分析知识库: papers.db(粒度粗, 已精细分析的论文)
         #   - 论文综述库:     surveys.db(主题 + 章节, 综述生成待 P6)
+        # 2026-09-29 加: 信息知识库 facts.db(粒度是"事实", 多篇论文可共用一条)
         # 模板参考"设置"下拉菜单 L122-128 模式
         knowledge_menu = menubar.addMenu("知识库")
         summary_kb_action = QAction("论文摘要知识库", self)
@@ -147,6 +148,9 @@ class ChatWindow(QMainWindow):
         paper_kb_action = QAction("论文分析知识库", self)
         paper_kb_action.triggered.connect(self.open_knowledge_base)
         knowledge_menu.addAction(paper_kb_action)
+        fact_kb_action = QAction("信息知识库", self)
+        fact_kb_action.triggered.connect(self.open_fact_kb)
+        knowledge_menu.addAction(fact_kb_action)
         survey_workspace_action = QAction("论文综述库", self)
         survey_workspace_action.triggered.connect(self.open_survey_workspace)
         knowledge_menu.addAction(survey_workspace_action)
@@ -334,6 +338,16 @@ class ChatWindow(QMainWindow):
         dialog = SummaryKBDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         self._summary_kb_dialog = dialog
+        dialog.show()
+
+    def open_fact_kb(self):
+        """信息知识库(2026-09-29 加): facts.db, 粒度是"事实"(多篇论文可共用一条)"""
+        from ui.fact_kb_dialog import FactKBDialog
+        dialog = FactKBDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        # 非模态: 不阻塞主窗口, 用户可以边看边切回去
+        dialog.setWindowModality(Qt.NonModal)
+        self._fact_kb_dialog = dialog
         dialog.show()
 
     def open_survey_workspace(self):
