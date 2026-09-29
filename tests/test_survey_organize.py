@@ -399,3 +399,48 @@ def test_load_thematic_map_missing(tmp_path):
     from agent.infra.survey_workspace import SurveyWorkspace
     ws = SurveyWorkspace("feedface9999", root=tmp_path, topic="t")
     assert O.load_thematic_map(ws) is None
+
+
+# ============================================================
+# JSON 容错提取 (9-29 实测: MiniMax 把答案吃进 think 块 / 被截断)
+# ============================================================
+
+_MAP = {"themes": [{"name": "T", "statement": "s", "fact_ids": ["pA::0"],
+                    "notes": "", "relations": []}],
+        "narrative_arc": ["T"], "gaps": []}
+
+
+def test_parse_plain_json():
+    assert O._parse_theme_json(json.dumps(_MAP))["themes"][0]["name"] == "T"
+
+
+def test_parse_fenced_json():
+    assert O._parse_theme_json("```json\n" + json.dumps(_MAP) + "\n```") is not None
+
+
+def test_parse_strips_think():
+    got = O._parse_theme_json("<think>先想一下</think>" + json.dumps(_MAP))
+    assert got and got["themes"][0]["name"] == "T"
+
+
+def test_parse_falls_back_into_raw_when_think_eats_everything():
+    """
+    实测场景: 思考吃光 max_tokens, 剥掉 think 后是空串,
+    但 JSON 写在 think 块内部 —— 必须回退。
+    """
+    got = O._parse_theme_json("<think>" + json.dumps(_MAP))
+    assert got and got["themes"][0]["name"] == "T"
+
+
+def test_parse_recovers_truncated_json():
+    """答案被 max_tokens 截断, 右括号缺失 —— 补齐后应能解析。"""
+    truncated = json.dumps(_MAP)[:-1]
+    got = O._parse_theme_json(truncated)
+    assert got and got["themes"][0]["name"] == "T"
+
+
+def test_parse_rejects_non_map():
+    assert O._parse_theme_json('{"foo": 1}') is None
+    assert O._parse_theme_json('{"themes": []}') is None   # 空主题不算成功
+    assert O._parse_theme_json("完全不是 JSON") is None
+    assert O._parse_theme_json("") is None

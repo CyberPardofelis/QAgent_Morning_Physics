@@ -93,6 +93,62 @@ def _facts_block(facts: list[dict[str, Any]], paper_titles: dict[str, str]) -> s
     return "\n".join(out)
 
 
+def _parse_theme_json(raw: str) -> dict[str, Any] | None:
+    """
+    从模型输出里抠出主题地图 JSON。
+
+    9-29 实测踩到的三种情况都要兜住:
+      1. 正常: 纯 JSON
+      2. ```json ... ``` 包裹
+      3. 前面一大段 <think> 思考, 答案被 max_tokens 截断在 think 里
+         —— 此时先剥 think 得到空串, 必须回退到**原始串**里找 JSON;
+         还有一种是把 JSON 写在 <think> 和 </think> 之间(思考与答案混排)。
+    """
+    import json as _json
+
+    def _try(s: str):
+        if not s:
+            return None
+        # 注意两个坑:
+        #  - 被 max_tokens 截断时可能**连右括号都没有**, 所以不能只匹配完整的 {...}
+        #  - ```json ... ``` 包裹时尾部有反引号, 不能直接 loads 整段
+        i = s.find("{")
+        if i < 0:
+            return None
+        body = s[i:]
+        j = body.rfind("}")
+        candidates = [body] if j < 0 else [body[:j + 1], body]
+        for cand in candidates:
+            try:
+                v = _json.loads(cand)
+            except Exception:
+                continue
+            if isinstance(v, dict) and isinstance(v.get("themes"), list) and v["themes"]:
+                return v
+        # 补右括号 / 补尾引号再试(截断恢复)
+        for tail in ("}", "}}", '"}}', '"}}}', '"]}}', '"', ']', '"}]', '"}}]}'):
+            try:
+                v = _json.loads(body + tail)
+            except Exception:
+                continue
+            if isinstance(v, dict) and isinstance(v.get("themes"), list) and v["themes"]:
+                return v
+        return None
+
+    # 1) 剥 think 后
+    stripped = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.S).strip()
+    for cand in (stripped, raw or ""):
+        got = _try(cand)
+        if got:
+            return got
+    # 2) <think> ... JSON ... </think> 混排: 取每个 think 块内部
+    for block in re.findall(r"<think>([\s\S]*?)</think>", raw or ""):
+        got = _try(block)
+        if got:
+            return got
+    return None
+
+
 def organize_facts_into_themes(
     facts: list[dict[str, Any]],
     paper_titles: dict[str, str] | None = None,
@@ -116,27 +172,19 @@ def organize_facts_into_themes(
     valid_ids = {f.get("fact_id") for f in facts if f.get("fact_id")}
     prompt = THEME_MAP_PROMPT.format(facts_block=_facts_block(facts, paper_titles))
 
+    # 9-29 实测: MiniMax 即使 enable_thinking=False 也会输出大段 <think>,
+    # 那部分**照样吃 max_tokens**。8000 会被思考吃光, JSON 答案被截断 -> 解析失败。
+    # 主题地图是要"想清楚"的活, 给足预算。
     out = _call_llm(prompt, provider=provider, model=model,
                     enable_thinking=False, temperature=temperature,
-                    max_tokens=8000, timeout=300)
+                    max_tokens=20000, timeout=600)
     if not out:
         return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["LLM 返回空"]}
-    if "<think>" in out:
-        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
 
-    import json as _json
-    parsed = None
-    m = re.search(r"\{[\s\S]*\}", out)
-    if m:
-        try:
-            v = _json.loads(m.group(0))
-            if isinstance(v, dict) and "themes" in v:
-                parsed = v
-        except Exception:
-            parsed = None
+    parsed = _parse_theme_json(out)
     if parsed is None:
         return {"themes": [], "narrative_arc": [], "gaps": [],
-                "warnings": [f"主题地图 JSON 解析失败: {out[:200]}"]}
+                "warnings": [f"主题地图 JSON 解析失败 (返回 {len(out)} 字符): {out[-300:]}"]}
 
     warnings: list[str] = []
     themes: list[dict[str, Any]] = []
@@ -284,10 +332,15 @@ def write_theme_narrative(
     n_para: int = 3,
     temperature: float = 0.4,
     max_retry: int = 1,
+    chunk_size: int = 8,
 ) -> dict[str, Any]:
     """
     Phase C: 围绕一个主题写叙述。返回
         {"text": str, "used_fact_ids": [...], "dropped_sentences": int, "warnings": [...]}
+
+    9-29 实测补充: 一个主题的 fact 数可能到 30+ 条。一次性全塞进 prompt 时
+    模型会完全忘了标注 fact_id(返回 0 字符)。所以**主题内也分批**:
+    每批 chunk_size 条写若干段, 拼起来。分批后每个小批的标注服从率显著提高。
     """
     from agent.tools.llm import _call_llm
 
@@ -297,64 +350,83 @@ def write_theme_narrative(
         return {"text": "", "used_fact_ids": [], "dropped_sentences": 0,
                 "warnings": ["主题没有可用的 fact"]}
 
-    fact2pid = {f["fact_id"]: f.get("paper_id", "") for f in theme_facts}
-    lines = []
-    for f in theme_facts:
-        claim = (f.get("claim") or "").strip()
-        quote = (f.get("support_quote") or "").strip()
-        lines.append(f"[{f['fact_id']}] ({f.get('fact_type','?')}) {claim}")
-        if quote:
-            lines.append(f"    原文: {quote[:180]}")
-    facts_block = "\n".join(lines)
-
-    rels = theme.get("relations") or []
-    rel_txt = "\n".join(
-        f"- 与「{r.get('to')}」是 {r.get('type')} 关系: {r.get('note')}"
-        for r in rels if r.get("to")
-    ) or "(无)"
-
-    prompt = THEME_WRITE_PROMPT.format(
-        theme_name=theme.get("name", ""),
-        theme_statement=theme.get("statement", "") or "(未给出)",
-        theme_notes=theme.get("notes", "") or "(无)",
-        theme_relations=rel_txt,
-        facts_block=facts_block,
-        n_para=n_para,
-    )
-
     warnings: list[str] = []
-    out = ""
-    for attempt in range(max_retry + 1):
-        if attempt:
-            prompt += (
-                "\n\n【重要 — 上一版没有任何 fact 标注, 已被作废】\n"
-                "每个陈述性句子的句末**必须**跟 [[fact_id]] 标注, id 只能取上面列出的。\n"
-                "没有 fact 支撑的话就不要写那一句。"
+    all_used: list[str] = []
+    paras: list[str] = []
+    dropped_total = 0
+    failed_batches = 0
+
+    batches = [theme_facts[i:i + chunk_size] for i in range(0, len(theme_facts), chunk_size)]
+    for bi, batch in enumerate(batches, 1):
+        fact2pid = {f["fact_id"]: f.get("paper_id", "") for f in batch}
+        lines = []
+        for f in batch:
+            claim = (f.get("claim") or "").strip()
+            quote = (f.get("support_quote") or "").strip()
+            lines.append(f"[{f['fact_id']}] ({f.get('fact_type','?')}) {claim}")
+            if quote:
+                lines.append(f"    原文: {quote[:180]}")
+        facts_block = "\n".join(lines)
+
+        prompt = THEME_WRITE_PROMPT.format(
+            theme_name=theme.get("name", ""),
+            theme_statement=theme.get("statement", "") or "(未给出)",
+            theme_notes=theme.get("notes", "") or "(无)",
+            theme_relations=(
+                "\n".join(f"- 与「{r.get('to')}」是 {r.get('type')} 关系: {r.get('note')}"
+                          for r in (theme.get("relations") or []) if r.get("to"))
+                or "(无)"
+            ),
+            facts_block=facts_block,
+            n_para=n_para if len(batches) == 1 else max(2, n_para // 2),
+        )
+
+        out = ""
+        for attempt in range(max_retry + 1):
+            if attempt:
+                prompt += (
+                    "\n\n【重要 — 上一版没有任何 fact 标注, 已被作废】\n"
+                    "每个陈述性句子的句末**必须**跟 [[fact_id]] 标注, id 只能取上面列出的。\n"
+                    "没有 fact 支撑的话就不要写那一句。"
+                )
+            out = _call_llm(prompt, provider=provider, model=model,
+                            enable_thinking=False, temperature=temperature,
+                            max_tokens=12000, timeout=420)
+            if not out:
+                continue
+            if "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+            out = out.replace("```markdown", "").replace("```", "").strip()
+            if re.search(r"\[\[", out):
+                break
+        else:
+            failed_batches += 1
+            warnings.append(
+                f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批未能建立 fact 对应"
             )
-        out = _call_llm(prompt, provider=provider, model=model,
-                        enable_thinking=False, temperature=temperature,
-                        max_tokens=8000, timeout=300)
-        if not out:
             continue
-        if "<think>" in out:
-            out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
-        out = out.replace("```markdown", "").replace("```", "").strip()
-        if re.search(r"\[\[", out):
-            break
-    else:
-        warnings.append(f"主题「{theme.get('name')}」未能建立 fact 对应, 已跳过")
 
-    if not out:
-        return {"text": "", "used_fact_ids": [], "dropped_sentences": 0, "warnings": warnings}
+        kept, dropped = _drop_unattributed(out)
+        dropped_total += dropped
+        if kept:
+            paras.append(_render_citations(kept, fact2pid))
+        all_used.extend(
+            x.strip() for m in re.findall(r"\[\[([^[\]]+)\]\]", kept)
+            for x in m.split(",") if x.strip() in fact2pid
+        )
 
-    kept, dropped = _drop_unattributed(out)
-    text = _render_citations(kept, fact2pid)
-    used = sorted({x.strip() for m in re.findall(r"\[\[([^[\]]+)\]\]", kept)
-                   for x in m.split(",") if x.strip() in fact2pid})
-    if dropped:
-        warnings.append(f"{dropped} 句因无 fact 标注被剔除")
-    return {"text": text, "used_fact_ids": used,
-            "dropped_sentences": dropped, "warnings": warnings}
+    if failed_batches == len(batches) and batches:
+        warnings.append(f"主题「{theme.get('name')}」全部批次均未建立 fact 对应, 已跳过")
+        return {"text": "", "used_fact_ids": [], "dropped_sentences": dropped_total,
+                "warnings": warnings}
+
+    if dropped_total:
+        warnings.append(f"{dropped_total} 句因无 fact 标注被剔除")
+    if len(batches) > 1:
+        warnings.append(f"主题含 {len(theme_facts)} 条 fact, 分 {len(batches)} 批生成")
+
+    return {"text": "\n\n".join(paras), "used_fact_ids": sorted(set(all_used)),
+            "dropped_sentences": dropped_total, "warnings": warnings}
 
 
 # ============================================================
