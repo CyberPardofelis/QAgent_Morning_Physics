@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 def cluster_by_subject(
     facts: list[dict[str, Any]],
-    min_count: int = 2,
+    min_count: int | None = None,
 ) -> list[tuple[str, list[dict[str, Any]]]]:
     """
     按 subject 把 fact 聚成簇。
@@ -67,8 +67,19 @@ def cluster_by_subject(
         **subject 是提示, 不是硬约束** —— LLM 仍可跨 subject 组合主题
         (真实的领域结构经常横跨几个对象), 只是不被单点分布带偏。
 
-    Returns: [(subject, facts), ...] 按簇大小降序; 少于 min_count 的并入 "其他"。
+    min_count: 少于这个条数的 subject 并入"其他"。**自适应语料规模** ——
+        9-27 实测: 10 篇主题各异的论文, 多数 subject 本就只出现 1 次,
+        固定 min_count=2 会把 29/67 条全丢进"其他", 分布失去意义。
+        语料越小, 门槛越低(小到只剩 3-4 篇时, 出现 1 次也值得单独看)。
+    Returns: [(subject, facts), ...] 按簇大小降序。
     """
+    n = len(facts)
+    if min_count is None:
+        # 语料小的时候(几十条), 多数 subject 本来就只出现 1 次 ——
+        # 那不是噪声, 那就是"这几篇论文各讲各的"这个事实本身。
+        # 门槛太高会把整个分布压成一个"其他", Phase B 就看不到结构了。
+        min_count = 1 if n < 120 else (2 if n < 300 else 3)
+
     buckets: dict[str, list[dict[str, Any]]] = {}
     no_subject: list[dict[str, Any]] = []
     bad_subject: list[dict[str, Any]] = []
@@ -99,15 +110,28 @@ def cluster_by_subject(
     return big
 
 
-def _subject_histogram(clusters) -> str:
-    """把 subject 聚类渲染成给 LLM 看的分布表。"""
+def _subject_histogram(clusters, top_k: int = 15) -> str:
+    """
+    把 subject 聚类渲染成给 LLM 看的分布表。
+
+    只列前 top_k 个簇, 其余汇总成一行 —— 40 多个只出现 1 次的对象全列出来
+    会把 prompt 撑爆, 而它们对"这个领域由哪几块构成"这个问题贡献不大。
+    但**总数必须守恒**(汇总行写明被折叠的簇数与 fact 数), 否则 LLM 看到的
+    数字和它手里的 fact 数对不上, 会困惑。
+    """
     if not clusters:
         return "(fact 没有 subject 字段, 无法按对象聚类)"
     lines = []
     total = sum(len(fs) for _s, fs in clusters)
-    for subj, fs in clusters:
+    for subj, fs in clusters[:top_k]:
         n_papers = len({f.get("paper_id") for f in fs})
         lines.append(f"- {subj}: {len(fs)} 条 fact, 来自 {n_papers} 篇不同论文")
+    rest = clusters[top_k:]
+    if rest:
+        n_rest_facts = sum(len(fs) for _s, fs in rest)
+        lines.append(
+            f"- (其余 {len(rest)} 个只覆盖少量 fact 的对象, 合计 {n_rest_facts} 条, 已折叠)"
+        )
     lines.append(f"(共 {total} 条 fact, {len(clusters)} 个对象簇)")
     return "\n".join(lines)
 
@@ -216,9 +240,14 @@ def flag_subject_variants(
     for _root, members in groups.items():
         if len(members) < 2:
             continue
+        # 9-27 实测修正: canonical 取**最短**的, 不是最长的。
+        # 之前选最长, 结果把"经典阴影与直接量子测量硬件对比"(一整个句子)
+        # 当成了规范名 —— 那是句子不是对象名。
+        # 短的反而更像"这个名字本身"。
+        canonical = min(members, key=lambda m: (len(m), m))
         out.append({
             "group": _root,
-            "canonical": max(members, key=len),   # 最长的通常最规范
+            "canonical": canonical,
             "members": [{"subject": m, "n_facts": len(buckets[m])} for m in members],
             "note": "疑似同一对象的多种叫法, 建议统一后再聚类",
         })
@@ -236,17 +265,37 @@ def flag_subject_variants(
 
 
 def _subjects_may_be_same(a: str, b: str, min_overlap: float) -> bool:
-    """两个 subject 是否可能是同一对象(子串 或 token 高重叠)。"""
+    """
+    两个 subject 是否可能是同一对象。
+
+    9-27 实测踩到的坑: 最初用 token 重叠率 `inter / min(len)` 判定,
+    结果中文被严重误判 —— "经典阴影" / "费米子经典阴影" / "经典阴影层析"
+    共享"经典/阴影/层析"这几个单字 token, 重叠率轻松过 0.6, 于是
+    20 个明显不同的 subject 被并成了一组, Phase B 拿到的是虚假分布。
+
+    改成两条**更严**的判据(满足其一即可):
+      a) 一方是另一方的子串, 且较短方长度 >= 4
+         ("经典阴影" ⊂ "经典阴影层析" -> 判为变体; 排除 "X" ⊂ 任何 X 的噪声)
+      b) token 重叠率高 **且** 较短方的 token 几乎完全被包含
+         (overlap >= 阈值, 且 inter / min >= 0.9 —— 几乎完全一致才认为同义)
+    """
     al, bl = a.lower(), b.lower()
     if al == bl:
-        return False          # 已经在同一个桶里, 不算变体
-    if al in bl or bl in al:
+        return False          # 同一个桶, 不算变体
+    short, long = (al, bl) if len(al) <= len(bl) else (bl, al)
+    # 判据 a: 子串, 但要求短侧像个完整对象名(>=4 字符)
+    if len(short) >= 4 and short in long:
         return True
+    # 判据 b: token 几乎完全重合(而不是"共享几个常用字")
     ta, tb = _tokenize(a), _tokenize(b)
     if not ta or not tb:
         return False
     inter = len(ta & tb)
-    return inter / min(len(ta), len(tb)) >= min_overlap
+    smaller = min(len(ta), len(tb))
+    if smaller == 0:
+        return False
+    containment = inter / smaller
+    return containment >= 0.9 and (inter / max(len(ta), len(tb))) >= min_overlap
 
 
 def _facts_block(facts: list[dict[str, Any]], paper_titles: dict[str, str]) -> str:

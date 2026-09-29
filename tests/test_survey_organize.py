@@ -546,13 +546,26 @@ def test_cluster_by_subject_groups_and_sorts():
     facts = [
         _sf("a::0", "随机测量快照"), _sf("a::1", "随机测量快照"), _sf("a::2", "随机测量快照"),
         _sf("b::0", "SIC-POVM 态层析"), _sf("b::1", "SIC-POVM 态层析"),
-        _sf("c::0", "张量网络"),
+        _sf("c::0", "张量网络态层析"),
     ]
-    got = O.cluster_by_subject(facts)
+    got = O.cluster_by_subject(facts, min_count=2)
     names = [s for s, _ in got]
     assert names[0] == "随机测量快照", "最大的簇应排最前"
     assert names[1] == "SIC-POVM 态层析"
-    assert "其他/未归类" in names, "只出现 1 次的 subject 应并入其他"
+    assert "其他/未归类" in names, "低于门槛的 subject 应并入其他"
+    assert sum(len(fs) for _s, fs in got) == len(facts), "总数守恒"
+
+
+def test_cluster_min_count_is_adaptive():
+    """
+    9-27 实测: 10 篇主题各异的论文, 多数 subject 只出现 1 次 ——
+    固定 min_count=2 会把 39/67 条全压进"其他", Phase B 看不到结构。
+    小语料必须用 min_count=1。
+    """
+    many_singletons = [_sf(f"a::{i}", f"主题对象{i}") for i in range(30)]
+    cl = O.cluster_by_subject(many_singletons)
+    assert len(cl) > 20, "小语料下 singleton 也该各自成簇, 否则分布失去意义"
+    assert sum(len(fs) for _s, fs in cl) == 30
 
 
 def test_cluster_by_subject_all_without_subject():
@@ -597,6 +610,15 @@ def test_subject_histogram_renders_counts():
 
 def test_subject_histogram_handles_missing():
     assert "无法按对象聚类" in O._subject_histogram([])
+
+
+def test_subject_histogram_folds_tail_but_keeps_total():
+    """9-27 实测: 41 个簇全列出来会撑爆 prompt, 但总数必须守恒。"""
+    cl = [(f"对象{i}", [_sf(f"a::{i}", f"对象{i}")]) for i in range(30)]
+    h = O._subject_histogram(cl, top_k=5)
+    assert "已折叠" in h
+    assert "共 30 条 fact, 30 个对象簇" in h
+    assert len(h.splitlines()) <= 7, "应只列头部几行 + 汇总"
 
 
 def test_theme_map_prompt_includes_histogram_slot():
