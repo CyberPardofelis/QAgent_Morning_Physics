@@ -28,21 +28,26 @@ logger = logging.getLogger(__name__)
 
 AUDIT_PROMPT = """你是事实核查员。下面每条是某篇论文抽取出的"原子事实", 以及它声称的原文出处。
 
-【任务】判断每条事实的 claim 是否**完全**有原文依据。
+【任务】为每条事实找出**支撑它的原文英文片段**, 并判断该 claim 是否超出原文。
 
-重点检查 claim 是否**补充了原文没有的细节**, 典型形态:
-- 原文只提到某个平台(如 ion trap), claim 就自行补出该平台上的**具体实现机制**
-  (如"利用离子内的附加能级"、"无需辅助离子") —— 原文没写就是编造
-- 原文说"方法 A 与方法 B 相关", claim 就写成"通过 A 实现 B"这种因果
-- 原文没有的数字、年份、人名、装置型号
-- 原文是"我们提出 X", claim 把 X 的适用范围/效果夸大了
+【关键 — 必须逐字引用, 不能意译】
+对每条 claim, 找出论文原文中**最具体、最能支撑它的那几个英文单词**, 原样抄进
+`evidence` 字段。只能抄论文原文里真实存在的英文, **不许翻译、不许改写、不许拼接**。
 
-判定标准:
-- claim 的**技术内容**必须有原文支持 → grounded: true
-- claim 加入了原文没有的技术细节/因果/数字 → grounded: false, 并在 unsupported 里写清楚多了什么
-- claim 只是把原文换了说法/语言(中文译述) → grounded: true
+这个设计是为了防止审查器自己产生幻觉: 抄不出来的, 就说明 claim 超出原文。
 
-不要因为 claim 是中文、原文是英文就判 false。只看**内容**是否有依据。
+【判定】
+- `grounded: true` 且 evidence 抄得出 -> claim 有据
+- `grounded: false` -> 以下任一情况:
+  a) 抄不出支撑片段(说明 claim 的技术内容原文没有)
+  b) 原文只提到某平台/现象, claim 自行补出了**具体实现机制**。
+     例: 原文有 "ion trap" 和 "nonorthogonal measurements", claim 写
+     "利用每个离子内的附加能级实现该非正交测量" —— 原文根本没提"附加能级", 是编的。
+  c) 原文说 A 与 B 相关, claim 写成"通过 A 实现 B"这种因果
+  d) claim 有原文没有的数字/年份/装置型号
+  e) claim 夸大了原文的适用范围或效果
+
+- claim 只是把原文换成中文说法 -> grounded: true, evidence 抄原文里对应的英文词组
 
 【论文原文】{source}
 
@@ -50,11 +55,38 @@ AUDIT_PROMPT = """你是事实核查员。下面每条是某篇论文抽取出�
 
 【输出格式】严格 JSON 数组, 不要 markdown:
 [
-  {{"id": "<fact_id>", "grounded": true, "unsupported": ""}},
-  {{"id": "<fact_id>", "grounded": false, "unsupported": "原文只提到 X, claim 自行补出 Y"}}
+  {{"id": "<fact_id>", "grounded": true, "evidence": "<原文里逐字抄的英文词组>"}},
+  {{"id": "<fact_id>", "grounded": false, "evidence": "", "unsupported": "原文只提到 X, claim 自行补出 Y"}}
 ]
 
-只输出 JSON, 覆盖每一条给定的 id。"""
+只输出 JSON, 覆盖每一条给定的 id。evidence 必须是**原文中逐字存在**的字符串。"""
+
+
+def _norm_for_match(s: str) -> str:
+    """归一化以便把引用片段和原文比对: 小写 + 只留字母数字空格。"""
+    return re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).strip()
+
+
+def _verify_evidence(evidence: str, source: str) -> bool:
+    """
+    引用片段是否真的在原文里。
+
+    这是审查环节的**机械校验** —— 光靠 LLM 说"grounded: true" 是不够的,
+    实测它会把"利用每个离子内的附加能级"这种明显编造放过去(因为源文确实有
+    ion trap / nonorthogonal 两个词, 审查器看到就信了)。
+    强制它逐字引用, 引不出来就等于没依据。
+    """
+    ev = _norm_for_match(evidence)
+    if not ev:
+        return False
+    src = _norm_for_match(source)
+    if ev in src:
+        return True
+    # 退一步: 逐个有内容的词都在原文里(容忍语序/标点差异)
+    words = [w for w in ev.split() if len(w) > 2]
+    if not words:
+        return False
+    return all(w in src for w in words)
 
 
 def _audit_batch(facts: list[dict[str, Any]], source: str, provider: str, model: str) -> dict[str, dict]:
@@ -103,6 +135,7 @@ def _audit_batch(facts: list[dict[str, Any]], source: str, provider: str, model:
         if isinstance(item, dict) and item.get("id"):
             res[str(item["id"])] = {
                 "grounded": bool(item.get("grounded", True)),
+                "evidence": str(item.get("evidence") or ""),
                 "unsupported": str(item.get("unsupported") or ""),
             }
     return res
@@ -149,8 +182,19 @@ def audit_fact_grounding(
                 if r is None:
                     stats["failed"] += 1
                     continue
+                # 机械校验: 审查器说 grounded 还不够, 引用的原文片段必须真的在原文里。
+                # 实测纯靠 LLM 判断会把明显编造放过去(源文恰有 ion trap/nonorthogonal,
+                # 审查器看到就信, 忽略了 claim 自行补出的"离子附加能级")。
+                if r["grounded"] and src:
+                    if not _verify_evidence(r.get("evidence", ""), src):
+                        r["grounded"] = False
+                        r["unsupported"] = (
+                            r.get("unsupported")
+                            or f"引用片段在原文中找不到: {r.get('evidence','')[:60]!r}"
+                        )
                 if r["grounded"]:
                     f["_grounded"] = True
+                    f["_evidence"] = r.get("evidence", "")
                     stats["grounded"] += 1
                 else:
                     f["_grounded"] = False
