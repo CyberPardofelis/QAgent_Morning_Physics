@@ -134,6 +134,23 @@ def _relevance_filter_pool(
         if p["_relevance_score"] >= threshold and p["_is_about_topic"]
     }
 
+    # 9-30 加: 分数分布诊断。
+    # 之前只报"过滤掉 N 篇, 保留 M 篇", 出了问题(比如 76 篇毙掉 74 篇)根本看不出
+    # 是 LLM 打低分还是 is_about_topic 全 false, 只能猜。分数直方图一眼就能定位。
+    if pool_dict:
+        hist: dict[int, int] = {}
+        n_about = 0
+        for p in pool_dict.values():
+            hist[p.get("_relevance_score", 5)] = hist.get(p.get("_relevance_score", 5), 0) + 1
+            if p.get("_is_about_topic"):
+                n_about += 1
+        dist = " ".join(f"{s}分:{hist[s]}" for s in sorted(hist, reverse=True))
+        print(
+            f"[_relevance_filter_pool] 分数分布 {dist}  |  is_about_topic=True: {n_about}/{len(pool_dict)}"
+            f"  |  门槛 score>={threshold} 且 is_about_topic",
+            flush=True,
+        )
+
     # 9-18: strict 模式 — 不 rescue 不抛错, 全 0 返空
     if strict:
         if not kept:

@@ -95,13 +95,27 @@ def _openalex_work_to_pool_entry(work: dict, source_tag: str) -> dict[str, Any]:
     # abstract 重组 (inverted index → 字符串)
     abstract = _oa_reconstruct(work.get("abstract_inverted_index")) or ""
 
+    # 9-30 修: core_method / core_contrib 一直留空, 导致 OpenAlex 来源的条目
+    #   在 LLM 相关性审查里被系统性压分。原因在 build_relevance_score_prompt:
+    #     "不要因为 title/abstract 含主题词就给高分 —— 必须看 core_method +
+    #      core_contrib 的实质内容"
+    #   而 is_about_topic=true 实际要求 score>=8。于是每篇 OpenAlex 条目只带着
+    #   title+abstract 去过审, 拿的却是 prompt 明令不许据以给高分的证据。
+    #   实测(接入引文图扩展后): 76 篇池子里 74 篇被毙, 只留 2 篇。
+    #
+    #   填法沿用 arxiv 兜底的既有约定 (见 _build_pool.py: "core_contrib": summary[:200]),
+    #   不是编造 —— 摘要本身就是贡献陈述, 只是之前没映射到这两个字段上。
+    contrib = abstract[:200]
+    # 方法句通常是摘要开头的第一句, 单独拆出来给 core_method
+    head = abstract.split(".")[0][:200] if abstract else ""
+
     return {
         "paper_id": paper_id,
         "title": title,
         "year": str(work.get("publication_year") or ""),
         "journal": journal_name,
-        "core_method": "",
-        "core_contrib": "",
+        "core_method": head,
+        "core_contrib": contrib,
         "abstract": abstract,
         "outlook": "",
         "keywords": authors_str,    # 跟 arxiv fallback 同, 用 authors 当 keywords 占位

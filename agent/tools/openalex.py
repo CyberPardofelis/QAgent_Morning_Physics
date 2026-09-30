@@ -165,6 +165,23 @@ def _openalex_identity_note() -> str | None:
     return None
 
 
+# 429 提示只完整打一次, 之后缩成一行短提示。
+# 撞限流时一次跑动里可能有几十次 429(每个 query 一次), 每次都刷三行长文
+# 会把控制台埋掉 —— 真实跑动里实测一次 APS 召回就刷了两遍完整文案。
+_IDENTITY_NOTE_SHOWN = False
+
+
+def _identity_hint() -> str:
+    global _IDENTITY_NOTE_SHOWN
+    note = _openalex_identity_note()
+    if not note:
+        return ""
+    if not _IDENTITY_NOTE_SHOWN:
+        _IDENTITY_NOTE_SHOWN = True
+        return f"  提示: {note}"
+    return "  (提示见首次 429; 配 OPENALEX_MAILTO 不增加额度, 只是便于官方联系)"
+
+
 def _get_with_backoff_on_429(sess, url: str, params: dict, caller: str):
     """发一次 GET, 遇 429 退避重试。
 
@@ -190,11 +207,10 @@ def _get_with_backoff_on_429(sess, url: str, params: dict, caller: str):
         except (TypeError, ValueError):
             ra = 0.0
         wait = max(2.0, min(ra or (5.0 * (i + 1)), _RETRY_ON_429_CAP))
-        note = _openalex_identity_note()
         print(
             f"[{caller}] HTTP 429 限流, 退避 {wait:.0f}s "
             f"(attempt={i + 1}/{_RETRY_ON_429 + 1})"
-            + (f"  提示: {note}" if note else ""),
+            + _identity_hint(),
             flush=True,
         )
         if i >= _RETRY_ON_429:

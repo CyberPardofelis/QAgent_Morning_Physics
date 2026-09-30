@@ -80,7 +80,13 @@ def get_min_pool_papers() -> int:
 #   QAGENT_SURVEY_EXPAND_BREADTH=N    广度: 每轮每方向取几篇去扩, 默认 20
 #   QAGENT_SURVEY_EXPAND_MAX_ADD=N    扩展结果最多注入池子多少篇, 默认 40
 #   QAGENT_SURVEY_EXPAND_REQUESTS=N   credit 兜底: 单次 survey 最多花几次, 默认 12
-#   QAGENT_SURVEY_EXPAND_REVIEWS=0    不走 type:review 综述通道(默认走)
+#   QAGENT_SURVEY_EXPAND_REVIEWS=1    只沿综述通道走 type:review(默认**关**)
+#
+# reviews 为什么默认关 (9-30 实测后改的):
+#   引文图扩展存在的意义是够到 arXiv 结构性触及不到的期刊文献。实测纳米剪纸那次,
+#   真正补上缺口的是 Nature Communications / Science Advances / ACS Nano 这类
+#   **原始研究论文**, 综述只占其中一小部分。默认锁 type:review 等于把扩展最该捞的
+#   那部分自己筛掉了。要综述通道时显式开。
 def _resolve_survey_expand_int(env: str, default: int, lo: int, hi: int) -> int:
     raw = os.getenv(env, "").strip()
     if not raw:
@@ -111,8 +117,9 @@ def get_survey_expand() -> dict:
         "breadth": _SURVEY_EXPAND_BREADTH,
         "max_add": _SURVEY_EXPAND_MAX_ADD,
         "max_requests": _SURVEY_EXPAND_REQUESTS,
-        # 综述通道: 一篇综述的参考文献/被引者里的综述, 正是综述要引的"基座材料"
-        "reviews": os.getenv("QAGENT_SURVEY_EXPAND_REVIEWS", "1").strip() not in ("0", "false", "False"),
+        # 综述通道: 一篇综述的参考文献/被引者里的综述, 正是综述要引的"基座材料"。
+        # 默认**关** —— 开启会把扩展最该捞的原始研究论文筛掉(见上方注释)。
+        "reviews": os.getenv("QAGENT_SURVEY_EXPAND_REVIEWS", "0").strip() not in ("0", "false", "False"),
     }
 
 
