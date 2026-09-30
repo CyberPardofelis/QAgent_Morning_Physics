@@ -59,15 +59,21 @@ def QStandardPaths_writableLocation():  # helper, 避免 lint 报错
 
 @pytest.fixture(autouse=True)
 def _isolated_config():
-    """每个测试重置 cost_ceiling_daily 默认值 50
+    """每个测试前后**快照并还原** cost_ceiling_daily。
 
-    test_set_ceiling_then_get 会改成 100,test_set_invalid_ceiling 会改 "not_a_number",
-    这些值会被持久化到 QSettings, 后续测试可能读到非默认值
+    ⚠️ 9-30 修: 原来 cleanup 是硬编码 `set_cost_ceiling_daily(50)`。
+    那是把"默认值"当成了"用户当前值" —— 但 cost_ceiling_daily 存在 QSettings 里,
+    是**用户设置**, 跑一次测试就把用户的值改掉了。实测用户被改成 50
+    (代码默认值其实是 100), 害得完整综述验证撞上成本守卫硬阻断。
+
+    正确做法: 进入测试前存下当前值, 退出时原样写回。测试改的应该是测试自己的
+    副本, 不是用户设置。
     """
     from config._config import Config
+    original = Config.get_cost_ceiling_daily()
     yield
-    # cleanup: 改回 50 (test fixture 后置)
-    Config.set_cost_ceiling_daily(50)
+    # cleanup: 原样还原用户当时的值, 而不是某个"默认值"
+    Config.set_cost_ceiling_daily(original)
 
 
 class TestCostGuardBasic:
@@ -203,8 +209,7 @@ class TestCostGuardConfigIntegration:
         from config._config import Config
         Config.set_cost_ceiling_daily(100)
         assert Config.get_cost_ceiling_daily() == 100
-        # reset 装回默认
-        Config.set_cost_ceiling_daily(50)
+        # 还原交给 autouse 的 _isolated_config (它存的是进入测试前的用户真实值)
 
     def test_set_invalid_ceiling_clamps_to_default(self):
         """
