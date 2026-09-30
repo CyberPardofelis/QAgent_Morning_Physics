@@ -14,12 +14,11 @@ from agent.tools.config import (
     get_chroma_sim_threshold,
     get_min_pool_papers,
     get_relevance_threshold,
-    get_survey_expand,
 )
 
-from ._expand import ExpandConfig, expand_from_seeds, select_frontier
 from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._pool_audit import _audit_pool_with_retry
+from ._topic_match import entry_text, qualifies
 from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
@@ -73,6 +72,11 @@ def _build_candidate_pool(
         pool_dict[pid] = entry
 
     # 关键词切分 (中文 + 英文)
+    # 9-30: 改用短语匹配。旧逻辑按空格切单词后"任一命中即相关", 在物理论文里
+    # "quantum"/"network" 几乎每篇都有 —— 实测 247 篇本地库命中 218 篇 (88%),
+    # 排在最前的是 Quantum Neural Network / 量子密钥分发 / quantum network stack
+    # 这些跟主题无关的。这些噪声原样流进池子, 每篇还要烧一次 LLM 审查才被倒掉。
+    # 短语准入把它压到 5%, 且活下来的确实是该进的。
     keywords = [kw.strip() for kw in re.split(r"[\s,，、。;；:：]+", topic) if len(kw.strip()) >= 2]
     if not keywords:
         keywords = [topic]
@@ -100,6 +104,14 @@ def _build_candidate_pool(
 
             scored = [(kw_score(it), it) for it in raw]
             scored = [(s, it) for s, it in scored if s > 0]
+            # 9-30 词法门控: 短语准入。放在 LLM 审查**之前**, 这是省成本的关键 ——
+            # 噪声在召回层就该剪掉, 不该每篇都烧一次审查。
+            n_before_gate = len(scored)
+            scored = [(s, it) for s, it in scored if qualifies(topic, entry_text(it))]
+            logger.info(
+                "[_build_candidate_pool] summary_items 词法门控: %d -> %d 篇 (主题短语准入)",
+                n_before_gate, len(scored),
+            )
             scored.sort(key=lambda x: -x[0])
             for score, it in scored[:max_pool]:
                 add_pool_entry({
@@ -292,76 +304,6 @@ def _build_candidate_pool(
         arxiv_status = "skipped"  # pool 已够大, 没调 arxiv
         external_status["arxiv"] = "skipped"
         safe_print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
-
-    # ========== 3d. 引文图扩展 (9-30 加) ==========
-    # 为什么挂在这: 种子来自 3a/3b 的 OpenAlex 结果(带 _openalex_id), 插在 audit 之前,
-    # 让扩出来的候选跟其他来源一样过 LLM 相关性审查, 不走后门直接进池。
-    #
-    # 成本对照 (实测, OpenAlex 响应头 X-RateLimit-Credits-Used):
-    #   关键词检索 search=          10 credits/次, 每天只有 100 次
-    #   引文图 cites:/cited_by:/doi:  1 credit /次, 每天 1000 次, per_page 给满 200 条
-    # 5 篇种子 → 269 篇候选, 14 credits / 13 秒; 老办法拿同样篇数要约 900 credits。
-    expand_cfg = get_survey_expand()
-    if not expand_cfg["enabled"]:
-        external_status["expand"] = "disabled"
-        safe_print("[_build_candidate_pool] 引文图扩展 disabled (QAGENT_SURVEY_EXPAND=0)", flush=True)
-    elif expand_cfg["max_add"] <= 0:
-        external_status["expand"] = "max_add=0"
-        safe_print("[_build_candidate_pool] 引文图扩展 max_add=0, 跳过", flush=True)
-    else:
-        # 只有带 OpenAlex id 的条目能当引文图 seed (arxiv 那些没有 W-id)
-        graph_seeds = [p for p in pool_dict.values() if p.get("_openalex_id")]
-        if not graph_seeds:
-            external_status["expand"] = "no_seed"
-            safe_print(
-                "[_build_candidate_pool] 引文图扩展 skipped  (池内没有带 OpenAlex id 的条目可作种子)",
-                flush=True,
-            )
-        else:
-            safe_print(
-                f"[_build_candidate_pool] 引文图扩展 start  种子 {len(graph_seeds)} 篇  "
-                f"rounds={expand_cfg['rounds']}  breadth={expand_cfg['breadth']}  "
-                f"max_add={expand_cfg['max_add']}",
-                flush=True,
-            )
-            try:
-                res = expand_from_seeds(
-                    graph_seeds,
-                    config=ExpandConfig(
-                        max_rounds=expand_cfg["rounds"],
-                        forward_breadth=expand_cfg["breadth"],
-                        backward_breadth=expand_cfg["breadth"],
-                        max_requests=expand_cfg["max_requests"],
-                        reviews_only=expand_cfg["reviews"],
-                    ),
-                    topic=topic,
-                )
-                # ⚠️ 注入量必须限量: 扩展可能出几百篇, 但下游 audit 是逐篇 LLM,
-                #    全塞进去瓶颈就从 API 配额变成 token 成本。按 select_frontier 的
-                #    排序(有摘要优先, 再按被引量)取前 max_add 篇。
-                picked = select_frontier(res.entries, expand_cfg["max_add"])
-                added = 0
-                for p in picked:
-                    before = len(pool_dict)
-                    add_pool_entry(p)
-                    added += len(pool_dict) - before
-                external_status["expand"] = (
-                    f"success:+{added}/{len(res.entries)}"
-                )
-                safe_print(
-                    f"[_build_candidate_pool] 引文图扩展 done  扩出 {len(res.entries)} 篇  "
-                    f"注入 +{added} 篇  pool={len(pool_dict)}  "
-                    f"请求 {res.stats['requests']}  {res.stats['dropped']}  "
-                    f"({res.stats['stopped_reason']})",
-                    flush=True,
-                )
-            except Exception as e:
-                external_status["expand"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
-                safe_print(
-                    f"[_build_candidate_pool] 引文图扩展 ❌ {external_status['expand']}",
-                    flush=True,
-                )
-                logger.warning("[_build_candidate_pool] 引文图扩展失败: %s", e)
 
     # ========== 4. 9-18 加: audit retry loop (严格筛选 + 自动重搜) ==========
     # 9-18 user 拍板: 在构建候选池的时候就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),

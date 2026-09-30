@@ -392,6 +392,35 @@ def test_select_frontier_prefers_has_abstract_then_citations():
     assert got == ["W3", "W2"], f"有摘要的应优先, 再按被引排序; 实得 {got}"
 
 
+def test_select_frontier_topic_first_over_citations():
+    """
+    9-30 实测修正: 给了 topic 就按主题匹配度排, 被引量只做次序。
+
+    否则被引量最高的会是邻域里"只是顺带引用"的高引经典论文 ——
+    实测扩出 727 篇取前 40, 词法门控毙掉 39, 只采纳 1 篇。
+    """
+    es = [
+        _entry("W1", title="High cited but adjacent",
+               abstract="quantum error correction codes for surface lattices", cited=9999),
+        _entry("W2", title="On topic tensor network work",
+               abstract="tensor network states for quantum simulation of lattice models", cited=1),
+    ]
+    got = EX.select_frontier(es, 1, topic="tensor network states quantum simulation")
+    assert [e["_openalex_id"] for e in got] == ["W2"], \
+        "主题切题的应压过被引量高但只是邻域的"
+
+
+def test_select_frontier_without_topic_keeps_old_order():
+    """不给 topic 时保持原排序(有摘要优先, 再按被引量), 行为不变。"""
+    es = [
+        _entry("W1", abstract="", cited=999),
+        _entry("W2", abstract="quantum", cited=1),
+        _entry("W3", abstract="quantum", cited=50),
+    ]
+    got = [e["_openalex_id"] for e in EX.select_frontier(es, 2)]
+    assert got == ["W3", "W2"]
+
+
 def test_select_frontier_respects_breadth():
     es = [_entry(f"W{i}") for i in range(50)]
     assert len(EX.select_frontier(es, 7)) == 7

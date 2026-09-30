@@ -138,13 +138,28 @@ def topic_overlap(topic: str, *texts: str) -> float:
 def select_frontier(
     entries: list[dict[str, Any]],
     breadth: int,
+    topic: str = "",
 ) -> list[dict[str, Any]]:
     """广度限制: 从候选里挑 breadth 篇值得继续扩的。
 
-    排序依据 (这个顺序是刻意的):
-      1. 有摘要的优先 —— 没摘要连剪枝都做不了, 扩了也是盲扩
-      2. 被引多的优先 —— 综述的参考文献里高被引的更可能是基座工作
+    给了 topic 时按 **主题匹配度优先**排序 (9-30 实测修正)。
+    之前只按 (有摘要, 被引量) 排, 结果被引量最高的恰恰是邻域里"只是顺带引用"的
+    高引经典论文 —— 实测扩出 727 篇取前 40, 词法门控毙掉 39, 只采纳 1 篇。
+    被引量该做的是**同分时的次序**, 不是主排序键。
+
+    没给 topic 时退回原排序(有摘要优先, 再按被引量), 行为不变。
     """
+    if topic:
+        from ._topic_match import entry_text, match_score
+
+        def key_t(e: dict[str, Any]):
+            has_abs = 1 if (e.get("abstract") or "").strip() else 0
+            # 主题分取 1e-3 量级, 保证它是主键, 被引量只做次序
+            return (has_abs, round(match_score(topic, entry_text(e)), 3),
+                    int(e.get("cited_by_count") or 0))
+
+        return sorted(entries, key=key_t, reverse=True)[: max(0, breadth)]
+
     def key(e: dict[str, Any]):
         has_abs = 1 if (e.get("abstract") or "").strip() else 0
         return (has_abs, int(e.get("cited_by_count") or 0))

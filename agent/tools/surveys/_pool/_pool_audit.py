@@ -9,12 +9,96 @@ import logging
 from typing import Any
 
 from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji 时不崩
+from agent.tools.config import get_survey_expand
 
 from ._arxiv import _arxiv_search
+from ._expand import ExpandConfig, expand_from_seeds, select_frontier
 from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._relevance_filter import _relevance_filter_pool
+from ._topic_match import entry_text, qualifies
 
 logger = logging.getLogger(__name__)
+
+
+def _expand_from_audited(
+    topic: str,
+    audited: dict[str, dict[str, Any]],
+    seen_ids: set,
+    print_prefix: str = "",
+) -> list[dict[str, Any]]:
+    """拿**已经过审**的论文当种子做引文图扩展 (9-30 user 拍板)。
+
+    为什么种子必须是过审的
+    ----------------------
+    9-30 实测踩过: 扩展放在审查之前, 种子取自原始召回(没审过), 结果种子落到了
+    邻近邻域(量子密钥分发那一带), 引文图顺着错误的种子走, 扩出 700 篇全部被审查
+    判 0~1 分 —— 扩展注入 40 篇, 通过 0 篇, 端到端质量增量为 0。
+
+    引文图会**放大**种子的方向, 所以种子错了代价是成百倍的。用过审的论文当种子,
+    扩展出来的至少在正确的邻域里, 再交给下一轮审查。
+
+    这是用户说的"剪枝要从一开始做起": 召回层剪一次, 审查层再剪一次, 扩展只从
+    活下来的东西往外长。
+
+    已知漏召: 词法门控认不出同义术语(MPS/PEPS 那类标题里没有 "tensor network"),
+    这部分靠引文图补 —— 种子对了, 沿引用边自然会走到那些论文。
+    """
+    cfg = get_survey_expand()
+    if not cfg["enabled"] or cfg["max_add"] <= 0:
+        return []
+    seeds = [p for p in audited.values() if p.get("_openalex_id")]
+    if not seeds:
+        safe_print(
+            f"{print_prefix} 引文图扩展 skipped (过审论文里没有带 OpenAlex id 的, "
+            f"无法作为引文图种子)",
+            flush=True,
+        )
+        return []
+
+    safe_print(
+        f"{print_prefix} 引文图扩展 start  种子 {len(seeds)} 篇(全部已过审)  "
+        f"rounds={cfg['rounds']}  breadth={cfg['breadth']}  max_add={cfg['max_add']}",
+        flush=True,
+    )
+    try:
+        res = expand_from_seeds(
+            seeds,
+            config=ExpandConfig(
+                max_rounds=cfg["rounds"],
+                forward_breadth=cfg["breadth"],
+                backward_breadth=cfg["breadth"],
+                max_requests=cfg["max_requests"],
+                reviews_only=cfg["reviews"],
+            ),
+            topic=topic,
+        )
+    except Exception as e:
+        safe_print(
+            f"{print_prefix} 引文图扩展 ❌ {type(e).__name__}: {str(e)[:90]}", flush=True)
+        return []
+
+    # 扩展出来的也要过词法门控 —— 否则又变成往池子里灌噪声。
+    # 选哪 40 篇送审按**主题匹配度**排, 不按被引量(见 select_frontier 的注释)。
+    picked = select_frontier(res.entries, cfg["max_add"], topic=topic)
+    out: list[dict[str, Any]] = []
+    dropped_gate = 0
+    for p in picked:
+        pid = p.get("paper_id", "")
+        if not pid or pid in seen_ids:
+            continue
+        if not qualifies(topic, entry_text(p)):
+            dropped_gate += 1
+            continue
+        seen_ids.add(pid)
+        out.append(p)
+
+    safe_print(
+        f"{print_prefix} 引文图扩展 done  扩出 {len(res.entries)} 篇  "
+        f"取前 {cfg['max_add']}  过词法门控 -{dropped_gate}  采纳 {len(out)} 篇  "
+        f"(请求 {res.stats['requests']}, {res.stats['stopped_reason']})",
+        flush=True,
+    )
+    return out
 
 def _audit_pool_with_retry(
     topic: str,
@@ -127,19 +211,24 @@ def _audit_pool_with_retry(
             )
             break
 
-        # retry: 拿 audit 反馈调整 query + 重新搜
-        # 策略: 用 audit 拒绝理由里的关键词做"否定指引", 但简单起见我们用原 query 加大 k 翻倍,
-        #       再多拉一轮, 期望新召回里包含之前漏的真相关 paper.
+        # retry: 两条腿走路
+        #   (a) 引文图扩展 —— 种子是**本轮已过审的论文** (9-30 user 拍板)
+        #   (b) 关键词再搜一遍 —— 换 k 翻倍拉, 期望捞到之前漏的真相关论文
         try:
             need_more = max(min_pool, max_pool) - len(all_kept)
             retry_k = min(need_more * 2, 60)   # 翻倍, 上限 60 (防太慢)
             safe_print(
                 f"{print_prefix} retry round {round_idx+1} start  need_more={need_more}  "
-                f"retry_k={retry_k}  source=aps+iop+arxiv",
+                f"retry_k={retry_k}  source=引文图扩展(过审种子)+aps+iop+arxiv",
                 flush=True,
             )
-            # 多源再拉一次 (跟 _build_candidate_pool 同样套路, 但不再走 summary_items / chroma)
             new_papers: list[dict[str, Any]] = []
+
+            # ---- (a) 引文图扩展: 种子 = all_kept (已过审) ----
+            for p in _expand_from_audited(topic, all_kept, seen_ids, print_prefix):
+                new_papers.append(p)
+
+            # ---- (b) 多源再拉一次 (跟 _build_candidate_pool 同样套路, 但不再走 summary_items / chroma) ----
             try:
                 aps_k = min(retry_k // 2, 30)
                 aps_new = _openalex_aps_search(topic, aps_k)
