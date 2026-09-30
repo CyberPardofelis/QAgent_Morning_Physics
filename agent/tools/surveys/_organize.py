@@ -38,9 +38,66 @@ import logging
 import re
 from typing import Any
 
-from agent.prompts_survey import _tokenize
+from agent.prompts_survey import (
+    CLAIM_CONDENSE_PROMPT,
+    THEME_WRITE_FROM_CLAIMS_PROMPT,
+    _tokenize,
+)
 
 logger = logging.getLogger(__name__)
+
+# 9-30: 主题地图的输出量随 fact 数线性增长, 顶到 max_tokens 就截断 -> JSON 解析失败。
+# 实测 303 条 fact 时返回 59349 字符, 远超 20000 max_tokens 对应的量。
+THEME_MAP_MAX_FACTS = 200
+THEME_MAP_MAX_TOKENS = 32000
+
+
+def _sample_facts_for_themes(
+    facts: list[dict[str, Any]],
+    clusters: list[tuple[str, list[dict[str, Any]]]] | list,
+    cap: int,
+) -> list[dict[str, Any]]:
+    """按 subject 聚簇**均匀**抽样到 cap 条。
+
+    为什么均匀而不是取前 cap 条: 主题地图的作用是给出"这个领域的结构"，
+    尾部 subject 往往正是那些**小众但有代表性**的分支(比如"费米子张量网络"),
+    直接截尾会把它们整个丢掉, 主题结构就缺了一块。
+    均匀抽样保证每个 subject 都有代表。
+    """
+    if len(facts) <= cap:
+        return list(facts)
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # 第一轮: 每个聚簇至少取 1 条(有 fact_id 的)
+    for _name, members in clusters:
+        for m in members:
+            fid = m.get("fact_id")
+            if fid and fid not in seen:
+                seen.add(fid)
+                picked.append(m)
+                break
+        if len(picked) >= cap:
+            return picked[:cap]
+    # 第二轮: 按聚簇轮流补齐到 cap。
+    # 起始索引必须是 1 —— 第一轮已经取过每个聚簇的 members[0] 了,
+    # 从 0 开始会全部命中 seen, added 恒为 False 直接 break(实测只抽出 5 条)。
+    round_no = 1
+    while len(picked) < cap and round_no < 500:
+        added = False
+        for _name, members in clusters:
+            if round_no < len(members):
+                m = members[round_no]
+                fid = m.get("fact_id")
+                if fid and fid not in seen:
+                    seen.add(fid)
+                    picked.append(m)
+                    added = True
+                    if len(picked) >= cap:
+                        break
+        if not added:
+            break
+        round_no += 1
+    return picked[:cap]
 
 
 # ============================================================
@@ -389,6 +446,26 @@ def organize_facts_into_themes(
     # 9-29: 先按 subject 聚簇, 把客观分布给 LLM 做归纳的锚。
     # 比"平铺全部 fact 让模型自己总结"稳 —— 那是凭印象, 换次跑就飘。
     clusters = cluster_by_subject(facts)
+
+    # 9-30 加固: 主题地图的**输出**随 fact 数线性增长, 超过 max_tokens 就被截断,
+    # JSON 解析必失败。实测 60 篇那次: 303 条 fact -> 25K prompt -> 返回 59349 字符,
+    # 撞上 20000 max_tokens 上限, 主题地图解析失败, 下游(命题层/成文)全断,
+    # 整轮白跑 40 分钟。40 篇那次(295 条)只是**侥幸**没过线。
+    #
+    # 三管齐下:
+    #   1) fact 数封顶 —— 主题地图要的是"有代表性的分布"而不是穷尽所有 fact,
+    #      超出的按 subject 聚簇均匀抽样, 保证每个 subject 都有代表
+    #   2) max_tokens 提到 32000
+    #   3) 解析失败时**自动折半重试**, 而不是整轮报废
+    if len(facts) > THEME_MAP_MAX_FACTS:
+        facts = _sample_facts_for_themes(facts, clusters, THEME_MAP_MAX_FACTS)
+        clusters = cluster_by_subject(facts)
+        print(
+            f"[organize] fact 数超上限 {THEME_MAP_MAX_FACTS}, 按 subject 聚簇均匀抽样到 "
+            f"{len(facts)} 条 (再多的输出会撑爆 max_tokens 导致 JSON 截断)",
+            flush=True,
+        )
+
     prompt = THEME_MAP_PROMPT.format(
         n_subject_histogram=_subject_histogram(clusters),
         facts_block=_facts_block(facts, paper_titles),
@@ -397,16 +474,32 @@ def organize_facts_into_themes(
     # 9-29 实测: MiniMax 即使 enable_thinking=False 也会输出大段 <think>,
     # 那部分**照样吃 max_tokens**。8000 会被思考吃光, JSON 答案被截断 -> 解析失败。
     # 主题地图是要"想清楚"的活, 给足预算。
-    out = _call_llm(prompt, provider=provider, model=model,
-                    enable_thinking=False, temperature=temperature,
-                    max_tokens=20000, timeout=600)
-    if not out:
-        return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["LLM 返回空"]}
-
-    parsed = _parse_theme_json(out)
+    parsed = None
+    last_err = ""
+    n_now = len(facts)
+    for _ in range(3):                     # 最多折半重试 2 次
+        out = _call_llm(prompt, provider=provider, model=model,
+                        enable_thinking=False, temperature=temperature,
+                        max_tokens=THEME_MAP_MAX_TOKENS, timeout=600)
+        if not out:
+            last_err = "LLM 返回空"
+        else:
+            parsed = _parse_theme_json(out)
+            if parsed is not None:
+                break
+            last_err = (f"主题地图 JSON 解析失败 (返回 {len(out)} 字符, "
+                        f"疑似被 max_tokens={THEME_MAP_MAX_TOKENS} 截断)")
+        n_now = n_now // 2
+        print(f"[organize] {last_err}; 折半到 {n_now} 条重试", flush=True)
+        if n_now < 40:
+            break
+        facts = facts[:n_now]
+        prompt = THEME_MAP_PROMPT.format(
+            n_subject_histogram=_subject_histogram(clusters),
+            facts_block=_facts_block(facts, paper_titles),
+        )
     if parsed is None:
-        return {"themes": [], "narrative_arc": [], "gaps": [],
-                "warnings": [f"主题地图 JSON 解析失败 (返回 {len(out)} 字符): {out[-300:]}"]}
+        return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": [last_err]}
 
     warnings: list[str] = []
     themes: list[dict[str, Any]] = []
@@ -733,13 +826,519 @@ def write_theme_narrative(
 
 
 # ============================================================
+# 命题层 (9-30 加) —— 综述"综"的缺失环节
+# ============================================================
+# 9-30 用户实测反馈: "综述很长、看上去到处都是引用, 但引文实际很稀疏,
+# 因为一篇文章提取的fact不少……综述当中试图把每个小的fact都引一下,
+# 而无论是否其实它们在讲同一件事。"
+#
+# 实测证据(40 篇那次): 同一篇 10.1103/revmodphys.93.045003 在**一段话里被引 5 次**,
+# 下一段整段只引一篇重复 3 次。295 条 fact → 逐条成句 → 逐条挂同一个引用。
+# 这不是综述, 是"把论文摘要抄一遍并标上出处"。
+#
+# 缺的一环: fact(原子事实) 和 句子 之间应该有 **命题(claim)** 这一层。
+#     fact ──[合并讲同一件事的]──> claim ──[成文]──> 句子
+# 一条 claim 可以由多篇论文共同支持, 成文时写成**一句话挂多个引用** ——
+# 这正是用户要的"一句话就表达了一个或多个文章的结果"。
+#
+# 用序号而不是 fact_id 喂给模型: fact_id 是内容哈希(几十字符), 20 条一批
+# 光 id 就占掉大半 prompt, 且模型抄不对长哈希。喂 [1]..[N] 让它回索引。
+
+
+def condense_facts_into_claims(
+    facts: list[dict[str, Any]],
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    batch_size: int = 24,
+    temperature: float = 0.2,
+    min_per_claim: int = 1,
+) -> list[dict[str, Any]]:
+    """把讲同一件事的多条 fact 合并成一条命题。
+
+    Args:
+        facts: [{fact_id, claim, subject, paper_id, fact_type}, ...]
+        batch_size: 每批喂给 LLM 多少条
+        min_per_claim: 合并率下限 —— 若模型几乎不合并(全 1 条 1 命题),
+            说明这批 fact 本来就各说各话, 保留原样不强凑
+
+    Returns:
+        [{claim_id, statement, fact_ids, paper_ids, theme_id}, ...]
+        未能合并的 fact 会各自成为一条 claim(保证不丢内容)
+    """
+    from agent.tools.llm import _call_llm
+
+    if not facts:
+        return []
+
+    claims: list[dict[str, Any]] = []
+    seq = 0
+    # 9-30 实测修正: **按 subject 聚簇后再分批**, 不能顺序切。
+    # 顺序切的问题: 讲同一件事的两条 fact(往往来自不同论文)隔了几十条,
+    # 落进不同批次, 模型永远没机会把它们放一起 —— 实测 629 条 fact 顺序切,
+    # 合并率只有 1.32:1, 且合并出来的几乎全是"同一篇的多个细节"。
+    # 同一 subject 内部的 fact 更可能是不同论文对同一件事的独立表述。
+    for cluster in _batch_by_subject(facts, batch_size):
+        lines = []
+        pid_index: dict[str, int] = {}
+
+        def _pid_label(pids: list[str], _idx=pid_index) -> str:
+            out = []
+            for p in pids:
+                if not p:
+                    continue
+                if p not in _idx:
+                    _idx[p] = len(_idx) + 1
+                out.append(str(_idx[p]))
+            return ",".join(out) if out else "-"
+
+        for i, f in enumerate(cluster, 1):
+            subj = (f.get("subject") or "").strip()
+            head = f"[{i}] <p{_pid_label([p for p in (f.get('paper_ids') or [f.get('paper_id') or '']) if p])}>"
+            if subj:
+                head += f" <{subj}>"
+            lines.append(head + " " + (f.get("claim") or "").strip())
+        prompt = CLAIM_CONDENSE_PROMPT.format(
+            n=len(cluster), facts_block="\n".join(lines))
+        groups: list[list[int]] = []
+        for _ in range(2):          # 一次重试, 提高 JSON 服从率
+            try:
+                out = _call_llm(prompt, provider=provider, model=model,
+                                enable_thinking=False, temperature=temperature,
+                                max_tokens=6000, timeout=300)
+            except Exception as e:
+                logger.warning("[condense_claims] batch 失败: %s", e)
+                out = ""
+            if out and "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+            groups = _parse_claim_groups(out, len(cluster))
+            if groups:
+                break
+        if not groups:
+            groups = [[i] for i in range(1, len(cluster) + 1)]   # 解析失败 -> 不强凑
+
+        # 覆盖检查: LLM 可能漏掉某些 fact, 漏的单独成条, 绝不能静默丢
+        covered = {i for g in groups for i in g}
+        for i in range(1, len(cluster) + 1):
+            if i not in covered:
+                groups.append([i])
+
+        for g in groups:
+            members = [cluster[i - 1] for i in g if 1 <= i <= len(cluster)]
+            if not members:
+                continue
+            seq += 1
+            pids: list[str] = []
+            for m in members:
+                pid = m.get("paper_id") or ""
+                if pid and pid not in pids:
+                    pids.append(pid)
+            statement = " ".join((m.get("claim") or "").strip() for m in members)
+            claims.append({
+                "claim_id": f"c{seq}",
+                "statement": statement,
+                "fact_ids": [m["fact_id"] for m in members if m.get("fact_id")],
+                "paper_ids": pids,
+                "theme_id": members[0].get("theme_id"),
+                "n_facts": len(members),
+            })
+
+    merged = sum(1 for c in claims if c["n_facts"] > 1)
+    cross = sum(1 for c in claims if len(c.get("paper_ids") or []) > 1)
+    ratio = len(claims) / max(len(facts), 1)
+    print(
+        f"[condense_claims] {len(facts)} 条 fact -> {len(claims)} 条命题 "
+        f"(合并 {merged} 条, 其中**跨论文** {cross} 条, 压缩比 {ratio:.2f})",
+        flush=True,
+    )
+    return claims
+
+
+def _batch_by_subject(
+    facts: list[dict[str, Any]],
+    batch_size: int,
+) -> list[list[dict[str, Any]]]:
+    """按 subject 聚簇, 簇内再分批(不足一批的相邻簇合并填满)。
+
+    目的: 让"不同论文讲同一件事"的 fact 落进同一批。顺序切做不到这点。
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for f in facts:
+        key = (f.get("subject") or "").strip() or "∅"
+        buckets.setdefault(key, []).append(f)
+    # 大簇优先, 便于填满批次
+    order = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+    out: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for _key, members in order:
+        for m in members:
+            cur.append(m)
+            if len(cur) >= batch_size:
+                out.append(cur)
+                cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+_CLAIM_GROUP_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _parse_claim_groups(raw: str, n: int) -> list[list[int]]:
+    """从 LLM 输出里解析 [[1,3,5], [2], ...] 或 [{"fact_idx":[1,3]}, ...]。
+    两种格式都收 —— 模型的 JSON 服从率不是 100%, 宽松点比整批丢掉强。"""
+    if not raw:
+        return []
+    txt = raw.replace("```json", "").replace("```", "").strip()
+
+    groups: list[list[int]] = []
+    # 优先按 JSON 对象分组 {"fact_idx": [1,3]}
+    for chunk in _CLAIM_GROUP_RE.findall(txt):
+        idxs = [int(x) for x in re.findall(r"\d+", chunk)]
+        idxs = [i for i in idxs if 1 <= i <= n]
+        if idxs:
+            groups.append(sorted(set(idxs)))
+    if groups:
+        return groups
+
+    # 整块形如 [[1, 3], [2, 5]] 或 [[1, 2, 3]]。
+    # 关键: 不能用 `\[\[...\]\]` 那种"内层排除方括号"的写法 —— 组间就是靠
+    # "], [" 断开的, 排除方括号会导致整块匹配不上(实测返回空)。
+    # 改成先抓"只由数字/空白/逗号/方括号组成"的整块, 剥掉外层再按 "], [" 拆组。
+    for block in re.findall(r"\[[\d\s,\[\]]{3,}\]", txt):
+        inner = block.strip()[1:-1].strip()      # 剥最外层方括号
+        for part in re.split(r"\]\s*,\s*\[", inner):
+            idxs = [int(x) for x in re.findall(r"\d+", part)]
+            idxs = [i for i in idxs if 1 <= i <= n]
+            if idxs:
+                groups.append(sorted(set(idxs)))
+    return groups
+
+
+# ============================================================
+# 命题层: 按主题合并 + 从命题成文
+# ============================================================
+def condense_facts_by_theme(
+    facts: list[dict[str, Any]],
+    theme_map: dict[str, Any],
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    batch_size: int = 24,
+    max_claims_per_theme: int = 60,
+) -> list[dict[str, Any]]:
+    """按主题分别合并 fact 成命题。
+
+    为什么分主题而不是一次性全合并: 跨主题的 fact 本来就不可能讲同一件事
+    (它们被 Phase B 分到不同主题就是因为讲的不是一回事), 混在一起喂给模型
+    只会浪费 token 并增加错合并风险。主题内合并, 命中率最高。
+
+    主题里 fact 太少(< 3 条)时合并没意义, 直接各自成条。
+    """
+    fmap = {f.get("fact_id"): f for f in facts if f.get("fact_id")}
+    all_claims: list[dict[str, Any]] = []
+    for theme in theme_map.get("themes", []):
+        tfs = [fmap[fid] for fid in (theme.get("fact_ids") or []) if fid in fmap]
+        if not tfs:
+            continue
+        name = theme.get("name", "")
+        if len(tfs) < 3:
+            for i, f in enumerate(tfs, 1):
+                all_claims.append({
+                    "claim_id": f"{name}#{i}", "statement": (f.get("claim") or "").strip(),
+                    "fact_ids": [f["fact_id"]], "paper_ids": [f.get("paper_id") or ""],
+                    "theme_id": name, "n_facts": 1, "theme_name": name,
+                })
+            continue
+        batch_claims = condense_facts_into_claims(
+            tfs, provider=provider, model=model, batch_size=batch_size)
+        for c in batch_claims:
+            c["theme_name"] = name
+            c["claim_id"] = f"{name}#{c['claim_id']}"
+        all_claims.extend(batch_claims)
+    return all_claims
+
+
+def write_theme_narrative_from_claims(
+    theme: dict[str, Any],
+    claims: list[dict[str, Any]],
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    max_retry: int = 2,
+    chunk_size: int = 12,
+    target_chars: int = 900,
+    max_claims: int = 60,
+) -> dict[str, Any]:
+    """Phase C (命题版): 围绕一个主题, 用命题写宏观叙述。
+
+    与 fact 版的关键差别:
+      - 写作单元从"一条 fact 一句话"变成"一条命题一句话"
+      - **允许多个命题写进同一句**(逗号分隔标注) —— 这就是"一句话好几个引用"
+      - 句末标注 `[[claim_id]]`, 渲染时展开成该命题所有出处的引用
+      - 给了篇幅目标, 逼模型往"宏观描述"写而不是逐条罗列
+    """
+    from agent.tools.llm import _call_llm
+
+    if not claims:
+        return {"text": "", "used_claim_ids": [], "dropped_sentences": 0,
+                "warnings": ["该主题没有可用命题"], "used_fact_ids": []}
+
+    # 9-30: 写之前再筛一道。合并层压不下来的时候靠这里兜 ——
+    # 实测 629 条 fact 合并后仍 476 条命题, 全写出来又变回几万字。
+    # 优先选**跨论文支持**的命题, 写出来天然就是"一句话几个引用"。
+    if len(claims) > max_claims:
+        n_before = len(claims)
+        claims = select_claims_for_writing(claims, max_claims)
+        multi = sum(1 for c in claims if len(c.get("paper_ids") or []) > 1)
+        print(
+            f"[write_claims] 主题「{theme.get('name')}」命题 {n_before} -> 选 {len(claims)} "
+            f"(其中跨论文 {multi} 条) 写",
+            flush=True,
+        )
+
+    warnings: list[str] = []
+    used_claim_ids: list[str] = []
+    used_fact_ids: list[str] = []
+    paras: list[str] = []
+    dropped_total = 0
+    failed = 0
+
+    batches = [claims[i:i + chunk_size] for i in range(0, len(claims), chunk_size)]
+    for bi, batch in enumerate(batches, 1):
+        claim2pids = {c["claim_id"]: [p for p in c.get("paper_ids", []) if p]
+                      for c in batch}
+        lines = []
+        for c in batch:
+            src = (f"（{len(c['paper_ids'])} 篇）" if len(c.get("paper_ids") or []) > 1 else "")
+            lines.append(f"[{c['claim_id']}]{src} {c.get('statement', '')}")
+        block = "\n".join(lines)
+        per_batch_chars = max(200, target_chars // max(1, len(batches)))
+
+        prompt = THEME_WRITE_FROM_CLAIMS_PROMPT.format(
+            theme_name=theme.get("name", ""),
+            theme_statement=theme.get("statement", "") or "(未给出)",
+            theme_notes=theme.get("notes", "") or "(无)",
+            claims_block=block,
+            n_claims=len(batch),
+            target_chars=per_batch_chars,
+        )
+
+        out = ""
+        for attempt in range(max_retry + 1):
+            if attempt:
+                prompt += (
+                    "\n\n【重要 — 上一版没有任何命题标注, 已被作废】\n"
+                    "每句话末尾**必须**跟 [[claim_id]] 标注, 只能取上面列出的。\n"
+                    "没有命题支撑的话就不要写那一句。"
+                )
+            try:
+                out = _call_llm(prompt, provider=provider, model=model,
+                                enable_thinking=False, temperature=0.4,
+                                max_tokens=8000, timeout=420)
+            except Exception as e:
+                logger.warning("[write_claims] batch %d 失败: %s", bi, e)
+                out = ""
+            if not out:
+                continue
+            if "<think>" in out:
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+            out = out.replace("```markdown", "").replace("```", "").strip()
+            if re.search(r"\[\[", out):
+                break
+        else:
+            failed += 1
+            warnings.append(f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批未能建立命题对应")
+            continue
+
+        kept, dropped = _drop_unattributed(out)
+        body, unres = _render_claim_citations_or_drop(kept, claim2pids)
+        dropped_total += dropped + unres
+        if body:
+            paras.append(body)
+        for m in _ANNOT_RE.findall(kept):
+            for cid in m.split(","):
+                cid = cid.strip()
+                if cid in claim2pids:
+                    used_claim_ids.append(cid)
+
+    if failed == len(batches) and batches:
+        warnings.append(f"主题「{theme.get('name')}」全部批次均未建立命题对应, 已跳过")
+        return {"text": "", "used_claim_ids": [], "used_fact_ids": [],
+                "dropped_sentences": dropped_total, "warnings": warnings}
+
+    if dropped_total:
+        warnings.append(f"{dropped_total} 句因无命题标注被剔除")
+    if len(batches) > 1:
+        warnings.append(f"主题含 {len(claims)} 条命题, 分 {len(batches)} 批生成")
+
+    cmap = {c["claim_id"]: c for c in claims}
+    for cid in used_claim_ids:
+        used_fact_ids.extend(cmap.get(cid, {}).get("fact_ids", []))
+
+    return {"text": "\n\n".join(paras), "used_claim_ids": sorted(set(used_claim_ids)),
+            "used_fact_ids": sorted(set(used_fact_ids)),
+            "dropped_sentences": dropped_total, "warnings": warnings}
+
+
+def _render_claim_citations_or_drop(text: str, claim2pids: dict[str, list[str]]
+                                   ) -> tuple[str, int]:
+    """`[[c1]]` -> `[pid1][pid2][...]`; 引不出出处的句子直接丢。
+
+    与 fact 版同规则(严格): 一句里只要有一个标注解析不出, 整句不可信 ——
+    抹掉标注留句子 = 制造"看起来通顺但无出处"的断言。
+    """
+    kept_paras, dropped = [], 0
+    for para in (text or "").split("\n\n"):
+        kept_lines = []
+        for line in para.split("\n"):
+            if not line.strip():
+                kept_lines.append(line)
+                continue
+            kept_sents = []
+            for sent in _SENT_SPLIT.split(line):
+                if not sent.strip():
+                    continue
+                if not _ANNOT_RE.search(sent):
+                    dropped += 1
+                    continue
+                ok = [False]
+                bad = [False]
+
+                def _sub(m, _ok=ok, _bad=bad):
+                    pids, unresolved = [], 0
+                    for part in m.group(1).split(","):
+                        cid = part.strip()
+                        got = claim2pids.get(cid) or []
+                        if got:
+                            for pid in got:
+                                if pid not in pids:
+                                    pids.append(pid)
+                        else:
+                            unresolved += 1
+                    if not pids:
+                        _bad[0] = True
+                        return ""
+                    _ok[0] = True
+                    return "".join(f"[{p}]" for p in pids)
+
+                new_sent = _ANNOT_RE.sub(_sub, sent)
+                if bad[0]:
+                    dropped += 1
+                    continue
+                kept_sents.append(new_sent)
+            if kept_sents:
+                kept_lines.append("".join(kept_sents))
+        if any(x.strip() for x in kept_lines):
+            kept_paras.append("\n".join(kept_lines))
+    return "\n\n".join(kept_paras), dropped
+
+
+def select_claims_for_writing(
+    claims: list[dict[str, Any]],
+    max_claims: int,
+) -> list[dict[str, Any]]:
+    """按"综述价值"挑命题, 而不是一股脑全写。
+
+    排序依据(这个顺序是刻意的):
+      1. **跨论文支持**的优先 —— 一条命题挂 3 篇, 写出来就是"一句话三个引用",
+         这正是综述该有的样子; 只挂 1 篇的命题写出来还是逐篇罗列
+      2. 覆盖的 fact 多 -> 信息量大
+      3. 被引多 -> 领域内更核心
+
+    为什么必须限: 9-30 实测 629 条 fact 合并后仍有 476 条命题, 拿 476 条命题去
+    写 6000 字的综述, 比例完全不对(上一版 27000 字/40 篇, 现在要 6000 字)。
+    命题层压不下来的时候, 只能在这里选 —— 选多论文支持的, 天然就会又短又"综"。
+    """
+    def key(c: dict[str, Any]):
+        return (len(c.get("paper_ids") or []), c.get("n_facts", 1),
+                len(c.get("fact_ids") or []))
+
+    return sorted(claims, key=key, reverse=True)[: max(0, max_claims)]
+
+
+# ============================================================
 # 组装
 # ============================================================
+# 9-30 修: 正文引用格式与文末参考文献表对不上。
+# 实测(40 篇那次): `_render_citations_or_drop` 把 fact_id 映射成 `[{paper_id}]`,
+# 而 OpenAlex 论文的 paper_id 就是 DOI 串, 于是正文渲染成
+# `[10.1103/revmodphys.93.045003]`; `build_reference_list` 却按首次出现顺序编号成
+# `[1]`..`[30]`。**两套格式永远对不上** —— 正文里一个数字引用都没有, 文末的编号
+# 没有任何一条在正文被引用过。之前"引用编号连续无越界"那个结论就是这么查错的。
+#
+# 修法: 正文照旧先渲染成 `[paper_id]`, 全文拼完后**一次性编号化**,
+# 同一张映射表交给 build_reference_list —— 一处编号, 两边天然一致。
+# 引用形如 [10.1103/revmodphys.93.045003] / [arXiv:2401.01234] / [2301.01234]
+# 不去猜 DOI 的位数(10.1103 是点前 2 位, 有的又是 4 位), 改成"先抓方括号内容,
+# 再判断像不像标识符" —— 宁可漏判也不能把正常的 [1] 编号误当成 paper_id。
+_BRACKET_RE = re.compile(r"\[([^\[\]\n]{3,120})\]")
+# 三种 paper_id 形态都要认:
+#   10.1103/revmodphys.93.045003   DOI(OpenAlex/APS 来源)
+#   arXiv:2401.01234              带前缀(少见)
+#   2301.01234                    裸 arXiv ID —— _arxiv.py 的 paper_id 就是这个形态,
+#                                  漏了它参考文献编号会跟正文对不上
+_IDISH_RE = re.compile(
+    r"^(?:https?://(?:dx\.)?doi\.org/|doi:)?\d{2,}\.\d{4,}/\S+$"   # DOI
+    r"|^arxiv[:/]\S+$"                                              # arXiv:xxx
+    r"|^\d{4}\.\d{4,5}(?:v\d+)?$",                                  # 裸 arXiv ID
+    re.I,
+)
+
+
+def _looks_like_paper_id(s: str) -> bool:
+    return bool(_IDISH_RE.match(s.strip()))
+
+
+def renumber_citations(text: str) -> tuple[str, dict[str, int]]:
+    """把正文里的 `[paper_id]` 换成 `[1] [2] ...`, 按首次出现顺序编号。
+
+    同一句里同一篇被引多次时折叠成一次 —— 之前"一段里同一篇被引 5 次"的
+    观感, 在编号化这一层就能压掉一半(合并命题层是另一半)。
+
+    Returns:
+        (编号后的正文, {paper_id: 编号})
+        没被引用的论文不会进映射, build_reference_list 也就不会收它们。
+    """
+    pid2num: dict[str, int] = {}
+
+    def _sub(m: re.Match) -> str:
+        pid = m.group(1).strip()
+        if pid.isdigit() or not _looks_like_paper_id(pid):
+            return m.group(0)                  # 已经是编号的 / 不是标识符的, 别动
+        if pid not in pid2num:
+            pid2num[pid] = len(pid2num) + 1
+        return f"\x00{pid2num[pid]}\x00"
+
+    new_text = _BRACKET_RE.sub(_sub, text or "")
+    # 临时标记换成 [n] 形式
+    new_text = re.sub(r"\x00(\d+)\x00", lambda m: f"[{m.group(1)}]", new_text)
+    # 句内重复的同一编号只留第一次。
+    # 必须**按句**做而不是只匹配相邻: 实测症状是
+    #   "A [1] B [1] C [1] D [1] E [1]" —— 中间隔着文字, 只匹配相邻折不掉。
+    out_lines = []
+    for line in new_text.split("\n"):
+        out_sents = []
+        for sent in _SENT_SPLIT.split(line):
+            seen_in_sent: set[str] = set()
+
+            def _dedup(m: re.Match, _s=seen_in_sent) -> str:
+                num = m.group(1)
+                if num in _s:
+                    return ""            # 这一句里已经引过这篇了
+                _s.add(num)
+                return m.group(0)
+
+            out_sents.append(re.sub(r"\[(\d+)\]", _dedup, sent))
+        out_lines.append("".join(out_sents))
+    new_text = "\n".join(out_lines)
+    # 折叠后可能留下多余空格, 收一下
+    new_text = re.sub(r"[ \t]{2,}", " ", new_text)
+    return new_text, pid2num
+
 
 def build_reference_list(
     text: str,
     pool: list[dict[str, Any]],
     title: str = "参考文献",
+    pid2num: dict[str, int] | None = None,
 ) -> str:
     """
     按正文**实际出现顺序**生成编号参考文献表。
@@ -748,16 +1347,26 @@ def build_reference_list(
 
     只收录正文真正引用到的 paper_id(按首次出现顺序编号), 不掺没引用的 ——
     未引用的论文会在 Phase B 另列为"文献覆盖的空白", 不该出现在参考文献里。
+
+    9-30: 传 pid2num 时用它自己的编号(正文已被 renumber_citations 编号化),
+    不再从正文重新解析 —— 之前"正文渲染成 [DOI]、文末编号成 [1]"两套格式
+    对不上, 编号对不上就等于没有引用。
     """
-    order: list[str] = []
-    for pid in _extract_cited_ids(text):
-        if pid not in order:
-            order.append(pid)
+    by_id = {p.get("paper_id"): p for p in pool}
+    if pid2num:
+        order = list(pid2num)
+        numbers = dict(pid2num)
+    else:
+        order = []
+        for pid in _extract_cited_ids(text):
+            if pid not in order:
+                order.append(pid)
+        numbers = {pid: i for i, pid in enumerate(order, 1)}
     if not order:
         return ""
-    by_id = {p.get("paper_id"): p for p in pool}
     lines = [f"## {title}", ""]
-    for i, pid in enumerate(order, 1):
+    for pid in sorted(order, key=lambda x: numbers.get(x, 99999)):
+        i = numbers.get(pid, 0)
         p = by_id.get(pid) or {}
         bits = []
         if p.get("title"):
@@ -817,11 +1426,14 @@ def render_survey(
     gaps = theme_map.get("gaps") or []
     if gaps:
         body_parts.append("## 文献覆盖的空白\n\n" + "\n".join(f"- {g}" for g in gaps))
-    # 9-29: 参考文献放最后, 按正文实际引用顺序
+    # 9-30: 正文先拼好(此时引用还是 [paper_id]), **一次性编号化**,
+    # 同一张映射表交给参考文献表 —— 之前两边各自编号, 格式对不上。
+    body, pid2num = renumber_citations("\n\n".join(body_parts))
     if pool:
-        refs = build_reference_list("\n\n".join(body_parts), pool)
+        refs = build_reference_list(body, pool, pid2num=pid2num)
         if refs:
-            body_parts.append(refs)
+            body = body + "\n\n" + refs
+    body_parts = [body]
     if body_parts:
         parts.append("\n\n".join(body_parts))
     return "\n\n".join(parts) + "\n"

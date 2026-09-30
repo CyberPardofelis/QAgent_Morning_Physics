@@ -35,6 +35,7 @@ def survey_generate(
     topic: str,
     max_steps: int = 20,
     max_pool: int = 50,                # 9-08 17:00 加: 候选池上限, 默认 50 (LLM 可显式传更大值)
+    target_chars: int = 0,             # 9-30 加: 综述目标篇幅, 0=按 fact 数自动反推
     dry_run: bool = False,
     phase: str = "all",
     section_idx: int = -1,
@@ -87,7 +88,8 @@ def survey_generate(
         return
 
     if phase == "organize" or organize:
-        yield from _run_organize_phase(topic, ws, topic_hash, max_pool=max_pool)
+        yield from _run_organize_phase(topic, ws, topic_hash, max_pool=max_pool,
+                                  target_chars=target_chars)
         return
 
     ws.set_status("init", 0, 0, f"topic={topic}")
@@ -254,7 +256,8 @@ def _yield_plan_summary(state: dict[str, Any], ws, topic: str):
 # phase="organize": 主题驱动路线 (Phase B + C)
 # ============================================================
 
-def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50):
+def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
+                        target_chars: int = 0):
     """
     主题驱动综述 (9-29 接入, 用户洞察):
         综述写不长、不像综述, 根因是以**文章**为锚点。真实的人写综述是以**信息**
@@ -336,6 +339,24 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50):
     for w in theme_map.get("warnings", []):
         yield f"   ⚠ {w}\n"
 
+    # ---- Phase B2: 命题合并 (9-30 加) ----
+    # 缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
+    # 被重复引 5 次(40 篇那次实测)。合并成命题后, 一句话可以挂多篇。
+    yield "\n🔗 合并讲同一件事的 fact 成命题...\n"
+    from ._organize import condense_facts_by_theme, write_theme_narrative_from_claims
+    try:
+        claims = condense_facts_by_theme(usable, theme_map)
+    except Exception as e:
+        logger.warning("[organize] 命题合并失败, 退回 fact 直写: %s", e)
+        claims = []
+    if claims:
+        n_multi = sum(1 for c in claims if c.get("n_facts", 1) > 1)
+        n_cited = len({p for c in claims for p in c.get("paper_ids", []) if p})
+        yield (f"✅ {len(usable)} 条 fact -> {len(claims)} 条命题 "
+               f"(其中 {n_multi} 条由多条 fact 合并, 涉及 {n_cited} 篇论文)\n")
+    else:
+        yield "⚠ 命题合并不可用, 退回逐 fact 直写(引文会偏稀疏)\n"
+
     # ---- Phase C: 逐主题写叙述 ----
     yield "\n✍️ 按主题写叙述...\n"
     arc = theme_map.get("narrative_arc") or []
@@ -344,16 +365,31 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50):
         rank = {n: i for i, n in enumerate(arc)}
         order = sorted(order, key=lambda n: (rank.get(n, len(rank)), order.index(n)))
 
+    by_theme: dict[str, list[dict[str, Any]]] = {}
+    for c in claims:
+        by_theme.setdefault(c.get("theme_name", ""), []).append(c)
+
+    # 9-30: 篇幅目标。综述该"用较少的语言描述宏观情况", 不是越长越好。
+    # 40 篇那次写出了 27000 字(675 字/篇), 用户要的是 60 篇配 6000 字(100 字/篇)。
+    # 按主题数摊开, 没给就按"每篇约 110 字符"的密度反推一个合理值。
+    n_themes = max(1, len(theme_map["themes"]))
+    if target_chars <= 0:
+        target_chars = max(1200, int(len(usable) * 0.32))
+    per_theme_chars = max(300, target_chars // n_themes)
+    yield f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题, 每主题约 {per_theme_chars} 字符\n"
+
     narratives: dict[str, dict[str, Any]] = {}
     for name in order:
         theme = next((t for t in theme_map["themes"] if t["name"] == name), None)
         if not theme:
             continue
-        r = write_theme_narrative(theme, facts)
+        tclaims = by_theme.get(name) or []
+        r = (write_theme_narrative_from_claims(theme, tclaims, target_chars=per_theme_chars)
+             if tclaims else write_theme_narrative(theme, facts))
         narratives[name] = r
         if r["text"]:
             yield f"   ✅ {name}: {len(r['text'])} 字符 "
-            yield f"(用 {len(r['used_fact_ids'])} 条 fact)\n"
+            yield f"(用 {len(r.get('used_claim_ids') or r.get('used_fact_ids') or [])} 条)\n"
         for w in r.get("warnings", []):
             yield f"      ⚠ {w}\n"
 
