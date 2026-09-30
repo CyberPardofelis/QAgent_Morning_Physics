@@ -24,6 +24,7 @@ agent.tools.openalex — 共享 OpenAlex API 客户端 (2026-09-09 新增)
 - 错误捕获: 网络 / 解析 / 401(需 polite pool email) 都 raise, 调用方决定 fallback
 """
 import logging
+import os
 import time
 from collections.abc import Iterable
 
@@ -132,7 +133,77 @@ def reconstruct_abstract(inverted_index) -> str:
 _OPENALEX_BASE = "https://api.openalex.org"
 _DEFAULT_TIMEOUT = 30
 _RETRY_ON_5XX = 2
-_USER_AGENT = "QAgent/1.0 (https://github.com/qagent; mailto:qagent@example.com)"
+# 9-30: 原来写死 qagent@example.com —— 那是**假邮箱**, OpenAlex 的 polite pool
+# 要求真实联系方式, 用假邮箱等于没申请, 拿到的就是较紧的配额(实测撞 429:
+# "Anonymous search is temporarily rate-limited ... use a free API key")。
+# 改成可配置: 设 OPENALEX_MAILTO=你的真实邮箱 即可进 polite pool。
+_DEFAULT_mailto = "qagent@example.com"
+_mailto = (os.getenv("OPENALEX_MAILTO", "").strip() or _DEFAULT_mailto)
+_USER_AGENT = f"QAgent/1.0 (mailto:{_mailto})"
+# 429 的退避上限(秒)。OpenAlex 会在 429 响应里给 retryAfter, 优先用它。
+_RETRY_ON_429_CAP = 90
+# 429 限流重试次数(与 5xx 分开计数: 限流等一会就好, 5xx 是服务端抽风)
+_RETRY_ON_429 = 3
+
+
+def _openalex_identity_note() -> str | None:
+    """没配真实邮箱时提醒一次。
+
+    9-30 更正: 原来这里写的是"占位邮箱拿不到 polite pool 的宽松配额"——
+    那是错的, 已被实测证伪。三种 UA (无 mailto / 占位邮箱 / 格式合法邮箱)
+    返回的 X-RateLimit-Limit 都是 1000 credits, 单次消耗也都是 10, 没有差别。
+    官方文档对 polite pool 的说法是"响应时间更一致"以及"出问题时能联系到你",
+    没提任何额度差异。
+    填真实邮箱的真实价值: 万一我们脚本跑飞被限流, 官方能写信找到人, 而不是直接把
+    IP 掐了。属于礼貌, 不是提速。
+    """
+    if _mailto == _DEFAULT_mailto:
+        return (
+            "OpenAlex 用的是占位邮箱 qagent@example.com。填真实邮箱(OPENALEX_MAILTO)不增加额度, "
+            "只是万一本项目脚本跑飞被限流时, 官方能联系到人而不是直接掐 IP。"
+        )
+    return None
+
+
+def _get_with_backoff_on_429(sess, url: str, params: dict, caller: str):
+    """发一次 GET, 遇 429 退避重试。
+
+    单独抽出来而不是塞在 openalex_search 的重试循环里, 是因为两者预算不同:
+    - 5xx / timeout 是"服务端抽风", 共享外层那个 _RETRY_ON_5XX 次预算
+    - 429 是"限流", 等一会就好, 每次外层尝试都应该有**自己完整**的 _RETRY_ON_429 次预算
+
+    之前 429 分支写在共用循环里, 有两个后果:
+    1) 想要 4 次尝试(_RETRY_ON_429=3), 实际被 _RETRY_ON_5XX+1=3 次的循环上限截断
+    2) 最后一次走 `continue` 而循环已到尾 -> 直接掉出函数**隐式返回 None**,
+       调用方拿到 None 当候选池用, 表现就是 Phase A 召回阶段"卡住不动也不报错"
+
+    9-30: 之前只对 5xx 重试, 429 直接当 4xx 放弃 —— 撞上限流这一轮召回就全废了。
+    """
+    for i in range(_RETRY_ON_429 + 1):
+        r = sess.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
+        if r.status_code != 429:
+            return r
+        # OpenAlex 会在 429 响应里给 Retry-After(秒), 优先按它退避
+        ra = 0.0
+        try:
+            ra = float((r.headers or {}).get("Retry-After") or 0)
+        except (TypeError, ValueError):
+            ra = 0.0
+        wait = max(2.0, min(ra or (5.0 * (i + 1)), _RETRY_ON_429_CAP))
+        note = _openalex_identity_note()
+        print(
+            f"[{caller}] HTTP 429 限流, 退避 {wait:.0f}s "
+            f"(attempt={i + 1}/{_RETRY_ON_429 + 1})"
+            + (f"  提示: {note}" if note else ""),
+            flush=True,
+        )
+        if i >= _RETRY_ON_429:
+            raise RuntimeError(
+                f"[http 429] OpenAlex 持续限流, 已退避重试 {_RETRY_ON_429} 次: {r.text[:200]}"
+            )
+        time.sleep(wait)
+    # 理论不可达 (循环最后一次必定 raise), 留一句兜底防将来改动漏出 None
+    raise RuntimeError("[http 429] OpenAlex 限流, 退避重试循环异常结束")
 
 
 def _build_session() -> requests.Session:
@@ -197,6 +268,7 @@ def openalex_search(
           - "[timeout]"     requests Timeout, 网络慢/被墙
           - "[conn]"        ConnectionError, DNS 失败 / 断网
           - "[http 4xx]"    query 写错 (字段名错 / 编码问题), 不重试
+          - "[http 429]"    限流, 已按 Retry-After 退避重试 _RETRY_ON_429 次仍失败
           - "[http 5xx]"    OpenAlex 服务端错, 已重试 _RETRY_ON_5XX 次
           - "[json]"        返回非 JSON
           - "[unknown]"     兜底
@@ -214,12 +286,14 @@ def openalex_search(
         # OpenAlex 允许多个 source_id OR 过滤: primary_location.source.id:S1|S2|...
         filters.append("primary_location.source.id:" + "|".join(source_ids))
     if from_year > 0:
-        filters.append(f"publication_year:>={int(from_year)}")
+        # 9-30 修: 原来写 publication_year:>=2019, OpenAlex 把 ">=2019" 当年份值解析,
+        # 回 400 "Value for param publication_year must be a number"。
+        # publication_year 只接受单个年份(=2019), 要"某年及以后"得用日期型下界字段。
+        filters.append(f"from_publication_date:{int(from_year)}-01-01")
     if sort and sort != "relevance_score:desc":
         # sort: relevance_score:desc | cited_by_count:desc | publication_date:desc
         if sort not in ("relevance_score:desc", "cited_by_count:desc", "publication_date:desc"):
             raise ValueError(f"不支持的 sort: {sort}")
-        filters.append(f"sort:{sort}")
 
     params = {
         "search": query,
@@ -236,6 +310,12 @@ def openalex_search(
     }
     if filters:
         params["filter"] = ",".join(filters)
+    if sort and sort != "relevance_score:desc":
+        # 9-30 修: 原来错把 sort 拼进 filter 串 -> 发出 filter=sort:cited_by_count:desc,
+        # OpenAlex 把 "sort" 当成一个 filter **字段名** 解析, 回 400
+        # "sort is not a valid field"。sort 必须是与 filter 平级的顶层查询参数。
+        # 后果: 只要不用默认的 relevance 排序(比如按被引量挑高质量论文), 召回必 400。
+        params["sort"] = sort
 
     url = f"{_OPENALEX_BASE}/works"
 
@@ -253,7 +333,7 @@ def openalex_search(
     for attempt in range(_RETRY_ON_5XX + 1):
         try:
             t0 = time.time()
-            r = sess.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
+            r = _get_with_backoff_on_429(sess, url, params, caller)
             dt = time.time() - t0
             if r.status_code >= 500:
                 print(
@@ -314,6 +394,213 @@ def openalex_search(
                 raise RuntimeError(f"[http 5xx] OpenAlex 服务端连续错 {_RETRY_ON_5XX+1} 次: {e}") from last_err
             # 4xx / json — 不重试, 直接上抛
             raise
+
+    # 兜底: 上面每条分支都以 raise 或 return 结束, 正常走不到这里。
+    # 但如果将来有人加了新的 except 却忘了 raise, 函数会隐式返回 None,
+    # 调用方 `for w in openalex_search(...)` 会炸在迭代上, 报错点离真凶很远。
+    raise last_err or RuntimeError("[unknown] OpenAlex 搜索重试循环异常结束")
+
+
+# ============================================================
+# 引文图遍历 (9-30)
+# ------------------------------------------------------------
+# 为什么值得单独一节:
+#   OpenAlex 是 credit 计费的, 不同原语代价差 10 倍, 而引文图是最便宜的那个。
+#   实测 (X-RateLimit-Credits-Used 响应头):
+#     search= 关键词检索          10 credits / 次  (per_page 不计费, 3 条和 200 条同价)
+#     cites:  / cited_by: / doi:   1 credit  / 次  (per_page 给满 200 条)
+#   也就是说: 关键词检索只适合用来"拿种子", 真正的产能必须走引文图。
+#
+# ★★★ 方向语义的坑 (实测确认, 名字和实际相反的地方有两个) ★★★
+#   cites:W123           -> 前向: 引用了 W123 的论文
+#   referenced_works:W123-> 前向: 同上, 是 cites 的**别名**, 返回完全一致
+#   cited_by:W123        -> 后向: W123 引用的论文 (即 W123 的参考文献)
+#
+#   "cited_by" 听着像前向, 实际是后向;
+#   "referenced_works" 听着像后向, 实际是前向。
+#   多 seed 用 | 连接是 **OR** 语义 (实测: 两个不相关领域的 seed 合并后
+#   返回 25 条而非 0 条, 不是 AND)。
+#
+#   验证方法(唯一无歧义): 看返回的论文**自己的** referenced_works 里有没有 seed。
+#   别用"结果是否落在 seed 的 referenced_works 列表里"来判断 cites: ——
+#   0% 是前向遍历的**正确**表现, 用错判据会误判成"接口坏了"。
+# ============================================================
+
+# 字段跟 openalex_search 对齐, 外加 cited_by_count / type:
+#   - type 用于 type:review 综述通道, 免得客户端再查一次
+#   - cited_by_count 用于 frontier 截断时按影响力排序
+_GRAPH_SELECT = ",".join([
+    "id", "doi", "title", "display_name",
+    "publication_year", "publication_date",
+    "authorships", "primary_location", "best_oa_location",
+    "abstract_inverted_index", "cited_by_count",
+    "open_access", "type",
+])
+
+_MAX_GRAPH_SEEDS = 50
+_MAX_GRAPH_PER_PAGE = 200
+
+
+def _normalize_oa_id(x: str) -> str:
+    """'https://openalex.org/W123' / 'W123' -> 'W123'。空值返回 ''。"""
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    return s.rstrip("/").rsplit("/", 1)[-1]
+
+
+def openalex_cites(
+    works: list[str],
+    per_page: int = _MAX_GRAPH_PER_PAGE,
+    reviews_only: bool = False,
+    caller: str = "openalex_cites",
+) -> list[dict]:
+    """前向扩展: 引用了这些论文的论文 (谁在用它)。
+
+    ⚠️ 方向别搞反: 这是**前向**。想拿某篇论文的参考文献请用 openalex_references()。
+
+    Args:
+        works: seed 论文 id 列表 (W123 或完整 URL 都行), 用 | 做 OR
+        reviews_only: 叠 type:review, 只返回综述
+        per_page: 1~200, **不计费**, 默认给满
+
+    Returns:
+        list[dict]: works; 出参同 openalex_search (多一个 type 字段)
+    """
+    return _openalex_graph(
+        "cites", works, per_page=per_page,
+        reviews_only=reviews_only, caller=caller,
+    )
+
+
+def openalex_references(
+    works: list[str],
+    per_page: int = _MAX_GRAPH_PER_PAGE,
+    reviews_only: bool = False,
+    caller: str = "openalex_references",
+) -> list[dict]:
+    """后向扩展: 这些论文引用的论文 (它的前人工作 / 参考文献)。
+
+    ⚠️ 这个用 `cited_by:` 过滤 —— 名字听着像前向, **实际是后向**。
+       `referenced_works:` 才是前向的(且与 cites: 等价), 那是 OpenAlex 的命名反直觉。
+
+    对综述特别有用: 一篇综述的参考文献就是它认为该引的全部基座工作,
+    比关键词检索准得多, 而且 1 credit 就能拿满 200 条。
+    """
+    return _openalex_graph(
+        "cited_by", works, per_page=per_page,
+        reviews_only=reviews_only, caller=caller,
+    )
+
+
+def openalex_batch_by_doi(
+    dois: list[str],
+    caller: str = "openalex_batch_doi",
+) -> dict[str, dict]:
+    """按 DOI 批量取 works, 返回 {规范化DOI: work}。
+
+    同样 1 credit 拿满一整批 (实测 129 个 DOI 一起查也是 1 credit),
+    适合把 Crossref 免费拿到的参考文献列表回填成带被引量/期刊名的完整记录。
+    查不到的 DOI 直接不出现在返回里, 不报错。
+    """
+    cleaned: list[str] = []
+    for d in dois or []:
+        s = str(d or "").strip()
+        if not s:
+            continue
+        for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix):]
+                break
+        if s:
+            cleaned.append(s.lower())
+    if not cleaned:
+        return {}
+
+    out: dict[str, dict] = {}
+    for i in range(0, len(cleaned), _MAX_GRAPH_SEEDS):
+        chunk = cleaned[i:i + _MAX_GRAPH_SEEDS]
+        params = {
+            "filter": "doi:" + "|".join(chunk),
+            "per_page": len(chunk),
+            "select": _GRAPH_SELECT,
+        }
+        try:
+            items = _oa_get_results(params, caller, f"doi 批量 {i}~{i + len(chunk)}")
+        except RuntimeError as e:
+            logging.getLogger(__name__).warning("[%s] doi 批量失败: %s", caller, e)
+            continue
+        for w in items or []:
+            d = (w.get("doi") or "").lower()
+            for prefix in ("https://doi.org/", "http://doi.org/"):
+                if d.startswith(prefix):
+                    d = d[len(prefix):]
+            if d:
+                out[d] = w
+    return out
+
+
+def _openalex_graph(
+    key: str,
+    works: list[str],
+    per_page: int = _MAX_GRAPH_PER_PAGE,
+    reviews_only: bool = False,
+    caller: str = "openalex_cites",
+) -> list[dict]:
+    """引文图遍历的统一实现。key 只有 "cites" / "cited_by" 两种语义。"""
+    seeds: list[str] = []
+    for w in works or []:
+        n = _normalize_oa_id(w)
+        if n and n not in seeds:
+            seeds.append(n)
+    if not seeds:
+        return []
+    if len(seeds) > _MAX_GRAPH_SEEDS:
+        # 静默截断会让用户以为"扩了全部", 这里明确打个折
+        logging.getLogger(__name__).info(
+            "[%s] seed %d 个, 截断到 %d 个 (单次上限)", caller, len(seeds), _MAX_GRAPH_SEEDS)
+        seeds = seeds[:_MAX_GRAPH_SEEDS]
+
+    filters = [f"{key}:" + "|".join(seeds)]
+    if reviews_only:
+        filters.append("type:review")
+
+    per_page = max(1, min(int(per_page), _MAX_GRAPH_PER_PAGE))
+    params = {
+        "filter": ",".join(filters),
+        "per_page": per_page,
+        "select": _GRAPH_SELECT,
+    }
+    short = f"{seeds[0]}...{seeds[-1]}" if len(seeds) > 2 else ",".join(seeds)
+    print(
+        f"[{caller}] 引文图 {key}({'前向' if key == 'cites' else '后向'})  "
+        f"seeds={len(seeds)}  per_page={per_page}  reviews_only={reviews_only}",
+        flush=True,
+    )
+    results = _oa_get_results(params, caller, f"引文图 {key} (seeds={short})")
+    return results
+
+
+def _oa_get_results(params: dict, caller: str, label: str) -> list[dict]:
+    """发一次裸 GET (带 429 退避), 返回 results 列表。引文图/批量回填共用。"""
+    sess = _build_session()
+    url = f"{_OPENALEX_BASE}/works"
+    r = _get_with_backoff_on_429(sess, url, params, caller)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"[http {r.status_code}] OpenAlex {label} 失败: {r.text[:200]}"
+        )
+    try:
+        results = (r.json() or {}).get("results") or []
+    except ValueError as e:
+        raise RuntimeError(f"[json] OpenAlex {label} 返回非 JSON: {e}") from e
+    print(
+        f"[{caller}] {label} → {len(results)} 篇  "
+        f"cost={r.headers.get('X-RateLimit-Credits-Used')}  "
+        f"rem={r.headers.get('X-RateLimit-Remaining')}",
+        flush=True,
+    )
+    return results
 
 
 # ============================================================

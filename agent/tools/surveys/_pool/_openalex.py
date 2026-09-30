@@ -107,6 +107,14 @@ def _openalex_work_to_pool_entry(work: dict, source_tag: str) -> dict[str, Any]:
         "keywords": authors_str,    # 跟 arxiv fallback 同, 用 authors 当 keywords 占位
         "_match_score": 0,
         "_source": source_tag,
+        # 9-30 引文图扩展层 (_expand.py) 需要这三个:
+        #   _openalex_id     —— 去重 + 作为 cites/cited_by 的 seed
+        #   cited_by_count   —— frontier 排序按影响力
+        #   type             —— 综述通道 (type:review) 判定
+        # 纯增量, 不影响已有消费方。
+        "_openalex_id": (work.get("id") or "").rstrip("/").rsplit("/", 1)[-1],
+        "cited_by_count": int(work.get("cited_by_count") or 0),
+        "type": work.get("type") or "",
     }
 
 
@@ -130,7 +138,14 @@ def _openalex_aps_search_batch(queries: list[str], k_per_query: int = 3) -> list
                 p["_query_source"] = q[:80]
                 out.append(p)
         except Exception as e:
-            logger.warning("[_openalex_aps_search_batch] query=%r failed: %s", q[:50], e)
+            # 9-30: 原来只 logger.warning, 控制台看不到。召回层塌了一路而界面一切正常,
+            # 在材料类学科那等于并集静默退化成只剩 arXiv 一路 (实测重合度 1/78)。
+            # 失败必须打到控制台。
+            print(
+                f"[_openalex_aps_search_batch] query={q[:50]!r} 召回失败: "
+                f"{type(e).__name__}: {str(e)[:100]}",
+                flush=True,
+            )
             continue
     logger.info(
         "[_openalex_aps_search_batch] %d queries × k=%d → union %d 篇 (deduped)",
@@ -159,7 +174,12 @@ def _openalex_iop_search_batch(queries: list[str], k_per_query: int = 3) -> list
                 p["_query_source"] = q[:80]
                 out.append(p)
         except Exception as e:
-            logger.warning("[_openalex_iop_search_batch] query=%r failed: %s", q[:50], e)
+            # 同上: 9-30 起控制台可见, 不再只进 logger
+            print(
+                f"[_openalex_iop_search_batch] query={q[:50]!r} 召回失败: "
+                f"{type(e).__name__}: {str(e)[:100]}",
+                flush=True,
+            )
             continue
     logger.info(
         "[_openalex_iop_search_batch] %d queries × k=%d → union %d 篇 (deduped)",

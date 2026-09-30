@@ -14,8 +14,10 @@ from agent.tools.config import (
     get_chroma_sim_threshold,
     get_min_pool_papers,
     get_relevance_threshold,
+    get_survey_expand,
 )
 
+from ._expand import ExpandConfig, expand_from_seeds, select_frontier
 from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._pool_audit import _audit_pool_with_retry
 from ._utils import _arxiv_author_name
@@ -291,6 +293,76 @@ def _build_candidate_pool(
         external_status["arxiv"] = "skipped"
         safe_print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
+    # ========== 3d. 引文图扩展 (9-30 加) ==========
+    # 为什么挂在这: 种子来自 3a/3b 的 OpenAlex 结果(带 _openalex_id), 插在 audit 之前,
+    # 让扩出来的候选跟其他来源一样过 LLM 相关性审查, 不走后门直接进池。
+    #
+    # 成本对照 (实测, OpenAlex 响应头 X-RateLimit-Credits-Used):
+    #   关键词检索 search=          10 credits/次, 每天只有 100 次
+    #   引文图 cites:/cited_by:/doi:  1 credit /次, 每天 1000 次, per_page 给满 200 条
+    # 5 篇种子 → 269 篇候选, 14 credits / 13 秒; 老办法拿同样篇数要约 900 credits。
+    expand_cfg = get_survey_expand()
+    if not expand_cfg["enabled"]:
+        external_status["expand"] = "disabled"
+        safe_print("[_build_candidate_pool] 引文图扩展 disabled (QAGENT_SURVEY_EXPAND=0)", flush=True)
+    elif expand_cfg["max_add"] <= 0:
+        external_status["expand"] = "max_add=0"
+        safe_print("[_build_candidate_pool] 引文图扩展 max_add=0, 跳过", flush=True)
+    else:
+        # 只有带 OpenAlex id 的条目能当引文图 seed (arxiv 那些没有 W-id)
+        graph_seeds = [p for p in pool_dict.values() if p.get("_openalex_id")]
+        if not graph_seeds:
+            external_status["expand"] = "no_seed"
+            safe_print(
+                "[_build_candidate_pool] 引文图扩展 skipped  (池内没有带 OpenAlex id 的条目可作种子)",
+                flush=True,
+            )
+        else:
+            safe_print(
+                f"[_build_candidate_pool] 引文图扩展 start  种子 {len(graph_seeds)} 篇  "
+                f"rounds={expand_cfg['rounds']}  breadth={expand_cfg['breadth']}  "
+                f"max_add={expand_cfg['max_add']}",
+                flush=True,
+            )
+            try:
+                res = expand_from_seeds(
+                    graph_seeds,
+                    config=ExpandConfig(
+                        max_rounds=expand_cfg["rounds"],
+                        forward_breadth=expand_cfg["breadth"],
+                        backward_breadth=expand_cfg["breadth"],
+                        max_requests=expand_cfg["max_requests"],
+                        reviews_only=expand_cfg["reviews"],
+                    ),
+                    topic=topic,
+                )
+                # ⚠️ 注入量必须限量: 扩展可能出几百篇, 但下游 audit 是逐篇 LLM,
+                #    全塞进去瓶颈就从 API 配额变成 token 成本。按 select_frontier 的
+                #    排序(有摘要优先, 再按被引量)取前 max_add 篇。
+                picked = select_frontier(res.entries, expand_cfg["max_add"])
+                added = 0
+                for p in picked:
+                    before = len(pool_dict)
+                    add_pool_entry(p)
+                    added += len(pool_dict) - before
+                external_status["expand"] = (
+                    f"success:+{added}/{len(res.entries)}"
+                )
+                safe_print(
+                    f"[_build_candidate_pool] 引文图扩展 done  扩出 {len(res.entries)} 篇  "
+                    f"注入 +{added} 篇  pool={len(pool_dict)}  "
+                    f"请求 {res.stats['requests']}  {res.stats['dropped']}  "
+                    f"({res.stats['stopped_reason']})",
+                    flush=True,
+                )
+            except Exception as e:
+                external_status["expand"] = f"exception:{type(e).__name__}:{str(e)[:80]}"
+                safe_print(
+                    f"[_build_candidate_pool] 引文图扩展 ❌ {external_status['expand']}",
+                    flush=True,
+                )
+                logger.warning("[_build_candidate_pool] 引文图扩展失败: %s", e)
+
     # ========== 4. 9-18 加: audit retry loop (严格筛选 + 自动重搜) ==========
     # 9-18 user 拍板: 在构建候选池的时候就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),
     #                 pool 不够 min_pool 时自动 retry (换 query / 换 source), 直到找到足够多合格论文.
@@ -312,7 +384,9 @@ def _build_candidate_pool(
         "summary_items_keyword": 1,
         "openalex_aps_api": 2,
         "openalex_iop_api": 3,
-        "arxiv_api_fallback": 4,
+        "openalex_forward_api": 4,   # 9-30 引文图前向(谁引用了种子)
+        "openalex_backward_api": 5,  # 9-30 引文图后向(种子的参考文献)
+        "arxiv_api_fallback": 6,
     }
     def _sort_key(x: dict[str, Any]) -> tuple:
         rel = x.get("_relevance_score")

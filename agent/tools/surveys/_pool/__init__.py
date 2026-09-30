@@ -10,10 +10,19 @@ _pool — 拆分子模块
 - ._facts_review.py — ['_review_facts_topic_alignment']
 - ._arxiv.py — ['_arxiv_search', '_arxiv_search_batch']
 - ._openalex.py — ['_openalex_aps_search', '_openalex_iop_search', '_openalex_work_to_pool_entry', '_openalex_aps_search_batch', '_openalex_iop_search_batch']
+- ._expand.py — ['ExpandConfig', 'ExpansionResult', 'expand_from_seeds', 'prune', 'select_frontier', 'topic_overlap']
 """
 
 from ._arxiv import _arxiv_search, _arxiv_search_batch
 from ._build_pool import _build_candidate_pool
+from ._expand import (
+    ExpandConfig,
+    ExpansionResult,
+    expand_from_seeds,
+    prune,
+    select_frontier,
+    topic_overlap,
+)
 from ._facts_review import _review_facts_topic_alignment
 from ._openalex import (
     _openalex_aps_search,
@@ -55,5 +64,12 @@ __all__ = [
     "_openalex_iop_search",
     "_openalex_work_to_pool_entry",
     "_openalex_aps_search_batch",
-    "_openalex_iop_search_batch"
+    "_openalex_iop_search_batch",
+    # 9-30 引文图扩展层
+    "ExpandConfig",
+    "ExpansionResult",
+    "expand_from_seeds",
+    "prune",
+    "select_frontier",
+    "topic_overlap",
 ]

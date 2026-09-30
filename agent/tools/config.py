@@ -63,6 +63,60 @@ def get_min_pool_papers() -> int:
 
 
 # ============================================================
+# Survey 工具: 引文图扩展 (2026-09-30 加)
+# ============================================================
+# 背景: OpenAlex 是 credit 计费的, 关键词检索 10 credits/次(每天仅 100 次),
+#       引文图(cites:/cited_by:/doi:) 只要 1 credit/次(每天 1000 次), per_page 给满 200 条。
+#       所以: 关键词检索只用来"拿种子", 产能走引文图。
+#       实测 5 篇种子 → 269 篇候选, 14 credits / 13 秒。
+#
+# 真正要卡的不是 credit 而是 LLM: 下游 _audit_pool_with_retry 要逐篇过 LLM,
+# 扩展出 2000 篇全塞进去会把瓶颈从 API 配额变成 token 成本和时间。
+# 所以除了扩展层自己的 max_candidates, 这里再单独限一个"注入池子的最大篇数"。
+#
+# 环境变量:
+#   QAGENT_SURVEY_EXPAND=0            关掉引文图扩展(默认开)
+#   QAGENT_SURVEY_EXPAND_ROUNDS=N     深度: 迭代轮数, 默认 2
+#   QAGENT_SURVEY_EXPAND_BREADTH=N    广度: 每轮每方向取几篇去扩, 默认 20
+#   QAGENT_SURVEY_EXPAND_MAX_ADD=N    扩展结果最多注入池子多少篇, 默认 40
+#   QAGENT_SURVEY_EXPAND_REQUESTS=N   credit 兜底: 单次 survey 最多花几次, 默认 12
+#   QAGENT_SURVEY_EXPAND_REVIEWS=0    不走 type:review 综述通道(默认走)
+def _resolve_survey_expand_int(env: str, default: int, lo: int, hi: int) -> int:
+    raw = os.getenv(env, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+        return v if lo <= v <= hi else default
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[config] %s=%r 不是合法整数, 走默认 %d", env, raw, default,
+        )
+        return default
+
+
+_SURVEY_EXPAND_ENABLED = os.getenv("QAGENT_SURVEY_EXPAND", "1").strip() not in ("0", "false", "False")
+_SURVEY_EXPAND_ROUNDS = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_ROUNDS", 2, 1, 5)
+_SURVEY_EXPAND_BREADTH = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_BREADTH", 20, 1, 50)
+_SURVEY_EXPAND_MAX_ADD = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_MAX_ADD", 40, 0, 200)
+_SURVEY_EXPAND_REQUESTS = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_REQUESTS", 12, 1, 200)
+
+
+def get_survey_expand() -> dict:
+    """引文图扩展配置 (见本节上方的环境变量说明)."""
+    return {
+        "enabled": _SURVEY_EXPAND_ENABLED,
+        "rounds": _SURVEY_EXPAND_ROUNDS,
+        "breadth": _SURVEY_EXPAND_BREADTH,
+        "max_add": _SURVEY_EXPAND_MAX_ADD,
+        "max_requests": _SURVEY_EXPAND_REQUESTS,
+        # 综述通道: 一篇综述的参考文献/被引者里的综述, 正是综述要引的"基座材料"
+        "reviews": os.getenv("QAGENT_SURVEY_EXPAND_REVIEWS", "1").strip() not in ("0", "false", "False"),
+    }
+
+
+# ============================================================
 # Survey 工具: 章节/大纲 LLM 输出 max_tokens (2026-09-08 加)
 # ============================================================
 # 9-08 23:50 user 拍板: 从 10000 放宽到 20000, 配合 outline/section 视角改造
