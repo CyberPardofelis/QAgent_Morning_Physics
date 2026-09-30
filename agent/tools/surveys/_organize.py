@@ -1240,6 +1240,7 @@ def _render_claim_citations_or_drop(text: str, claim2pids: dict[str, list[str]]
 def select_claims_for_writing(
     claims: list[dict[str, Any]],
     max_claims: int,
+    max_per_paper: int = 3,
 ) -> list[dict[str, Any]]:
     """按"综述价值"挑命题, 而不是一股脑全写。
 
@@ -1247,17 +1248,53 @@ def select_claims_for_writing(
       1. **跨论文支持**的优先 —— 一条命题挂 3 篇, 写出来就是"一句话三个引用",
          这正是综述该有的样子; 只挂 1 篇的命题写出来还是逐篇罗列
       2. 覆盖的 fact 多 -> 信息量大
-      3. 被引多 -> 领域内更核心
 
     为什么必须限: 9-30 实测 629 条 fact 合并后仍有 476 条命题, 拿 476 条命题去
     写 6000 字的综述, 比例完全不对(上一版 27000 字/40 篇, 现在要 6000 字)。
     命题层压不下来的时候, 只能在这里选 —— 选多论文支持的, 天然就会又短又"综"。
+
+    max_per_paper: **同一篇论文最多贡献几条命题**。
+    9-30 实测踩的坑: 60 条命题里好几条引同一篇, 结果 2242 字符只覆盖 **11 篇**,
+    广度根本不够(用户要"一二百篇引 3 万字")。加了这个配额后, 同样的 60 条
+    至少能覆盖 20 篇 —— 篇幅不变, 广度翻倍。
     """
     def key(c: dict[str, Any]):
         return (len(c.get("paper_ids") or []), c.get("n_facts", 1),
                 len(c.get("fact_ids") or []))
 
-    return sorted(claims, key=key, reverse=True)[: max(0, max_claims)]
+    ordered = sorted(claims, key=key, reverse=True)
+    picked: list[dict[str, Any]] = []
+    paper_count: dict[str, int] = {}
+
+    # 第一轮: 遵守每篇配额, 尽量铺开覆盖面
+    for c in ordered:
+        if len(picked) >= max_claims:
+            break
+        pids = [p for p in (c.get("paper_ids") or []) if p]
+        if not pids:
+            continue
+        if max(paper_count.get(p, 0) for p in pids) >= max_per_paper:
+            continue
+        picked.append(c)
+        for p in pids:
+            paper_count[p] = paper_count.get(p, 0) + 1
+
+    # 第二轮: 配额用完了还有名额, 放宽限制补满。
+    # 按"这条能新增几篇没被引过的论文"排序 —— 上一版是无脑按原顺序补,
+    # 结果配额被架空(实测 60 条还是单篇最多 7 条, 跟没加配额一样)。
+    if len(picked) < max_claims:
+        chosen = {id(c) for c in picked}
+        covered = {p for c in picked for p in (c.get("paper_ids") or []) if p}
+        rest = [c for c in ordered if id(c) not in chosen]
+        rest.sort(key=lambda c: -len({p for p in (c.get("paper_ids") or [])
+                                      if p and p not in covered}))
+        for c in rest:
+            if len(picked) >= max_claims:
+                break
+            picked.append(c)
+            covered |= {p for p in (c.get("paper_ids") or []) if p}
+
+    return picked[: max(0, max_claims)]
 
 
 # ============================================================
