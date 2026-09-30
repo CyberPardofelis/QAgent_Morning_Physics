@@ -898,10 +898,13 @@ def test_render_survey_without_pool_has_no_refs():
 def test_fact_prompt_asks_for_enough_facts():
     """
     9-29 实测: 10 篇 × 每篇 5 条 = 48 条 fact -> 综述仅 9000 字符。
-    篇幅正比于 fact 总数, 配额必须提上去。
+    9-30 user 拍板: 8-12 改成 4-12, 数量由抽取时按这篇的信息量自己决定
+    (短文/短综述抽 4 条就够, 不为凑数把一句话拆三条)。
     """
     from agent.prompts_survey import SURVEY_FACT_PROMPT
-    assert "8-12" in SURVEY_FACT_PROMPT, "每篇 fact 配额应提到 8-12"
+    assert "4-12" in SURVEY_FACT_PROMPT, "每篇 fact 配额应为 4-12 条"
+    assert "信息量" in SURVEY_FACT_PROMPT or "自己决定" in SURVEY_FACT_PROMPT, \
+        "应写明数量由模型按信息量自己决定"
 
 
 def test_fact_prompt_still_forbids_padding():

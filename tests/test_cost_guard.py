@@ -208,7 +208,7 @@ class TestCostGuardConfigIntegration:
         from config._config import Config
         s = Config._settings()
         s.remove("cost_ceiling_daily")   # 清掉持久化值, 逼它走代码默认值分支
-        assert Config.get_cost_ceiling_daily() == 100
+        assert Config.get_cost_ceiling_daily() == 400
 
     def test_set_ceiling_then_get(self, _isolated_cost_guard):
         """set_cost_ceiling_daily(100) → get_cost_ceiling_daily() == 100"""
@@ -227,7 +227,7 @@ class TestCostGuardConfigIntegration:
         """
         from config._config import Config
         Config.set_cost_ceiling_daily("not_a_number")  # type: ignore
-        assert Config.get_cost_ceiling_daily() == 100
+        assert Config.get_cost_ceiling_daily() == 400
 
 
 class TestCostGuardRealUsageIssue:

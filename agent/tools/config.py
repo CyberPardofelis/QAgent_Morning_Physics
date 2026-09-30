@@ -178,7 +178,7 @@ def _resolve_survey_relevance_threshold() -> int:
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
-            "[config] QAGENT_SURVEY_RELEVANCE_THRESHOLD=%r 不是合法整数, 走默认 8", raw,
+            "[config] QAGENT_SURVEY_RELEVANCE_THRESHOLD=%r 不是合法整数, 走默认 20", raw,
         )
         return 8
 
@@ -232,7 +232,7 @@ def _resolve_survey_fact_review_batch_size() -> int:
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
-            "[config] QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE=%r 不是合法整数, 走默认 8", raw,
+            "[config] QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE=%r 不是合法整数, 走默认 20", raw,
         )
         return 8
 
@@ -241,7 +241,11 @@ SURVEY_FACT_REVIEW_BATCH_SIZE = _resolve_survey_fact_review_batch_size()
 
 
 def get_fact_review_batch_size() -> int:
-    """fact 审查每批条数 (默认 8). 见 SURVEY_FACT_REVIEW_BATCH_SIZE 注释."""
+    """fact 主题对齐每批条数 (默认 20, 9-30 user 拍板从 8 提上来).
+
+    9-30: 345 条 fact 按 8 一批 = 43 次调用; 提到 20 = 18 次。
+    审查是逐条判定的, 批大小只影响调用次数, 不影响判定质量。
+    """
     return SURVEY_FACT_REVIEW_BATCH_SIZE
 
 

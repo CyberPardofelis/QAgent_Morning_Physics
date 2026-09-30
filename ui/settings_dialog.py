@@ -319,7 +319,10 @@ class SettingsDialog(QDialog):
         ceiling_group = QGroupBox("每日 LLM 调用上限")
         ceiling_layout = QFormLayout(ceiling_group)
         self.cost_ceiling_spin = QSpinBox()
-        self.cost_ceiling_spin.setRange(1, 9999)
+        # 9-30: 下限 30。上限调到 400 是因为一次完整综述真要 200+ 次调用
+        # (中途被 ceiling 硬阻断, 后面几小时全白跑, 比超支更亏);
+        # 但下限仍要给到 30, 低于这个数连一次小调研都跑不完, 没有实际意义。
+        self.cost_ceiling_spin.setRange(30, 9999)
         self.cost_ceiling_spin.setSuffix(" 次/天")
         ceiling_layout.addRow("上限:", self.cost_ceiling_spin)
         ceiling_hint = QLabel(

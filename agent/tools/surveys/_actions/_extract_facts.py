@@ -39,28 +39,61 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
 
     yield f"📝 extract_facts: 抽 {len(targets)} 篇, 调 {_PROVIDER}/{_MODEL}\n"
 
-    for _i, paper in enumerate(targets, 1):
-        paper_id = paper["paper_id"]
-        # 9-08 17:20 user 拍板: 不显示具体 fact_id / 单篇进度
+    # 9-30 user 拍板: 摘要制可以多篇一批, 全文只能一篇一批。
+    # 不写死篇数, 改成**按字符预算动态打包** —— 摘要短的自动凑到 4 篇左右,
+    # 碰上全文自然退化成 1 篇, 不用人判断"这篇算不算全文"。
+    # 依据: 单篇 prompt 实测约 3600 字符(OpenAlex 摘要制), 预算 14000 ≈ 4 篇。
+    # 参照: 主题归纳那一步单个 prompt 25421 字符是跑通过的, 说明模型吃得下这个量级。
+    _PROMPT_CHAR_BUDGET = 14000
+    _MAX_PAPERS_PER_CALL = 4
+
+    def _est_chars(p: dict[str, Any]) -> int:
+        return sum(len(str(p.get(k) or "")) for k in
+                   ("title", "abstract", "core_method", "core_contrib", "outlook", "journal"))
+
+    batches: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_chars = 0
+    for p in targets:
+        c = _est_chars(p)
+        # 单篇就超预算 -> 自己一批(全文情况)
+        if cur and (cur_chars + c > _PROMPT_CHAR_BUDGET or len(cur) >= _MAX_PAPERS_PER_CALL):
+            batches.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(p)
+        cur_chars += c
+    if cur:
+        batches.append(cur)
+
+    multi = sum(1 for b in batches if len(b) > 1)
+    yield (f"📝 extract_facts: 按字符预算打包成 {len(batches)} 批"
+           f"(其中 {multi} 批是多篇合抽)\n")
+
+    for batch in batches:
+        # 9-30: 一篇一个 prompt_id 会被模型混淆(多篇同名), 这里用批次内序号区分
+        blocks = []
+        for p in batch:
+            blocks.append(build_fact_prompt(
+                paper_id=p["paper_id"],
+                title=p.get("title", ""),
+                year=str(p.get("year", "")),
+                journal=p.get("journal", ""),
+                core_method=p.get("core_method", ""),
+                core_contrib=p.get("core_contrib", ""),
+                abstract=p.get("abstract", ""),
+                outlook=p.get("outlook", ""),
+            ))
+        fact_prompt = "\n\n".join(blocks) if len(blocks) > 1 else blocks[0]
+        batch_pids = [p["paper_id"] for p in batch]
         try:
-            fact_prompt = build_fact_prompt(
-                paper_id=paper_id,
-                title=paper.get("title", ""),
-                year=str(paper.get("year", "")),
-                journal=paper.get("journal", ""),
-                core_method=paper.get("core_method", ""),
-                core_contrib=paper.get("core_contrib", ""),
-                abstract=paper.get("abstract", ""),
-                outlook=paper.get("outlook", ""),
-            )
             out = _call_llm(
                 fact_prompt,
                 provider=_PROVIDER,
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.2,
-                max_tokens=10000,   # 9-08 user 拍板: 上限 10000
-                timeout=180,
+                max_tokens=10000 * max(1, len(batch)),
+                timeout=180 + 60 * len(batch),
             )
             # 剥 <think>
             if out and "<think>" in out:
@@ -81,15 +114,29 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
                 # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
                 # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
-                f = clean_fact(raw, paper_id, _i)
+                # 9-30: 多篇合抽时, 出处**只能靠 fact 自带的 paper_id 字段**回来。
+                # 模型可能把 paper_id 写成批内序号、写成批次号、或干脆不写 ——
+                # 这种情况**宁可丢掉这条 fact**, 也不能让它挂到错的论文上。
+                # 引用错比少一条严重得多: 错引用会一路带到正文和参考文献表。
+                fpid = str(raw.get("paper_id") or "").strip()
+                if fpid not in batch_pids:
+                    state["errors"].append({
+                        "step": state["step"], "action": "extract_facts",
+                        "paper": fpid or "?",
+                        "msg": f"多篇合抽时 paper_id 缺失或不在本批({batch_pids[:3]}...), 已丢弃该 fact",
+                    })
+                    continue
+                f = clean_fact(raw, fpid, _i)
                 ws.append_fact(f)
                 state["facts"].append(f)
         except Exception as e:
-            # 单篇失败不阻塞 batch, 不 yield 详情
-            state["errors"].append({
-                "step": state["step"], "action": "extract_facts",
-                "paper": paper_id, "msg": _friendly_error(e, "extract_facts"),
-            })
+            # 单批失败不阻塞后面的批, 不 yield 详情
+            for paper_id in batch_pids:
+                state["errors"].append({
+                    "step": state["step"], "action": "extract_facts",
+                    "paper": paper_id, "msg": _friendly_error(e, "extract_facts"),
+                })
+            continue
 
     # 9-08 17:20 user 拍板: 只显示"抽了 N 条 fact" 高层
     yield f"👁️ 抽完 {len(targets)} 篇, 累计 {len(state['facts'])} 条 fact\n"

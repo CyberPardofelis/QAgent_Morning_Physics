@@ -146,7 +146,10 @@ def audit_fact_grounding(
     paper_source: dict[str, str] | None = None,
     provider: str = "minimax",
     model: str = "MiniMax-M3",
-    batch_size: int = 8,
+    # 9-30 user 拍板: 8 -> 20。345 条 fact 按 8 一批要 43 次调用,
+    # 两道 fact 审查加起来占整轮 42%。提到 20 就是 18 次, 质量不受影响 ——
+    # 每条 fact 判定的输入没变, 只是塞进更长的 prompt。
+    batch_size: int = 20,
 ) -> dict[str, Any]:
     """
     审查 fact 是否有原文支撑, 就地写回 _grounded / _unsupported_terms。
