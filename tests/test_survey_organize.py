@@ -424,7 +424,7 @@ def test_render_survey_orders_by_arc():
     md = O.render_survey(tm, nar, title="综述")
     assert md.index("## B") < md.index("## A"), "应按 narrative_arc 排序"
     assert "# 综述" in md
-    assert "## 文献覆盖的不足" in md
+    assert "文献覆盖的空白" in md
 
 
 def test_render_survey_skips_empty_narratives():
@@ -814,3 +814,97 @@ def test_subject_variant_skips_bad_subjects():
 def test_subject_variant_empty_input():
     assert O.flag_subject_variants([]) == []
     assert O.flag_subject_variants([_sf("a::0", "快照")]) == []
+
+
+# ============================================================
+# 参考文献列表 (9-29 用户要求: 正文有 doi, 但最后要有文献列表)
+# ============================================================
+
+POOL = [
+    {"paper_id": "2401.11111", "title": "First paper on shadows",
+     "journal": "PRX Quantum", "year": "2024"},
+    {"paper_id": "10.1103/physrevlett.130.111111", "title": "Second paper",
+     "journal": "PRL", "year": "2022"},
+    {"paper_id": "uncited-9999", "title": "Never cited", "journal": "", "year": ""},
+]
+
+
+def test_reference_list_numbered_in_citation_order():
+    text = "先说这个 [2401.11111]，再说那个 [10.1103/physrevlett.130.111111]。"
+    md = O.build_reference_list(text, POOL)
+    lines = [ln for ln in md.splitlines() if ln.startswith("[")]
+    assert lines[0].startswith("[1]") and "2401.11111" in lines[0]
+    assert lines[1].startswith("[2]") and "physrevlett" in lines[1]
+    assert "First paper on shadows" in lines[0]
+    assert "PRX Quantum, 2024" in lines[0]
+
+
+def test_reference_list_excludes_uncited():
+    """正文没引用的不该出现在参考文献里(它属于'文献覆盖的空白')。"""
+    md = O.build_reference_list("只引了 [2401.11111]", POOL)
+    assert "2401.11111" in md
+    assert "uncited-9999" not in md
+    assert "Never cited" not in md
+
+
+def test_reference_list_empty_when_no_citation():
+    assert O.build_reference_list("完全没有引用的一段话。", POOL) == ""
+
+
+def test_reference_list_dedups_repeat_citation():
+    md = O.build_reference_list("提到 [2401.11111] 又提到 [2401.11111]。", POOL)
+    assert md.count("[1]") == 1
+
+
+def test_render_survey_appends_references():
+    tm = {
+        "themes": [{"name": "A", "statement": "s", "fact_ids": ["p::0"],
+                    "notes": "", "relations": []}],
+        "narrative_arc": ["A"], "gaps": [],
+    }
+    nar = {"A": {"text": "断言 [2401.11111]。"}}
+    md = O.render_survey(tm, nar, title="综述", pool=POOL)
+    assert "## 参考文献" in md
+    assert md.index("## 参考文献") > md.index("## A"), "参考文献必须在正文之后"
+
+
+def test_reference_list_after_gaps():
+    """顺序: 正文 → 文献空白 → 参考文献。"""
+    tm = {
+        "themes": [{"name": "A", "statement": "s", "fact_ids": ["p::0"],
+                    "notes": "", "relations": []}],
+        "narrative_arc": ["A"], "gaps": ["缺某方向"],
+    }
+    nar = {"A": {"text": "断言 [2401.11111]。"}}
+    md = O.render_survey(tm, nar, title="综述", pool=POOL)
+    assert md.index("文献覆盖的空白") < md.index("## 参考文献")
+
+
+def test_render_survey_without_pool_has_no_refs():
+    tm = {
+        "themes": [{"name": "A", "statement": "s", "fact_ids": ["p::0"],
+                    "notes": "", "relations": []}],
+        "narrative_arc": ["A"], "gaps": [],
+    }
+    nar = {"A": {"text": "断言 [2401.11111]。"}}
+    md = O.render_survey(tm, nar, title="综述")
+    assert "## 参考文献" not in md
+
+
+# ============================================================
+# fact 配额: 篇幅正比于 fact 数, 配额太低是篇幅不够的根因
+# ============================================================
+
+def test_fact_prompt_asks_for_enough_facts():
+    """
+    9-29 实测: 10 篇 × 每篇 5 条 = 48 条 fact -> 综述仅 9000 字符。
+    篇幅正比于 fact 总数, 配额必须提上去。
+    """
+    from agent.prompts_survey import SURVEY_FACT_PROMPT
+    assert "8-12" in SURVEY_FACT_PROMPT, "每篇 fact 配额应提到 8-12"
+
+
+def test_fact_prompt_still_forbids_padding():
+    """提配额不能变成凑数 —— 仍要写明编造的代价。"""
+    from agent.prompts_survey import SURVEY_FACT_PROMPT
+    assert "宁可少提也不要编" in SURVEY_FACT_PROMPT

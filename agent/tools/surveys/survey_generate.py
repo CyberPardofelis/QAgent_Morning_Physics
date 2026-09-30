@@ -358,7 +358,7 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50):
             yield f"      ⚠ {w}\n"
 
     # ---- 组装 + 落库 ----
-    doc = render_survey(theme_map, narratives, title=topic,
+    doc = render_survey(theme_map, narratives, title=topic, pool=pool,
                         subtitle="本综述章节结构由文献内容归纳得出(Phase B 主题地图), 非预设模板。")
     from ._crud import create_section
     theme_id = _find_or_create_theme(topic, edited=True)

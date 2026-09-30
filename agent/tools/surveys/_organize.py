@@ -736,11 +736,59 @@ def write_theme_narrative(
 # 组装
 # ============================================================
 
+def build_reference_list(
+    text: str,
+    pool: list[dict[str, Any]],
+    title: str = "参考文献",
+) -> str:
+    """
+    按正文**实际出现顺序**生成编号参考文献表。
+
+    9-29 用户要求: "引用的论文虽然在正文里有 doi, 但最后还是希望有一个文献列表"。
+
+    只收录正文真正引用到的 paper_id(按首次出现顺序编号), 不掺没引用的 ——
+    未引用的论文会在 Phase B 另列为"文献覆盖的空白", 不该出现在参考文献里。
+    """
+    order: list[str] = []
+    for pid in _extract_cited_ids(text):
+        if pid not in order:
+            order.append(pid)
+    if not order:
+        return ""
+    by_id = {p.get("paper_id"): p for p in pool}
+    lines = [f"## {title}", ""]
+    for i, pid in enumerate(order, 1):
+        p = by_id.get(pid) or {}
+        bits = []
+        if p.get("title"):
+            bits.append(str(p["title"]).strip())
+        meta = []
+        if p.get("journal"):
+            meta.append(str(p["journal"]))
+        if p.get("year"):
+            meta.append(str(p["year"]))
+        if meta:
+            bits.append("(" + ", ".join(meta) + ")")
+        lines.append(f"[{i}] {''.join(bits)}  `{pid}`")
+    return "\n".join(lines) + "\n"
+
+
+def _extract_cited_ids(text: str) -> list[str]:
+    """从正文抽 paper_id, 按首次出现顺序去重。"""
+    from ._pool._utils import _extract_paper_ids
+    out: list[str] = []
+    for pid in _extract_paper_ids(text or ""):
+        if pid not in out:
+            out.append(pid)
+    return out
+
+
 def render_survey(
     theme_map: dict[str, Any],
     narratives: dict[str, dict[str, Any]],
     title: str = "",
     subtitle: str = "",
+    pool: list[dict[str, Any]] | None = None,
 ) -> str:
     """把主题地图 + 各主题叙述拼成综述 markdown。"""
     parts: list[str] = []
@@ -753,6 +801,7 @@ def render_survey(
     if arc:
         rank = {n: i for i, n in enumerate(arc)}
         order = sorted(order, key=lambda n: (rank.get(n, len(rank)), order.index(n)))
+    body_parts: list[str] = []
     for name in order:
         theme = next((t for t in theme_map["themes"] if t["name"] == name), None)
         if not theme:
@@ -764,10 +813,17 @@ def render_survey(
         head = f"## {name}"
         if theme.get("statement"):
             head += f"\n\n*{theme['statement']}*"
-        parts.append(head + "\n\n" + text)
+        body_parts.append(head + "\n\n" + text)
     gaps = theme_map.get("gaps") or []
     if gaps:
-        parts.append("## 文献覆盖的不足\n\n" + "\n".join(f"- {g}" for g in gaps))
+        body_parts.append("## 文献覆盖的空白\n\n" + "\n".join(f"- {g}" for g in gaps))
+    # 9-29: 参考文献放最后, 按正文实际引用顺序
+    if pool:
+        refs = build_reference_list("\n\n".join(body_parts), pool)
+        if refs:
+            body_parts.append(refs)
+    if body_parts:
+        parts.append("\n\n".join(body_parts))
     return "\n\n".join(parts) + "\n"
 
 
