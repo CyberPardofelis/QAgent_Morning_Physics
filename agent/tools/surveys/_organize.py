@@ -1035,6 +1035,7 @@ def condense_facts_by_theme(
     """
     fmap = {f.get("fact_id"): f for f in facts if f.get("fact_id")}
     all_claims: list[dict[str, Any]] = []
+    _global_seq = [0]   # 跨主题递增, 保证 q1/q2/... 全局不撞号
     for theme in theme_map.get("themes", []):
         tfs = [fmap[fid] for fid in (theme.get("fact_ids") or []) if fid in fmap]
         if not tfs:
@@ -1050,9 +1051,14 @@ def condense_facts_by_theme(
             continue
         batch_claims = condense_facts_into_claims(
             tfs, provider=provider, model=model, batch_size=batch_size)
+        # 9-30 修: claim_id 原来拼成 f"{name}#{cid}"。这个前缀**把标注语法搞脆了** ——
+        # 模型看到 [张量网络与拟设#c1], 写出来多半是 [[c1]], 解析不上 -> 整句被丢,
+        # 实测 4 批成文全部 0 字符。claim_id 是要让模型在句末**照抄**的, 必须好写。
+        # 改成全局递增的短 id, 跨主题不撞号(所以要维护一个全局 seq)。
         for c in batch_claims:
             c["theme_name"] = name
-            c["claim_id"] = f"{name}#{c['claim_id']}"
+            _global_seq[0] += 1
+            c["claim_id"] = f"q{_global_seq[0]}"
         all_claims.extend(batch_claims)
     return all_claims
 
