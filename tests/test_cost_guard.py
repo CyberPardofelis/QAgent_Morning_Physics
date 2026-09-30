@@ -195,14 +195,20 @@ class TestCostGuardThreadSafety:
 class TestCostGuardConfigIntegration:
     """Config.get_cost_ceiling_daily() 集成"""
 
-    def test_default_ceiling_is_50(self):
-        """Config.get_cost_ceiling_daily() 默认返回 50
+    def test_default_ceiling_when_unset(self):
+        """**代码默认值**是 100 —— 键不存在时该返回它。
 
-        ⚠️ 9-21 体检发现: 这个默认 50 太大, 实际用户用不到 (见 TestCostGuardRealUsageIssue)
+        ⚠️ 9-30 修: 原来这个测试叫 test_default_ceiling_is_50 并断言 == 50, 但它
+        读的是 QSettings 里**用户持久化的值**, 不是代码默认值。两个后果:
+          1. 断言的数是错的 —— 代码默认 9-27 就从 50 上调到 100 了
+          2. 它一直"通过"只是因为另一个测试的 cleanup 把用户设置写死成 50
+        所以想验默认值必须**先把键删掉**, 否则验的是用户当前设置。
+        还原交给 autouse 的 _isolated_config (它存的是进入测试前的用户真实值)。
         """
         from config._config import Config
-        # 注意: 用了独立 QSettings (autouse fixture 设了)
-        assert Config.get_cost_ceiling_daily() == 50
+        s = Config._settings()
+        s.remove("cost_ceiling_daily")   # 清掉持久化值, 逼它走代码默认值分支
+        assert Config.get_cost_ceiling_daily() == 100
 
     def test_set_ceiling_then_get(self, _isolated_cost_guard):
         """set_cost_ceiling_daily(100) → get_cost_ceiling_daily() == 100"""
