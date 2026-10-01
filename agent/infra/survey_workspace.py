@@ -103,6 +103,30 @@ class SurveyWorkspace:
         with p.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
+    def clear_facts(self) -> int:
+        """清空 _facts.jsonl, 返回清掉的条数。
+
+        9-30 加: 之前只 append 不清, 于是**同一个主题重跑会累积 fact**。
+        实测 workspace 里堆到 1089 行, 同一篇论文积累了 42 条(配额本来 4-12),
+        跨运行的陈旧 fact 和新一轮的混在一起。
+
+        这个坑还间接造成过一次事故: 某次 fact 抽取全军覆没(抽了 0 条),
+        `extract_state["facts"] or ws.load_facts()` 静默端上了历史累积的 685 条,
+        综述照常产出、**看起来完全正常, 实际建在旧数据上**。
+
+        一轮 survey 应该产出它自己那一轮的 fact, 所以抽取开始前先清。
+        (phase=write 这类续跑不调抽取, 不受影响。)
+        """
+        p = self.path / "_facts.jsonl"
+        if not p.exists():
+            return 0
+        try:
+            n = sum(1 for _ in p.open("r", encoding="utf-8"))
+        except OSError:
+            return 0
+        p.write_text("", encoding="utf-8")
+        return n
+
     def load_facts(self) -> list[dict[str, Any]]:
         p = self.path / "_facts.jsonl"
         if not p.exists():

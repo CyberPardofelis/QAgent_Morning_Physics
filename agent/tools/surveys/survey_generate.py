@@ -293,6 +293,13 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
 
     # ---- Phase 2: fact 抽取 ----
     yield "\n📝 抽取原子 fact...\n"
+    # 9-30: 抽取前先清掉上一轮遗留的 fact。workspace 按主题 hash 复用, 之前
+    # 只 append 不清, 同一主题重跑会一路累积(实测堆到 1089 行, 同一篇论文
+    # 攒了 42 条, 而配额本来是 4-12)。更糟的是抽取一旦失败,
+    # `or ws.load_facts()` 会静默端上这些陈旧数据 —— 产出看着正常, 实际是旧数据。
+    _stale = ws.clear_facts()
+    if _stale:
+        yield f"   (清掉上一轮遗留 fact {_stale} 条)\n"
     from ._actions import action_extract_facts
     # 9-27 修: state 必须带 topic —— action_extract_facts 末尾的**主题对齐审查**
     # 要用它。漏了会 KeyError('topic'), 那套审查静默降级(实测踩到, 日志里
