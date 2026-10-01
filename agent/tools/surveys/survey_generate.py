@@ -310,7 +310,18 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
                                       extract_state, ws):
         if chunk:
             yield chunk
-    facts = extract_state["facts"] or ws.load_facts()
+    # 9-30 修: 原来写的是 `extract_state["facts"] or ws.load_facts()` ——
+    # 抽取**全军覆没**时会静默退回 workspace 里的旧 fact。而 workspace 按主题
+    # hash 复用, 同主题重跑就是上一轮的数据。实测: 51 篇抽了 0 条, 端上来 685 条
+    # 陈旧的, 综述照常产出, 看上去完全正常 —— 实际建在旧数据上。
+    facts = extract_state["facts"]
+    stale = ws.load_facts()
+    if not facts and stale:
+        # 有意保留兜底(比如续跑 phase=write), 但**必须喊出来**, 不能静默
+        print(f"[organize] ⚠️ 本轮抽取 0 条 fact, 沿用 workspace 里的 {len(stale)} 条旧数据", flush=True)
+        facts = stale
+    elif not facts:
+        print("[organize] ❌ 本轮抽取 0 条 fact 且 workspace 无历史数据", flush=True)
     usable = [f for f in facts if _fact_is_usable(f)]
     ws.set_status("facts", len(usable), len(facts), "fact 抽取完成")
     if not usable:

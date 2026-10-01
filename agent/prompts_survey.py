@@ -226,7 +226,12 @@ def clean_fact(f: dict[str, Any], paper_id: str, idx: int) -> dict[str, Any]:
         _subject_ok/_subject_issues  subject 是否可用于跨论文对齐
     """
     f = dict(f)
-    f.setdefault("paper_id", paper_id)
+    # 9-30 修: 原来用 setdefault —— 只在 key **不存在**时才写入。而模型基本总会
+    # 带上 paper_id 字段(多篇合抽时甚至可能填成批内序号 "4"), 于是 setdefault 什么
+    # 都不做, 调用方传进来的**权威值被无视**, fact 就挂到了错的论文上。
+    # 实测: 51 篇合抽, 落盘一堆 paper_id="4" 的 fact。
+    # 调用方(抽取循环)知道真实 paper_id, 这里必须**强制覆盖**。
+    f["paper_id"] = paper_id
     f["fact_id"] = f"{paper_id}::{idx}"
     # subject: 这条 fact 讨论的核心对象(跨论文对齐用, Phase B 聚类的依据)
     subj = (f.get("subject") or "").strip()

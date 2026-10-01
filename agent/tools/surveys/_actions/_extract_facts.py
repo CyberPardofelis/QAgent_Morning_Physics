@@ -85,6 +85,19 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             ))
         fact_prompt = "\n\n".join(blocks) if len(blocks) > 1 else blocks[0]
         batch_pids = [p["paper_id"] for p in batch]
+        if len(batch) > 1:
+            # 9-30 实测事故: 多篇合抽时, 模型**不会原样回抄 paper_id**(长的 DOI 串
+            # 抄不准/截断/干脆不写) -> 校验全部落空 -> 51 篇抽出 0 条 fact。
+            # 教训: 让模型抄长字符串是不可靠的, 要抄**批内序号**。
+            idx_hint = ", ".join(f"{i+1}={pid}" for i, pid in enumerate(batch_pids))
+            fact_prompt = (
+                f"【本次共 {len(batch)} 篇论文, 编号如下】\n{idx_hint}\n"
+                f"**每条 fact 的 paper_id 字段必须填上面表格里的编号(1 到 {len(batch)}), "
+                f"不要填完整的 paper_id 字符串。**\n\n" + fact_prompt
+            )
+        # 批内序号 -> 真实 paper_id
+        idx2pid = {str(i + 1): pid for i, pid in enumerate(batch_pids)}
+        idx2pid.update({pid: pid for pid in batch_pids})
         try:
             out = _call_llm(
                 fact_prompt,
@@ -114,16 +127,16 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
                 # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
                 # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
-                # 9-30: 多篇合抽时, 出处**只能靠 fact 自带的 paper_id 字段**回来。
-                # 模型可能把 paper_id 写成批内序号、写成批次号、或干脆不写 ——
-                # 这种情况**宁可丢掉这条 fact**, 也不能让它挂到错的论文上。
-                # 引用错比少一条严重得多: 错引用会一路带到正文和参考文献表。
-                fpid = str(raw.get("paper_id") or "").strip()
-                if fpid not in batch_pids:
+                # 9-30: 多篇合抽时, 出处靠 fact 自带的 paper_id 字段回来。
+                # 模型可能回**批内序号**(1..N)或原样的 paper_id, 两种都认;
+                # 都对不上就**丢掉这条** —— 错引用会一路带到正文和参考文献表, 比少一条严重。
+                raw_pid = raw.get("paper_id")
+                fpid = idx2pid.get(str(raw_pid).strip(), "")
+                if not fpid:
                     state["errors"].append({
                         "step": state["step"], "action": "extract_facts",
-                        "paper": fpid or "?",
-                        "msg": f"多篇合抽时 paper_id 缺失或不在本批({batch_pids[:3]}...), 已丢弃该 fact",
+                        "paper": str(raw_pid)[:60] or "?",
+                        "msg": f"多篇合抽时 paper_id 缺失或不在本批 {batch_pids[:2]}..., 已丢弃该 fact",
                     })
                     continue
                 f = clean_fact(raw, fpid, _i)
