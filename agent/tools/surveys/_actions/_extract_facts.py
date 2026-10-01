@@ -112,15 +112,18 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
                 # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
                 # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
-                # 9-30: 多篇合抽时, 出处靠 fact 自带的 paper_id 字段回来。
-                # 模型可能回**批内序号**(1..N)或原样的 paper_id, 两种都认;
-                # 都对不上就**丢掉这条** —— 错引用会一路带到正文和参考文献表, 比少一条严重。
-                raw_pid = raw.get("paper_id")
-                fpid = idx2pid.get(str(raw_pid).strip(), "")
+                # 9-30: 多篇合抽时, 出处靠 fact 自带的 paper_id 字段回来(可能是批内序号)。
+                # **单篇时根本不用查表** —— 批次里只有一篇, paper_id 是已知的。
+                # 踩过的坑: 单篇时模型经常**不填** paper_id 字段(老代码靠 clean_fact 的
+                # setdefault 兜住), 改成"先查表再覆盖"后查不到就全丢, 49 篇抽出 0 条。
+                if len(batch_pids) == 1:
+                    fpid = batch_pids[0]
+                else:
+                    fpid = idx2pid.get(str(raw.get("paper_id") or "").strip(), "")
                 if not fpid:
                     state["errors"].append({
                         "step": state["step"], "action": "extract_facts",
-                        "paper": str(raw_pid)[:60] or "?",
+                        "paper": str(raw.get("paper_id"))[:60] or "?",
                         "msg": f"多篇合抽时 paper_id 缺失或不在本批 {batch_pids[:2]}..., 已丢弃该 fact",
                     })
                     continue
