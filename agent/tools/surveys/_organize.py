@@ -904,7 +904,11 @@ def condense_facts_into_claims(
             try:
                 out = _call_llm(prompt, provider=provider, model=model,
                                 enable_thinking=False, temperature=temperature,
-                                max_tokens=6000, timeout=300)
+                                # 9-30: 6000 -> 3000。输出里真正有用的只有
+                                # fact_idx 列表 + 一句 statement; MiniMax 即便
+                                # enable_thinking=False 也会吐<think> 且照样吃额度,
+                                # 给太多就一路生成到上限(实测每批 16000 字符)。
+                                max_tokens=3000, timeout=300)
             except Exception as e:
                 logger.warning("[condense_claims] batch 失败: %s", e)
                 out = ""
@@ -914,15 +918,15 @@ def condense_facts_into_claims(
             if groups:
                 break
         if not groups:
-            groups = [[i] for i in range(1, len(cluster) + 1)]   # 解析失败 -> 不强凑
+            groups = [([i], "") for i in range(1, len(cluster) + 1)]   # 解析失败 -> 不强凑
 
         # 覆盖检查: LLM 可能漏掉某些 fact, 漏的单独成条, 绝不能静默丢
-        covered = {i for g in groups for i in g}
+        covered = {i for g, _s in groups for i in g}
         for i in range(1, len(cluster) + 1):
             if i not in covered:
-                groups.append([i])
+                groups.append(([i], ""))
 
-        for g in groups:
+        for g, stmt in groups:
             members = [cluster[i - 1] for i in g if 1 <= i <= len(cluster)]
             if not members:
                 continue
@@ -932,7 +936,11 @@ def condense_facts_into_claims(
                 pid = m.get("paper_id") or ""
                 if pid and pid not in pids:
                     pids.append(pid)
-            statement = " ".join((m.get("claim") or "").strip() for m in members)
+            # 9-30: 优先用**模型合成的 statement**, 拿不到才回退到拼接 fact 原文。
+            # 原来无论模型写没写都拼接原文 —— 模型那句概括白写(付了 token 就被扔),
+            # 而且命题层本来该做的"综合"就没了, 这也是合并率上不去的原因之一。
+            statement = (stmt or "").strip() or " ".join(
+                (m.get("claim") or "").strip() for m in members)
             claims.append({
                 "claim_id": f"c{seq}",
                 "statement": statement,
@@ -983,35 +991,41 @@ def _batch_by_subject(
 _CLAIM_GROUP_RE = re.compile(r"\{[^{}]*\}")
 
 
-def _parse_claim_groups(raw: str, n: int) -> list[list[int]]:
-    """从 LLM 输出里解析 [[1,3,5], [2], ...] 或 [{"fact_idx":[1,3]}, ...]。
-    两种格式都收 —— 模型的 JSON 服从率不是 100%, 宽松点比整批丢掉强。"""
+def _parse_claim_groups(raw: str, n: int) -> list[tuple[list[int], str]]:
+    """从 LLM 输出里解析分组。返回 [(fact_idx 列表, statement)], statement 可为空串。
+
+    9-30 修: 原来只返回 idx 列表, **模型写的 statement 被整个丢掉**, 后面又用
+    fact 原文拼接替代 —— 等于模型每组白写一句概括(付了 token), 换回来的还是
+    原始 fact 拼接。既浪费输出, 又丢掉了"综合"本身, 这正是合并率上不去的原因之一。
+
+    两种格式都收(JSON 对象 / 纯下标数组), 模型的 JSON 服从率不是 100%。
+    """
     if not raw:
         return []
     txt = raw.replace("```json", "").replace("```", "").strip()
+    out: list[tuple[list[int], str]] = []
 
-    groups: list[list[int]] = []
-    # 优先按 JSON 对象分组 {"fact_idx": [1,3]}
+    def _idxs(part: str) -> list[int]:
+        v = [int(x) for x in re.findall(r"\d+", part)]
+        return sorted({i for i in v if 1 <= i <= n})
+
+    # 1) JSON 对象: {"fact_idx": [1,3], "statement": "..."}
     for chunk in _CLAIM_GROUP_RE.findall(txt):
-        idxs = [int(x) for x in re.findall(r"\d+", chunk)]
-        idxs = [i for i in idxs if 1 <= i <= n]
-        if idxs:
-            groups.append(sorted(set(idxs)))
-    if groups:
-        return groups
+        idxs = _idxs(chunk)
+        if not idxs:
+            continue
+        sm = re.search(r'"statement"\s*:\s*"([^"]*)"', chunk)
+        out.append((idxs, (sm.group(1).strip() if sm else "")))
+    if out:
+        return out
 
-    # 整块形如 [[1, 3], [2, 5]] 或 [[1, 2, 3]]。
-    # 关键: 不能用 `\[\[...\]\]` 那种"内层排除方括号"的写法 —— 组间就是靠
-    # "], [" 断开的, 排除方括号会导致整块匹配不上(实测返回空)。
-    # 改成先抓"只由数字/空白/逗号/方括号组成"的整块, 剥掉外层再按 "], [" 拆组。
+    # 2) 多组块 [[1,3],[2,5]] —— 这种格式没有 statement, 留空让调用方兜底
     for block in re.findall(r"\[[\d\s,\[\]]{3,}\]", txt):
-        inner = block.strip()[1:-1].strip()      # 剥最外层方括号
-        for part in re.split(r"\]\s*,\s*\[", inner):
-            idxs = [int(x) for x in re.findall(r"\d+", part)]
-            idxs = [i for i in idxs if 1 <= i <= n]
+        for part in re.split(r"\]\s*,\s*\[", block.strip("[]")):
+            idxs = _idxs(part)
             if idxs:
-                groups.append(sorted(set(idxs)))
-    return groups
+                out.append((idxs, ""))
+    return out
 
 
 # ============================================================
@@ -1138,7 +1152,10 @@ def write_theme_narrative_from_claims(
             try:
                 out = _call_llm(prompt, provider=provider, model=model,
                                 enable_thinking=False, temperature=0.4,
-                                max_tokens=8000, timeout=420)
+                                # 9-30: 8000 -> 2000。实测每批最终只活下来约 245 字符, 给了 32 倍余量,
+            # 模型每次都生成到上限(26 次共吐 34 万字符, 成文 6371 字符, 54 倍放大,
+            # 94% 被 _render_claim_citations_or_drop 丢掉)。2000 够用。
+            max_tokens=2000, timeout=420)
             except Exception as e:
                 logger.warning("[write_claims] batch %d 失败: %s", bi, e)
                 out = ""

@@ -101,13 +101,23 @@ def test_uncited_paper_not_in_reference_list():
 # ============================================================
 # 命题合并: 分组解析
 # ============================================================
+# 9-30: 返回值改成 (indices, statement) 二元组 —— statement 会被真正使用,
+# 原来模型写的概括被整个丢掉, 换回 fact 原文拼接, 白付 token 又丢掉"综合"本身。
+
+def test_parse_claim_groups_keeps_statement():
+    """
+    9-30 修的核心: 模型为每组合成的 statement 之前被整个丢弃。
+    """
+    raw = '{"groups": [{"fact_idx": [1, 3], "statement": "两篇都指出临界点对数标度"}]}'
+    assert OG._parse_claim_groups(raw, 10) == [([1, 3], "两篇都指出临界点对数标度")]
+
 
 @pytest.mark.parametrize("raw,expect", [
-    ('{"groups": [{"fact_idx": [1, 3]}, {"fact_idx": [2]}]}', [[1, 3], [2]]),
-    ('[[1, 3], [2]]', [[1, 3], [2]]),
-    ('[[1,2],[4,5,6]]', [[1, 2], [4, 5, 6]]),
-    ('   [[1, 2]]   ', [[1, 2]]),
-    ("```json\n[[1,2]]\n```", [[1, 2]]),
+    ('{"groups": [{"fact_idx": [1, 3]}, {"fact_idx": [2]}]}', [([1, 3], ""), ([2], "")]),
+    ('[[1, 3], [2]]', [([1, 3], ""), ([2], "")]),
+    ('[[1,2],[4,5,6]]', [([1, 2], ""), ([4, 5, 6], "")]),
+    ('   [[1, 2]]   ', [([1, 2], "")]),
+    ("```json\n[[1,2]]\n```", [([1, 2], "")]),
 ])
 def test_parse_claim_groups(raw, expect):
     assert OG._parse_claim_groups(raw, 10) == expect
@@ -115,7 +125,7 @@ def test_parse_claim_groups(raw, expect):
 
 def test_parse_claim_groups_filters_out_of_range():
     """模型编造越界序号时要丢掉, 否则会 IndexError 或错配 fact。"""
-    assert OG._parse_claim_groups("[[1, 99], [2]]", 3) == [[1], [2]]
+    assert OG._parse_claim_groups("[[1, 99], [2]]", 3) == [([1], ""), ([2], "")]
 
 
 def test_parse_claim_groups_empty():
