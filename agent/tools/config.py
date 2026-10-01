@@ -209,7 +209,7 @@ def _resolve_survey_fact_review_threshold() -> int:
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
-            "[config] QAGENT_SURVEY_FACT_REVIEW_THRESHOLD=%r 不是合法整数, 走默认 5", raw,
+            "[config] QAGENT_SURVEY_FACT_REVIEW_THRESHOLD=%r 不是合法整数, 走默认 20", raw,
         )
         return 5
 
@@ -276,14 +276,14 @@ def get_chroma_sim_threshold() -> float:
 def _resolve_survey_relevance_batch_size() -> int:
     raw = os.getenv("QAGENT_SURVEY_RELEVANCE_BATCH_SIZE", "").strip()
     if not raw:
-        return 5
+        return 20
     try:
         v = int(raw)
-        return v if 1 <= v <= 20 else 5
+        return v if 1 <= v <= 20 else 20
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
-            "[config] QAGENT_SURVEY_RELEVANCE_BATCH_SIZE=%r 不是合法整数, 走默认 5", raw,
+            "[config] QAGENT_SURVEY_RELEVANCE_BATCH_SIZE=%r 不是合法整数, 走默认 20", raw,
         )
         return 5
 
@@ -292,5 +292,11 @@ SURVEY_RELEVANCE_BATCH_SIZE = _resolve_survey_relevance_batch_size()
 
 
 def get_relevance_batch_size() -> int:
-    """relevance 评分每批论文数 (默认 5). 见 SURVEY_RELEVANCE_BATCH_SIZE 注释."""
+    """relevance 评分每批论文数 (默认 20)。
+
+    9-30 从 5 提到 20: 相关性判定的输入只有 title/core_method/core_contrib/abstract,
+    **不带原文**, 一篇约 1200 字符 —— 5 篇一批极保守。实测 112 篇要 57 次调用,
+    提到 20 篇约 10 次, 判定内容不变。
+    注意 max_tokens 必须同步提(见 _relevance_filter.py), 否则 JSON 会被截断。
+    """
     return SURVEY_RELEVANCE_BATCH_SIZE

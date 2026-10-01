@@ -70,7 +70,15 @@ def _relevance_filter_pool(
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.2,
-                max_tokens=2000,    # 5 篇 × ~100 token/篇 + JSON overhead
+                # 9-30: 批大小和 max_tokens 一起提。
+                # 原来 5 篇/批 + max_tokens=2000 —— **真正卡住的是 max_tokens**:
+                # 5 篇的 JSON 判定输出就已经贴着上限, 实测出现
+                # "batch 7/8 失败 (relevance batch JSON parse 失败)" 就是被截断。
+                # 而相关性判定的输入只有 title/core_method/core_contrib/abstract,
+                # **不带原文**, 一篇约 1200 字符, 塞 20 篇才 2.4 万字符
+                # (同规模的 fact 语义审查单 prompt 1.8 万字符是跑通过的)。
+                # 57 次 -> 约 10 次, 判定内容不变。
+                max_tokens=max(4000, 400 * len(batch)),
                 timeout=120,
             )
             # 剥 <think>
