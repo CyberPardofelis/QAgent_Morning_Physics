@@ -39,35 +39,17 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
 
     yield f"📝 extract_facts: 抽 {len(targets)} 篇, 调 {_PROVIDER}/{_MODEL}\n"
 
-    # 9-30 user 拍板: 摘要制可以多篇一批, 全文只能一篇一批。
-    # 不写死篇数, 改成**按字符预算动态打包** —— 摘要短的自动凑到 4 篇左右,
-    # 碰上全文自然退化成 1 篇, 不用人判断"这篇算不算全文"。
-    # 依据: 单篇 prompt 实测约 3600 字符(OpenAlex 摘要制), 预算 14000 ≈ 4 篇。
-    # 参照: 主题归纳那一步单个 prompt 25421 字符是跑通过的, 说明模型吃得下这个量级。
-    _PROMPT_CHAR_BUDGET = 14000
-    _MAX_PAPERS_PER_CALL = 4
-
-    def _est_chars(p: dict[str, Any]) -> int:
-        return sum(len(str(p.get(k) or "")) for k in
-                   ("title", "abstract", "core_method", "core_contrib", "outlook", "journal"))
-
-    batches: list[list[dict[str, Any]]] = []
-    cur: list[dict[str, Any]] = []
-    cur_chars = 0
-    for p in targets:
-        c = _est_chars(p)
-        # 单篇就超预算 -> 自己一批(全文情况)
-        if cur and (cur_chars + c > _PROMPT_CHAR_BUDGET or len(cur) >= _MAX_PAPERS_PER_CALL):
-            batches.append(cur)
-            cur, cur_chars = [], 0
-        cur.append(p)
-        cur_chars += c
-    if cur:
-        batches.append(cur)
-
-    multi = sum(1 for b in batches if len(b) > 1)
-    yield (f"📝 extract_facts: 按字符预算打包成 {len(batches)} 批"
-           f"(其中 {multi} 批是多篇合抽)\n")
+    # 9-30 实测结论: **fact 抽取不能合批**, 已从 4 篇/批回退到 1 篇/批。
+    #
+    # 我原本按字符预算做多篇合批(省 4 倍调用), 实测 12 篇分 3 批跑下来:
+    #     26 条 fact, 但只来自 **4 篇** —— 另外 8 篇产出为零
+    # 模型把多篇 prompt 当成**一个整体**处理: 只挑 1 篇抽, 其余直接无视。
+    # (哪怕在 prompt 里补一句"每篇都要各自抽 4-12 条"也没用。)
+    # 代价太大: 丢掉 2/3 的论文, 综述覆盖面直接塌。所以这里退回逐篇。
+    #
+    # 省调用的正确位置在**审查**: 语义审查/主题对齐是逐条判定,
+    # 批大小只影响调用次数不影响判定质量, 那两处 8 -> 20 的提批是安全的。
+    batches = [[p] for p in targets]
 
     for batch in batches:
         # 9-30: 一篇一个 prompt_id 会被模型混淆(多篇同名), 这里用批次内序号区分
@@ -93,7 +75,10 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             fact_prompt = (
                 f"【本次共 {len(batch)} 篇论文, 编号如下】\n{idx_hint}\n"
                 f"**每条 fact 的 paper_id 字段必须填上面表格里的编号(1 到 {len(batch)}), "
-                f"不要填完整的 paper_id 字符串。**\n\n" + fact_prompt
+                f"不要填完整的 paper_id 字符串。**\n"
+                f"**每篇论文都要各自抽 4-12 条 fact, 不是这一批总共 4-12 条。**\n"
+                f"每篇论文各自独立判断信息量, 不要把一篇的细节拆到另一篇上。\n\n"
+                + fact_prompt
             )
         # 批内序号 -> 真实 paper_id
         idx2pid = {str(i + 1): pid for i, pid in enumerate(batch_pids)}
