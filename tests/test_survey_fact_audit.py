@@ -357,3 +357,168 @@ def test_fact_prompt_demands_chinese_claim():
     from agent.prompts_survey import SURVEY_FACT_PROMPT
     assert "必须用中文写" in SURVEY_FACT_PROMPT
     assert "不要因为" in SURVEY_FACT_PROMPT and "整句写成英文" in SURVEY_FACT_PROMPT
+
+
+# ============================================================
+# 10-02 跨论文合批
+# ============================================================
+# 要修的问题 (实测 v60e): 旧实现先按 paper_id 分组、再在组内按 batch_size 切。
+# fact 配额只有 4-12 条/篇, 永远切不满一批 —— batch_size 写 8 还是 20 结果都一样,
+# 退化成"每篇一次调用": 49 篇 = 47 次, 311 条 fact 实测 86 次两级审查, 占整轮 ~28%。
+# 改成跨论文合批 + 原文字符预算, 预期降到 ~32 次。
+
+
+def _mk(n_papers, n_facts, src_len=800):
+    facts = [{"fact_id": f"p{i}::{j}", "paper_id": f"p{i}", "claim": "c", "support_quote": "q"}
+             for i in range(n_papers) for j in range(n_facts)]
+    src = {f"p{i}": "x" * src_len for i in range(n_papers)}
+    return facts, src
+
+
+def test_plan_batches_actually_merges_papers():
+    """
+    核心回归: 49 篇 x 6 条 fact 必须合成 ~15 批, 而不是 49 批。
+    这条断言直接对应 10-02 实测的 47 次调用。
+    """
+    facts, src = _mk(49, 6)
+    batches = A._plan_batches(facts, src, 20)
+    assert len(batches) == 15, f"294 条 / 20 = 15 批, 实得 {len(batches)}"
+    assert len(batches) < 49, "必须显著少于论文数, 否则等于没合批"
+    assert sum(len(b) for b in batches) == len(facts), "不能漏 fact"
+
+
+def test_plan_batches_respects_batch_size():
+    facts, src = _mk(10, 9)          # 90 条
+    for b in A._plan_batches(facts, src, 20):
+        assert len(b) <= 20, "批大小上限失效"
+
+
+def test_plan_batches_respects_source_budget():
+    """原文总字符是闸门 —— 合批后 prompt 会变长, 不能失控。"""
+    facts = [{"fact_id": f"p{i}::0", "paper_id": f"p{i}", "claim": "c", "support_quote": "q"}
+             for i in range(10)]
+    src = {f"p{i}": "x" * A.PER_PAPER_SOURCE_CHARS for i in range(10)}
+    batches = A._plan_batches(facts, src, 20, source_budget=3 * A.PER_PAPER_SOURCE_CHARS)
+    assert len(batches) == 4, "每批 3 篇 -> 10 篇切 4 批(3+3+3+1)"
+    for b in batches:
+        papers = {f["paper_id"] for f in b}
+        total = sum(min(len(src[p]), A.PER_PAPER_SOURCE_CHARS) for p in papers)
+        assert total <= 3 * A.PER_PAPER_SOURCE_CHARS
+
+
+def test_plan_batches_keeps_same_paper_contiguous():
+    """同一篇的 fact 应聚成连续一段(原文只贴一次), 不能被别的篇插在中间。"""
+    facts, src = _mk(5, 4)
+    for b in A._plan_batches(facts, src, 6):
+        pids = [f["paper_id"] for f in b]
+        runs = [p for i, p in enumerate(pids) if i == 0 or pids[i - 1] != p]
+        assert len(runs) == len(set(pids)), f"批内同一篇被拆成多段: {pids}"
+
+
+def test_plan_batches_oversized_single_paper_still_audited():
+    """
+    一篇本身超预算时必须整篇合进同一批, 不能被预算拆成 N 次调用
+    (拆了就等于把同一段原文重复贴 N 遍, 白烧钱); 更不能因为超预算跳过审查。
+    """
+    facts = [{"fact_id": f"pA::{i}", "paper_id": "pA", "claim": "c", "support_quote": "q"}
+             for i in range(5)]
+    batches = A._plan_batches(facts, {"pA": "x" * 99999}, 20, source_budget=10)
+    assert len(batches) == 1, "同一篇的后续 fact 不新增原文, 不该被预算切开"
+    assert sum(len(b) for b in batches) == 5
+
+
+def test_audit_merges_multiple_papers_into_one_call(patched):
+    """两篇论文的 fact 必须合成一次调用。"""
+    fake = patched([json.dumps([
+        {"id": "pA::0", "grounded": True, "evidence": "one dimensional chain"},
+        {"id": "pB::0", "grounded": True, "evidence": "kagome"},
+    ])])
+    facts = [
+        {"fact_id": "pA::0", "paper_id": "pA", "claim": "c", "support_quote": "q"},
+        {"fact_id": "pB::0", "paper_id": "pB", "claim": "c", "support_quote": "q"},
+    ]
+    src = {"pA": "we study a one dimensional chain", "pB": "we report a kagome model"}
+    A.audit_fact_grounding(facts, src)
+    assert len(fake.prompts) == 1, "两篇应合成一次调用"
+
+
+def test_audit_checks_evidence_against_the_facts_own_paper(patched):
+    """
+    合批带来的新风险: 一次 prompt 里有多篇原文, 机械校验如果拿"批内任意一篇"
+    去比对, 审查器抄了别的论文的证据也会被放行 —— 这是合批引入的漏判口子。
+    """
+    patched([json.dumps([
+        {"id": "pA::0", "grounded": True, "evidence": "chiral spin liquid"},
+        {"id": "pB::0", "grounded": True, "evidence": "chiral spin liquid"},
+    ])])
+    facts = [
+        {"fact_id": "pA::0", "paper_id": "pA", "claim": "c", "support_quote": "q"},
+        {"fact_id": "pB::0", "paper_id": "pB", "claim": "c", "support_quote": "q"},
+    ]
+    src = {
+        "pA": "we study matrix product states on a one dimensional chain",
+        "pB": "we report a chiral spin liquid phase in a kagome model",
+    }
+    A.audit_fact_grounding(facts, src)
+    assert facts[0]["_grounded"] is False, "证据抄自 pB, pA 里没有 -> 必须判编造"
+    assert facts[1]["_grounded"] is True
+
+
+def test_audit_prompt_labels_each_paper_block_and_fact(patched):
+    """合批后 prompt 必须标出每篇原文的归属, 否则审查器分不清证据该从哪篇抄。"""
+    fake = patched([json.dumps([
+        {"id": "pA::0", "grounded": False, "evidence": "", "unsupported": "x"},
+        {"id": "pB::0", "grounded": False, "evidence": "", "unsupported": "x"},
+    ])])
+    facts = [
+        {"fact_id": "pA::0", "paper_id": "pA", "claim": "c", "support_quote": "q"},
+        {"fact_id": "pB::0", "paper_id": "pB", "claim": "c", "support_quote": "q"},
+    ]
+    A.audit_fact_grounding(facts, {"pA": "SRC_A_TEXT", "pB": "SRC_B_TEXT"})
+    p = fake.prompts[0]
+    assert "paper_id = pA" in p and "paper_id = pB" in p
+    assert "SRC_A_TEXT" in p and "SRC_B_TEXT" in p
+    assert "所属论文: pA" in p and "所属论文: pB" in p
+    assert "不许从别的论文里抄" in p, "必须显式禁止跨篇抄证据"
+
+
+# ============================================================
+# fact 主题对齐: 批大小默认值 + max_tokens 跟着批走
+# ============================================================
+# 10-02 实测: get_fact_review_batch_size() 的 docstring 和告警文案都写"默认 20",
+# 代码三处却都 return 8。311 条 fact 走了 39 批 = ceil(311/8), 铁证。
+
+
+def test_fact_review_batch_size_default_is_20(monkeypatch):
+    import agent.tools.config as C
+    monkeypatch.delenv("QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE", raising=False)
+    assert C._resolve_survey_fact_review_batch_size() == 20, "无 env 时应回默认 20"
+    monkeypatch.setenv("QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE", "8")
+    assert C._resolve_survey_fact_review_batch_size() == 8, "显式 env 应优先"
+    monkeypatch.setenv("QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE", "999")
+    assert C._resolve_survey_fact_review_batch_size() == 20, "越界值应回落到默认值 20"
+
+
+def test_fact_review_max_tokens_scales_with_batch(monkeypatch):
+    """
+    批提到 20 后 max_tokens 必须跟着涨 —— 固定 3000 会截断后半批,
+    截断的批走 fallback 整批变中性分, 等于白花钱。
+    """
+    import agent.tools.llm as lm
+    from agent.tools.surveys._pool import _facts_review as FR
+
+    captured = {}
+
+    def fake(prompt, **kw):
+        captured["max_tokens"] = kw.get("max_tokens")
+        captured["n"] = prompt.count("fact_id=")
+        return "[]"
+
+    monkeypatch.setattr(lm, "_call_llm", fake)
+    facts = [{"fact_id": f"f{i}", "paper_id": "pA", "claim": "c", "fact_type": "method"}
+             for i in range(20)]
+    FR._review_facts_topic_alignment("topic", facts, threshold=5)
+    assert captured["n"] == 20, "20 条应进一次调用"
+    assert captured["max_tokens"] >= 4000, (
+        f"max_tokens 没跟上批大小: {captured['max_tokens']}"
+    )

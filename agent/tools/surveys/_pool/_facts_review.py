@@ -73,7 +73,10 @@ def _review_facts_topic_alignment(
                 model=_MODEL,
                 enable_thinking=False,
                 temperature=0.2,
-                max_tokens=3000,    # 8 条 × ~80 token/条 + JSON overhead
+                # 批大小从 8 提到 20 后, 每条 ~80 token + JSON overhead,
+                # 固定 3000 会截断后半批 —— 截断的批整批 fallback 成中性分。
+                # 与 _relevance_filter 的 max(4000, 400×n) 同一套做法。
+                max_tokens=max(3000, 200 * len(batch)),
                 timeout=120,
             )
             if out and "<think>" in out:

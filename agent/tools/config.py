@@ -63,6 +63,48 @@ def get_min_pool_papers() -> int:
 
 
 # ============================================================
+# Survey 工具: 并发度 (10-02 加)
+# ============================================================
+# 背景: 一轮 42 篇的完整跑要 200+ 次 LLM 调用, 其中 fact 抽取 / 命题合并 /
+#       命题成文三段是严格串行的 for 循环, 实测(v60d, 50 篇)占全流程
+#       LLM 等待时间的 59% —— 91 次调用 / 4417 秒, 而这些批次互不依赖。
+#
+# 为什么是并发而不是合批:
+#       合批把 N 个输入拼成 1 个 prompt, **改了单次调用的输入**, 所以实测出了
+#       "多篇合抽丢 2/3 论文" 这类质量回归(见 _extract_facts.py 的注释)。
+#       并发一个字节都不改输入, 每篇照样单独发请求、拿单独的结果。
+#       换句话说, 合批是拿质量换次数, 并发是白捡的。
+#
+# 默认 4: 和 extract_keywords.py / summary.py 的 Semaphore(4) 同一档 ——
+#       再往上 MiniMax 侧 429 概率上升明显, 而 429 重试会把省下的时间还回去。
+#       设 1 即完全退回改动前的串行行为(测试和排障用)。
+#
+# 环境变量:
+#   QAGENT_SURVEY_MAX_WORKERS=N   并发度, 1-12, 默认 4
+def _resolve_survey_max_workers() -> int:
+    raw = os.getenv("QAGENT_SURVEY_MAX_WORKERS", "").strip()
+    if not raw:
+        return 4
+    try:
+        v = int(raw)
+        return v if 1 <= v <= 12 else 4
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[config] QAGENT_SURVEY_MAX_WORKERS=%r 不是合法整数, 走默认 4", raw,
+        )
+        return 4
+
+
+SURVEY_MAX_WORKERS = _resolve_survey_max_workers()
+
+
+def get_survey_max_workers() -> int:
+    """综述流水线并发度 (1-12, 默认 4)。见 SURVEY_MAX_WORKERS 注释。"""
+    return SURVEY_MAX_WORKERS
+
+
+# ============================================================
 # Survey 工具: 引文图扩展 (2026-09-30 加)
 # ============================================================
 # 背景: OpenAlex 是 credit 计费的, 关键词检索 10 credits/次(每天仅 100 次),
@@ -225,26 +267,29 @@ def get_fact_review_threshold() -> int:
 def _resolve_survey_fact_review_batch_size() -> int:
     raw = os.getenv("QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE", "").strip()
     if not raw:
-        return 8  # fact 比 paper 短, 可以一次批更多
+        return 20
     try:
         v = int(raw)
-        return v if 1 <= v <= 20 else 8
+        return v if 1 <= v <= 20 else 20
     except ValueError:
         import logging
         logging.getLogger(__name__).warning(
             "[config] QAGENT_SURVEY_FACT_REVIEW_BATCH_SIZE=%r 不是合法整数, 走默认 20", raw,
         )
-        return 8
+        return 20
 
 
 SURVEY_FACT_REVIEW_BATCH_SIZE = _resolve_survey_fact_review_batch_size()
 
 
 def get_fact_review_batch_size() -> int:
-    """fact 主题对齐每批条数 (默认 20, 9-30 user 拍板从 8 提上来).
+    """fact 主题对齐每批条数 (默认 20, 9-30 user 拍板从 8 提上来)。
 
     9-30: 345 条 fact 按 8 一批 = 43 次调用; 提到 20 = 18 次。
     审查是逐条判定的, 批大小只影响调用次数, 不影响判定质量。
+
+    10-02: 实测发现代码一直返回 8(只有 docstring 和告警文案写成了 20),
+    311 条 fact 实测走了 39 批 = ceil(311/8), 铁证。这里把三个 return 一起改回 20。
     """
     return SURVEY_FACT_REVIEW_BATCH_SIZE
 

@@ -14,8 +14,12 @@ agent.tools.surveys._fact_audit — fact 落地审查 (9-29 新增)
     根本不成立(改用"只查英文术语"又会被残留标注污染, 且中文编造细节看不见)。
     唯一能真正判断"claim 有没有超出原文"的是语义审查。
 
-成本 (可接受):
-    每 8 条 fact 一次调用, 181 条 ≈ 23 次。相对抽取本身(每篇 1 次)是小头。
+成本 (10-02 实测后调整):
+    早期"按论文分组再分批"—— 每篇只有 4-12 条 fact, 永远切不满一批, 于是每篇恰好
+    一次调用: 49 篇 = 47 次, 实测占整轮 ~25%, 比抽取本身(每篇 1 次)还贵。
+    现在改为**跨论文合批**: 每批最多 `batch_size` 条 fact, 且所含论文原文总字符不超过
+    `SOURCE_BUDGET`。311 条 ≈ 16 次。审查是逐条判定, 合批只影响调用次数,
+    不影响任何一条 fact 拿到的输入。
 """
 from __future__ import annotations
 
@@ -31,15 +35,16 @@ AUDIT_PROMPT = """你是事实核查员。下面每条是某篇论文抽取出�
 【任务】为每条事实找出**支撑它的原文英文片段**, 并判断该 claim 是否超出原文。
 
 【关键 — 必须逐字引用, 不能意译】
-对每条 claim, 找出论文原文中**最具体、最能支撑它的那几个英文单词**, 原样抄进
-`evidence` 字段。只能抄论文原文里真实存在的英文, **不许翻译、不许改写、不许拼接**。
+对每条 claim, 在**它所属的那一篇**论文原文中, 找出**最具体、最能支撑它的那几个英文单词**,
+原样抄进 `evidence` 字段。只能抄该篇原文里真实存在的英文, **不许翻译、不许改写、不许拼接**。
+**不许从别的论文里抄** —— 抄到别篇的证据一律算 grounded: false。
 
 这个设计是为了防止审查器自己产生幻觉: 抄不出来的, 就说明 claim 超出原文。
 
 【判定】
 - `grounded: true` 且 evidence 抄得出 -> claim 有据
 - `grounded: false` -> 以下任一情况:
-  a) 抄不出支撑片段(说明 claim 的技术内容原文没有)
+  a) 在**它所属的论文**里抄不出支撑片段(说明 claim 的技术内容原文没有)
   b) 原文只提到某平台/现象, claim 自行补出了**具体实现机制**。
      例: 原文有 "ion trap" 和 "nonorthogonal measurements", claim 写
      "利用每个离子内的附加能级实现该非正交测量" —— 原文根本没提"附加能级", 是编的。
@@ -55,11 +60,18 @@ AUDIT_PROMPT = """你是事实核查员。下面每条是某篇论文抽取出�
 
 【输出格式】严格 JSON 数组, 不要 markdown:
 [
-  {{"id": "<fact_id>", "grounded": true, "evidence": "<原文里逐字抄的英文词组>"}},
+  {{"id": "<fact_id>", "grounded": true, "evidence": "<所属论文原文里逐字抄的英文词组>"}},
   {{"id": "<fact_id>", "grounded": false, "evidence": "", "unsupported": "原文只提到 X, claim 自行补出 Y"}}
 ]
 
-只输出 JSON, 覆盖每一条给定的 id。evidence 必须是**原文中逐字存在**的字符串。"""
+只输出 JSON, 覆盖每一条给定的 id。evidence 必须是**所属论文原文里逐字存在**的字符串。"""
+
+# 单篇论文塞进 prompt 的原文上限(沿用旧值, 没变)
+PER_PAPER_SOURCE_CHARS = 4000
+
+# 一个批次里所有论文原文的总字符上限。跨论文合批后 prompt 会变长,
+# 这个预算是防 prompt 失控的闸门; 单篇就超限时仍然照发(不能因为超预算就丢掉审查)。
+SOURCE_BUDGET = 24000
 
 
 def _norm_for_match(s: str) -> str:
@@ -89,19 +101,85 @@ def _verify_evidence(evidence: str, source: str) -> bool:
     return all(w in src for w in words)
 
 
-def _audit_batch(facts: list[dict[str, Any]], source: str, provider: str, model: str) -> dict[str, dict]:
-    """审查一批 fact, 返回 {fact_id: {"grounded": bool, "unsupported": str}}"""
+def _plan_batches(
+    facts: list[dict[str, Any]],
+    paper_source: dict[str, str],
+    batch_size: int,
+    source_budget: int = SOURCE_BUDGET,
+) -> list[list[dict[str, Any]]]:
+    """
+    跨论文切批 —— 10-02 user 拍板。
+
+    旧逻辑先按 paper_id 分组、每组内部再按 batch_size 切。fact 配额是 4-12 条/篇,
+    永远切不满一批, 于是 batch_size 写多少都退化成"每篇一次调用"(实测 49 篇 = 47 次)。
+    改成: 把同一篇的 fact 聚在一起(省原文), 但让**相邻几篇合并成一次调用**。
+
+    双约束:
+      - 每批 fact 条数 <= batch_size
+      - 每批所含论文原文总字符 <= source_budget (单篇已封 PER_PAPER_SOURCE_CHARS)
+
+    单篇自身就超预算时照发 —— 不能因为超预算就跳过审查。
+    """
+    def _src_len(pid: str) -> int:
+        return min(len((paper_source.get(pid) or "").strip()), PER_PAPER_SOURCE_CHARS)
+
+    ordered = sorted(facts, key=lambda f: str(f.get("paper_id") or ""))
+    batches: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    used = 0
+    for f in ordered:
+        pid = f.get("paper_id") or "?"
+        # 预算只对"新论文"生效: 同一篇的后续 fact 不再新增原文, 不该因为预算被切开
+        # (否则一篇 99999 字符的论文会被拆成 N 次调用, 原文重复贴 N 遍)。
+        add = 0 if pid in seen else _src_len(pid)
+        over_budget = add > 0 and (used + add > source_budget)
+        if cur and (len(cur) >= batch_size or over_budget):
+            batches.append(cur)
+            cur, seen, used = [], set(), 0
+            add = _src_len(pid)
+        cur.append(f)
+        seen.add(pid)
+        used += add
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _audit_batch(
+    facts: list[dict[str, Any]],
+    paper_source: dict[str, str],
+    provider: str,
+    model: str,
+) -> dict[str, dict]:
+    """审查一批 fact(可跨多篇论文), 返回 {fact_id: {"grounded": bool, "unsupported": str}}"""
     from agent.tools.llm import _call_llm
+
+    # 原文按 paper_id 分块给出, 审查器必须知道每条 fact 属于哪一篇 ——
+    # 合批后同一段 prompt 里有好几篇, 不标归属就会互相串证据。
+    pids: list[str] = []
+    for f in facts:
+        pid = f.get("paper_id") or "?"
+        if pid not in pids:
+            pids.append(pid)
+    src_blocks = [
+        f"## paper_id = {pid}\n{(paper_source.get(pid) or '').strip() or '(无原文)'}"
+        for pid in pids
+    ]
 
     lines = []
     for f in facts:
         quote = (f.get("support_quote") or "").strip()
         lines.append(
             f'- id={f.get("fact_id")}\n'
+            f'  所属论文: {f.get("paper_id") or "?"}\n'
             f'  claim: {(f.get("claim") or "").strip()}\n'
             f'  出处原文: {quote[:400] or "(抽取器未给出)"}'
         )
-    prompt = AUDIT_PROMPT.format(source=source[:4000] or "(无)", facts="\n".join(lines))
+    prompt = AUDIT_PROMPT.format(
+        source="\n\n".join(s[:PER_PAPER_SOURCE_CHARS] for s in src_blocks) or "(无)",
+        facts="\n".join(lines),
+    )
 
     try:
         out = _call_llm(prompt, provider=provider, model=model,
@@ -146,10 +224,12 @@ def audit_fact_grounding(
     paper_source: dict[str, str] | None = None,
     provider: str = "minimax",
     model: str = "MiniMax-M3",
-    # 9-30 user 拍板: 8 -> 20。345 条 fact 按 8 一批要 43 次调用,
-    # 两道 fact 审查加起来占整轮 42%。提到 20 就是 18 次, 质量不受影响 ——
-    # 每条 fact 判定的输入没变, 只是塞进更长的 prompt。
+    # 10-02 user 拍板: 跨论文合批。旧实现按 paper_id 分组再在组内分批, 而 fact
+    # 配额只有 4-12 条/篇, 永远切不满一批 —— batch_size 写 8 还是 20 结果都一样,
+    # 实测 49 篇 = 47 次调用, 是整轮第三贵的阶段。现在跨论文合批, 311 条 ≈ 16 次。
+    # 审查是逐条判定, 合批只影响调用次数, 不影响每条 fact 拿到的输入。
     batch_size: int = 20,
+    source_budget: int = SOURCE_BUDGET,
 ) -> dict[str, Any]:
     """
     审查 fact 是否有原文支撑, 就地写回 _grounded / _unsupported_terms。
@@ -166,41 +246,36 @@ def audit_fact_grounding(
     paper_source = paper_source or {}
     stats = {"audited": 0, "grounded": 0, "ungrounded": 0, "failed": 0}
 
-    # 按论文分组(同一篇的 fact 一起审, 原文只需给一次)
-    by_paper: dict[str, list[dict]] = {}
-    for f in facts:
-        by_paper.setdefault(f.get("paper_id", "?"), []).append(f)
-
-    for _pid, group in by_paper.items():
-        src = paper_source.get(_pid, "")
-        for i in range(0, len(group), batch_size):
-            batch = group[i:i + batch_size]
-            got = _audit_batch(batch, src, provider, model)
-            if not got:
-                stats["failed"] += len(batch)
+    for batch in _plan_batches(facts, paper_source, batch_size, source_budget):
+        got = _audit_batch(batch, paper_source, provider, model)
+        if not got:
+            stats["failed"] += len(batch)
+            continue
+        for f in batch:
+            stats["audited"] += 1
+            r = got.get(f.get("fact_id"))
+            if r is None:
+                stats["failed"] += 1
                 continue
-            for f in batch:
-                stats["audited"] += 1
-                r = got.get(f.get("fact_id"))
-                if r is None:
-                    stats["failed"] += 1
-                    continue
-                # 机械校验: 审查器说 grounded 还不够, 引用的原文片段必须真的在原文里。
-                # 实测纯靠 LLM 判断会把明显编造放过去(源文恰有 ion trap/nonorthogonal,
-                # 审查器看到就信, 忽略了 claim 自行补出的"离子附加能级")。
-                if r["grounded"] and src:
-                    if not _verify_evidence(r.get("evidence", ""), src):
-                        r["grounded"] = False
-                        r["unsupported"] = (
-                            r.get("unsupported")
-                            or f"引用片段在原文中找不到: {r.get('evidence','')[:60]!r}"
-                        )
-                if r["grounded"]:
-                    f["_grounded"] = True
-                    f["_evidence"] = r.get("evidence", "")
-                    stats["grounded"] += 1
-                else:
-                    f["_grounded"] = False
-                    f["_unsupported_terms"] = [r["unsupported"]] if r["unsupported"] else ["审查未通过"]
-                    stats["ungrounded"] += 1
+            # 每条 fact 只能拿**自己那篇**的原文做机械校验。合批后 prompt 里有多篇,
+            # 用批内任意一篇的原文校验会漏判(证据其实抄自另一篇)。
+            src = paper_source.get(f.get("paper_id") or "", "")
+            # 机械校验: 审查器说 grounded 还不够, 引用的原文片段必须真的在原文里。
+            # 实测纯靠 LLM 判断会把明显编造放过去(源文恰有 ion trap/nonorthogonal,
+            # 审查器看到就信, 忽略了 claim 自行补出的"离子附加能级")。
+            if r["grounded"] and src:
+                if not _verify_evidence(r.get("evidence", ""), src):
+                    r["grounded"] = False
+                    r["unsupported"] = (
+                        r.get("unsupported")
+                        or f"引用片段在原文中找不到: {r.get('evidence','')[:60]!r}"
+                    )
+            if r["grounded"]:
+                f["_grounded"] = True
+                f["_evidence"] = r.get("evidence", "")
+                stats["grounded"] += 1
+            else:
+                f["_grounded"] = False
+                f["_unsupported_terms"] = [r["unsupported"]] if r["unsupported"] else ["审查未通过"]
+                stats["ungrounded"] += 1
     return stats
