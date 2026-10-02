@@ -217,12 +217,76 @@ def test_condense_by_theme_scopes_to_theme(monkeypatch):
                  "paper_ids": ["p"], "theme_id": "", "n_facts": len(tfs)}]
 
     monkeypatch.setattr(OG_m, "condense_facts_into_claims", _fake)
-    facts = [{"fact_id": f"f{i}", "claim": "c", "paper_id": "p"} for i in range(6)]
+    # 10-02: paper_id 必须各不相同 —— 同篇同 subject 的 fact 会被
+    # _dedupe_same_paper_same_subject 先收成一条(见下面那个测试),
+    # 全给同一篇的话这个用例测的就不是"主题隔离"了。
+    facts = [{"fact_id": f"f{i}", "claim": "c", "paper_id": f"p{i}"} for i in range(6)]
     tmap = {"themes": [{"name": "A", "fact_ids": ["f0", "f1", "f2"]},
                        {"name": "B", "fact_ids": ["f3", "f4", "f5"]}]}
     claims = OG_m.condense_facts_by_theme(facts, tmap)
     assert seen_batches == [["f0", "f1", "f2"], ["f3", "f4", "f5"]], "两个主题应分开调用"
     assert {c["theme_name"] for c in claims} == {"A", "B"}
+
+
+def test_dedup_collapses_same_paper_same_subject():
+    """
+    10-02 核心护栏。
+
+    实测 (v60g, 241 条 usable fact): 163 个 subject 里只有 4 个跨论文,
+    93% 的 fact 其 subject 只对应一篇论文。把它们批量喂给合并器, 模型面对的
+    是"一篇论文的各个细节", 合并它们是摘要不是综合 —— 模型**正确地**不合并
+    (实测簇级压缩比 1.01)。所以这一步只能机械做, 不能指望模型。
+    """
+    OG_m = _mod("agent.tools.surveys._organize")
+    facts = [
+        {"fact_id": "a1", "paper_id": "P", "subject": "折叠算法", "claim": "用折叠算法做收缩"},
+        {"fact_id": "a2", "paper_id": "P", "subject": "折叠算法", "claim": "截断误差可控"},
+        {"fact_id": "a3", "paper_id": "P", "subject": "折叠算法", "claim": "键长可调"},
+        {"fact_id": "b1", "paper_id": "Q", "subject": "折叠算法", "claim": "另一篇也做折叠"},
+    ]
+    out = OG_m._dedupe_same_paper_same_subject(facts)
+    assert len(out) == 2, "同篇同 subject 的 3 条应收成 1 条"
+    assert {f["paper_id"] for f in out} == {"P", "Q"}
+    p = next(f for f in out if f["paper_id"] == "P")
+    assert p["fact_ids"] == ["a1", "a2", "a3"], "覆盖度审计靠这个, 不能丢"
+    assert p["n_facts"] == 3
+    assert "截断误差可控" in p["claim"] and "键长可调" in p["claim"], "细节要并进 claim"
+
+
+def test_dedup_keeps_different_papers_apart():
+    """不同论文的同 subject **不能**被收在一起 —— 那才是真正的跨论文合并。"""
+    OG_m = _mod("agent.tools.surveys._organize")
+    facts = [
+        {"fact_id": "a1", "paper_id": "P", "subject": "iPEPS 变分优化", "claim": "x"},
+        {"fact_id": "b1", "paper_id": "Q", "subject": "iPEPS 变分优化", "claim": "y"},
+    ]
+    assert len(OG_m._dedupe_same_paper_same_subject(facts)) == 2
+
+
+def test_dedup_keeps_different_subjects_of_same_paper_apart():
+    """同一篇论文的不同 subject 是不同工作, 不该并成一条。"""
+    OG_m = _mod("agent.tools.surveys._organize")
+    facts = [
+        {"fact_id": "a1", "paper_id": "P", "subject": "iTEBD 算法", "claim": "x"},
+        {"fact_id": "a2", "paper_id": "P", "subject": "MPS 基态", "claim": "y"},
+    ]
+    assert len(OG_m._dedupe_same_paper_same_subject(facts)) == 2
+
+
+def test_claim_layer_preserves_all_fact_ids_after_dedup(monkeypatch):
+    """去重后进命题层的 fact_ids 必须全都在, 否则覆盖度审计会漏。"""
+    OG_m = _mod("agent.tools.surveys._organize")
+    monkeypatch.setattr(
+        OG_m, "condense_facts_into_claims",
+        lambda tfs, **kw: [{"claim_id": "c1", "statement": "s",
+                            "fact_ids": [fid for f in tfs
+                                         for fid in f.get("fact_ids", [f["fact_id"]])],
+                            "paper_ids": ["P"], "theme_id": "", "n_facts": len(tfs)}])
+    facts = [{"fact_id": f"f{i}", "paper_id": "P", "subject": "S", "claim": f"c{i}"}
+             for i in range(5)]
+    tmap = {"themes": [{"name": "T", "fact_ids": [f"f{i}" for i in range(5)]}]}
+    claims = OG_m.condense_facts_by_theme(facts, tmap)
+    assert set(claims[0]["fact_ids"]) == {f"f{i}" for i in range(5)}
 
 
 def test_claim_ids_are_unique_across_themes(monkeypatch):

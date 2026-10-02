@@ -10,10 +10,13 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
+from .._parallel import run_ordered
 from .._pool import _safe_json_loads_array
 from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
+
+
 def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Iterator[str]:
     """
     extract_facts action (step 3 真实实现):
@@ -51,8 +54,12 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
     # 批大小只影响调用次数不影响判定质量, 那两处 8 -> 20 的提批是安全的。
     batches = [[p] for p in targets]
 
-    for batch in batches:
-        # 9-30: 一篇一个 prompt_id 会被模型混淆(多篇同名), 这里用批次内序号区分
+    # 10-02 并发: 每次调用**只抽一篇**, 每篇的 prompt / 请求 / 解析完全独立,
+    # 所以并发不改动任何单次调用的输入 —— 这是并发和"合批"的本质区别。
+    # (合批会改输入, 实测丢 2/3 论文; 并发不会, 见本文件顶部注释。)
+    # 下面 42-49 次串行调用占了全流程等待时间的最大一块, 并发后约 1/4。
+    def _extract_one(batch: list[dict]) -> tuple[list[str], list | None, Exception | None]:
+        """纯函数: 发请求 + 解析。**不许碰 state / ws** —— 那是主线程的活。"""
         blocks = []
         for p in batch:
             blocks.append(build_fact_prompt(
@@ -80,9 +87,6 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
                 f"每篇论文各自独立判断信息量, 不要把一篇的细节拆到另一篇上。\n\n"
                 + fact_prompt
             )
-        # 批内序号 -> 真实 paper_id
-        idx2pid = {str(i + 1): pid for i, pid in enumerate(batch_pids)}
-        idx2pid.update({pid: pid for pid in batch_pids})
         try:
             out = _call_llm(
                 fact_prompt,
@@ -103,41 +107,56 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
             facts = _safe_json_loads_array(m.group(0))
             if facts is None:
                 raise ValueError(f"JSON parse 失败 (含容错): {(out or '')[:200]}")
-            # 落 _facts.jsonl
-            from agent.prompts_survey import clean_fact
-            for _i, raw in enumerate(facts):
-                if not isinstance(raw, dict):
-                    continue
-                # 9-29: 规范化 —— 去模型自写的 [paper_id] 标注、重编全局唯一 id、
-                # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
-                # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
-                # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
-                # 9-30: 多篇合抽时, 出处靠 fact 自带的 paper_id 字段回来(可能是批内序号)。
-                # **单篇时根本不用查表** —— 批次里只有一篇, paper_id 是已知的。
-                # 踩过的坑: 单篇时模型经常**不填** paper_id 字段(老代码靠 clean_fact 的
-                # setdefault 兜住), 改成"先查表再覆盖"后查不到就全丢, 49 篇抽出 0 条。
-                if len(batch_pids) == 1:
-                    fpid = batch_pids[0]
-                else:
-                    fpid = idx2pid.get(str(raw.get("paper_id") or "").strip(), "")
-                if not fpid:
-                    state["errors"].append({
-                        "step": state["step"], "action": "extract_facts",
-                        "paper": str(raw.get("paper_id"))[:60] or "?",
-                        "msg": f"多篇合抽时 paper_id 缺失或不在本批 {batch_pids[:2]}..., 已丢弃该 fact",
-                    })
-                    continue
-                f = clean_fact(raw, fpid, _i)
-                ws.append_fact(f)
-                state["facts"].append(f)
-        except Exception as e:
+            return batch_pids, facts, None
+        except Exception as e:      # noqa: BLE001 — 单批失败不阻塞后面的批
+            return batch_pids, None, e
+
+    from agent.prompts_survey import clean_fact
+    # 按**原始顺序**归并(不是完成顺序) —— fact_id 序号和 _facts.jsonl 行序都靠它
+    for res in run_ordered(batches, _extract_one, desc="extract_facts"):
+        if res.ok:
+            batch_pids, facts, err = res.value
+        else:
+            # _extract_one 内部已经把异常收进返回值了, 走到这里说明是它之外的意外
+            # (比如 build_fact_prompt 抛了) —— 记一条, 不静默
+            batch_pids, facts, err = [], None, res.exc
+        if facts is None:
             # 单批失败不阻塞后面的批, 不 yield 详情
-            for paper_id in batch_pids:
+            for paper_id in (batch_pids or ["?"]):
                 state["errors"].append({
                     "step": state["step"], "action": "extract_facts",
-                    "paper": paper_id, "msg": _friendly_error(e, "extract_facts"),
+                    "paper": paper_id,
+                    "msg": _friendly_error(err or RuntimeError("抽取失败"), "extract_facts"),
                 })
             continue
+        # 批内序号 -> 真实 paper_id
+        idx2pid = {str(i + 1): pid for i, pid in enumerate(batch_pids)}
+        idx2pid.update({pid: pid for pid in batch_pids})
+        for _i, raw in enumerate(facts):
+            if not isinstance(raw, dict):
+                continue
+            # 9-29: 规范化 —— 去模型自写的 [paper_id] 标注、重编全局唯一 id、
+            # 加确定性质检标记(术语是否超出 support_quote / 是否带自指措辞)。
+            # 实测: 上一版"离子阱/附加能级"那组编造**出在抽取阶段**, 写作阶段
+            # 只是照抄, 所以 prompt 纪律 + 确定性检查要同时上。
+            # 9-30: 多篇合抽时, 出处靠 fact 自带的 paper_id 字段回来(可能是批内序号)。
+            # **单篇时根本不用查表** —— 批次里只有一篇, paper_id 是已知的。
+            # 踩过的坑: 单篇时模型经常**不填** paper_id 字段(老代码靠 clean_fact 的
+            # setdefault 兜住), 改成"先查表再覆盖"后查不到就全丢, 49 篇抽出 0 条。
+            fpid = (
+                batch_pids[0] if len(batch_pids) == 1
+                else idx2pid.get(str(raw.get("paper_id") or "").strip(), "")
+            )
+            if not fpid:
+                state["errors"].append({
+                    "step": state["step"], "action": "extract_facts",
+                    "paper": str(raw.get("paper_id"))[:60] or "?",
+                    "msg": f"多篇合抽时 paper_id 缺失或不在本批 {batch_pids[:2]}..., 已丢弃该 fact",
+                })
+                continue
+            f = clean_fact(raw, fpid, _i)
+            ws.append_fact(f)
+            state["facts"].append(f)
 
     # 9-08 17:20 user 拍板: 只显示"抽了 N 条 fact" 高层
     yield f"👁️ 抽完 {len(targets)} 篇, 累计 {len(state['facts'])} 条 fact\n"

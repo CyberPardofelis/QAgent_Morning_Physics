@@ -44,6 +44,8 @@ from agent.prompts_survey import (
     _tokenize,
 )
 
+from ._parallel import run_ordered
+
 logger = logging.getLogger(__name__)
 
 # 9-30: 主题地图的输出量随 fact 数线性增长, 顶到 max_tokens 就截断 -> JSON 解析失败。
@@ -747,8 +749,12 @@ def write_theme_narrative(
     failed_batches = 0
 
     batches = [theme_facts[i:i + chunk_size] for i in range(0, len(theme_facts), chunk_size)]
-    for bi, batch in enumerate(batches, 1):
-        fact2pid = {f["fact_id"]: f.get("paper_id", "") for f in batch}
+
+    # 10-02 并发: 每批的 prompt / 请求 / 解析互相独立。
+    # 顺序是硬约束 —— paras 的先后就是最终段落的排版顺序。
+    # 所以并发只跑"拿 out", 剔引用/渲染/append 回主线程按原序做。
+    def _write_one(batch: list[dict[str, Any]]) -> tuple[str, bool]:
+        """纯函数: 组 prompt + 调 LLM(带重试) + 剥壳。返回 (正文, 是否建立 fact 对应)。"""
         lines = []
         for f in batch:
             claim = (f.get("claim") or "").strip()
@@ -793,8 +799,20 @@ def write_theme_narrative(
                 out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
             out = out.replace("```markdown", "").replace("```", "").strip()
             if re.search(r"\[\[", out):
-                break
-        else:
+                return out, True
+        return "", False
+
+    for bi, (batch, res) in enumerate(
+            zip(batches, run_ordered(batches, _write_one, desc="theme_write"), strict=True), 1):
+        fact2pid = {f["fact_id"]: f.get("paper_id", "") for f in batch}
+        if not res.ok:
+            failed_batches += 1
+            warnings.append(
+                f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批异常: {res.exc}"
+            )
+            continue
+        out, ok = res.value
+        if not ok:
             failed_batches += 1
             warnings.append(
                 f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批未能建立 fact 对应"
@@ -877,7 +895,13 @@ def condense_facts_into_claims(
     # 落进不同批次, 模型永远没机会把它们放一起 —— 实测 629 条 fact 顺序切,
     # 合并率只有 1.32:1, 且合并出来的几乎全是"同一篇的多个细节"。
     # 同一 subject 内部的 fact 更可能是不同论文对同一件事的独立表述。
-    for cluster in _batch_by_subject(facts, batch_size):
+    #
+    # 10-02 并发: 每个 subject 聚簇的 prompt / 请求 / 解析完全独立。
+    # **顺序是硬约束** —— 下面 `seq` 是全局递增的 claim_id 计数器, claim_id 决定
+    # 正文引用编号, 顺序一变整篇的引用编号就漂。所以并发只跑"拿 groups",
+    # 分配 claim_id 和 append 一律回主线程按簇的原序做。
+    def _condense_one(cluster: list[dict[str, Any]]) -> list[tuple[list[int], str]]:
+        """纯函数: 组 prompt + 调 LLM + 解析成 groups。不碰 seq / claims。"""
         lines = []
         pid_index: dict[str, int] = {}
 
@@ -899,7 +923,7 @@ def condense_facts_into_claims(
             lines.append(head + " " + (f.get("claim") or "").strip())
         prompt = CLAIM_CONDENSE_PROMPT.format(
             n=len(cluster), facts_block="\n".join(lines))
-        groups: list[list[int]] = []
+        groups: list[tuple[list[int], str]] = []
         for _ in range(2):          # 一次重试, 提高 JSON 服从率
             try:
                 out = _call_llm(prompt, provider=provider, model=model,
@@ -925,6 +949,16 @@ def condense_facts_into_claims(
         for i in range(1, len(cluster) + 1):
             if i not in covered:
                 groups.append(([i], ""))
+        return groups
+
+    clusters = _batch_by_subject(facts, batch_size)
+    _condensed = run_ordered(clusters, _condense_one, desc="condense_claims")
+    for cluster, res in zip(clusters, _condensed, strict=True):
+        if res.ok:
+            groups = res.value
+        else:
+            logger.warning("[condense_claims] 簇失败, 退回逐条: %s", res.exc)
+            groups = [([i], "") for i in range(1, len(cluster) + 1)]
 
         for g, stmt in groups:
             members = [cluster[i - 1] for i in g if 1 <= i <= len(cluster)]
@@ -944,10 +978,14 @@ def condense_facts_into_claims(
             claims.append({
                 "claim_id": f"c{seq}",
                 "statement": statement,
-                "fact_ids": [m["fact_id"] for m in members if m.get("fact_id")],
+                # 10-02: 去重后的代表 fact 带着 fact_ids(同篇同 subject 的全部),
+                # 这里要展开, 否则覆盖度审计和论文覆盖统计会漏掉被收掉的那些。
+                "fact_ids": [fid for m in members
+                             for fid in (m.get("fact_ids") or [m["fact_id"]])
+                             if fid],
                 "paper_ids": pids,
                 "theme_id": members[0].get("theme_id"),
-                "n_facts": len(members),
+                "n_facts": sum(m.get("n_facts", 1) for m in members),
             })
 
     merged = sum(1 for c in claims if c["n_facts"] > 1)
@@ -985,6 +1023,53 @@ def _batch_by_subject(
                 cur = []
     if cur:
         out.append(cur)
+    return out
+
+
+_DETAIL_TAIL_CHARS = 220
+
+
+def _dedupe_same_paper_same_subject(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一篇论文、同一 subject 的多条 fact -> 一条(细节并进 claim 尾部)。
+
+    10-02 实测 (v60g, 241 条 usable fact):
+        不同 subject 163 个, 但**只有 4 个 subject 跨论文**, 落在跨论文 subject
+        里的 fact 只有 17 条 (7%) —— 也就是 93% 的 fact 的 subject 只对应一篇论文。
+        把这样的 fact 批量喂给合并器, 模型看到的是"一篇论文的各个细节",
+        合并它们是摘要不是综合, 所以模型**正确地**不合并(实测簇级压缩比 1.01)。
+
+        于是命题 ≈ 1:1 对应论文, 成文时一句只能挂一个引用 —— 这才是
+        "引文看着有、实际很稀疏"的根因, 不是引用编号机制的问题。
+
+    这里机械地把"同一篇论文讲的同一件事"收成一条, 不指望模型做 ——
+    模型两次实测都拒绝合并同论文 fact, 所以这事只能在这儿做。
+
+    fact_ids 合并保留, 所以覆盖度审计/论文覆盖统计不受影响。
+    """
+    order: list[str] = []
+    by: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for f in facts:
+        key = (f.get("paper_id") or "", (f.get("subject") or "").strip())
+        if key not in by:
+            by[key] = []
+            order.append(key)
+        by[key].append(f)
+
+    out: list[dict[str, Any]] = []
+    for key in order:
+        group = by[key]
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        rep = dict(group[0])
+        ids = [g.get("fact_id") for g in group if g.get("fact_id")]
+        extra = "；".join((g.get("claim") or "").strip() for g in group[1:] if g.get("claim"))
+        base = (rep.get("claim") or "").strip()
+        rep["claim"] = f"{base}（同一工作的其他侧面: {extra}）"[:len(base) + _DETAIL_TAIL_CHARS] \
+            if extra else base
+        rep["fact_ids"] = ids
+        rep["n_facts"] = len(group)
+        out.append(rep)
     return out
 
 
@@ -1050,6 +1135,7 @@ def condense_facts_by_theme(
     fmap = {f.get("fact_id"): f for f in facts if f.get("fact_id")}
     all_claims: list[dict[str, Any]] = []
     _global_seq = [0]   # 跨主题递增, 保证 q1/q2/... 全局不撞号
+    n_condensed_facts = 0        # 真正进了合并器的 fact 数(不含主题地图没覆盖的)
     for theme in theme_map.get("themes", []):
         tfs = [fmap[fid] for fid in (theme.get("fact_ids") or []) if fid in fmap]
         if not tfs:
@@ -1063,6 +1149,10 @@ def condense_facts_by_theme(
                     "theme_id": name, "n_facts": 1, "theme_name": name,
                 })
             continue
+        # 10-02: 同篇同 subject 先机械收成一条(见 _dedupe_same_paper_same_subject
+        # 的实测数据), 否则模型面对的全是"一篇论文的各个细节", 不会合并。
+        n_condensed_facts += len(tfs)
+        tfs = _dedupe_same_paper_same_subject(tfs)
         batch_claims = condense_facts_into_claims(
             tfs, provider=provider, model=model, batch_size=batch_size)
         # 9-30 修: claim_id 原来拼成 f"{name}#{cid}"。这个前缀**把标注语法搞脆了** ——
@@ -1122,9 +1212,12 @@ def write_theme_narrative_from_claims(
     failed = 0
 
     batches = [claims[i:i + chunk_size] for i in range(0, len(claims), chunk_size)]
-    for bi, batch in enumerate(batches, 1):
-        claim2pids = {c["claim_id"]: [p for p in c.get("paper_ids", []) if p]
-                      for c in batch}
+
+    # 10-02 并发: 每批命题的 prompt / 请求 / 解析互相独立。
+    # 顺序是硬约束 —— paras 顺序 = 最终段落排版, used_claim_ids 也按批序累积。
+    # 并发只跑"拿 out", 渲染引用 / append 回主线程按原序做。
+    def _write_one(_bi: int, batch: list[dict[str, Any]]) -> tuple[str, bool]:
+        """纯函数: 组 prompt + 调 LLM(带重试) + 剥壳。返回 (正文, 是否建立命题对应)。"""
         lines = []
         for c in batch:
             src = (f"（{len(c['paper_ids'])} 篇）" if len(c.get("paper_ids") or []) > 1 else "")
@@ -1153,11 +1246,11 @@ def write_theme_narrative_from_claims(
                 out = _call_llm(prompt, provider=provider, model=model,
                                 enable_thinking=False, temperature=0.4,
                                 # 9-30: 8000 -> 2000。实测每批最终只活下来约 245 字符, 给了 32 倍余量,
-            # 模型每次都生成到上限(26 次共吐 34 万字符, 成文 6371 字符, 54 倍放大,
-            # 94% 被 _render_claim_citations_or_drop 丢掉)。2000 够用。
-            max_tokens=2000, timeout=420)
+                                # 模型每次都生成到上限(26 次共吐 34 万字符, 成文 6371 字符, 54 倍放大,
+                                # 94% 被 _render_claim_citations_or_drop 丢掉)。2000 够用。
+                                max_tokens=2000, timeout=420)
             except Exception as e:
-                logger.warning("[write_claims] batch %d 失败: %s", bi, e)
+                logger.warning("[write_claims] batch %d 失败: %s", _bi, e)
                 out = ""
             if not out:
                 continue
@@ -1165,8 +1258,24 @@ def write_theme_narrative_from_claims(
                 out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
             out = out.replace("```markdown", "").replace("```", "").strip()
             if re.search(r"\[\[", out):
-                break
-        else:
+                return out, True
+        return "", False
+
+    _written = run_ordered(
+        list(enumerate(batches, 1)), lambda pair: _write_one(pair[0], pair[1]),
+        desc="write_claims",
+    )
+    for bi, (batch, res) in enumerate(zip(batches, _written, strict=True), 1):
+        claim2pids = {c["claim_id"]: [p for p in c.get("paper_ids", []) if p]
+                      for c in batch}
+        if not res.ok:
+            failed += 1
+            warnings.append(
+                f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批异常: {res.exc}"
+            )
+            continue
+        out, ok = res.value
+        if not ok:
             failed += 1
             warnings.append(f"主题「{theme.get('name')}」第 {bi}/{len(batches)} 批未能建立命题对应")
             continue

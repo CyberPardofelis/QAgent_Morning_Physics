@@ -19,6 +19,7 @@
 - 工具如果想强制用某个 model(比如 _smoke 测试),还是显式传 provider/model
 """
 import logging
+import threading
 
 from agent.cost_guard import charge as cost_guard_charge
 from agent.llm_clients import (
@@ -27,6 +28,17 @@ from agent.llm_clients import (
     get_client,
     resolve_legacy_model,
 )
+
+# 10-02: 综述流水线开始并发调用 _call_llm 之后, 这些 print 会在多线程里交错,
+# 严重时把两条日志黏成一行("...done 耗时 12.3s[llm] _call_llm start ..."),
+# 阶段耗时统计就废了。print(x, flush=True) 不是原子的(字符串和换行是两次写)。
+# 只锁 print 本身 —— 不锁请求, 并发度不受影响。
+_LOG_LOCK = threading.Lock()
+
+
+def _log(msg: str) -> None:
+    with _LOG_LOCK:
+        print(msg, flush=True)
 
 logger = logging.getLogger(__name__)
 
@@ -212,17 +224,17 @@ def _call_llm(
     try:
         import time as _t
         _t0 = _t.time()
-        print(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符 timeout={timeout}s", flush=True)
+        _log(f"[llm] _call_llm start  provider={provider} model={model} thinking={enable_thinking} prompt 长度={len(prompt)} 字符 timeout={timeout}s")
         # 9-27 P0 fix: 工具内部的 LLM 调用之前完全不走 cost_guard。
         # survey_generate 一次运行会在 _call_llm 里发 100+ 次请求 (每篇论文抽 fact /
         # 相关性评分 / 写章节 ...), 守卫却只看见 controller 那 ~50 次 —— ceiling
         # 完全约束不住真实开销。计费收口到这里。
         _is_ok, _guard_msg = cost_guard_charge()
         if not _is_ok:
-            print(f"[llm] _call_llm 被 cost_guard 阻断: {_guard_msg}", flush=True)
+            _log(f"[llm] _call_llm 被 cost_guard 阻断: {_guard_msg}")
             return f"❌ {_guard_msg.strip()}\n(cost_guard 阻断, 未发出 LLM 请求)"
         if _guard_msg:
-            print(f"[llm] cost_guard: {_guard_msg.strip()}", flush=True)
+            _log(f"[llm] cost_guard: {_guard_msg.strip()}")
 
         resp = client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
@@ -235,9 +247,9 @@ def _call_llm(
             rc = getattr(msg, "reasoning_content", None)
             if rc and rc.strip():
                 out = rc
-                print(f"[llm] _call_llm fallback: content 空 → reasoning_content ({len(rc)} 字符)", flush=True)
-        print(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符", flush=True)
+                _log(f"[llm] _call_llm fallback: content 空 → reasoning_content ({len(rc)} 字符)")
+        _log(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符")
         return out
     except Exception as e:
-        print(f"[llm] _call_llm 失败: {e}", flush=True)
+        _log(f"[llm] _call_llm 失败: {e}")
         return classify_llm_error(display_name, e)
