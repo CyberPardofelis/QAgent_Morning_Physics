@@ -142,6 +142,89 @@ class SurveyWorkspace:
                 continue
         return facts
 
+    # ============== _claims.json ==============
+    def save_claims(self, claims: list[dict[str, Any]]) -> None:
+        """落命题层产物 (fact 合并后的命题)。
+
+        10-02 崩溃续跑: 命题合并要 1000+ 秒, 丢了重跑很贵。
+        """
+        p = self.path / "_claims.json"
+        p.write_text(
+            json.dumps({"topic": self.topic, "created_at":
+                        datetime.now().isoformat(timespec="seconds"),
+                        "size": len(claims), "claims": claims},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_claims(self) -> list[dict[str, Any]] | None:
+        """读命题层产物。**没有文件返回 None**(区别于"有文件但空列表")。"""
+        p = self.path / "_claims.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            claims = data.get("claims")
+            return claims if isinstance(claims, list) and claims else None
+        except Exception:
+            return None
+
+    # ============== _narratives.json ==============
+    def save_narratives(self, narratives: dict[str, dict[str, Any]]) -> None:
+        p = self.path / "_narratives.json"
+        p.write_text(
+            json.dumps({"topic": self.topic, "created_at":
+                        datetime.now().isoformat(timespec="seconds"),
+                        "narratives": narratives}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_narratives(self) -> dict[str, dict[str, Any]] | None:
+        p = self.path / "_narratives.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            nar = data.get("narratives")
+            return nar if isinstance(nar, dict) and nar else None
+        except Exception:
+            return None
+
+    # ============== _checkpoint.json (10-02 崩溃续跑) ==============
+    # 为什么需要: v60e 那轮跑了 76 分钟 / 151 次调用, 卡死在主题归纳那一步,
+    # 全轮作废 —— 而 fact 其实早就落盘在 _facts.jsonl 里了。流水线是严格串行的,
+    # 前面每个阶段的产物都已经在手上, 只是没有"跑到哪了"的记录。
+    #
+    # 关键是 signature: 改了 max_pool / target_chars 就不能续, 否则会把
+    # 旧参数下的中间产物接到新参数上 —— 那种错最难查(输出看着完全正常)。
+    def save_checkpoint(self, stage: str, **extra: Any) -> None:
+        p = self.path / "_checkpoint.json"
+        payload = {
+            "topic": self.topic,
+            "topic_hash": self.topic_hash,
+            "stage": stage,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        payload.update(extra)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
+
+    def load_checkpoint(self) -> dict[str, Any] | None:
+        p = self.path / "_checkpoint.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) and data.get("stage") else None
+        except Exception:
+            return None
+
+    def clear_checkpoint(self) -> None:
+        p = self.path / "_checkpoint.json"
+        if p.exists():
+            p.unlink()
+
     # ============== _outline.json ==============
     def save_outline(self, outline: dict[str, Any]) -> None:
         p = self.path / "_outline.json"

@@ -536,9 +536,15 @@ def test_organize_phase_shares_pool_and_facts_with_old_route():
     """
     主题驱动只替换 3/4(主题地图+主题叙述), Phase A 候选池和 fact 抽取必须复用 ——
     否则两条路线不可对照, 而且重复造轮子。
+
+    10-02: fact 抽取抽成了 _phase_facts、成文抽成了 _phase_write(它们分支多,
+    留在主函数里 C901 会爆), 所以这里看三个函数的合并源码 ——
+    守卫的意图是"必须复用", 不是"必须写在哪个函数里"。
     """
     import inspect as _i
-    src = _i.getsource(SG_MOD._run_organize_phase)
+    src = (_i.getsource(SG_MOD._run_organize_phase)
+           + _i.getsource(SG_MOD._phase_facts)
+           + _i.getsource(SG_MOD._phase_write))
     assert "_build_candidate_pool" in src, "必须复用 Phase A 候选池"
     assert "action_extract_facts" in src, "必须复用 fact 抽取"
     assert "organize_facts_into_themes" in src, "Phase B 主题地图"

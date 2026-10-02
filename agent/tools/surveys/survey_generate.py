@@ -12,6 +12,7 @@ agent.tools.surveys.survey_generate — 综述生成主入口 (L2 工具)
 - 5 action + decision     → _actions.py
 - 独立 audit 工具         → survey_audit.py
 """
+import hashlib
 import logging
 from collections.abc import Iterator
 from typing import Any
@@ -40,6 +41,7 @@ def survey_generate(
     phase: str = "all",
     section_idx: int = -1,
     organize: bool = False,
+    resume: bool = True,             # 10-02 加: 崩溃续跑, 见下方说明
 ) -> Iterator[str]:
     """
     生成综述 (P6.5 ReAct 改写) — L2 档, 流式 yield 进度 + 章节内容.
@@ -52,6 +54,11 @@ def survey_generate(
         section_idx: >=0 时只写第 section_idx 章 (单章重写), 配合 phase="write"
         organize: True = 走**主题驱动**路线 (Phase B/C), 章节结构由 fact 内容归纳
                   而非预设模板。默认 False = 旧的 5 段模板路线(保留, 可对照回退)。
+        resume: True(默认) = 崩溃续跑。上一轮如果死在流水线中途(实测卡死在主题归纳
+                  那一步, 已经跑掉 76 分钟 / 151 次调用), 且参数没变, 就从最后一个
+                  完成的阶段接着走, 不重跑前面的阶段。resume=False = 强制从头跑
+                  (改了 prompt 想重测时用)。续跑时一定会 yield 一行「♻️ 续跑」,
+                  绝不静默接上旧数据。
 
     phase 拆分 (9-27, 为"大纲可编辑"而加):
         "plan"  — 只跑到大纲: 候选池 → fact → 大纲, 然后**停住**。
@@ -89,7 +96,7 @@ def survey_generate(
 
     if phase == "organize" or organize:
         yield from _run_organize_phase(topic, ws, topic_hash, max_pool=max_pool,
-                                  target_chars=target_chars)
+                                  target_chars=target_chars, resume=resume)
         return
 
     ws.set_status("init", 0, 0, f"topic={topic}")
@@ -256,42 +263,97 @@ def _yield_plan_summary(state: dict[str, Any], ws, topic: str):
 # phase="organize": 主题驱动路线 (Phase B + C)
 # ============================================================
 
-def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
-                        target_chars: int = 0):
+def _phase_write(ws, theme_map, order, by_theme, facts, usable,
+                 target_chars: int, from_stage: str, sig: str):
+    """Phase C: 逐主题写叙述。产出 narratives dict。
+
+    成文是最慢的一段(v60d 实测 26 次调用 / 1720 秒), 所以按**主题**逐个存 ——
+    挂在第 5 个主题时崩了, 前 4 个主题的正文不用重写。
     """
-    主题驱动综述 (9-29 接入, 用户洞察):
-        综述写不长、不像综述, 根因是以**文章**为锚点。真实的人写综述是以**信息**
-        为锚点: 收集 fact → 把 fact 归入主题、看它们之间什么关系 → 围绕主题写叙述。
-        "把 fact 归类"才是智识劳动本身, 所以它必须是一个独立且**有产物**的阶段。
+    from ._organize import write_theme_narrative, write_theme_narrative_from_claims
 
-    流程:
-        1. Phase A  候选池 (0 LLM, 复用 _build_candidate_pool)
-        2. fact 抽取 (每篇 1 次 LLM) + 落地审查(每 8 条 1 次, 见 _fact_audit)
-        3. Phase B  主题地图 → workspace/_thematic_map.json (可编辑复用)
-        4. Phase C  逐主题写叙述 (引文由 fact_id 机械映射, 模型碰不到 paper_id)
-        5. 章节落 surveys.db + 覆盖度审计
+    n_themes = max(1, len(theme_map["themes"]))
+    if target_chars <= 0:
+        target_chars = max(1200, int(len(usable) * 0.32))
+    per_theme_chars = max(300, target_chars // n_themes)
+    yield f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题, 每主题约 {per_theme_chars} 字符\n"
 
-    与旧路线的区别只在 3/4 —— 1/2/5 完全共用, 所以两条路线可以互相对照。
+    narratives: dict[str, dict[str, Any]] = {}
+    if from_stage == "done":
+        narratives = ws.load_narratives() or {}
+        if narratives:
+            yield f"\n♻️ 成文: 沿用 checkpoint 的 {len(narratives)} 个主题正文\n"
+    for name in order:
+        theme = next((t for t in theme_map["themes"] if t["name"] == name), None)
+        if not theme:
+            continue
+        if name in narratives:
+            r = narratives[name]
+            yield f"   ♻️ {name}: {len(r.get('text') or '')} 字符 (沿用)\n"
+            for w in r.get("warnings", []):
+                yield f"      ⚠ {w}\n"
+            continue
+        tclaims = by_theme.get(name) or []
+        r = (write_theme_narrative_from_claims(theme, tclaims, target_chars=per_theme_chars)
+             if tclaims else write_theme_narrative(theme, facts))
+        narratives[name] = r
+        ws.save_narratives(narratives)      # 每写完一个主题就落盘
+        ws.save_checkpoint("narratives", signature=sig,
+                           done_themes=list(narratives.keys()))
+        if r["text"]:
+            yield f"   ✅ {name}: {len(r['text'])} 字符 "
+            yield f"(用 {len(r.get('used_claim_ids') or r.get('used_fact_ids') or [])} 条)\n"
+        for w in r.get("warnings", []):
+            yield f"      ⚠ {w}\n"
+    return narratives
+
+
+def _resolve_resume(ws, topic_hash: str, max_pool: int, target_chars: int,
+                    resume: bool, stages: tuple[str, ...]) -> tuple[str, dict[str, Any]]:
+    """决定从哪个阶段接着跑, 并返回要打印的提示行。
+
+    抽出来是因为续跑判定有 4 个分支, 塞在 _run_organize_phase 里会把那个函数
+    的复杂度顶爆(C901)。逻辑本身很直白, 见下面三条规则。
     """
-    from ._organize import (
-        organize_facts_into_themes,
-        render_survey,
-        save_thematic_map,
-        write_theme_narrative,
-    )
+    sig = hashlib.sha1(f"{topic_hash}|{max_pool}|{target_chars}".encode()).hexdigest()[:12]
+    lines: list[str] = []
+    ck = ws.load_checkpoint() if resume else None
 
-    # ---- Phase A: 候选池 ----
-    yield f"🔍 主题驱动模式: {topic}\n"
-    pool, build_status = _build_candidate_pool(topic, max_pool=max_pool)
-    if not pool:
-        ws.set_status("failed", 0, 0, "pool empty")
-        yield "❌ 候选池为空, 无法继续。\n- 建议: 换个主题词(优先英文)或先抓文\n"
-        return
-    ws.save_pool(pool)
-    ws.set_status("pool", len(pool), 0, "候选池已建")
-    yield f"📚 候选池: {len(pool)} 篇\n"
+    if ck and ck.get("signature") != sig:
+        lines.append("♻️ 上轮 checkpoint 参数对不上(改了 max_pool/target_chars), 从头重跑\n")
+        ws.clear_checkpoint()
+        return "pool", {"signature": sig, "lines": lines}
 
-    # ---- Phase 2: fact 抽取 ----
+    if ck:
+        st = ck.get("stage")
+        if st in stages:
+            nxt = stages[min(stages.index(st) + 1, len(stages) - 1)]
+            lines.append(
+                f"♻️ 续跑: 上轮停在「{st}」阶段之后 ({ck.get('updated_at', '?')}), "
+                f"从「{nxt}」接着走\n")
+            return st, {"signature": sig, "lines": lines}
+        ws.clear_checkpoint()
+
+    return "pool", {"signature": sig, "lines": lines}
+
+
+def _phase_facts(topic: str, ws, pool: list[dict[str, Any]], from_stage: str,
+                 sig: str):
+    """Phase 2: fact 抽取 (含续跑)。产出 (facts, from_stage)。
+
+    续跑回来的 from_stage 可能被**回退** —— checkpoint 说 fact 已经抽好了,
+    但 _facts.jsonl 是空的(被手动删了/上轮抽了 0 条), 这时必须老实重跑,
+    不能拿着空 fact 往下走。
+    """
+    facts: list[dict[str, Any]] = []
+    if from_stage in ("facts", "themes", "claims", "narratives", "done"):
+        facts = ws.load_facts()
+        yield f"\n♻️ fact 抽取: 沿用 checkpoint 的 {len(facts)} 条\n"
+    if facts:
+        yield from _yield_usable_summary(facts)
+        return facts, from_stage
+
+    from_stage = "pool"              # checkpoint 说有 fact 但文件空了 -> 老实重跑
     yield "\n📝 抽取原子 fact...\n"
     # 9-30: 抽取前先清掉上一轮遗留的 fact。workspace 按主题 hash 复用, 之前
     # 只 append 不清, 同一主题重跑会一路累积(实测堆到 1089 行, 同一篇论文
@@ -329,26 +391,114 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
         facts = stale
     elif not facts:
         print("[organize] ❌ 本轮抽取 0 条 fact 且 workspace 无历史数据", flush=True)
+    ws.save_checkpoint("facts", signature=sig, n_facts=len(facts))
+    yield from _yield_usable_summary(facts)
+    return facts, from_stage
+
+
+def _yield_usable_summary(facts: list[dict[str, Any]]):
+    """打印 fact 可用情况。抽出来是因为"续跑/新抽"两条路都要说同一段话。"""
+    usable = [f for f in facts if _fact_is_usable(f)]
+    ws_bad = [f for f in facts if not _fact_is_usable(f)]
+    if ws_bad:
+        yield f"   (另有 {len(ws_bad)} 条 fact 未通过落地审查, 已剔除)\n"
+    yield f"✅ 可用 fact: {len(usable)} 条 / 共 {len(facts)} 条\n"
+
+
+def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
+                        target_chars: int = 0, resume: bool = True):
+    """
+    主题驱动综述 (9-29 接入, 用户洞察):
+        综述写不长、不像综述, 根因是以**文章**为锚点。真实的人写综述是以**信息**
+        为锚点: 收集 fact → 把 fact 归入主题、看它们之间什么关系 → 围绕主题写叙述。
+        "把 fact 归类"才是智识劳动本身, 所以它必须是一个独立且**有产物**的阶段。
+
+    流程:
+        1. Phase A  候选池 (0 LLM, 复用 _build_candidate_pool)
+        2. fact 抽取 (每篇 1 次 LLM) + 落地审查(见 _fact_audit)
+        3. Phase B  主题地图 → workspace/_thematic_map.json (可编辑复用)
+        4. Phase C  逐主题写叙述 (引文由 fact_id 机械映射, 模型碰不到 paper_id)
+        5. 章节落 surveys.db + 覆盖度审计
+
+    与旧路线的区别只在 3/4 —— 1/2/5 完全共用, 所以两条路线可以互相对照。
+
+    崩溃续跑 (10-02):
+        这条流水线是严格串行的, 中途挂掉就整轮作废 —— v60e 实测跑了 76 分钟 /
+        151 次调用死在主题归纳那一步, 而 fact 早就落盘在 _facts.jsonl 里了。
+        每个阶段完成时打一个 checkpoint, 下次参数没变就从最后一个完成的阶段接着走。
+
+        两个防错设计 (都是"静默接上旧数据"这类最难查的 bug):
+        1. **signature 必须逐位相同**: max_pool / target_chars 改了就不续 ——
+           否则会把旧参数下的中间产物接到新参数上, 输出看着完全正常但结论是错的。
+        2. **续跑时一定 yield 一行「♻️ 续跑」**。宁可吵, 不可静默。
+        候选池也直接从 checkpoint 读, 不重跑召回+审查(顺带省 18 次调用)。
+    """
+    from ._organize import (
+        load_thematic_map,
+        organize_facts_into_themes,
+        render_survey,
+        save_thematic_map,
+    )
+
+    # ---------- 崩溃续跑: 读 checkpoint ----------
+    # 阶段顺序 = 流水线顺序, "已完成的最后一个阶段"决定从哪接着跑
+    _STAGES = ("pool", "facts", "themes", "claims", "narratives", "done")
+    from_stage, ck_msgs = _resolve_resume(
+        ws, topic_hash, max_pool, target_chars, resume, _STAGES)
+    _sig = ck_msgs["signature"]
+    yield from ck_msgs["lines"]
+
+    # ---- Phase A: 候选池 ----
+    yield f"🔍 主题驱动模式: {topic}\n"
+    pool: list[dict[str, Any]] = []
+    if from_stage != "pool":
+        pool = ws.load_pool()
+    if not pool:
+        from_stage = "pool"          # checkpoint 说有池子但文件没了 -> 老实重跑
+        pool, build_status = _build_candidate_pool(topic, max_pool=max_pool)
+        if not pool:
+            ws.set_status("failed", 0, 0, "pool empty")
+            yield "❌ 候选池为空, 无法继续。\n- 建议: 换个主题词(优先英文)或先抓文\n"
+            return
+        ws.save_pool(pool)
+        ws.save_checkpoint("pool", signature=_sig,
+                           pool_ids=[p["paper_id"] for p in pool])
+        yield f"📚 候选池: {len(pool)} 篇\n"
+    else:
+        yield f"📚 候选池(沿用 checkpoint): {len(pool)} 篇\n"
+    ws.set_status("pool", len(pool), 0, "候选池已建")
+
+    # ---- Phase 2: fact 抽取 ----
+    # 抽成独立生成器: 这段本身分支就多(续跑判定 + 遗留清理 + 兜底告警),
+    # 留在主函数里会把 C901 顶爆。
+    facts, from_stage = yield from _phase_facts(topic, ws, pool, from_stage, _sig)
     usable = [f for f in facts if _fact_is_usable(f)]
     ws.set_status("facts", len(usable), len(facts), "fact 抽取完成")
     if not usable:
         yield "❌ 没有可用 fact (全部未通过落地审查或抽取失败), 停止。\n"
         return
-    bad = [f for f in facts if not _fact_is_usable(f)]
-    if bad:
-        yield f"   (另有 {len(bad)} 条 fact 未通过落地审查, 已剔除)\n"
-    yield f"✅ 可用 fact: {len(usable)} 条 / 共 {len(facts)} 条\n"
 
     # ---- Phase B: 主题地图 ----
-    yield "\n🧭 归纳主题结构 (从 fact 内容, 而非预设模板)...\n"
-    titles = {p["paper_id"]: (p.get("title") or "") for p in pool}
-    theme_map = organize_facts_into_themes(usable, paper_titles=titles)
-    if not theme_map["themes"]:
-        for w in theme_map.get("warnings", []):
-            yield f"   ⚠ {w}\n"
-        yield "❌ 主题地图生成失败。\n"
-        return
-    save_thematic_map(ws, theme_map)
+    theme_map: dict[str, Any] | None = None
+    if from_stage in ("themes", "claims", "done"):
+        theme_map = load_thematic_map(ws)
+    if theme_map and theme_map.get("themes"):
+        yield f"\n♻️ 主题地图: 沿用 checkpoint 的 {len(theme_map['themes'])} 个主题\n"
+    else:
+        from_stage = "facts"        # checkpoint 说有主题地图但文件没了/空了 -> 重跑
+        theme_map = None
+    if theme_map is None:
+        yield "\n🧭 归纳主题结构 (从 fact 内容, 而非预设模板)...\n"
+        titles = {p["paper_id"]: (p.get("title") or "") for p in pool}
+        theme_map = organize_facts_into_themes(usable, paper_titles=titles)
+        if not theme_map["themes"]:
+            for w in theme_map.get("warnings", []):
+                yield f"   ⚠ {w}\n"
+            yield "❌ 主题地图生成失败。\n"
+            return
+        save_thematic_map(ws, theme_map)
+        ws.save_checkpoint("themes", signature=_sig,
+                           n_themes=len(theme_map["themes"]))
     yield f"✅ 归纳出 {len(theme_map['themes'])} 个主题:\n"
     for i, t in enumerate(theme_map["themes"], 1):
         yield f"   [{i}] {t['name']} ({len(t['fact_ids'])} 条 fact)\n"
@@ -360,18 +510,34 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     # ---- Phase B2: 命题合并 (9-30 加) ----
     # 缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
     # 被重复引 5 次(40 篇那次实测)。合并成命题后, 一句话可以挂多篇。
-    yield "\n🔗 合并讲同一件事的 fact 成命题...\n"
-    from ._organize import condense_facts_by_theme, write_theme_narrative_from_claims
-    try:
-        claims = condense_facts_by_theme(usable, theme_map)
-    except Exception as e:
-        logger.warning("[organize] 命题合并失败, 退回 fact 直写: %s", e)
-        claims = []
+    claims: list[dict[str, Any]] = []
+    if from_stage in ("claims", "done"):
+        claims = ws.load_claims() or []
     if claims:
-        n_multi = sum(1 for c in claims if c.get("n_facts", 1) > 1)
+        yield f"\n♻️ 命题合并: 沿用 checkpoint 的 {len(claims)} 条命题\n"
+    else:
+        from_stage = "themes"
+        yield "\n🔗 合并讲同一件事的 fact 成命题...\n"
+        from ._organize import condense_facts_by_theme
+        try:
+            claims = condense_facts_by_theme(usable, theme_map)
+        except Exception as e:
+            logger.warning("[organize] 命题合并失败, 退回 fact 直写: %s", e)
+            claims = []
+        if claims:
+            ws.save_claims(claims)
+            ws.save_checkpoint("claims", signature=_sig, n_claims=len(claims))
+    if claims:
         n_cited = len({p for c in claims for p in c.get("paper_ids", []) if p})
-        yield (f"✅ {len(usable)} 条 fact -> {len(claims)} 条命题 "
-               f"(其中 {n_multi} 条由多条 fact 合并, 涉及 {n_cited} 篇论文)\n")
+        # 10-02: 原来打的是 `len(usable) -> len(claims)`, 但 usable 里有一大截
+        # **主题地图根本没覆盖**的 fact(实测 v60g: 241 条里 49 条)。把它们算进
+        # 分子, 于是"丢得越多, 压缩比越好看" —— 方向完全反了。
+        # 真正该看的是"进了合并器的 fact 被压成了几条命题"。
+        n_covered = len({fid for c in claims for fid in c.get("fact_ids", [])})
+        yield (f"✅ {len(usable)} 条可用 fact -> {len(claims)} 条命题 "
+               f"(覆盖 {n_covered} 条, 未覆盖 {len(usable) - n_covered} 条; "
+               f"压缩比 {n_covered / max(len(claims), 1):.2f}:1; "
+               f"涉及 {n_cited} 篇论文)\n")
     else:
         yield "⚠ 命题合并不可用, 退回逐 fact 直写(引文会偏稀疏)\n"
 
@@ -390,26 +556,9 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     # 9-30: 篇幅目标。综述该"用较少的语言描述宏观情况", 不是越长越好。
     # 40 篇那次写出了 27000 字(675 字/篇), 用户要的是 60 篇配 6000 字(100 字/篇)。
     # 按主题数摊开, 没给就按"每篇约 110 字符"的密度反推一个合理值。
-    n_themes = max(1, len(theme_map["themes"]))
-    if target_chars <= 0:
-        target_chars = max(1200, int(len(usable) * 0.32))
-    per_theme_chars = max(300, target_chars // n_themes)
-    yield f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题, 每主题约 {per_theme_chars} 字符\n"
-
-    narratives: dict[str, dict[str, Any]] = {}
-    for name in order:
-        theme = next((t for t in theme_map["themes"] if t["name"] == name), None)
-        if not theme:
-            continue
-        tclaims = by_theme.get(name) or []
-        r = (write_theme_narrative_from_claims(theme, tclaims, target_chars=per_theme_chars)
-             if tclaims else write_theme_narrative(theme, facts))
-        narratives[name] = r
-        if r["text"]:
-            yield f"   ✅ {name}: {len(r['text'])} 字符 "
-            yield f"(用 {len(r.get('used_claim_ids') or r.get('used_fact_ids') or [])} 条)\n"
-        for w in r.get("warnings", []):
-            yield f"      ⚠ {w}\n"
+    # (具体计算搬到 _phase_write 里 —— 它要用 target_chars 算每主题配额。)
+    narratives = yield from _phase_write(
+        ws, theme_map, order, by_theme, facts, usable, target_chars, from_stage, _sig)
 
     # ---- 组装 + 落库 ----
     doc = render_survey(theme_map, narratives, title=topic, pool=pool,
@@ -430,6 +579,9 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     ws.save_audit(_organize_audit(theme_map, narratives, usable))
     ws.set_status("done", created, len(theme_map["themes"]),
                   f"主题驱动完成, theme_id={theme_id}")
+    # 跑完了才清 checkpoint —— 清掉之后下次同参数重跑就是干净的一轮,
+    # 而不是接着上一轮的 narratives 走(resume=False 同样能强制重来)。
+    ws.clear_checkpoint()
     yield (f"\n## 主题驱动综述完成 — {topic}\n"
            f"- theme_id: `{theme_id}`\n"
            f"- 主题: {len(theme_map['themes'])} 个, 写入 {created} 章\n"
