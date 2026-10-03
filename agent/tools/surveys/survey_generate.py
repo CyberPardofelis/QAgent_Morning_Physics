@@ -507,9 +507,14 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     for w in theme_map.get("warnings", []):
         yield f"   ⚠ {w}\n"
 
-    # ---- Phase B2: 命题合并 (9-30 加) ----
+    # ---- Phase B2: 命题合并 (9-30 加, 10-03 改成范式层) ----
     # 缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
     # 被重复引 5 次(40 篇那次实测)。合并成命题后, 一句话可以挂多篇。
+    #
+    # 10-03: 改走**范式层**(主题 -> 技术路线 -> 命题)。原路线按 subject 分簇
+    # 再让 LLM 合并, 但 subject 是"按论文取的标签"(实测 93% 的 fact 其 subject
+    # 只对应一篇论文), LLM 正确地不合并, 命题 ≈1:1 对应论文 -> 均引只有 0.94/句。
+    # 范式层实测均引 12.0/句。任何一步失败都退回原路线。
     claims: list[dict[str, Any]] = []
     if from_stage in ("claims", "done"):
         claims = ws.load_claims() or []
@@ -517,8 +522,14 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
         yield f"\n♻️ 命题合并: 沿用 checkpoint 的 {len(claims)} 条命题\n"
     else:
         from_stage = "themes"
-        yield "\n🔗 合并讲同一件事的 fact 成命题...\n"
-        from ._organize import condense_facts_by_theme
+        yield "\n🔗 归纳技术路线并合并成命题...\n"
+        from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
+    try:
+        claims = condense_facts_by_paradigm(usable, theme_map)
+    except Exception as e:
+        logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
+        claims = []
+    if not claims:
         try:
             claims = condense_facts_by_theme(usable, theme_map)
         except Exception as e:

@@ -1155,6 +1155,12 @@ def condense_facts_by_theme(
         tfs = _dedupe_same_paper_same_subject(tfs)
         batch_claims = condense_facts_into_claims(
             tfs, provider=provider, model=model, batch_size=batch_size)
+        # 10-03 兜底: 范式层失败退回这条路时, 同一篇论文会在**多个 subject** 下
+        # 各出一条命题, 于是成文时同一篇被连引 8 次(实测「二维网络变分优化」)。
+        # _dedupe_same_paper_same_subject 挡不住这种(它们 subject 不同),
+        # 所以这里再加一道**同主题内同论文**合并: 一篇论文在一个主题里只出一条
+        # 命题, 其余作为该命题的 fact 支撑。
+        batch_claims = _merge_same_paper_within_theme(batch_claims)
         # 9-30 修: claim_id 原来拼成 f"{name}#{cid}"。这个前缀**把标注语法搞脆了** ——
         # 模型看到 [张量网络与拟设#c1], 写出来多半是 [[c1]], 解析不上 -> 整句被丢,
         # 实测 4 批成文全部 0 字符。claim_id 是要让模型在句末**照抄**的, 必须好写。
@@ -1164,6 +1170,110 @@ def condense_facts_by_theme(
             _global_seq[0] += 1
             c["claim_id"] = f"q{_global_seq[0]}"
         all_claims.extend(batch_claims)
+    return all_claims
+
+
+def _merge_same_paper_within_theme(
+    claims: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """一个主题内, 同一篇论文只保留一条命题(最长的那条), 其余合并进去。
+
+    10-03 实测: 范式层对部分主题失败退回旧路线时, 「二维网络变分优化」那 4262 字里
+    同一篇论文被连引 8 次。`_dedupe_same_paper_same_subject` 挡不住 —— 那些 fact
+    的 subject 各不相同, 只是碰巧来自同一篇论文。
+    """
+    best: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for c in claims:
+        pids = [p for p in (c.get("paper_ids") or []) if p]
+        if len(pids) != 1:
+            # 多篇支撑的命题已经是"综合", 天然不会被重复引 —— 原样留
+            key = f"_multi_{len(order)}"
+            best[key] = c
+            order.append(key)
+            continue
+        pid = pids[0]
+        cur = best.get(pid)
+        if cur is None:
+            best[pid] = c
+            order.append(pid)
+            continue
+        # 同一篇的第二条: 并进第一条, 保留信息更全的那条 statement
+        merged_ids = list(dict.fromkeys(
+            (cur.get("fact_ids") or []) + (c.get("fact_ids") or [])))
+        if len(c.get("statement") or "") > len(cur.get("statement") or ""):
+            cur["statement"] = c["statement"]
+        cur["fact_ids"] = merged_ids
+        cur["n_facts"] = sum(int(x.get("n_facts", 1)) for x in (cur, c))
+    return [best[k] for k in order if best.get(k)]
+
+
+def condense_facts_by_paradigm(
+    facts: list[dict[str, Any]],
+    theme_map: dict[str, Any],
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+) -> list[dict[str, Any]]:
+    """主题 -> **范式** -> 命题。**一条范式就是一条命题, 天然跨多篇论文。**
+
+    这是引文密度的正解。实测(10-03, 110 条真实 fact, 主题「纯态张量网络表示」):
+    归属后 MPS 5 篇 / PEPS 5 篇 / MERA 2 篇, 写出来均引 **12.0/句**
+    (原路线 0.94/句)。
+
+    为什么不再用 `condense_facts_by_theme`(主题 -> LLM 合并):
+    fact 的 subject 是"按论文取的标签", 实测 163 个 subject 只有 4 个跨论文,
+    93% 的 fact 其 subject 只对应一篇论文 —— LLM 面对"一篇论文的各个细节"
+    正确地不合并(簇级压缩比 1.01), 于是命题 ≈1:1 对应论文。
+    范式层把"该按什么归类"这件事从 fact 自带的标签里拿出来, 交给模型按
+    **技术路线**重新判断, 再用向量质心把 fact 落到路线上(见 _paradigm)。
+
+    范式层任何一步失败(模型没吐出 themes / 编码不可用)都返回 [] ,
+    调用方退回 `condense_facts_by_theme` —— 宁可密度低, 不能丢内容。
+    """
+    from ._paradigm import assign, build_paradigms
+
+    fmap = {f["fact_id"]: f for f in facts if f.get("fact_id")}
+    if not fmap:
+        return []
+    paras = build_paradigms(list(fmap.values()), theme_map, provider, model)
+    if not paras:
+        print("[paradigm] 范式层没产出, 退回主题合并", flush=True)
+        return []
+
+    all_claims: list[dict[str, Any]] = []
+    seq = 0
+    # 10-03: 范式 statement 截到 120 字。这不是省 token, 是**压输入**:
+    # 思维链长度随输入复杂度增长 —— 同样的成文调用, statement 是 146 字时
+    # max_tokens=2000 正常出正文, 换成 2-3 句的长 statement 就全被 think 吃光
+    # (实测返回 4795 字符、0 正文)。范式的**身份由 name 承担**, statement 只需
+    # 交代机制和局限, 细节由写作模型自己补。
+    for theme in theme_map.get("themes", []):
+        name = (theme.get("name") or "").strip()
+        plist = paras.get(name) or []
+        if not plist:
+            continue
+        tfs = [fmap[i] for i in (theme.get("fact_ids") or []) if i in fmap]
+        if not tfs:
+            continue
+        groups = assign(tfs, plist)
+        for pn, g in groups.items():
+            if not g:
+                continue
+            meta = next((p for p in plist if p["name"] == pn), {})
+            pids = sorted({f.get("paper_id") or "" for f in g if f.get("paper_id")})
+            seq += 1
+            stmt = (meta.get("statement") or "").strip()[:120]
+            all_claims.append({
+                "claim_id": f"q{seq}",
+                "statement": f"{meta.get('name', '')}: {stmt}".strip(),
+                "fact_ids": [f["fact_id"] for f in g if f.get("fact_id")],
+                "paper_ids": pids,
+                "theme_id": name,
+                "n_facts": len(g),
+                "theme_name": name,
+            })
+    if not all_claims:
+        print("[paradigm] 归属后没有命题, 退回主题合并", flush=True)
     return all_claims
 
 
@@ -1245,10 +1355,15 @@ def write_theme_narrative_from_claims(
             try:
                 out = _call_llm(prompt, provider=provider, model=model,
                                 enable_thinking=False, temperature=0.4,
-                                # 9-30: 8000 -> 2000。实测每批最终只活下来约 245 字符, 给了 32 倍余量,
-                                # 模型每次都生成到上限(26 次共吐 34 万字符, 成文 6371 字符, 54 倍放大,
-                                # 94% 被 _render_claim_citations_or_drop 丢掉)。2000 够用。
-                                max_tokens=2000, timeout=420)
+                                # 9-30: 8000 -> 2000(实测每批只活下来约 245 字符)。
+                                # 10-03: 2000 -> 6000。范式级命题的 statement 更长
+                                # (120 字), 模型的思维链跟着变长, 2000 经常被 think
+                                # 吃光 -> 返回 5000+ 字符却 0 正文(实测连续 3 次)。
+                                # 注意这里跟**分类任务**相反: 写作是自由文本,
+                                # think 长度和输出结构没有绑定, 加预算是安全的;
+                                # 分类那种要吐结构化 JSON 的任务才是一加就废
+                                # (3000 能过、5000 起 100% think、JSON 归零)。
+                                max_tokens=6000, timeout=420)
             except Exception as e:
                 logger.warning("[write_claims] batch %d 失败: %s", _bi, e)
                 out = ""
