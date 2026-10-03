@@ -14,8 +14,55 @@ from __future__ import annotations
 
 import json
 
-from agent.tools.surveys import _organize as OG
-from agent.tools.surveys import _paradigm as PA
+import sys
+
+import pytest
+
+
+def _P():
+    """**调用时**取当前的 _paradigm 模块。
+
+    10-03 踩过: 同套件里有测试 reload 了模块, 于是模块顶层 import 到的 PA/OG
+    变成了旧对象 —— 而 condense_facts_by_paradigm 内部的函数级 import 取的是
+    reload 后的新对象。补丁打在旧对象上完全无效, 于是测试真调了一次 LLM(58 秒)。
+    所以这里和补丁处都走 sys.modules 现取。
+    """
+    import importlib
+
+    name = "agent.tools.surveys._paradigm"
+    return sys.modules.get(name) or importlib.import_module(name)
+
+
+def _O():
+    import importlib
+
+    name = "agent.tools.surveys._organize"
+    return sys.modules.get(name) or importlib.import_module(name)
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """任何测试都**不许**真发 LLM 请求。
+
+    10-03 踩过: 补丁打在了旧的模块对象上(同套件里有测试 reload 了 _paradigm),
+    而 `condense_facts_by_paradigm` 的函数内 import 取的是新对象, 补丁失效 ->
+    真的调了 MiniMax 58 秒, 还把 4 条 fact 归成 1 个范式(真实范式就一个)。
+    测试打网络 = CI 不稳 + 离线跑不了 + 烧配额, 一律在这里堵死。
+    """
+    def _boom(*a, **k):
+        raise AssertionError("测试里不许真调 LLM —— 补丁没生效?")
+
+    monkeypatch.setattr("agent.tools.llm._call_llm", _boom)
+
+
+def _patch_paradigm(monkeypatch, name, value):
+    """按**调用时**的模块对象打补丁。
+
+    `condense_facts_by_paradigm` 内部是 `from ._paradigm import ...`，
+    同套件里若有测试 reload 过模块，模块顶部的 `PA` 就成了旧对象，补丁无效。
+    这里每次都从 sys.modules 现取，和函数内 import 拿到的是同一个对象。
+    """
+    monkeypatch.setattr(_P(), name, value)
 
 
 # ============================================================
@@ -39,26 +86,26 @@ def test_salvage_recovers_complete_paradigms_from_truncated_output():
     ]}
     s = json.dumps(full, ensure_ascii=False)
     truncated = s[:s.rindex('{"name": "路线丙"')] + '{"name": "路线丙", "state'
-    got = PA._salvage_paradigms(truncated)
+    got = _P()._salvage_paradigms(truncated)
     names = [p["name"] for p in got]
     assert "路线甲" in names and "路线乙" in names
     assert "路线丙" not in names, "残缺对象不该被收进来"
 
 
 def test_salvage_returns_none_when_first_object_is_broken():
-    assert PA._salvage_paradigms('{"paradigms": [{"name": "x", "st') is None
+    assert _P()._salvage_paradigms('{"paradigms": [{"name": "x", "st') is None
 
 
 def test_salvage_handles_wrapped_in_themes():
     """模型有时会多包一层 {"themes":[{"paradigms":[...]}]}。"""
-    got = PA._salvage_paradigms(
+    got = _P()._salvage_paradigms(
         json.dumps({"themes": [{"paradigms": [_para("路线", ["K1", "K2"])]}]},
                    ensure_ascii=False))
     assert got and got[0]["name"] == "路线"
 
 
 def test_salvage_ignores_objects_without_keywords():
-    got = PA._salvage_paradigms(json.dumps(
+    got = _P()._salvage_paradigms(json.dumps(
         {"paradigms": [{"name": "没关键词", "statement": "x"}]}, ensure_ascii=False))
     assert got is None
 
@@ -68,14 +115,14 @@ def test_parse_falls_back_to_salvage():
     good = json.dumps({"paradigms": [_para("甲", ["A"]), _para("乙", ["B"])]},
                       ensure_ascii=False)
     broken = good[:good.rindex('{"name": "乙"')] + '{"name": "乙", "x'
-    got = PA._parse(broken, "某主题")
+    got = _P()._parse(broken, "某主题")
     assert got and [p["name"] for p in got] == ["甲"]
 
 
 def test_parse_handles_clean_output_without_salvage():
     raw = ('<think>先想想</think>{"paradigms": ['
            + json.dumps(_para("甲", ["A", "B"]), ensure_ascii=False) + "]}")
-    got = PA._parse(raw, "某主题")
+    got = _P()._parse(raw, "某主题")
     assert got and got[0]["keywords"] == ["A", "B"]
 
 
@@ -100,14 +147,14 @@ def test_merge_same_paper_collapses_duplicate_claims():
         _claim("c3", ["P1"], "关于 X 的细节三"),
         _claim("c4", ["P2"], "另一篇"),
     ]
-    got = OG._merge_same_paper_within_theme(claims)
+    got = _O()._merge_same_paper_within_theme(claims)
     assert [c["paper_ids"] for c in got] == [["P1"], ["P2"]]
     assert got[0]["fact_ids"] == ["c1-f0", "c2-f0", "c3-f0"], "事实不能丢"
     assert got[0]["n_facts"] == 3
 
 
 def test_merge_keeps_the_longer_statement():
-    got = OG._merge_same_paper_within_theme(
+    got = _O()._merge_same_paper_within_theme(
         [_claim("c1", ["P1"], "短"), _claim("c2", ["P1"], "明显更长的那句")])
     assert got[0]["statement"] == "明显更长的那句"
 
@@ -115,13 +162,13 @@ def test_merge_keeps_the_longer_statement():
 def test_merge_never_touches_multi_paper_claims():
     """多篇支撑的命题已经是"综合", 天然不会被重复引, 必须原样保留。"""
     claims = [_claim("c1", ["P1", "P2"]), _claim("c2", ["P1", "P2"])]
-    assert OG._merge_same_paper_within_theme(claims) == claims
+    assert _O()._merge_same_paper_within_theme(claims) == claims
 
 
 def test_merge_preserves_order():
     claims = [_claim("c1", ["P1"]), _claim("c2", ["P2"]), _claim("c3", ["P1"]),
               _claim("c4", ["P3"])]
-    got = OG._merge_same_paper_within_theme(claims)
+    got = _O()._merge_same_paper_within_theme(claims)
     assert [c["claim_id"] for c in got] == ["c1", "c2", "c4"]
 
 
@@ -152,8 +199,8 @@ def test_assign_groups_facts_by_centroid(monkeypatch):
     paras = [{"name": "MPS", "statement": "", "keywords": ["MPS"]},
              {"name": "PEPS", "statement": "", "keywords": ["PEPS"]}]
     vec = _vec(["a", "b"], ["a", "a", "b", "b"], 4)
-    monkeypatch.setattr(PA, "encode", lambda t, **k: vec)
-    got = PA.assign(facts, paras)
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: vec)
+    got = _P().assign(facts, paras)
     assert {f["fact_id"] for f in got["MPS"]} == {"f1", "f2"}
     assert {f["fact_id"] for f in got["PEPS"]} == {"f3", "f4"}
 
@@ -170,8 +217,8 @@ def test_assign_drops_ambiguous_facts(monkeypatch):
     # 前两条指向 A, 后两条指向 B, 但各自与另一个几乎一样近 -> 全部不归属
     vec = np.array([[1.0, 0.0], [1.0, 0.0], [0.5, 0.87], [0.5, 0.87]], dtype="float32")
     vec /= np.linalg.norm(vec, axis=1, keepdims=True)
-    monkeypatch.setattr(PA, "encode", lambda t, **k: vec)
-    got = PA.assign(facts, paras, margin=0.30)
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: vec)
+    got = _P().assign(facts, paras, margin=0.30)
     assert got == {}, "分不出来的就该一个都不归属"
 
 
@@ -184,8 +231,8 @@ def test_assign_skips_paradigm_with_too_few_seeds(monkeypatch):
              {"name": "PEPS", "statement": "", "keywords": ["PEPS", "PEPS"]},
              {"name": "MERA", "statement": "", "keywords": ["MERA", "MERA"]}]
     vec = _vec(["a", "b", "c"], ["a", "a", "b", "b", "c"], 5)
-    monkeypatch.setattr(PA, "encode", lambda t, **k: vec)
-    got = PA.assign(facts, paras)
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: vec)
+    got = _P().assign(facts, paras)
     assert "MERA" not in got, "只有 1 条种子的范式不该参与归属"
     assert {f["fact_id"] for f in got.get("MPS", [])} == {"f1", "f2"}
 
@@ -195,15 +242,15 @@ def test_assign_falls_back_to_seeds_when_encode_unavailable(monkeypatch):
     facts = [_fact("f1", "P1", "MPS 一维"), _fact("f2", "P2", "MPS 一维链")]
     paras = [{"name": "MPS", "statement": "", "keywords": ["MPS", "一维"]},
              {"name": "PEPS", "statement": "", "keywords": ["PEPS", "二维"]}]
-    monkeypatch.setattr(PA, "encode", lambda t, **k: None)
-    got = PA.assign(facts, paras)
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: None)
+    got = _P().assign(facts, paras)
     assert {f["fact_id"] for f in got["MPS"]} == {"f1", "f2"}
     assert "PEPS" not in got, "没有 fact 命中的范式不该出现"
 
 
 def test_assign_empty_inputs():
-    assert PA.assign([], []) == {}
-    assert PA.assign([_fact("f", "P", "x")], []) == {}
+    assert _P().assign([], []) == {}
+    assert _P().assign([_fact("f", "P", "x")], []) == {}
 
 
 # ============================================================
@@ -212,16 +259,16 @@ def test_assign_empty_inputs():
 
 def test_condense_by_paradigm_returns_empty_when_no_paradigms(monkeypatch):
     """范式层任何一步失败都要返回空, 让调用方退回旧路线 —— 不能抛。"""
-    monkeypatch.setattr(PA, "build_paradigms", lambda *a, **k: {})
+    _patch_paradigm(monkeypatch, "build_paradigms", lambda *a, **k: {})
     facts = [{"fact_id": "f1", "paper_id": "P1", "claim": "c"}]
     tmap = {"themes": [{"name": "T", "fact_ids": ["f1"]}]}
-    assert OG.condense_facts_by_paradigm(facts, tmap) == []
+    assert _O().condense_facts_by_paradigm(facts, tmap) == []
 
 
 def test_condense_by_paradigm_makes_one_claim_per_paradigm(monkeypatch):
     # 关键词给**两个**且 fact 里都出现: 不依赖 SEED_MIN_HITS 这个模块全局,
     # 阈值是 1 还是 2 都能过(全量跑时若有别的测试动过它, 单词关键词的版本会翻车)。
-    monkeypatch.setattr(PA, "build_paradigms", lambda *a, **k: {
+    _patch_paradigm(monkeypatch, "build_paradigms", lambda *a, **k: {
         "T": [{"name": "MPS", "statement": "链状表示", "keywords": ["MPS", "一维"]},
               {"name": "PEPS", "statement": "二维推广", "keywords": ["PEPS", "二维"]}]})
     facts = [
@@ -231,8 +278,8 @@ def test_condense_by_paradigm_makes_one_claim_per_paradigm(monkeypatch):
         {"fact_id": "f4", "paper_id": "P4", "claim": "c4", "subject": "PEPS 二维面积律"},
     ]
     tmap = {"themes": [{"name": "T", "fact_ids": ["f1", "f2", "f3", "f4"]}]}
-    monkeypatch.setattr(PA, "encode", lambda t, **k: None)   # 退回播种
-    got = OG.condense_facts_by_paradigm(facts, tmap)
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: None)   # 退回播种
+    got = _O().condense_facts_by_paradigm(facts, tmap)
     assert len(got) == 2, f"应一类范式一条命题, 实际 {len(got)} 条: {got}"
     mps = next(c for c in got if "MPS" in c["statement"])
     assert mps["paper_ids"] == ["P1", "P2"], "一条范式 = 一条跨论文命题"
@@ -246,11 +293,11 @@ def test_paradigm_statement_is_truncated():
     所以这里截到 120 字: 范式的身份由 name 承担, statement 只需交代机制和局限。
     """
     import inspect as _i
-    src = _i.getsource(OG.condense_facts_by_paradigm)
+    src = _i.getsource(_O().condense_facts_by_paradigm)
     assert "[:120]" in src, "statement 必须截断, 否则成文会被 think 吃光"
 
 
 def test_organize_phase_uses_paradigm_layer():
     import inspect as _i
-    src = _i.getsource(OG.condense_facts_by_paradigm)
+    src = _i.getsource(_O().condense_facts_by_paradigm)
     assert "build_paradigms" in src and "assign" in src
