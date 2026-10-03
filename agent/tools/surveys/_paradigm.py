@@ -114,12 +114,15 @@ def _salvage_paradigms(body: str) -> list[dict[str, Any]] | None:
     中间)。整块丢掉等于这个主题白跑 —— 而丢掉的主题会退回旧路径,
     退回的主题恰恰暴露出"同一篇论文连引 8 次"的老毛病。
 
-    做法: 扫出所有**括号平衡**的 {"name":..., "statement":..., "keywords":[...]}
-    对象, 逐个 json.loads。前面的完整对象照收, 最后一个残缺的丢掉。
+    做法: 用栈扫出所有**括号平衡**的对象, 逐个 json.loads, 只收"长得像范式"的
+    (有 name + keywords)。前面的完整对象照收, 残缺的那个解析失败自然丢掉。
+
+    注意**不能只在 depth==0 记录**: 输出被截断时外层 `{"paradigms": [` 是不平衡的,
+    于是里面每个范式对象都处在 depth>=1, 只认顶层会把它们全漏掉 —— 这正是
+    2026-10-03 第一版抢救逻辑的 bug, 对着真实失败样本才发现。
     """
     out: list[dict[str, Any]] = []
-    depth = 0
-    start = -1
+    stack: list[int] = []
     in_str = False
     esc = False
     for i, ch in enumerate(body):
@@ -134,32 +137,28 @@ def _salvage_paradigms(body: str) -> list[dict[str, Any]] | None:
         if ch == '"':
             in_str = True
         elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        obj = json.loads(body[start:i + 1])
-                    except Exception:
-                        start = -1
-                        continue
-                    start = -1
-                    if isinstance(obj, dict) and isinstance(obj.get("paradigms"), list):
-                        out.extend(x for x in obj["paradigms"] if isinstance(x, dict))
-                    elif isinstance(obj, dict) and obj.get("keywords") is not None:
-                        out.append(obj)
+            stack.append(i)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            try:
+                obj = json.loads(body[start:i + 1])
+            except Exception:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("paradigms"), list):
+                out.extend(x for x in obj["paradigms"] if isinstance(x, dict))
+            elif isinstance(obj, dict) and obj.get("keywords") is not None:
+                out.append(obj)
     if not out:
         return None
-    res = []
+    res, seen = [], set()
     for p in out:
         pn = (p.get("name") or "").strip()
         kws = [k.strip() for k in (p.get("keywords") or []) if k and k.strip()]
-        if pn and kws:
-            res.append({"name": pn, "statement": (p.get("statement") or "").strip(),
-                        "keywords": kws})
+        if not (pn and kws) or (pn, tuple(kws)) in seen:
+            continue
+        seen.add((pn, tuple(kws)))
+        res.append({"name": pn, "statement": (p.get("statement") or "").strip(),
+                    "keywords": kws})
     return res or None
 
 
