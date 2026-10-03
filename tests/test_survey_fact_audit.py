@@ -522,3 +522,61 @@ def test_fact_review_max_tokens_scales_with_batch(monkeypatch):
     assert captured["max_tokens"] >= 4000, (
         f"max_tokens 没跟上批大小: {captured['max_tokens']}"
     )
+
+
+# ============================================================
+# 10-02 并发: 两处审查循环
+# ============================================================
+
+
+def test_audit_grounding_uses_run_ordered():
+    """护栏: 落地审查必须走 run_ordered。忘了并行就白改(实测这阶段 ~8 分钟)。"""
+    import inspect as _i
+    from agent.tools.surveys import _fact_audit as FA
+    assert "run_ordered" in _i.getsource(FA.audit_fact_grounding)
+
+
+def test_fact_alignment_uses_run_ordered():
+    """护栏: 主题对齐必须走 run_ordered。"""
+    import inspect as _i
+    from agent.tools.surveys._pool import _facts_review as FR
+    assert "run_ordered" in _i.getsource(FR._review_facts_topic_alignment)
+
+
+def test_audit_grounding_parallel_matches_serial(monkeypatch):
+    """
+    并发与串行的产物必须**逐字节相同**, 包括每个 fact 写回的 _grounded。
+
+    fact 本体的写回顺序是可复现性的一部分 —— 诊断报告里的
+    "通过 X / 超纲 Y" 统计直接来自它。
+    """
+    import agent.tools.config as cfg
+    from agent.tools.surveys import _fact_audit as FA
+
+    facts = [{"fact_id": f"p{i%3}::{i}", "paper_id": f"p{i%3}",
+              "claim": f"关于方法 {i} 的断言", "support_quote": "real quote",
+              "subject": f"主题{i%7}"}
+             for i in range(45)]
+    src = {f"p{k}": f"这是 p{k} 的原文 real quote inside" for k in range(3)}
+
+    def fake_llm(prompt, **kw):
+        import json as _json
+        import re as _re
+        ids = _re.findall(r"- id=(\S+)", prompt)
+        return _json.dumps([
+            {"id": i, "grounded": True, "evidence": "real quote"} for i in ids])
+
+    import agent.tools.llm as lm
+    monkeypatch.setattr(lm, "_call_llm", fake_llm)
+
+    def run(workers):
+        monkeypatch.setattr(cfg, "SURVEY_MAX_WORKERS", workers)
+        out = [dict(f) for f in facts]
+        FA.audit_fact_grounding(out, src, batch_size=8, source_budget=40000)
+        return ([f.get("_grounded") for f in out],
+                [f.get("_evidence", "") for f in out])
+
+    serial = run(1)
+    parallel = run(4)
+    assert serial == parallel, "并发下的写回结果必须与串行逐位相同"
+    assert serial[0] == [True] * 45

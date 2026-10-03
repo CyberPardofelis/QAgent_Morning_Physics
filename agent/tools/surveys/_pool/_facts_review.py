@@ -9,6 +9,7 @@ import logging
 import re
 from typing import Any
 
+from .._parallel import run_ordered
 from ._utils import _safe_json_loads_array
 
 logger = logging.getLogger(__name__)
@@ -62,28 +63,39 @@ def _review_facts_topic_alignment(
         claim_hash = hash(str(f.get("claim", ""))[:50]) & 0xFFFF
         return f"{pid}:{idx}:{claim_hash}"
 
-    for i in range(0, len(facts), batch_size):
-        batch = facts[i: i + batch_size]
-        batch_keys = [_fact_key(f, i + j) for j, f in enumerate(batch)]
-        try:
-            prompt = build_fact_review_prompt(topic, batch)
-            out = _call_llm(
-                prompt,
-                provider=_PROVIDER,
-                model=_MODEL,
-                enable_thinking=False,
-                temperature=0.2,
-                # 批大小从 8 提到 20 后, 每条 ~80 token + JSON overhead,
-                # 固定 3000 会截断后半批 —— 截断的批整批 fallback 成中性分。
-                # 与 _relevance_filter 的 max(4000, 400×n) 同一套做法。
-                max_tokens=max(3000, 200 * len(batch)),
-                timeout=120,
-            )
-            if out and "<think>" in out:
-                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
-            results = _safe_json_loads_array(out or "")
-            if results is None:
-                raise ValueError(f"fact review batch JSON parse 失败: {(out or '')[:200]}")
+    # 10-02 并发: 批次之间互不依赖, worker 只负责"发请求 + 解析出 results"。
+    # scored 的写入和 fallback 全部回主线程按原序做 —— 保序保证同一份输入
+    # 的输出可复现(诊断日志里的分数分布直方图就是拿 scored 算的)。
+    def _review_one(pair):
+        idx, batch = pair
+        prompt = build_fact_review_prompt(topic, batch)
+        out = _call_llm(
+            prompt,
+            provider=_PROVIDER,
+            model=_MODEL,
+            enable_thinking=False,
+            temperature=0.2,
+            # 批大小从 8 提到 20 后, 每条 ~80 token + JSON overhead,
+            # 固定 3000 会截断后半批 —— 截断的批整批 fallback 成中性分。
+            # 与 _relevance_filter 的 max(4000, 400×n) 同一套做法。
+            max_tokens=max(3000, 200 * len(batch)),
+            timeout=120,
+        )
+        if out and "<think>" in out:
+            out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+        results = _safe_json_loads_array(out or "")
+        if results is None:
+            raise ValueError(f"fact review batch JSON parse 失败: {(out or '')[:200]}")
+        return results
+
+    _slices = [(i, facts[i: i + batch_size]) for i in range(0, len(facts), batch_size)]
+    _calls = run_ordered(_slices, _review_one, desc="fact_align")
+
+    for idx, batch, res in zip([s[0] for s in _slices],
+                                [s[1] for s in _slices], _calls, strict=True):
+        batch_keys = [_fact_key(f, idx + j) for j, f in enumerate(batch)]
+        if res.ok:
+            results = res.value
             # 用 fact_id 匹配; LLM 可能没严格用我们的 fact_id, 用 paper_id + 顺序回退匹配
             for j, r in enumerate(results):
                 if not isinstance(r, dict):
@@ -109,14 +121,16 @@ def _review_facts_topic_alignment(
                         "score": 5, "is_topic_aligned": True,  # fallback 默认对齐 (保守)
                         "reason": "[fallback] LLM 未评, 用中性分", "paper_id": f.get("paper_id", "?"),
                     }
-        except Exception as e:
-            logger.warning("[_review_facts_topic_alignment] batch %d 失败 (整批保留): %s", i // batch_size, e)
+        else:
+            logger.warning("[_review_facts_topic_alignment] batch %d 失败 (整批保留): %s",
+                           idx // batch_size, res.exc)
             for j, f in enumerate(batch):
                 fk = batch_keys[j]
                 if fk not in scored:
                     scored[fk] = {
                         "score": 5, "is_topic_aligned": True,
-                        "reason": f"[batch_failed] {type(e).__name__}", "paper_id": f.get("paper_id", "?"),
+                        "reason": f"[batch_failed] {type(res.exc).__name__}",
+                        "paper_id": f.get("paper_id", "?"),
                     }
 
     # 统计

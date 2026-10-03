@@ -28,6 +28,8 @@ import logging
 import re
 from typing import Any
 
+from ._parallel import run_ordered
+
 logger = logging.getLogger(__name__)
 
 AUDIT_PROMPT = """你是事实核查员。下面每条是某篇论文抽取出的"原子事实", 以及它声称的原文出处。
@@ -246,8 +248,17 @@ def audit_fact_grounding(
     paper_source = paper_source or {}
     stats = {"audited": 0, "grounded": 0, "ungrounded": 0, "failed": 0}
 
-    for batch in _plan_batches(facts, paper_source, batch_size, source_budget):
-        got = _audit_batch(batch, paper_source, provider, model)
+    # 10-02 并发: 批次之间互不依赖, _audit_batch 本身是纯函数(只发请求+解析)。
+    # 状态变更(**_grounded / _unsupported_terms 写回 fact 本体)一律留在这里,
+    # 按批次原序做 —— 保序不是为了计数好看, 而是 fact 的写回顺序要可复现。
+    batches = _plan_batches(facts, paper_source, batch_size, source_budget)
+    _calls = run_ordered(
+        batches,
+        lambda b: _audit_batch(b, paper_source, provider, model),
+        desc="fact_audit",
+    )
+    for batch, res in zip(batches, _calls, strict=True):
+        got = res.value if res.ok else None
         if not got:
             stats["failed"] += len(batch)
             continue
