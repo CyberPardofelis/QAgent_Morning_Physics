@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .._paper_id import normalize_arxiv_id
 from ._utils import _arxiv_author_name
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def _arxiv_search(query: str, k: int = 5) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in client.results(search):
         out.append({
-            "paper_id": r.entry_id.split("/")[-1].split("v")[0],  # 去 /abs/ 前缀和版本号
+            "paper_id": normalize_arxiv_id(r.entry_id),  # 10-04: 见 _paper_id
             "title": r.title or "",
             "year": str(r.published.year) if r.published else "",
             "authors": ", ".join([_arxiv_author_name(a) for a in (r.authors or [])[:5]]),
@@ -69,7 +70,7 @@ def _arxiv_search_batch(queries: list[str], k_per_query: int = 3) -> list[dict[s
                 sort_by=arxiv.SortCriterion.Relevance,
             )
             for r in client.results(search):
-                pid = r.entry_id.split("/")[-1].split("v")[0]
+                pid = normalize_arxiv_id(r.entry_id)   # 10-04: 旧格式要留 archive 前缀
                 if pid in seen:
                     continue
                 seen.add(pid)

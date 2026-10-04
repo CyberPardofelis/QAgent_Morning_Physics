@@ -10,6 +10,14 @@ import logging
 import re
 from typing import Any
 
+from .._paper_id import (
+    ARXIV_ID_ALT,
+    dedup_key,
+    normalize_arxiv_id,
+    normalize_doi,
+    normalize_paper_id,
+)
+
 logger = logging.getLogger(__name__)
 
 # paper_id 抽取用 regex
@@ -20,19 +28,34 @@ logger = logging.getLogger(__name__)
 #   - in_pool 恒为 0        → 覆盖度审计失真
 #   - 幻觉的 APS 引用抓不到 → 审计形同虚设
 #   - 实测: 一段 10892 字符的章节因误判触发 2 次重写, 被砍到 3075 字符
-_PAPER_ID_SIMPLE_RE = re.compile(r"\[(\d{4,5}\.\d{4,5}|\d{7})\]")
-_PAPER_ID_ARXIV_RE = re.compile(r"arXiv[:\s]+(\d{4,5}\.\d{4,5}|\d{7})")
-_PAPER_ID_PAPERS_MD_RE = re.compile(r"papers/(\d{4,5}\.\d{4,5}|\d{7})\.md")
-# DOI 形式 (APS / IOP 等出版商): 10.NNNN/suffix
+#
+# 10-04: 三条 arXiv regex 里的 id 形态改成引用 _paper_id.ARXIV_ID_ALT, 让
+# "推导侧产出什么形态" 和 "抽取侧认什么形态" 共用同一份定义。以前各写各的,
+# 于是旧格式 arXiv(带 archive 前缀)推导得出、却抽不出来 -> in_pool 恒为 0。
+_PAPER_ID_SIMPLE_RE = re.compile(rf"\[({ARXIV_ID_ALT})\]")
+_PAPER_ID_ARXIV_RE = re.compile(rf"arXiv[:\s]+({ARXIV_ID_ALT})")
+_PAPER_ID_PAPERS_MD_RE = re.compile(rf"papers/({ARXIV_ID_ALT})\.md")
+# DOI 形式 (APS / IOP / JHEP 等出版商): 10.NNNN/suffix
 # 后缀允许字母数字和 . - _ / (部分 DOI 后缀含斜杠, 如 10.1088/1367-2630/aad1ea)
-_PAPER_ID_DOI_RE = re.compile(r"\[(10\.\d{4,9}/[^\]\s\)]+)\]")
+#
+# 10-04 改: 原来用 `[^\]\s\)]` 把右括号排掉了, 于是 **JHEP 的 DOI 全被截断** ——
+# `10.1007/JHEP11(2013)158` 只抽到 `10.1007/JHEP11`, 跟池子里的 id 对不上 ->
+# 判成"引用了池外的幻觉 id" -> 触发重写。JHEP 是高能领域主要刊物之一, 这条对
+# 物理用户是实打实的坑。括号改成"方括号内可以随便, 只要不是 ] 或空白"。
+_PAPER_ID_DOI_RE = re.compile(r"\[(10\.\d{4,9}/[^\]\s]+)\]")
 # 链接形式: papers/<doi>.md —— 后缀非贪婪, 否则会把 ".md" 一起吞进去
 _PAPER_ID_DOI_LINK_RE = re.compile(r"papers/(10\.\d{4,9}/[^)\s]*?)\.md")
-# 裸 DOI: 结尾必须是词字符, 避免把后面的标点/斜杠也吃进来;
-# 前面不能是 papers/, 否则会把 papers/<doi>.md 里的 ".md" 也当成 id
+# 裸 DOI: 中间允许圆括号(JHEP), 但**结尾**必须是词字符, 避免把后面的标点/斜杠/
+# 右括号也吃进来; 前面不能是 papers/, 否则会把 papers/<doi>.md 的 ".md" 当成 id
 _PAPER_ID_DOI_BARE_RE = re.compile(
-    r"(?<!papers/)\b(10\.\d{4,9}/[A-Za-z0-9._/-]*[A-Za-z0-9._-])\b"
+    r"(?<!papers/)\b(10\.\d{4,9}/[A-Za-z0-9._/()-]*[A-Za-z0-9._-])\b"
 )
+# 10-04 加: 无 DOI 的 OpenAlex 文献。_safe_paper_id 的第 3/4 优先级会产出
+# `W3104022488` / `OA-<md5>` 两种形态, 之前只在 _organize 的编号侧认, 抽取侧
+# 完全不认 -> 正文里挂着 [W3104022488] 而覆盖度审计看不见它。实测存量里有 2 条。
+_PAPER_ID_OPENALEX_RE = re.compile(r"\[(W\d+|OA-[0-9a-f]{8,})\]")
+
+
 def _arxiv_author_name(a: Any) -> str:
     """
     兼容不同 arxiv 库的 Author 表示 (9-18 修复: 'Author' object has no attribute 'text').
@@ -137,6 +160,7 @@ def _extract_paper_ids(text: str) -> list[str]:
         _PAPER_ID_PAPERS_MD_RE,
         _PAPER_ID_DOI_LINK_RE,
         _PAPER_ID_DOI_BARE_RE,
+        _PAPER_ID_OPENALEX_RE,   # 10-04 加
     ):
         for m in pattern.finditer(text):
             hits.append((m.start(), m.group(1)))
@@ -151,12 +175,19 @@ def _extract_paper_ids(text: str) -> list[str]:
 
 
 def _audit_section_paper_ids(content_md: str, pool_ids: set) -> dict[str, list[str]]:
-    """候选池内/外分桶 (plan §3.2 覆盖度审计核心)"""
+    """候选池内/外分桶 (plan §3.2 覆盖度审计核心)
+
+    10-04: 两侧都过一遍 dedup_key 再比。池子里的 id 是 API 推导出来的规范形态,
+    正文里的 id 是模型照抄的 —— 大小写 / URL 前缀 / arXiv 版本号都可能不同。
+    不归一就比, 同一篇论文会被判成"引用了池外的幻觉 id", 然后触发无意义的
+    重写(9-27 那次砍掉 72% 内容的机制)。
+    """
+    pool_keys = {dedup_key(p) for p in (pool_ids or set()) if p}
     cites = _extract_paper_ids(content_md or "")
     in_pool = []
     out_pool = []
     for c in cites:
-        if c in pool_ids:
+        if dedup_key(c) in pool_keys:
             in_pool.append(c)
         else:
             out_pool.append(c)
@@ -179,8 +210,13 @@ def _safe_paper_id(work: dict) -> str:
       4. title hash (兜底, 不会重复但不可读)
 
     返回 paper_id (字符串).
+
+    10-04: 三个分支全部改走 _paper_id 的归一函数。原来 2/3 两个分支各写各的,
+    而且 2 号分支 `.replace(".pdf","")` **保留了版本号** —— 同一篇论文走 arxiv API
+    得 `2209.02093`, 走 OpenAlex 这条路得 `2209.02093v1`, 两个 id 双双通过去重,
+    于是重复烧一次相关性审查 + 一次 fact 抽取, 参考文献表里出现重复条目。
     """
-    doi = (work.get("doi") or "").replace("https://doi.org/", "").strip()
+    doi = normalize_doi(work.get("doi") or "")
     if doi:
         return doi
 
@@ -191,12 +227,12 @@ def _safe_paper_id(work: dict) -> str:
         src = loc.get("source") or {}
         # 有些 source 字段是 OpenAlex source object
         if isinstance(src, dict) and src.get("id") and "arxiv" in (src.get("display_name") or "").lower():
-            arxiv_id = (loc.get("pdf_url") or "").split("/")[-1].replace(".pdf", "")
+            arxiv_id = normalize_arxiv_id(loc.get("pdf_url") or "")
             if arxiv_id:
                 return arxiv_id
 
     # OpenAlex ID (例 "https://openalex.org/W123456" → "W123456")
-    oa_id = (work.get("id") or "").replace("https://openalex.org/", "").strip()
+    oa_id = normalize_paper_id(work.get("id") or "")
     if oa_id:
         return oa_id
 

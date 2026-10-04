@@ -16,6 +16,7 @@ from agent.tools.config import (
     get_relevance_threshold,
 )
 
+from .._paper_id import dedup_key, normalize_arxiv_id
 from ._openalex import _openalex_aps_search, _openalex_iop_search
 from ._pool_audit import _audit_pool_with_retry
 from ._topic_match import entry_text, qualifies
@@ -60,15 +61,20 @@ def _build_candidate_pool(
     from agent.tools.summary import list_summary_items
 
     # 9-08 修: 拆成多路召回, 每路各取 top, 然后 union + 去重
+    # 10-04: seen_ids 存的是 **dedup_key** 而不是原始 paper_id —— DOI 大小写
+    # 不敏感, `10.1103/PhysRevLett.123.100501` 和全小写写法是同一篇, 不折的话
+    # 同一个池子里会出现两条(参考文献表肉眼可见的重复)。折键不影响存储形态,
+    # 所以不需要动存量数据。
     seen_ids: set = set()
     pool_dict: dict[str, dict[str, Any]] = {}  # paper_id -> pool entry
 
     def add_pool_entry(entry: dict[str, Any]) -> None:
         """union + 去重"""
         pid = entry.get("paper_id", "")
-        if not pid or pid in seen_ids:
+        key = dedup_key(pid)
+        if not pid or key in seen_ids:
             return
-        seen_ids.add(pid)
+        seen_ids.add(key)
         pool_dict[pid] = entry
 
     # 关键词切分 (中文 + 英文)
@@ -266,8 +272,8 @@ def _build_candidate_pool(
             client = arxiv.Client()
             arxiv_added = 0
             for r in client.results(search):
-                pid = r.entry_id.split("/")[-1].split("v")[0]
-                if pid in seen_ids:
+                pid = normalize_arxiv_id(r.entry_id)   # 10-04: 旧格式要留 archive 前缀
+                if dedup_key(pid) in seen_ids:
                     continue
                 add_pool_entry({
                     "paper_id": pid,

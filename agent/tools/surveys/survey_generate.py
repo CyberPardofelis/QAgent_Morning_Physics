@@ -31,6 +31,20 @@ from ._pool import _build_candidate_pool
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 续跑签名用的 prompt/逻辑版本号
+# ============================================================
+# 为什么必须有: 续跑签名原本只覆盖 (topic_hash | max_pool | target_chars)。
+# 10-03 把命题层从 subject 合并换成范式层, 签名一模一样 -> 上一轮按旧逻辑
+# 产出的 themes/claims 会被当成"同参数的合法产物"接上, 输出看着完全正常,
+# 结论却是旧逻辑的。这就是"静默接上旧数据"最难查的那一类。
+#
+# **改了任何 prompt 常量 / 阶段顺序 / 合并逻辑, 就把这个日期往后挪一天。**
+# 代价是所有现存 checkpoint 作废(从头重跑一次); 不挪的代价是静默产出
+# 上一个版本的结论。后者贵得多。
+PROMPT_VERSION = "2026-10-04"
+
+
 @register_tool(name="survey_generate", is_streaming=True, cost_tier="L2")
 def survey_generate(
     topic: str,
@@ -279,7 +293,10 @@ def _phase_write(ws, theme_map, order, by_theme, facts, usable,
     yield f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题, 每主题约 {per_theme_chars} 字符\n"
 
     narratives: dict[str, dict[str, Any]] = {}
-    if from_stage == "done":
+    # 10-04 修: 原来只判 `== "done"`, 而 save_checkpoint("done") 全仓库从来没
+    # 调过, 所以这行是死代码, _narratives.json 逐主题落盘的收益完全没兑现。
+    # 真正会出现的续跑点是 "narratives" —— 写到第 5 个主题崩了, 前 4 个得留下。
+    if from_stage in ("narratives", "done"):
         narratives = ws.load_narratives() or {}
         if narratives:
             yield f"\n♻️ 成文: 沿用 checkpoint 的 {len(narratives)} 个主题正文\n"
@@ -315,12 +332,19 @@ def _resolve_resume(ws, topic_hash: str, max_pool: int, target_chars: int,
     抽出来是因为续跑判定有 4 个分支, 塞在 _run_organize_phase 里会把那个函数
     的复杂度顶爆(C901)。逻辑本身很直白, 见下面三条规则。
     """
-    sig = hashlib.sha1(f"{topic_hash}|{max_pool}|{target_chars}".encode()).hexdigest()[:12]
+    # signature 必须逐位相同才续跑 —— PROMPT_VERSION 在最前面, 所以改 prompt /
+    # 改阶段逻辑会自动作废旧 checkpoint(见 PROMPT_VERSION 处的说明)。
+    sig = hashlib.sha1(
+        f"{PROMPT_VERSION}|{topic_hash}|{max_pool}|{target_chars}".encode()
+    ).hexdigest()[:12]
     lines: list[str] = []
     ck = ws.load_checkpoint() if resume else None
 
     if ck and ck.get("signature") != sig:
-        lines.append("♻️ 上轮 checkpoint 参数对不上(改了 max_pool/target_chars), 从头重跑\n")
+        lines.append(
+            "♻️ 上轮 checkpoint 参数对不上(改了 max_pool/target_chars 或 prompt 版本), "
+            "从头重跑\n"
+        )
         ws.clear_checkpoint()
         return "pool", {"signature": sig, "lines": lines}
 
@@ -405,6 +429,87 @@ def _yield_usable_summary(facts: list[dict[str, Any]]):
     yield f"✅ 可用 fact: {len(usable)} 条 / 共 {len(facts)} 条\n"
 
 
+# ============================================================
+# Phase B2: 命题合并
+# ============================================================
+
+def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
+                  from_stage: str, sig: str):
+    """主题 -> (技术路线) -> 命题。产出 (claims, from_stage)。
+
+    缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
+    被重复引 5 次(40 篇那次实测)。合并成命题后, 一句话可以挂多篇。
+
+    10-03 改走**范式层**(主题 -> 技术路线 -> 命题)。原路线按 subject 分簇再让
+    LLM 合并, 但 subject 是"按论文取的标签"(实测 93% 的 fact 其 subject 只对应
+    一篇论文), LLM 正确地不合并, 命题 ≈1:1 对应论文 -> 均引只有 0.94/句。
+    范式层实测均引 12.0/句。任何一步失败都退回原路线。
+
+    10-04 抽成独立生成器, 与 _phase_facts / _phase_write 同一形状。原因不是
+    C901, 是**这个块以前根本没法测**: 它内联在 _run_organize_phase 里, 而
+    现有的续跑测试是 `assert "load_claims" in inspect.getsource(...)` —— 只
+    验证那行字符串在源码里, 不验证它返回值。于是下面两个 bug 一起从测试缝里
+    漏了过去(10-03 上线, 11 天):
+      (a) 原来的 `try: claims = condense_facts_by_paradigm(...)` 缩进在
+          if/else **之外** -> 续跑时也会无条件重跑范式层, 刚读出来的 checkpoint
+          被直接覆盖, "沿用 checkpoint" 那行提示是假的;
+      (b) import 写在 else 里 -> 走 if 分支时那个名字是未绑定的局部变量, 必然
+          UnboundLocalError, 被 except 吞掉 -> claims=[] -> 退主题合并 -> 那个
+          名字同样没绑定, 再抛一次 -> 最后落到"退回 fact 直写"。
+      合起来的效果: 续跑不但没省调用, 还把范式层(均引 12.0/句)换成了代码自己
+      标注为劣质的旧路线(0.94/句), 而 UI 里只看得到一行 logger.warning。
+    另: 原来的 save_claims / save_checkpoint 嵌在 `if not claims:` 里面, 等于
+    **只有范式层失败走了兜底时才落盘** —— 主路线从不写 _claims.json。实测佐证:
+    10-03 15:09 走范式路线跑完的 workspace 没有 _claims.json, 13:18 范式失败
+    走兜底的反而有。
+    """
+    claims: list[dict[str, Any]] = []
+    if from_stage in ("claims", "narratives", "done"):
+        claims = ws.load_claims() or []
+    if claims:
+        # 复用路径: 一定不碰 LLM。这条 if/else 边界是本函数存在的理由。
+        yield f"\n♻️ 命题合并: 沿用 checkpoint 的 {len(claims)} 条命题\n"
+    else:
+        from_stage = "themes"
+        yield "\n🔗 归纳技术路线并合并成命题...\n"
+        from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
+        try:
+            claims = condense_facts_by_paradigm(usable, theme_map)
+        except Exception as e:
+            logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
+            claims = []
+        if not claims:
+            # 10-04 加: 范式层挂掉原先只在 logger.warning 里, 用户的流式输出看不到。
+            # 而这一层直接决定引文密度(实测 12.0/句 vs 旧路线 0.94/句), 静默退回
+            # 等于"看着正常但质量掉了一档" —— 正是这个模块开头写的"宁可吵, 不可
+            # 静默"要防的那一类。所以这里明确告诉用户走了兜底。
+            yield ("   ⚠ 范式层没产出, 已退回主题合并(引文密度会明显变稀)\n")
+            try:
+                claims = condense_facts_by_theme(usable, theme_map)
+            except Exception as e:
+                logger.warning("[organize] 命题合并失败, 退回 fact 直写: %s", e)
+                claims = []
+        if claims:
+            ws.save_claims(claims)
+            ws.save_checkpoint("claims", signature=sig, n_claims=len(claims))
+
+    if not claims:
+        yield "⚠ 命题合并不可用, 退回逐 fact 直写(引文会偏稀疏)\n"
+        return claims, from_stage
+
+    n_cited = len({p for c in claims for p in c.get("paper_ids", []) if p})
+    # 10-02: 原来打的是 `len(usable) -> len(claims)`, 但 usable 里有一大截
+    # **主题地图根本没覆盖**的 fact(实测 v60g: 241 条里 49 条)。把它们算进
+    # 分子, 于是"丢得越多, 压缩比越好看" —— 方向完全反了。
+    # 真正该看的是"进了合并器的 fact 被压成了几条命题"。
+    n_covered = len({fid for c in claims for fid in c.get("fact_ids", [])})
+    yield (f"✅ {len(usable)} 条可用 fact -> {len(claims)} 条命题 "
+           f"(覆盖 {n_covered} 条, 未覆盖 {len(usable) - n_covered} 条; "
+           f"压缩比 {n_covered / max(len(claims), 1):.2f}:1; "
+           f"涉及 {n_cited} 篇论文)\n")
+    return claims, from_stage
+
+
 def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
                         target_chars: int = 0, resume: bool = True):
     """
@@ -422,15 +527,22 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
 
     与旧路线的区别只在 3/4 —— 1/2/5 完全共用, 所以两条路线可以互相对照。
 
-    崩溃续跑 (10-02):
+    崩溃续跑 (10-02 起, 10-04 修):
         这条流水线是严格串行的, 中途挂掉就整轮作废 —— v60e 实测跑了 76 分钟 /
         151 次调用死在主题归纳那一步, 而 fact 早就落盘在 _facts.jsonl 里了。
         每个阶段完成时打一个 checkpoint, 下次参数没变就从最后一个完成的阶段接着走。
 
-        两个防错设计 (都是"静默接上旧数据"这类最难查的 bug):
-        1. **signature 必须逐位相同**: max_pool / target_chars 改了就不续 ——
-           否则会把旧参数下的中间产物接到新参数上, 输出看着完全正常但结论是错的。
+        三个防错设计 (都是"静默接上旧数据"这类最难查的 bug):
+        1. **signature 必须逐位相同**: signature = sha1(PROMPT_VERSION | topic_hash |
+           max_pool | target_chars)。参数或 prompt 版本任一变了就不续 —— 否则会把
+           旧条件下的中间产物接到新条件上, 输出看着完全正常但结论是错的。
+           (PROMPT_VERSION 是 10-04 补的: 之前只覆盖三个参数, 于是 10-03 把命题层
+            从 subject 换成范式层时签名没变, 旧产物会被当成同参数合法产物接上。)
         2. **续跑时一定 yield 一行「♻️ 续跑」**。宁可吵, 不可静默。
+        3. **阶段梯 _STAGES 的每一级都真的会被写、也真的会被读**。10-04 之前
+           "done" 从没被写过(→ 读端是死代码), "narratives" 只写不读(→ 续跑会重跑
+           最贵的主题地图那一步), 命题层的 save 还嵌在 fallback 分支里(→ 主路线
+           从不落盘)。改这套的时候, 写端和读端的阶段集合必须一起核对。
         候选池也直接从 checkpoint 读, 不重跑召回+审查(顺带省 18 次调用)。
     """
     from ._organize import (
@@ -480,7 +592,7 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
 
     # ---- Phase B: 主题地图 ----
     theme_map: dict[str, Any] | None = None
-    if from_stage in ("themes", "claims", "done"):
+    if from_stage in ("themes", "claims", "narratives", "done"):
         theme_map = load_thematic_map(ws)
     if theme_map and theme_map.get("themes"):
         yield f"\n♻️ 主题地图: 沿用 checkpoint 的 {len(theme_map['themes'])} 个主题\n"
@@ -508,49 +620,8 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
         yield f"   ⚠ {w}\n"
 
     # ---- Phase B2: 命题合并 (9-30 加, 10-03 改成范式层) ----
-    # 缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
-    # 被重复引 5 次(40 篇那次实测)。合并成命题后, 一句话可以挂多篇。
-    #
-    # 10-03: 改走**范式层**(主题 -> 技术路线 -> 命题)。原路线按 subject 分簇
-    # 再让 LLM 合并, 但 subject 是"按论文取的标签"(实测 93% 的 fact 其 subject
-    # 只对应一篇论文), LLM 正确地不合并, 命题 ≈1:1 对应论文 -> 均引只有 0.94/句。
-    # 范式层实测均引 12.0/句。任何一步失败都退回原路线。
-    claims: list[dict[str, Any]] = []
-    if from_stage in ("claims", "done"):
-        claims = ws.load_claims() or []
-    if claims:
-        yield f"\n♻️ 命题合并: 沿用 checkpoint 的 {len(claims)} 条命题\n"
-    else:
-        from_stage = "themes"
-        yield "\n🔗 归纳技术路线并合并成命题...\n"
-        from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
-    try:
-        claims = condense_facts_by_paradigm(usable, theme_map)
-    except Exception as e:
-        logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
-        claims = []
-    if not claims:
-        try:
-            claims = condense_facts_by_theme(usable, theme_map)
-        except Exception as e:
-            logger.warning("[organize] 命题合并失败, 退回 fact 直写: %s", e)
-            claims = []
-        if claims:
-            ws.save_claims(claims)
-            ws.save_checkpoint("claims", signature=_sig, n_claims=len(claims))
-    if claims:
-        n_cited = len({p for c in claims for p in c.get("paper_ids", []) if p})
-        # 10-02: 原来打的是 `len(usable) -> len(claims)`, 但 usable 里有一大截
-        # **主题地图根本没覆盖**的 fact(实测 v60g: 241 条里 49 条)。把它们算进
-        # 分子, 于是"丢得越多, 压缩比越好看" —— 方向完全反了。
-        # 真正该看的是"进了合并器的 fact 被压成了几条命题"。
-        n_covered = len({fid for c in claims for fid in c.get("fact_ids", [])})
-        yield (f"✅ {len(usable)} 条可用 fact -> {len(claims)} 条命题 "
-               f"(覆盖 {n_covered} 条, 未覆盖 {len(usable) - n_covered} 条; "
-               f"压缩比 {n_covered / max(len(claims), 1):.2f}:1; "
-               f"涉及 {n_cited} 篇论文)\n")
-    else:
-        yield "⚠ 命题合并不可用, 退回逐 fact 直写(引文会偏稀疏)\n"
+    claims, from_stage = yield from _phase_claims(
+        ws, usable, theme_map, from_stage, _sig)
 
     # ---- Phase C: 逐主题写叙述 ----
     yield "\n✍️ 按主题写叙述...\n"
@@ -590,6 +661,10 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     ws.save_audit(_organize_audit(theme_map, narratives, usable))
     ws.set_status("done", created, len(theme_map["themes"]),
                   f"主题驱动完成, theme_id={theme_id}")
+    # 10-04 加: 阶段梯 _STAGES 里有 "done", 但从来没人写过它。补上之后, 万一在
+    # 最后一步(清 checkpoint 之前)崩掉, 下次能识别"已经跑完了"而不是当成
+    # narratives 阶段重跑。正常路径下一行就被下面的 clear_checkpoint 清掉。
+    ws.save_checkpoint("done", signature=_sig, n_sections=created)
     # 跑完了才清 checkpoint —— 清掉之后下次同参数重跑就是干净的一轮,
     # 而不是接着上一轮的 narratives 走(resume=False 同样能强制重来)。
     ws.clear_checkpoint()

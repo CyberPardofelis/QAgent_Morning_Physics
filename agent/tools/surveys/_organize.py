@@ -1559,10 +1559,19 @@ _BRACKET_RE = re.compile(r"\[([^\[\]\n]{3,120})\]")
 #   arXiv:2401.01234              带前缀(少见)
 #   2301.01234                    裸 arXiv ID —— _arxiv.py 的 paper_id 就是这个形态,
 #                                  漏了它参考文献编号会跟正文对不上
+#   quant-ph/0003004              旧格式 arXiv(带 archive 前缀) —— 10-04 补, 漏了它
+#                                  旧格式论文既不编号也不进文献表, 而正文里挂着
+#                                  [quant-ph/0003004], 覆盖度审计还报它 0 引用
+#   W2741809807 / OA-<md5>        无 DOI 时的 OpenAlex 兜底 id —— 10-04 补, 同上:
+#                                  _safe_paper_id 的第 3/4 优先级会产出这两种形态,
+#                                  之前 _IDISH_RE 完全不认, 于是它们逃出参考文献表
 _IDISH_RE = re.compile(
     r"^(?:https?://(?:dx\.)?doi\.org/|doi:)?\d{2,}\.\d{4,}/\S+$"   # DOI
     r"|^arxiv[:/]\S+$"                                              # arXiv:xxx
-    r"|^\d{4}\.\d{4,5}(?:v\d+)?$",                                  # 裸 arXiv ID
+    r"|^\d{4}\.\d{4,5}(?:v\d+)?$"                                   # 裸 arXiv 新格式
+    r"|^[a-z][a-z0-9-]*(?:\.[A-Za-z]{2})?/\d{7}$"                   # 旧格式 arXiv
+    r"|^W\d+$"                                                      # OpenAlex work id
+    r"|^OA-[0-9a-f]{8,}$",                                          # OpenAlex 标题 hash
     re.I,
 )
 
