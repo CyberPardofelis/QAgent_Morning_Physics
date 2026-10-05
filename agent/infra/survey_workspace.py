@@ -169,6 +169,37 @@ class SurveyWorkspace:
         except Exception:
             return None
 
+    # ============== _paradigms.json ==============
+    def save_paradigms(self, paradigms: dict[str, list[dict[str, Any]]]) -> None:
+        """落范式层产物 {主题名: [范式, ...]}。
+
+        10-05 加。范式层以前只把结果拍扁进 claim 的 statement 字符串里, 内存里
+        用完就没了 —— 于是磁盘上**从来没有任何地方存过"技术路线"这一层**。
+        实测: 10-03 走范式路线的 workspace 里 155 条命题没有一条带范式签名。
+        而 fact -> 范式 -> 主题 的多归属结构正是"一篇论文同时落在多个主题里"
+        的来源, 不落盘就等于这个结构不存在。
+        """
+        p = self.path / "_paradigms.json"
+        p.write_text(
+            json.dumps({"topic": self.topic, "created_at":
+                        datetime.now().isoformat(timespec="seconds"),
+                        "paradigms": paradigms},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_paradigms(self) -> dict[str, list[dict[str, Any]]] | None:
+        """读范式层产物。**没有文件返回 None**(区别于"有文件但空 dict")。"""
+        p = self.path / "_paradigms.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            ps = data.get("paradigms")
+            return ps if isinstance(ps, dict) and ps else None
+        except Exception:
+            return None
+
     # ============== _narratives.json ==============
     def save_narratives(self, narratives: dict[str, dict[str, Any]]) -> None:
         p = self.path / "_narratives.json"

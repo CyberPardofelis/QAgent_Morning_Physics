@@ -156,6 +156,29 @@ def _paper_text(p: dict[str, Any], facts: list[dict[str, Any]] | None) -> str:
 # 本文件只做**确定无争议**的清理: 去掉模型自写的 paper_id 标注。
 
 
+# 10-05 补: 模型漏进 claim 的 paper_id 标注, 实测过 5 种形态。**必须一份实现**。
+#   [paper_id]                  字面占位
+#   [paper_id: 2209.02093]      带真实 id
+#   [2209.02093] / [2209.02093v2]  光秃秃的裸 arxiv id —— 迁移脚本曾漏掉这一种,
+#                                后果是 767 条 fact 的内容哈希被 id 污染, 且
+#                                "[方法],[id]" 与 "[方法] [id]" 算成两条 fact
+#   [[fact_id_local]]           双括号引用标记漏出
+#   paper_id: 2209.02093        无方括号裸形式
+#   [10.1103/xxx]               期刊 id
+# 之前 prompts_survey 与 migrate_to_graph 各写一套, 覆盖形态不一致 ——
+# 存量数据走迁移脚本进来, 绕过了这里, 于是两种形态在库里同时存在。
+# 凡是清理 claim 里标注的地方一律调这个函数, 不要自己再写正则。
+_PLACEHOLDER_RES = (
+    re.compile(r"\[\s*paper[_\s-]?id\s*[:：]\s*[^\]]{0,60}\]", re.I),  # [paper_id: 2209.02093]
+    re.compile(r"\[\s*paper[_\s-]?id\s*\]", re.I),                    # [paper_id]
+    re.compile(r"<\s*paper[_\s-]?id\s*>", re.I),                     # <paper_id>
+    re.compile(r"\[\[\s*[^\]\[]{1,40}\s*\]\]"),                      # [[fact_id_local]]
+    re.compile(r"\[(?:\d{4}\.\d{4,5}(?:v\d+)?|\d{7})\]"),            # [2209.02093] / [2209.02093v2]
+    re.compile(r"\[10\.\d{4,9}/[^\]]{1,60}\]"),                      # [10.1103/xxx]
+    re.compile(r"(?<![\w.])paper[_\s-]?id\s*[:：]\s*\d{4}\.\d{4,5}(?![\w])", re.I),
+)
+
+
 def strip_paper_id_from_claim(claim: str) -> str:
     """
     去掉 claim 里模型自写的 [paper_id] / [paper_id: xxx] / [2209.02093] 之类标注。
@@ -163,13 +186,30 @@ def strip_paper_id_from_claim(claim: str) -> str:
     9-29: paper_id 现在由 fact_id 机械映射, claim 里再带一份既是冗余,
     也是污染源 —— 实测 91% 的 claim 内嵌了这种标注, 且格式五花八门
     ([2209.02093] / [paper_id: 10.1103/xxx]), 抽取器根本解析不出来。
+
+    10-05: 合并进 migrate_to_graph 那套(见上面 _PLACEHOLDER_RES), 消除两份实现。
+    剥完顺带收掉**分隔标点**: 标注常在句尾, 只去空白会留下 "…弱点, " 这种尾巴。
+    但**不能收句号** `。` —— 它是正文的一部分, 收掉的话 UI 上每条 fact 末尾
+    都没有标点了。10-05 实测: 收尾正则里多写了一个 `。`, 当场被回归测试逮到。
     """
     if not claim:
         return ""
-    s = re.sub(r"\[\s*paper_id\s*[:：]\s*[^\]]*\]", "", claim, flags=re.I)
-    s = re.sub(r"\[(?:\d{4}\.\d{4,5}(?:v\d+)?|\d{7})\]", "", s)
-    s = re.sub(r"\[10\.\d{4,9}/[^\]]*\]", "", s)
-    return re.sub(r"\s{2,}", " ", s).strip(" ，,;；")
+    s = claim
+    for rx in _PLACEHOLDER_RES:
+        s = rx.sub("", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    # 标注被剥掉会留下悬空白: "方法有效 [id]。" -> "方法有效 。"。收掉标点前的空格,
+    # 否则正文里凭空多一个空格, 跟另一条干净 fact 再也对不上。
+    s = re.sub(r"\s+([。,.;:!?、)\]】」》%])", r"\1", s)
+    # 收掉句尾的分隔标点(标注被剥掉后剩下的孤零零逗号), 但**保留句号**
+    s = re.sub(r"[\s，,;；、:：]+$", "", s)
+    return s.strip()
+
+
+def count_placeholder_forms(text: str) -> dict[str, int]:
+    """按形态统计一份文本里的占位符。**回归测试用** ——
+    新增形态时在这里加一条, 免得又出现"某个形态没人认"的情况。"""
+    return {i: len(rx.findall(text or "")) for i, rx in enumerate(_PLACEHOLDER_RES)}
 
 
 # ============================================================

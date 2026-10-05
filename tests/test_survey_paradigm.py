@@ -258,11 +258,22 @@ def test_assign_empty_inputs():
 # ============================================================
 
 def test_condense_by_paradigm_returns_empty_when_no_paradigms(monkeypatch):
-    """范式层任何一步失败都要返回空, 让调用方退回旧路线 —— 不能抛。"""
+    """范式层任何一步失败都要返回空, 让调用方退回旧路线 —— 不能抛。
+
+    10-05: 返回值改成 (claims, paradigms) 二元组, 失败时是 ([], {}):
+    范式层也一起空, 不能一边给空 claims 一边留着半份 paradigms。
+    """
     _patch_paradigm(monkeypatch, "build_paradigms", lambda *a, **k: {})
     facts = [{"fact_id": "f1", "paper_id": "P1", "claim": "c"}]
     tmap = {"themes": [{"name": "T", "fact_ids": ["f1"]}]}
-    assert _O().condense_facts_by_paradigm(facts, tmap) == []
+    assert _O().condense_facts_by_paradigm(facts, tmap) == ([], {})
+
+
+def test_condense_by_paradigm_returns_empty_pair_when_no_fact_ids(monkeypatch):
+    """没有可用 fact_id 时也走同一形状的降级, 不能返回裸 list。"""
+    facts = [{"paper_id": "P1", "claim": "c"}]      # 没有 fact_id
+    tmap = {"themes": [{"name": "T", "fact_ids": []}]}
+    assert _O().condense_facts_by_paradigm(facts, tmap) == ([], {})
 
 
 def test_condense_by_paradigm_makes_one_claim_per_paradigm(monkeypatch):
@@ -279,11 +290,47 @@ def test_condense_by_paradigm_makes_one_claim_per_paradigm(monkeypatch):
     ]
     tmap = {"themes": [{"name": "T", "fact_ids": ["f1", "f2", "f3", "f4"]}]}
     _patch_paradigm(monkeypatch, "encode", lambda t, **k: None)   # 退回播种
-    got = _O().condense_facts_by_paradigm(facts, tmap)
+    got, paras = _O().condense_facts_by_paradigm(facts, tmap)
     assert len(got) == 2, f"应一类范式一条命题, 实际 {len(got)} 条: {got}"
     mps = next(c for c in got if "MPS" in c["statement"])
     assert mps["paper_ids"] == ["P1", "P2"], "一条范式 = 一条跨论文命题"
     assert set(mps["fact_ids"]) == {"f1", "f2"}
+
+
+def test_paradigms_layer_is_persisted_and_keyed_by_paradigm_name(monkeypatch):
+    """10-05: 范式层必须能落盘, 且命题要记得自己来自哪条范式。
+
+    这是"主题 -> 范式 -> 命题"三层能不能用起来的两个必要条件:
+    ① 范式不能只活在内存里(以前拍扁进 statement 字符串, 用完就没了);
+    ② 中间那层和下层之间要有连接键, 否则落盘下来是两段平铺而不是层级。
+    """
+    _patch_paradigm(monkeypatch, "build_paradigms", lambda *a, **k: {
+        "T": [{"name": "MPS", "statement": "链状表示", "keywords": ["MPS", "一维"]},
+              {"name": "PEPS", "statement": "二维推广", "keywords": ["PEPS", "二维"]}]})
+    facts = [
+        {"fact_id": "f1", "paper_id": "P1", "claim": "c1", "subject": "MPS 一维链"},
+        {"fact_id": "f2", "paper_id": "P2", "claim": "c2", "subject": "MPS 一维基态"},
+        {"fact_id": "f3", "paper_id": "P3", "claim": "c3", "subject": "PEPS 二维格点"},
+        {"fact_id": "f4", "paper_id": "P4", "claim": "c4", "subject": "PEPS 二维面积律"},
+    ]
+    tmap = {"themes": [{"name": "T", "fact_ids": ["f1", "f2", "f3", "f4"]}]}
+    _patch_paradigm(monkeypatch, "encode", lambda t, **k: None)
+    claims, paras = _O().condense_facts_by_paradigm(facts, tmap)
+
+    # ② 连接键
+    for c in claims:
+        assert c.get("paradigm"), f"命题 {c['claim_id']} 必须带上 paradigm 连接键"
+        assert c["paradigm"] in {p["name"] for p in paras["T"]}
+
+    # ① 范式层内容
+    names = {p["name"] for p in paras["T"]}
+    assert names == {"MPS", "PEPS"}, f"范式层应有两类, 实际 {names}"
+    mps = next(p for p in paras["T"] if p["name"] == "MPS")
+    assert set(mps["fact_ids"]) == {"f1", "f2"}
+    assert mps["paper_ids"] == ["P1", "P2"]
+    # 命题和范式之间能对上(claim_id 是双向可追的连接键)
+    by_id = {c["claim_id"]: c for c in claims}
+    assert by_id[mps["claim_id"]]["paradigm"] == "MPS"
 
 
 def test_paradigm_statement_is_truncated():

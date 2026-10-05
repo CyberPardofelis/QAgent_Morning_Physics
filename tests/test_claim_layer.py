@@ -305,62 +305,130 @@ def test_claim_ids_are_unique_across_themes(monkeypatch):
     assert len(ids) == len(set(ids)), f"claim_id 撞了: {ids}"
 
 # ============================================================
-# 主题地图的缩放性 (2026-09-30 加)
+# 主题地图的缩放性 (2026-09-30 加, 10-05 改)
 # ============================================================
-def test_theme_map_caps_cover_every_subject(monkeypatch):
+def test_theme_map_does_not_drop_facts():
     """
     9-30 实测事故: 60 篇/303 条 fact 时, 主题地图输出 59349 字符, 撞上
     max_tokens=20000 被截断 -> JSON 解析失败 -> 整轮白跑 40 分钟。
-    40 篇那次(295 条)只是侥幸没过线。
+
+    10-05 的修法换了方向: 原来是"超 200 条就均匀抽样到 200"(被抽掉的 fact
+    永远不被任何主题覆盖, 实测 309 条静默丢 35%), 现在按字符**分块**逐块归纳
+    再按主题名合并。这条测试锁住新不变量: **一条 fact 都不能少**。
     """
     OG = _mod("agent.tools.surveys._organize")
     assert OG.THEME_MAP_MAX_TOKENS >= 32000, "截断过的上限不够, 必须加高"
-    assert OG.THEME_MAP_MAX_FACTS <= 220, "fact 上限要能在输出预算内写完"
-
-    facts = [{"fact_id": f"f{i}", "subject": f"s{i%5}", "claim": "c", "paper_id": "p"}
+    # claim 长度刻意拉开差异: 按条数封顶的旧写法就是这么翻车的
+    # (同 140 条, prompt 3360~13194 字符, 大的那次卡死 43 分钟)
+    facts = [{"fact_id": f"f{i}", "subject": f"s{i%5}",
+              "claim": "短" if i % 3 else "长" * 120, "paper_id": "p"}
              for i in range(300)]
-    clusters = OG.cluster_by_subject(facts)
-    s = OG._sample_facts_for_themes(facts, clusters, OG.THEME_MAP_MAX_FACTS)
-    assert len(s) == OG.THEME_MAP_MAX_FACTS
-    assert len({f["fact_id"] for f in s}) == len(s), "不能重复"
-    subs = {f["subject"] for f in s}
-    assert subs == {f"s{i}" for i in range(5)}, f"每个 subject 都要有代表, 实得 {subs}"
+    chunks = OG.split_fact_chunks(facts)
+    assert len(chunks) > 1, "300 条应该被切开"
+    seen = [f["fact_id"] for ch in chunks for f in ch]
+    assert sorted(seen) == sorted(f["fact_id"] for f in facts), \
+        "分块不能丢 fact 也不能重复"
+    for ch in chunks:
+        # 不给余量: 上限就是上限。留 +200 容差的话, "只按条数切"这个退化
+        # (13194 字符那次卡死 43 分钟的根因) 照样能过 —— 10-05 反向验证实测到。
+        n = sum(len(f["claim"]) for f in ch) + 40 * len(ch)
+        assert n <= OG.THEME_CHUNK_CHARS, f"块超字符上限: {n} > {OG.THEME_CHUNK_CHARS}"
+        assert len(ch) <= OG.THEME_CHUNK_FACTS
 
 
-def test_sampler_keeps_rare_small_subjects(monkeypatch):
-    """
-    均匀抽样而不是截尾: 小众 subject 往往正是那些有代表性的分支
-    (比如"费米子张量网络"), 截尾会把整个主题结构挖掉一块。
+def test_chunks_split_by_chars_not_by_count():
+    """极端长度分布: 200 条极短的 fact 必须**按字符**切开, 而不是按条数一把梭。
+
+    10-05 踩过: 同样是 140 条, prompt 能从 3360 到 13194 字符(claim 长度差异
+    极大), 而 13194 那次卡死 43 分钟。决定输出和稳定性的是 prompt 大小。
     """
     OG = _mod("agent.tools.surveys._organize")
-    facts = [{"fact_id": f"g{i}", "subject": "big", "claim": "c", "paper_id": "p"}
-             for i in range(280)]
-    facts += [{"fact_id": f"x{i}", "subject": f"rare{j}", "claim": "c", "paper_id": "p"}
-              for j in range(4) for i in range(5)]
-    clusters = OG.cluster_by_subject(facts)
-    s = OG._sample_facts_for_themes(facts, clusters, 200)
-    subs = {f["subject"] for f in s}
-    assert {"rare0", "rare1", "rare2", "rare3"} <= subs, f"小众 subject 被丢了, 实得 {subs}"
+    facts = [{"fact_id": f"f{i}", "subject": "s", "claim": "长" * 400, "paper_id": "p"}
+             for i in range(200)]
+    chunks = OG.split_fact_chunks(facts)
+    # 每条开销 = 400 字 + 40 字([fact_id] (type) 那部分), 所以每块装
+    # 8000/440 = 18 条 -> 200/18 = 12 块。**关键是块数由字符决定**:
+    # 若只按条数切(上限 60), 会得到 4 块 x 26400 字符, 那正是卡死 43 分钟的形态。
+    assert len(chunks) == 12, f"应按字符切成 12 块, 实得 {len(chunks)}"
+    for ch in chunks:
+        n = sum(len(f["claim"]) for f in ch) + 40 * len(ch)
+        assert n <= OG.THEME_CHUNK_CHARS
+    # 反证: 只按条数切会是什么样
+    by_count = [facts[i:i + OG.THEME_CHUNK_FACTS]
+                for i in range(0, len(facts), OG.THEME_CHUNK_FACTS)]
+    naive_max = max(sum(len(f["claim"]) for f in c) for c in by_count)
+    assert naive_max > OG.THEME_CHUNK_CHARS * 2, \
+        "对照组本身就超预算, 说明'按条数'确实是病根"
 
 
-def test_sampler_passthrough_under_cap():
+def test_split_fact_chunks_single_chunk_when_small():
     OG = _mod("agent.tools.surveys._organize")
     facts = [{"fact_id": f"f{i}", "subject": "s", "claim": "c", "paper_id": "p"}
              for i in range(50)]
-    out = OG._sample_facts_for_themes(facts, OG.cluster_by_subject(facts), 200)
-    assert len(out) == 50, "不够 cap 时不该动"
+    assert len(OG.split_fact_chunks(facts)) == 1, "不够一块时不该切"
 
 
-def test_sampler_fills_cap_not_just_one_per_cluster():
-    """
-    回归: 第二轮起始索引写错成 0, 会全部命中 seen -> added 恒 False -> break,
-    300 条只抽出 5 条(每簇一条), cap 完全没达到。
+def test_organize_entry_point_chunks_instead_of_sampling(monkeypatch):
+    """入口超量时必须**分块**, 不能抽样(10-05 的核心修复)。
+
+    10-05 之前是 `len(facts) > 200 -> _sample_facts_for_themes(...)`,
+    实测 309 条静默丢掉 35%。这条测试 monkeypatch 掉底层调用, 数它被调了几次:
+    一次 = 单块没切开; 多次 = 走了分块路径。
     """
     OG = _mod("agent.tools.surveys._organize")
-    facts = [{"fact_id": f"f{i}", "subject": f"s{i%5}", "claim": "c", "paper_id": "p"}
-             for i in range(300)]
-    s = OG._sample_facts_for_themes(facts, OG.cluster_by_subject(facts), 200)
-    assert len(s) == 200, f"应抽满 200, 实得 {len(s)}"
+    calls = []
+
+    def fake_chunk(facts, paper_titles=None, provider="minimax", model="MiniMax-M3",
+                   temperature=0.4, max_themes=8):
+        calls.append(len(facts))
+        ids = [f["fact_id"] for f in facts]
+        return {"themes": [{"name": f"T{i}", "statement": "", "fact_ids": [ids[i]],
+                            "notes": "", "relations": []} for i in range(len(ids))],
+                "narrative_arc": [], "gaps": [], "warnings": []}
+
+    monkeypatch.setattr(OG, "_organize_one_chunk", fake_chunk)
+    facts = [{"fact_id": f"f{i}", "subject": f"s{i%5}", "claim": "长" * 100,
+              "paper_id": "p"} for i in range(300)]
+    out = OG.organize_facts_into_themes(facts, max_themes=1000)
+    assert len(calls) > 1, f"应当分块调用, 实际只调了 {len(calls)} 次"
+    got = sorted(fid for t in out["themes"] for fid in t["fact_ids"])
+    assert got == sorted(f["fact_id"] for f in facts), \
+        f"分块后有 fact 丢了: 300 -> {len(got)}"
+
+
+def test_merge_chunk_results_unions_fact_ids_by_theme_name():
+    """同名主题必须并集 fact_ids —— 分块会把同一个主题劈到两块里。"""
+    OG = _mod("agent.tools.surveys._organize")
+    merged = OG._merge_chunk_results([
+        {"themes": [{"name": "A", "statement": "s1", "fact_ids": ["f1", "f2"],
+                     "notes": "", "relations": [{"to": "B", "note": "n1"}]}],
+         "narrative_arc": ["a1"], "gaps": ["g1"], "warnings": ["w1"]},
+        {"themes": [{"name": "A", "statement": "更长的陈述", "fact_ids": ["f2", "f3"],
+                     "notes": "", "relations": [{"to": "B", "note": "n1"},
+                                                {"to": "C", "note": "n2"}]}],
+         "narrative_arc": ["a1", "a2"], "gaps": ["g2"], "warnings": ["w2"]},
+    ], max_themes=8)
+    assert [t["name"] for t in merged["themes"]] == ["A"]
+    a = merged["themes"][0]
+    assert a["fact_ids"] == ["f1", "f2", "f3"], f"同名主题没并集: {a['fact_ids']}"
+    assert a["statement"] == "更长的陈述", "该保留信息量更大的陈述"
+    assert len(a["relations"]) == 2, f"关系应去重后合并: {a['relations']}"
+    assert merged["narrative_arc"] == ["a1", "a2"]
+    assert merged["gaps"] == ["g1", "g2"]
+    assert merged["warnings"] == ["w1", "w2"], "块的告警必须全部保留"
+
+
+def test_merge_chunk_results_truncation_says_how_many_facts_lost():
+    """砍主题 = 砍 fact, 属于有损操作 —— 必须说清丢了多少条, 不能只说"已截断"。"""
+    OG = _mod("agent.tools.surveys._organize")
+    merged = OG._merge_chunk_results([
+        {"themes": [{"name": f"T{i}", "statement": "", "fact_ids": [f"f{i}"],
+                     "notes": "", "relations": []} for i in range(5)],
+         "narrative_arc": [], "gaps": [], "warnings": []},
+    ], max_themes=2)
+    assert len(merged["themes"]) == 2
+    assert any("3 条 fact" in w for w in merged["warnings"]), \
+        f"截断告警必须报出丢失的 fact 数: {merged['warnings']}"
 
 # ============================================================
 # 命题层第二轮修正 (9-30 实测驱动)

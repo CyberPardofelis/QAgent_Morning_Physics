@@ -430,6 +430,60 @@ def _yield_usable_summary(facts: list[dict[str, Any]]):
 
 
 # ============================================================
+# Phase B1.5: 宏观主题
+# ============================================================
+
+def _phase_macros(ws, theme_map: dict[str, Any]):
+    """在主题之上再聚一层宏观板块, 原地写进 theme_map 并补写盘。
+
+    10-05 加。抽成独立生成器(而不是内联在 _run_organize_phase 里)的理由跟
+    _phase_claims 一样: 这块有"复用/不用"的分支 + 失败降级, 内联就没法测。
+
+    **为什么这一层要放在 themes 判定之后、而不是塞进 organize_facts_into_themes**:
+    磁盘上已有的 _thematic_map.json 全部没有 macros 字段(实测 56 个 workspace
+    里只有 3 个有主题地图, 都是这次改动之前写的)。只改产出侧, 那 3 个永远
+    补不上这一层; 而它们恰恰是最该补的(有真实 fact 覆盖)。所以这里对
+    "复用了 checkpoint 的主题地图" 也照样跑一次。
+
+    代价要说清楚: 复用路径会多出 1 次 LLM 调用。这是**有意的**取舍 ——
+    补齐缺失的层级比"续跑绝不多调一次"更要紧, 而且它只发生一次(写进文件
+    之后 macros 就非空了, 之后每次续跑都直接跳过)。这一行提示是刻意加的,
+    免得用户以为续跑没省下调用。
+    """
+    from ._organize import cluster_themes_into_macros, save_thematic_map
+
+    if theme_map.get("macros"):
+        return                      # 已有(新跑的或上次补过的) -> 一次调用都不花
+    n_themes = len(theme_map.get("themes") or [])
+    if n_themes < 2:
+        theme_map["macros"] = []
+        theme_map["macro_warnings"] = [f"只有 {n_themes} 个主题, 不做宏观聚类"]
+        return
+
+    yield f"\n🏛️ 归纳宏观板块(把 {n_themes} 个主题再聚一层, 1 次调用)...\n"
+    try:
+        macros, warns = cluster_themes_into_macros(theme_map["themes"])
+    except Exception as e:
+        # 宏观层是**加法** —— 缺了它单层主题结构照样能用。所以这里降级但必须
+        # 吵出来(这个模块开头就写着"宁可吵, 不可静默")。
+        logger.warning("[organize] 宏观主题层异常: %s", e)
+        theme_map["macros"] = []
+        theme_map["macro_warnings"] = [f"宏观主题层异常: {e}"]
+        yield "   ⚠ 宏观主题层异常, 保留单层主题结构(不影响综述正文)\n"
+        return
+
+    theme_map["macros"] = macros
+    theme_map["macro_warnings"] = warns
+    if not macros:
+        yield "   ⚠ 宏观主题层没产出, 保留单层主题结构(不影响综述正文)\n"
+        return
+    # 补写盘: 新跑的 workspace 上面刚 save 过一次, 这里再写一次把 macros 带上;
+    # 复用 checkpoint 的旧 workspace 全靠这一次才拿到这一层。
+    save_thematic_map(ws, theme_map)
+    yield f"   🏛️ {len(macros)} 个宏观板块已写入 {ws.path.name}/_thematic_map.json\n"
+
+
+# ============================================================
 # Phase B2: 命题合并
 # ============================================================
 
@@ -464,20 +518,30 @@ def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
     走兜底的反而有。
     """
     claims: list[dict[str, Any]] = []
+    paradigms: dict[str, list[dict[str, Any]]] = {}
     if from_stage in ("claims", "narratives", "done"):
         claims = ws.load_claims() or []
     if claims:
         # 复用路径: 一定不碰 LLM。这条 if/else 边界是本函数存在的理由。
+        # 范式层不重跑也不重落盘: _paradigms.json 是当初生成这些 claims 时写的,
+        # 已经在磁盘上; 再写一遍只会用一份新的 created_at 覆盖掉旧的溯源信息。
         yield f"\n♻️ 命题合并: 沿用 checkpoint 的 {len(claims)} 条命题\n"
     else:
         from_stage = "themes"
         yield "\n🔗 归纳技术路线并合并成命题...\n"
         from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
         try:
-            claims = condense_facts_by_paradigm(usable, theme_map)
+            claims, paradigms = condense_facts_by_paradigm(usable, theme_map)
         except Exception as e:
             logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
-            claims = []
+            claims, paradigms = [], {}
+        if paradigms:
+            # 10-05: 范式层以前只把名字拍扁进 claim 的 statement 字符串, 用完
+            # 就丢 —— 于是磁盘上从来没有"技术路线"这一层。而 fact -> 范式 ->
+            # 主题 的多归属结构正是"一篇论文同时落在多个主题里"的来源。
+            ws.save_paradigms(paradigms)
+            n_par = sum(len(v) for v in paradigms.values())
+            yield f"   🧭 归纳出 {n_par} 条技术路线, 覆盖 {len(paradigms)} 个主题\n"
         if not claims:
             # 10-04 加: 范式层挂掉原先只在 logger.warning 里, 用户的流式输出看不到。
             # 而这一层直接决定引文密度(实测 12.0/句 vs 旧路线 0.94/句), 静默退回
@@ -616,8 +680,31 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
         yield f"   [{i}] {t['name']} ({len(t['fact_ids'])} 条 fact)\n"
         if t.get("statement"):
             yield f"       {t['statement']}\n"
+        # 10-05: 关系不再有 type 标签, 只显示那句具体的话(见 _organize 里
+        # "不再存 type" 的注释)。空 note 的边也要显示 —— 少了 type 它就
+        # 什么都不剩, 静默丢掉等于假装没有这条关系。
+        for rel in t.get("relations") or []:
+            note = (rel.get("note") or "").strip()
+            yield (f"       ↔ 「{rel.get('to')}」: {note}\n" if note
+                    else f"       ↔ 「{rel.get('to')}」(无说明)\n")
     for w in theme_map.get("warnings", []):
         yield f"   ⚠ {w}\n"
+
+    # ---- Phase B1.5: 宏观主题层 (10-05 加) ----
+    yield from _phase_macros(ws, theme_map)
+    if theme_map.get("macros"):
+        by_name = {t["name"]: len(t.get("fact_ids") or []) for t in theme_map["themes"]}
+        yield f"\n🏛️ 归纳出 {len(theme_map['macros'])} 个宏观板块:\n"
+        for i, m in enumerate(theme_map["macros"], 1):
+            n_facts = sum(by_name.get(n, 0) for n in m["theme_names"])
+            yield (f"   ({i}) {m['name']} — 含 {len(m['theme_names'])} 个主题 / "
+                    f"{n_facts} 条 fact\n")
+            if m.get("statement"):
+                yield f"       {m['statement']}\n"
+            for cn in m.get("cross_notes") or []:
+                yield f"       ↔ {cn}\n"
+        for w in theme_map.get("macro_warnings") or []:
+            yield f"   ⚠ {w}\n"
 
     # ---- Phase B2: 命题合并 (9-30 加, 10-03 改成范式层) ----
     claims, from_stage = yield from _phase_claims(
@@ -697,7 +784,8 @@ def _organize_audit(theme_map: dict, narratives: dict, facts: list) -> str:
         if t.get("statement"):
             lines.append(f"- 领域判断: {t['statement']}")
         for rel in t.get("relations", []):
-            lines.append(f"- 关系 {rel.get('type')} → {rel.get('to')}: {rel.get('note')}")
+            # 10-05: 不再有 type —— 只记那句具体的话
+            lines.append(f"- 关联 → {rel.get('to')}: {rel.get('note') or '(无说明)'}")
         for w in nar.get("warnings", []):
             lines.append(f"- ⚠ {w}")
         lines.append("")
@@ -707,6 +795,22 @@ def _organize_audit(theme_map: dict, narratives: dict, facts: list) -> str:
     lines.append(f"- 总计: {len(all_ids)} 条可用 fact")
     lines.append(f"- 被引用: {len(total_used)} 条 ({len(total_used) * 100 // max(1, len(all_ids))}%)")
     lines.append(f"- 未被引用: {len(unused)} 条")
+    if theme_map.get("macros"):
+        lines.append("")
+        lines.append("## 宏观板块 (10-05)")
+        n2t = {t["name"]: len(t.get("fact_ids", [])) for t in theme_map["themes"]}
+        for m in theme_map["macros"]:
+            lines.append(
+                f"### {m['name']}  ({len(m['theme_names'])} 个主题 / "
+                f"{sum(n2t.get(n, 0) for n in m['theme_names'])} 条 fact)")
+            if m.get("statement"):
+                lines.append(f"- 板块判断: {m['statement']}")
+            for cn in m.get("cross_notes") or []:
+                lines.append(f"- 跨板块关联: {cn}")
+            lines.append(f"- 含主题: {'、'.join(m['theme_names'])}")
+    if theme_map.get("macro_warnings"):
+        lines.append("")
+        lines += [f"- ⚠ {w}" for w in theme_map["macro_warnings"]]
     if theme_map.get("gaps"):
         lines.append("")
         lines.append("## 文献覆盖空白")

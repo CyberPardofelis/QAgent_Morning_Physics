@@ -253,8 +253,10 @@ def test_claims_resume_does_not_call_llm_at_all(monkeypatch):
 
     def _boom_paradigm(*a, **kw):
         calls.append("paradigm")
-        return [{"claim_id": "q1", "statement": "x", "fact_ids": ["f1"],
-                 "paper_ids": ["p1"], "theme_name": "T", "n_facts": 1}]
+        # 10-05: 真实返回值是 (claims, paradigms) 二元组, 补丁必须同形状,
+        # 否则解包会炸, 而炸了会被 _phase_claims 的 except 吞掉 -> 假绿。
+        return ([{"claim_id": "q1", "statement": "x", "fact_ids": ["f1"],
+                  "paper_ids": ["p1"], "theme_name": "T", "n_facts": 1}], {})
 
     def _boom_theme(*a, **kw):
         calls.append("theme")
@@ -291,8 +293,11 @@ def test_paradigm_success_is_persisted(monkeypatch):
 
     made = [{"claim_id": "q1", "statement": "范式命题", "fact_ids": ["f1"],
              "paper_ids": ["p1"], "theme_name": "T", "n_facts": 1}]
+    paras = {"T": [{"name": "MPS", "statement": "链状表示", "fact_ids": ["f1"],
+                    "paper_ids": ["p1"], "n_facts": 1, "keywords": ["MPS"],
+                    "claim_id": "q1"}]}
     monkeypatch.setattr(_org(), "condense_facts_by_paradigm",
-                        lambda *a, **kw: made, raising=False)
+                        lambda *a, **kw: (made, paras), raising=False)
     monkeypatch.setattr(_org(), "condense_facts_by_theme",
                         lambda *a, **kw: [], raising=False)
 
@@ -302,10 +307,13 @@ def test_paradigm_success_is_persisted(monkeypatch):
                                                {"themes": []}, "pool", "SIG"))
         claims, _stage = ret
         reloaded = w.load_claims()
+        reloaded_paras = w.load_paradigms()
         ck = w.load_checkpoint()
 
     assert claims == made
     assert reloaded == made, "范式层成功也必须写 _claims.json"
+    assert reloaded_paras == paras, "范式层也必须写 _paradigms.json(10-05)"
+    assert "技术路线" in out, "范式条数要喊出来(否则用户不知道这一层建了没)"
     assert ck and ck.get("stage") == "claims", "范式层成功也必须打 claims checkpoint"
     assert ck.get("signature") == "SIG"
 

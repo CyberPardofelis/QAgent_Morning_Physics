@@ -154,6 +154,11 @@ class ChatWindow(QMainWindow):
         survey_workspace_action = QAction("论文综述库", self)
         survey_workspace_action.triggered.connect(self.open_survey_workspace)
         knowledge_menu.addAction(survey_workspace_action)
+        # 2026-10-05 加: 主题地图。放在综述库后面 —— 综述库是"一次 run 的章节",
+        # 主题地图是"跨 run 累积起来的结构本身"(宏观/主题/核心对象 三层)。
+        theme_map_action = QAction("主题地图", self)
+        theme_map_action.triggered.connect(self.open_theme_map)
+        knowledge_menu.addAction(theme_map_action)
 
         memory_action = QAction("记忆库", self)
         memory_action.triggered.connect(self.open_memory_viewer)
@@ -356,6 +361,20 @@ class ChatWindow(QMainWindow):
         dialog = SurveyWorkspaceDialog(self)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         self._survey_workspace_dialog = dialog
+        dialog.show()
+
+    def open_theme_map(self):
+        """主题地图(2026-10-05 加): facts.db 的 theme_macro/theme/theme_fact 三层
+
+        跟论文综述库的区别: 综述库是"一次 run 的主题 + 章节"(会随 run 变),
+        主题地图是跨 run 累积生长的结构本身 —— 主题不是任何一次运行的产物。
+        """
+        from ui.theme_map_dialog import ThemeMapDialog
+        dialog = ThemeMapDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        # 非模态: 边看结构边切回主窗口写综述
+        dialog.setWindowModality(Qt.NonModal)
+        self._theme_map_dialog = dialog
         dialog.show()
 
     def open_memory_viewer(self):

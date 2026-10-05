@@ -13,9 +13,16 @@ agent.tools.surveys._organize — fact 优先的综述组织 (9-29 新增)
              输出: 主题列表, 每个主题有
                      - statement   该主题的**领域判断**(不是"哪些论文做了什么")
                      - fact_ids    归属 fact(只给 fact_id, 不给 paper_id)
-                     - relations   与其他主题的关系(support/tension/evolution/contrast)
+                     - relations   与其他主题的关系(只有一句具体的话, **不分类**)
                      - notes       主题内部的逻辑线索
              外加: narrative_arc(推荐叙述顺序) + gaps(文献覆盖不足处)
+
+    Phase B1.5 cluster_themes_into_macros() → 同一文件里的 macros 字段
+             把主题再往上聚一层: 宏观主题 -> 主题 -> 范式 -> 命题 -> fact。
+             这是"知识结构地图"里的第三层, 以前只到主题就停了。
+
+    Phase B2  condense_facts_by_paradigm()  → _paradigms.json + _claims.json
+             主题 -> 技术路线 -> 命题。范式层以前只活在内存里(10-05 起落盘)。
 
     Phase C  write_theme_narrative()        → 按主题写叙述
              锚点是主题, fact 是证据。引文由 fact_id 机械映射 —— 模型碰不到 paper_id。
@@ -50,56 +57,94 @@ logger = logging.getLogger(__name__)
 
 # 9-30: 主题地图的输出量随 fact 数线性增长, 顶到 max_tokens 就截断 -> JSON 解析失败。
 # 实测 303 条 fact 时返回 59349 字符, 远超 20000 max_tokens 对应的量。
-THEME_MAP_MAX_FACTS = 200
 THEME_MAP_MAX_TOKENS = 32000
 
+# 10-05: 分块参数, 从 backfill_graph.py 搬过来(那边有完整的实测记录)。
+# **按字符封顶, 不按条数**: 实测同是 140 条的块, prompt 能从 3360 到 13194 字符
+# (claim 长度差异极大), 而 13194 那次**卡死 43 分钟**、timeout=600 形同虚设。
+# 决定输出和稳定性的是 prompt 大小, 不是条数。8000 是实测安全线。
+THEME_CHUNK_CHARS = 8000
+THEME_CHUNK_FACTS = 60          # 双重保险: 极长的 claim 也不会把块撑爆
 
-def _sample_facts_for_themes(
-    facts: list[dict[str, Any]],
-    clusters: list[tuple[str, list[dict[str, Any]]]] | list,
-    cap: int,
-) -> list[dict[str, Any]]:
-    """按 subject 聚簇**均匀**抽样到 cap 条。
 
-    为什么均匀而不是取前 cap 条: 主题地图的作用是给出"这个领域的结构"，
-    尾部 subject 往往正是那些**小众但有代表性**的分支(比如"费米子张量网络"),
-    直接截尾会把它们整个丢掉, 主题结构就缺了一块。
-    均匀抽样保证每个 subject 都有代表。
+def split_fact_chunks(
+        facts: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """按 claim 总字符数切块, 同时受条数上限约束。
+
+    为什么生产路径要分块而不是抽样(10-05 改): 原来是"fact 数 > 200 就按 subject
+    均匀抽样到 200", 被抽掉的 fact **永远不会被任何主题覆盖**。实测
+    `669cfc28a53e` 有 309 条 fact, 硬上限静默丢掉 35% —— 而那正是要总结的目标
+    数据。抽样只在"一次调用吃下全部 fact"这个旧前提下才成立; 现在主题是全局
+    累积的, 分块跑完把主题按名合并即可, 一条 fact 都不丢。
     """
-    if len(facts) <= cap:
-        return list(facts)
-    picked: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    # 第一轮: 每个聚簇至少取 1 条(有 fact_id 的)
-    for _name, members in clusters:
-        for m in members:
-            fid = m.get("fact_id")
-            if fid and fid not in seen:
-                seen.add(fid)
-                picked.append(m)
-                break
-        if len(picked) >= cap:
-            return picked[:cap]
-    # 第二轮: 按聚簇轮流补齐到 cap。
-    # 起始索引必须是 1 —— 第一轮已经取过每个聚簇的 members[0] 了,
-    # 从 0 开始会全部命中 seen, added 恒为 False 直接 break(实测只抽出 5 条)。
-    round_no = 1
-    while len(picked) < cap and round_no < 500:
-        added = False
-        for _name, members in clusters:
-            if round_no < len(members):
-                m = members[round_no]
-                fid = m.get("fact_id")
-                if fid and fid not in seen:
-                    seen.add(fid)
-                    picked.append(m)
-                    added = True
-                    if len(picked) >= cap:
-                        break
-        if not added:
-            break
-        round_no += 1
-    return picked[:cap]
+    chunks: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    n = 0
+    for f in facts:
+        L = len(f.get("claim") or "") + 40      # 40 是 [fact_id] (type) 的开销
+        if cur and (n + L > THEME_CHUNK_CHARS or len(cur) >= THEME_CHUNK_FACTS):
+            chunks.append(cur)
+            cur, n = [], 0
+        cur.append(f)
+        n += L
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _merge_chunk_results(
+        results: list[dict[str, Any]], max_themes: int) -> dict[str, Any]:
+    """把多个块的主题结果合并成一张图。
+
+    - 同名主题**并集** fact_ids(同名即同一主题, 这与 theme 表按 name upsert 一致)
+    - relations 按 (to, note) 去重后合并
+    - narrative_arc / gaps 逐块拼接去重 —— 它们本来就是全局性的
+    - warnings 全部保留: 某块失败/截断必须让用户看见
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    arc: list[str] = []
+    gaps: list[str] = []
+    warnings: list[str] = []
+    for r in results:
+        warnings.extend(r.get("warnings") or [])
+        for x in r.get("narrative_arc") or []:
+            if x not in arc:
+                arc.append(x)
+        for x in r.get("gaps") or []:
+            if x not in gaps:
+                gaps.append(x)
+        for t in r.get("themes") or []:
+            name = t["name"]
+            cur = by_name.get(name)
+            if cur is None:
+                by_name[name] = {
+                    "name": name,
+                    "statement": t.get("statement") or "",
+                    "fact_ids": list(dict.fromkeys(t.get("fact_ids") or [])),
+                    "notes": t.get("notes") or "",
+                    "relations": list(t.get("relations") or []),
+                }
+                continue
+            # 同名: 并 fact_ids, 关系去重合并
+            cur["fact_ids"] = list(dict.fromkeys(
+                cur["fact_ids"] + (t.get("fact_ids") or [])))
+            seen = {(x["to"], x.get("note", "")) for x in cur["relations"]}
+            for rel in t.get("relations") or []:
+                if (rel["to"], rel.get("note", "")) not in seen:
+                    seen.add((rel["to"], rel.get("note", "")))
+                    cur["relations"].append(rel)
+            if len(t.get("statement") or "") > len(cur["statement"]):
+                cur["statement"] = t["statement"]
+
+    themes = list(by_name.values())
+    if len(themes) > max_themes:
+        # 砍主题 = 砍 fact, 属于**有损**操作: 必须说清楚丢了多少条 fact。
+        dropped = sum(len(t["fact_ids"]) for t in themes[max_themes:])
+        warnings.append(
+            f"主题数 {len(themes)} 超过上限 {max_themes}, 已截断, "
+            f"被截掉的主题涉及 {dropped} 条 fact(这些 fact 不会出现在主题地图里)")
+        themes = themes[:max_themes]
+    return {"themes": themes, "narrative_arc": arc, "gaps": gaps, "warnings": warnings}
 
 
 # ============================================================
@@ -213,8 +258,11 @@ THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**
 1. **只能使用下面给出的 fact_id**。不要发明 id。
 2. 每个主题的 statement 必须是一句**领域判断**(对领域的认识/分类/趋势/矛盾),
    而不是"A 等人提出 X, B 等人改进了 Y"这种论文列举。
-3. 关系类型只能用这四种: support(互相支持) / tension(存在张力或矛盾) /
-   evolution(演化/前后代关系) / contrast(适用范围或前提不同)。
+3. 关系**不分类, 只写清楚是什么关系**。不要给关系贴任何类别标签(任何从
+   固定小词表里挑一个的标签都不要) —— 那几个词换成任何一对主题都成立,
+   等于没信息。要写的是这句话在**具体**说清什么: 哪个前提被哪个结果挑战了、
+   哪条路线接替了哪条路线的哪个瓶颈、哪两个结论在哪个条件下相反。
+   带上具体的对象和条件。写不出具体的就别写这条关系。
 4. 如果某几条 fact 其实说的是同一件事的不同侧面, 把它们放**同一个主题**而不是拆开。
 5. 宁可 4-6 个扎实的主题, 也不要 12 个碎主题。覆盖面不足的地方写进 gaps, 不要硬凑。
 
@@ -229,7 +277,7 @@ THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**
       "fact_ids": ["fact_id_1", "fact_id_2"],
       "notes": "这个主题内部的逻辑线索(2-3 句, 说明这些 fact 如何串起来)",
       "relations": [
-        {{"to": "另一个主题名", "type": "support|tension|evolution|contrast", "note": "一句话"}}
+        {{"to": "另一个主题名", "note": "具体说清什么关系(带对象和条件), 不写关系类型"}}
       ]
     }}
   ],
@@ -368,9 +416,10 @@ def _facts_block(facts: list[dict[str, Any]], paper_titles: dict[str, str]) -> s
     return "\n".join(out)
 
 
-def _parse_theme_json(raw: str) -> dict[str, Any] | None:
+def _parse_theme_json(raw: str, key: str = "themes") -> dict[str, Any] | None:
     """
-    从模型输出里抠出主题地图 JSON。
+    从模型输出里抠出主题地图 JSON。`key` = 要找的顶层非空列表键
+    ("themes" 主题层 / "macros" 宏观主题层), 截断抢救那套逻辑两边共用。
 
     9-29 实测踩到的三种情况都要兜住:
       1. 正常: 纯 JSON
@@ -398,7 +447,7 @@ def _parse_theme_json(raw: str) -> dict[str, Any] | None:
                 v = _json.loads(cand)
             except Exception:
                 continue
-            if isinstance(v, dict) and isinstance(v.get("themes"), list) and v["themes"]:
+            if isinstance(v, dict) and isinstance(v.get(key), list) and v[key]:
                 return v
         # 补右括号 / 补尾引号再试(截断恢复)
         for tail in ("}", "}}", '"}}', '"}}}', '"]}}', '"', ']', '"}]', '"}}]}'):
@@ -406,7 +455,7 @@ def _parse_theme_json(raw: str) -> dict[str, Any] | None:
                 v = _json.loads(body + tail)
             except Exception:
                 continue
-            if isinstance(v, dict) and isinstance(v.get("themes"), list) and v["themes"]:
+            if isinstance(v, dict) and isinstance(v.get(key), list) and v[key]:
                 return v
         return None
 
@@ -424,6 +473,160 @@ def _parse_theme_json(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def _salvage_themes(body: str) -> list[dict[str, Any]] | None:
+    """从**被截断**的主题地图输出里抢救出已经写完整的主题对象。
+
+    10-05 补。这是从范式层照搬的教训 —— 10-03 就因为范式 JSON 被 max_tokens
+    截断而白跑 2 个主题, 范式层因此有了 `_salvage_paradigms`, **但主题层一直没
+    有**。后果实测: 一次 34 个 workspace 的回填里 5 个(约 360 条 fact)因为
+    "结构写对了但在 max_tokens 处被截断"而整块作废, 一条主题都没产出。
+
+    为什么 `_parse_theme_json` 的"补右括号"救不了: 它只能修**最后一个**对象
+    缺尾巴的情况; 而实际失败是最后一个对象**只写了一半**(JSON 字符串没闭合),
+    补任何数量的右括号都拼不出合法 JSON。
+
+    两个必须遵守的点(来自 `_salvage_paradigms` 的实测教训):
+      - 不能只认 depth==0: 输出被截断时外层 `{"themes": [` 是不平衡的, 里面
+        每个主题对象都处在 depth>=1, 只认顶层会把它们全漏掉(这是第一版抢救
+        逻辑的 bug, 对着真实失败样本才发现)
+      - 必须跟踪字符串状态: statement 里出现 `{` `}` 或转义引号时, 不跟踪就会
+        把字符串内容当成结构符号, 括号深度彻底算错
+    """
+    import json as _json
+
+    out: list[dict[str, Any]] = []
+    stack: list[int] = []
+    in_str = False
+    esc = False
+    for i, ch in enumerate(body):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            try:
+                obj = _json.loads(body[start:i + 1])
+            except Exception:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("themes"), list):
+                out.extend(x for x in obj["themes"] if isinstance(x, dict))
+            elif isinstance(obj, dict) and obj.get("name") and "fact_ids" in obj:
+                out.append(obj)
+    # 长得像主题 = 有 name 且 fact_ids 存在(哪怕是空数组, 也说明写完了)
+    return [o for o in out if (o.get("name") or "").strip() and "fact_ids" in o] or None
+
+
+def _is_llm_error_response(text: str) -> str | None:
+    """判断 `_call_llm` 返回的是**错误提示**还是模型输出, 是则返回错误摘要。
+
+    10-05 加。原因: `_call_llm` 失败时**不抛异常, 而是返回一段 markdown 错误
+    提示字符串**(见 llm.py 的 "失败时为带错误提示的字符串")。于是调用方会拿
+    这段错误提示去当 JSON 解析, 解析失败, 然后报"疑似被 max_tokens 截断" ——
+    **诊断完全错了**, 而且折半重试是最糟的补救: 提示词变短对 API 错误毫无帮助,
+    只是把一次瞬时故障放大成连续 3 次失败。
+
+    实测踩到: 34 个 workspace 的回填里 5 个"一条主题都没产出", 日志全是
+    "返回 228 字符, 疑似被 max_tokens 截断"。手抄同一份 prompt 单发一次完全
+    正常(4099 字符 / 5 个主题) —— 证明不是数据问题也不是模型问题, 是瞬时 API
+    故障被误诊成了截断。
+
+    错误串由 `llm_clients.classify_llm_error` 生成, 统一带 emoji 前缀
+    (💰 余额不足 / ❌ 鉴权失败 / ❌ 超时 / 未设置 key 等)。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    head = t[:80]
+    for marker in ("💰", "❌", "未设置", "创建 client 失败", "未知 provider"):
+        if marker in head:
+            return t[:200].replace("\n", " ")
+    return None
+
+
+def _theme_map_retry_loop(
+    facts: list[dict[str, Any]],
+    clusters: list[tuple[str, list[dict[str, Any]]]] | list,
+    paper_titles: dict[str, str],
+    provider: str, model: str, temperature: float,
+):
+    """主题地图的调用+重试循环。返回 (facts, prompt, parsed, salvaged, last_err, n_api_err)。
+
+    抽出来只为把 `organize_facts_into_themes` 的复杂度压回 30 以下(10-05 加了
+    API 错误识别和截断抢救两个分支之后超了), 逻辑一行没改。
+
+    **两条重试路径的补救方式相反, 这是本函数最要紧的地方**:
+      - **API 错误**: 原样重试, **不折半**。故障跟提示词长度无关, 折半只会把
+        一次瞬时故障放大成连续 3 次失败。实测 5 个 workspace 就是这么全灭的,
+        日志里还全是误导人的"疑似被 max_tokens 截断"(那段其实是错误提示字符串,
+        因为 `_call_llm` 失败时不抛异常, 见 llm.py)。
+      - **截断/解析失败**: 折半重试, 并先抢救一次已写完整的主题。
+    """
+    from agent.tools.llm import _call_llm
+
+    prompt = THEME_MAP_PROMPT.format(
+        n_subject_histogram=_subject_histogram(clusters),
+        facts_block=_facts_block(facts, paper_titles),
+    )
+    parsed = None
+    salvaged: list[dict[str, Any]] | None = None
+    last_err = ""
+    n_api_err = 0
+    n_now = len(facts)
+    for _ in range(3):                     # 最多折半重试 2 次
+        # 10-05: timeout 从 600 降到 240。实测 3789 字符的调用**卡了 6 分钟
+        # 不返回**, 而同一批里 9458 字符的 154 秒就跑完了 —— 不是 prompt 大小
+        # 问题, 是瞬时挂起。更糟的是 OpenAI SDK 默认 max_retries=2, 客户端超时
+        # 不是"最多 600 秒"而是 600×3, 再乘本循环 3 次 = 理论最坏 90 分钟。
+        # 240s 足够覆盖实测最长的一次(170s), 又能让挂起快速失败。
+        # ⚠ 改这个数之前要记住: 170s 是 **M3.1 flash** 的实测值, M3 明显更慢。
+        #   本函数默认 model="MiniMax-M3", 首次投产时务必盯一次真实耗时。
+        out = _call_llm(prompt, provider=provider, model=model,
+                        enable_thinking=False, temperature=temperature,
+                        max_tokens=THEME_MAP_MAX_TOKENS, timeout=240)
+        api_err = _is_llm_error_response(out)
+        if api_err:
+            n_api_err += 1
+            last_err = f"LLM 调用失败: {api_err}"
+            print(f"[organize] {last_err}; 原样重试", flush=True)
+            continue
+        if not out:
+            last_err = "LLM 返回空"
+        else:
+            parsed = _parse_theme_json(out)
+            if parsed is not None:
+                break
+            # 10-05: 解析不过先抢救一次。截断是这条路径上最常见的失败模式,
+            # 前面几个主题往往**已经写完整了**, 整块丢掉等于那一轮白跑
+            # (范式层 10-03 就有同样的教训, 见 _salvage_paradigms)。
+            salvaged = _salvage_themes(out)
+            if salvaged:
+                print(f"[organize] 主题地图 JSON 被截断, 抢救出 "
+                      f"{len(salvaged)} 个完整主题 (返回 {len(out)} 字符)",
+                      flush=True)
+                break
+            last_err = (f"主题地图 JSON 解析失败 (返回 {len(out)} 字符, "
+                        f"疑似被 max_tokens={THEME_MAP_MAX_TOKENS} 截断)")
+        n_now = n_now // 2
+        print(f"[organize] {last_err}; 折半到 {n_now} 条重试", flush=True)
+        if n_now < 40:
+            break
+        facts = facts[:n_now]
+        prompt = THEME_MAP_PROMPT.format(
+            n_subject_histogram=_subject_histogram(clusters),
+            facts_block=_facts_block(facts, paper_titles),
+        )
+    return facts, prompt, parsed, salvaged, last_err, n_api_err
+
+
 def organize_facts_into_themes(
     facts: list[dict[str, Any]],
     paper_titles: dict[str, str] | None = None,
@@ -437,9 +640,46 @@ def organize_facts_into_themes(
 
     返回 {"themes": [...], "narrative_arc": [...], "gaps": [...], "warnings": [...]}
     校验不通过的 fact_id 会被丢弃并记进 warnings(不静默)。
-    """
-    from agent.tools.llm import _call_llm
 
+    **10-05 改: 超量时"分块"而不是"抽样"。**
+    原来是 `fact 数 > THEME_MAP_MAX_FACTS(200) 就按 subject 均匀抽样到 200`,
+    被抽掉的 fact 永远不会被任何主题覆盖 —— 实测 `669cfc28a53e` 有 309 条,
+    静默丢掉 35%, 而那正是要总结的目标数据。现在按字符切块(见
+    split_fact_chunks), 每块独立归纳, 最后按主题名合并(_merge_chunk_results):
+    一条 fact 都不丢, 代价是超量时多次调用。
+    """
+    paper_titles = paper_titles or {}
+    if not facts:
+        return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["没有 fact"]}
+
+    chunks = split_fact_chunks(facts)
+    if len(chunks) > 1:
+        print(f"[organize] {len(facts)} 条 fact 切成 {len(chunks)} 块"
+              f"(每块 <= {THEME_CHUNK_CHARS} 字符 / {THEME_CHUNK_FACTS} 条), "
+              f"逐块归纳后按主题名合并 —— 一条 fact 都不丢", flush=True)
+        results = []
+        for i, ch in enumerate(chunks, 1):
+            print(f"[organize]   块 {i}/{len(chunks)}: {len(ch)} 条", flush=True)
+            results.append(_organize_one_chunk(
+                ch, paper_titles=paper_titles, provider=provider, model=model,
+                temperature=temperature, max_themes=max_themes))
+        merged = _merge_chunk_results(results, max_themes)
+        return merged
+    return _organize_one_chunk(
+        chunks[0], paper_titles=paper_titles, provider=provider, model=model,
+        temperature=temperature, max_themes=max_themes)
+
+
+def _organize_one_chunk(
+    facts: list[dict[str, Any]],
+    paper_titles: dict[str, str] | None = None,
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    temperature: float = 0.4,
+    max_themes: int = 8,
+) -> dict[str, Any]:
+    """单块(调用量在 max_tokens 之内)的归纳。10-05 从 organize_facts_into_themes
+    抽出来, 让上层能分块调用; 逻辑一行没改。"""
     paper_titles = paper_titles or {}
     if not facts:
         return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["没有 fact"]}
@@ -448,25 +688,6 @@ def organize_facts_into_themes(
     # 9-29: 先按 subject 聚簇, 把客观分布给 LLM 做归纳的锚。
     # 比"平铺全部 fact 让模型自己总结"稳 —— 那是凭印象, 换次跑就飘。
     clusters = cluster_by_subject(facts)
-
-    # 9-30 加固: 主题地图的**输出**随 fact 数线性增长, 超过 max_tokens 就被截断,
-    # JSON 解析必失败。实测 60 篇那次: 303 条 fact -> 25K prompt -> 返回 59349 字符,
-    # 撞上 20000 max_tokens 上限, 主题地图解析失败, 下游(命题层/成文)全断,
-    # 整轮白跑 40 分钟。40 篇那次(295 条)只是**侥幸**没过线。
-    #
-    # 三管齐下:
-    #   1) fact 数封顶 —— 主题地图要的是"有代表性的分布"而不是穷尽所有 fact,
-    #      超出的按 subject 聚簇均匀抽样, 保证每个 subject 都有代表
-    #   2) max_tokens 提到 32000
-    #   3) 解析失败时**自动折半重试**, 而不是整轮报废
-    if len(facts) > THEME_MAP_MAX_FACTS:
-        facts = _sample_facts_for_themes(facts, clusters, THEME_MAP_MAX_FACTS)
-        clusters = cluster_by_subject(facts)
-        print(
-            f"[organize] fact 数超上限 {THEME_MAP_MAX_FACTS}, 按 subject 聚簇均匀抽样到 "
-            f"{len(facts)} 条 (再多的输出会撑爆 max_tokens 导致 JSON 截断)",
-            flush=True,
-        )
 
     prompt = THEME_MAP_PROMPT.format(
         n_subject_histogram=_subject_histogram(clusters),
@@ -477,35 +698,34 @@ def organize_facts_into_themes(
     # 那部分**照样吃 max_tokens**。8000 会被思考吃光, JSON 答案被截断 -> 解析失败。
     # 主题地图是要"想清楚"的活, 给足预算。
     parsed = None
+    salvaged: list[dict[str, Any]] | None = None
     last_err = ""
-    n_now = len(facts)
-    for _ in range(3):                     # 最多折半重试 2 次
-        out = _call_llm(prompt, provider=provider, model=model,
-                        enable_thinking=False, temperature=temperature,
-                        max_tokens=THEME_MAP_MAX_TOKENS, timeout=600)
-        if not out:
-            last_err = "LLM 返回空"
-        else:
-            parsed = _parse_theme_json(out)
-            if parsed is not None:
-                break
-            last_err = (f"主题地图 JSON 解析失败 (返回 {len(out)} 字符, "
-                        f"疑似被 max_tokens={THEME_MAP_MAX_TOKENS} 截断)")
-        n_now = n_now // 2
-        print(f"[organize] {last_err}; 折半到 {n_now} 条重试", flush=True)
-        if n_now < 40:
-            break
-        facts = facts[:n_now]
-        prompt = THEME_MAP_PROMPT.format(
-            n_subject_histogram=_subject_histogram(clusters),
-            facts_block=_facts_block(facts, paper_titles),
-        )
+    n_api_err = 0
+    facts, prompt, parsed, salvaged, last_err, n_api_err = _theme_map_retry_loop(
+        facts, clusters, paper_titles, provider, model, temperature)
     if parsed is None:
-        return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": [last_err]}
+        if not salvaged:
+            if n_api_err:
+                # 全程都是 API 故障, 没有一次真的拿到模型输出 —— 说清楚,
+                # 别让用户以为是数据太大或 prompt 写坏了
+                return {"themes": [], "narrative_arc": [], "gaps": [],
+                        "warnings": [f"{last_err} (连续 {n_api_err} 次 API 故障, "
+                                     f"不是输出被截断; 重跑即可)"]}
+            return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": [last_err]}
+        # 抢救出来的只有 themes, narrative_arc / gaps 必然残缺(它们排在数组后面)
+        parsed = {"macros": None, "themes": salvaged,
+                  "narrative_arc": [], "gaps": []}
 
     warnings: list[str] = []
+    if salvaged:
+        # 「宁可吵, 不可静默」: 抢救成功不等于没损失 —— narrative_arc 和 gaps
+        # 排在 themes 数组后面, 截断时必然残缺, 写综述的顺序和覆盖空白会少一块
+        warnings.append(
+            f"主题地图 JSON 被 max_tokens 截断, 已抢救出 {len(salvaged)} 个主题; "
+            f"叙述顺序(narrative_arc)和覆盖空白(gaps)丢失")
     themes: list[dict[str, Any]] = []
     seen_theme: set[str] = set()
+    _pending_rel_check: list[tuple[str, list[str]]] = []
     for t in parsed.get("themes") or []:
         if not isinstance(t, dict):
             continue
@@ -533,14 +753,31 @@ def organize_facts_into_themes(
         if not kept:
             warnings.append(f"主题「{name}」无有效 fact, 已跳过")
             continue
+        # 10-05: **不再存 type**。support/tension/evolution/contrast 换成任何
+        # 一对主题都成立 —— 实测 68 条关系边里 type 只有 4 个取值, 而同一
+        # 取值下 note 说的东西毫无共性(6 条 tension 实际是三类完全不同的关系
+        # 混标)。标签不携带信息, 具体的那句话才携带。现在只留 to + note。
+        # 兼容: 磁盘上已有的旧 _thematic_map.json 里 type 还在, 读侧原样
+        # 忽略即可(没有代码按 type 分支), 所以不需要数据迁移。
         rels = []
+        n_blank_note = 0
         for r in t.get("relations") or []:
             if isinstance(r, dict) and (r.get("to") or "").strip():
+                note = (r.get("note") or "").strip()
+                if not note:
+                    n_blank_note += 1
                 rels.append({
                     "to": (r.get("to") or "").strip(),
-                    "type": (r.get("type") or "support").strip(),
-                    "note": (r.get("note") or "").strip(),
+                    "note": note,
                 })
+        if n_blank_note:
+            # 「宁可吵, 不可静默」: 去掉 type 之后, 一条 note 为空的关系边就
+            # 什么都不剩了。留着它是结构、丢掉它会掩盖问题 —— 所以说出来。
+            warnings.append(
+                f"主题「{name}」有 {n_blank_note} 条关联没有具体说明(只有指向没有内容)")
+        # 指向校验**必须等所有主题都进 seen_theme 之后再做**: 关系可以指向
+        # 在 JSON 里排在后面才出现的主题, 在循环内查会把它误报成"不存在"。
+        _pending_rel_check.append((name, [r["to"] for r in rels]))
         themes.append({
             "name": name,
             "statement": (t.get("statement") or "").strip(),
@@ -553,6 +790,19 @@ def organize_facts_into_themes(
         warnings.append(f"主题数 {len(themes)} 超过上限 {max_themes}, 已截断")
         themes = themes[:max_themes]
 
+    # 关系指向校验(见 _pending_rel_check 处的注释): 只警告, **不删边** ——
+    # 模型写错主题名是常见现象, 直接删会让结构凭空少一块, 而这里只要让
+    # 用户看见"有 N 条边指向了不存在的名字"就够了。指向自身不算错。
+    n_bad_rel = 0
+    for src, tos in _pending_rel_check:
+        bad = sorted({t for t in tos if t not in seen_theme and t != src})
+        if bad:
+            n_bad_rel += len(bad)
+            warnings.append(f"主题「{src}」关联指向了不存在的主题: {'、'.join(bad)}")
+    if n_bad_rel:
+        print(f"[organize] 关系边校验: {n_bad_rel} 条指向了不存在的主题名(保留边, 仅告警)",
+              flush=True)
+
     assigned = {fid for t in themes for fid in t["fact_ids"]}
     unused = sorted(valid_ids - assigned)
     if unused:
@@ -564,6 +814,247 @@ def organize_facts_into_themes(
         "gaps": [x for x in (parsed.get("gaps") or []) if isinstance(x, str)],
         "warnings": warnings,
     }
+
+
+# ============================================================
+# Phase B1.5: 宏观主题层 (10-05 加)
+# ============================================================
+
+MACRO_THEME_PROMPT = """你在为一份文献综述整理**上位结构**。
+
+下面已经归纳好了一批主题(每个主题 = 一个子问题方向, 附有它的领域判断和 fact 数)。
+你的任务是把这些主题**再往上聚一层**, 也就是回答: "这个领域由哪几个更大的板块
+构成, 每个板块里包含下面哪几个主题"。
+
+【已经归纳出的主题】
+{themes_block}
+
+【怎么聚】
+1. 按**研究对象/技术路线所属的板块**聚, 不是按"哪几个主题看起来像"。
+   一个宏观主题至少要含 2 个主题; 只装 1 个主题的板块没有意义, 别拆。
+2. **不要平分**。如果 5 个主题里 4 个明显同属一个板块, 就是 1 大 + 1 小,
+   不要为了"平均"硬凑成 2-3 个。
+3. 板块数量控制在 {n_macro_hint} 个左右。宁可 2 个大板块, 不要 6 个小分组。
+4. 每个板块的 statement 写**这个板块在解决什么问题、为什么它们该放一起**,
+   不是把下面主题的名字串一遍。
+5. 板块之间如果有一条值得记的关系, 写进 cross_notes, 说清楚具体是什么关系
+   (带对象和条件), **不要给关系贴类别标签**。
+
+【输出格式】严格 JSON, 不要 markdown 包裹:
+{{
+  "macros": [
+    {{
+      "name": "宏观板块名(14 字以内)",
+      "statement": "这个板块在解决什么问题, 为什么这些主题属于同一块",
+      "theme_names": ["主题名1", "主题名2"],
+      "notes": "板块内部的推进逻辑(2-3 句)",
+      "cross_notes": ["与另一个板块之间的具体关系(可留空数组)"]
+    }}
+  ]
+}}
+
+theme_names 只能从上面给出的主题名里原样挑, 不能改写、不能新造。
+每个主题应当恰好归入一个板块; 实在归不进去的可以不列。
+只输出 JSON。"""
+
+
+def _salvage_macros(body: str) -> list[dict[str, Any]] | None:
+    """从**被截断**的宏观主题输出里抢救出已经写完整的板块对象。
+
+    `_parse_theme_json` 的"补右括号"救不了这种截断: 它只能修**最后一个**
+    对象缺尾巴的情况, 而实际失败是"最后一个对象只写了一半"—— 补任何数量的
+    右括号都拼不回一个合法 JSON。必须像 `_paradigm._salvage_paradigms` 那样
+    用括号栈扫出**所有平衡的对象**, 逐个 loads, 前面的完整对象照收。
+
+    两个坑(都来自 _salvage_paradigms 的实测教训):
+      - 不能只认 depth==0: 输出被截断时外层 `{"macros": [` 是不平衡的,
+        里面每个板块对象都处在 depth>=1, 只认顶层会把它们全漏掉。
+      - 必须跟踪字符串状态: statement 里出现 `{` `}` 或转义引号时,
+        不跟踪就会把字符串内容当成结构符号, 括号深度彻底算错。
+    """
+    out: list[dict[str, Any]] = []
+    stack: list[int] = []
+    in_str = False
+    esc = False
+    for i, ch in enumerate(body):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            try:
+                obj = json.loads(body[start:i + 1])
+            except Exception:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("macros"), list):
+                out.extend(x for x in obj["macros"] if isinstance(x, dict))
+            elif isinstance(obj, dict) and obj.get("theme_names") is not None:
+                out.append(obj)
+    # 长得像板块 = 有 name 且 theme_names 非空
+    return [o for o in out
+            if (o.get("name") or "").strip() and o.get("theme_names")]
+
+
+def cluster_themes_into_macros(
+    themes: list[dict[str, Any]],
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    max_macros: int = 5,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """主题 -> **宏观主题**。返回 (macros, warnings)。
+
+    10-05 加。这是"知识结构地图"的第三层: 以前流水线到主题就停了
+    (宏观主题 → 主题 → 范式 → 命题 → fact 四层里的第二层是终点)。
+
+    为什么是**对主题再聚**而不是对 fact 重聚:
+      主题层已经做完"哪些 fact 说的是一件事"的判断, 那是这块语料里最难的一步。
+      再对 fact 跑一遍聚类, 等于把已经付过学费的判断推翻重来, 而且会得到
+      与主题层**不一致**的边界(两层对不上, 图谱就自相矛盾了)。
+      宏观层要回答的是另一个问题 —— 主题之间的上位关系, 它的输入本来就该是主题。
+
+    输入只有主题名 + 领域判断 + fact 数, **不喂 fact 正文**: 这一层不看细节,
+    只看主题的归属关系。1 次调用, 输出很小(实测 6-8 个主题 -> 2-4 个板块),
+    相比主题层的 20000+ max_tokens 预算基本可以忽略。
+
+    失败不抛异常, 返回 ([], warnings) —— 宏观层是加法, 缺了它单层结构照样能用。
+    """
+    from agent.tools.llm import _call_llm
+
+    warnings: list[str] = []
+    names = [(t.get("name") or "").strip() for t in themes]
+    names = [n for n in names if n]
+    if len(names) < 2:
+        # 一个主题谈不上"再聚一层", 强行聚只会得到 1:1 的空壳结构
+        return [], ([f"只有 {len(names)} 个主题, 不做宏观聚类"] if names else ["没有主题"])
+
+    known = set(names)
+    lines = []
+    for t in themes:
+        nm = (t.get("name") or "").strip()
+        if not nm:
+            continue
+        st = (t.get("statement") or "").strip() or "(无领域判断)"
+        lines.append(f"- 「{nm}」({len(t.get('fact_ids') or [])} 条 fact): {st}")
+    prompt = MACRO_THEME_PROMPT.format(
+        themes_block="\n".join(lines),
+        n_macro_hint=max(2, min(max_macros, len(names) // 2)),
+    )
+
+    parsed = None
+    salvaged: list[dict[str, Any]] | None = None
+    last_err = ""
+    n_api_err = 0
+    for _attempt in range(2):                # 最多重试 1 次, 宏观层不是关键路径
+        out = _call_llm(prompt, provider=provider, model=model,
+                        enable_thinking=False, temperature=0.3,
+                        # 10-05: 必须和主题层一样给 32000。第一版这里写的 8000,
+                        # 结果模型把 22868 字符全花在 <think> 上、正文一个字没出
+                        # (llm.py 打的是 "content 空 → reasoning_content"),
+                        # 于是解析失败。这正是本文件 9-29 就记过的坑:
+                        # enable_thinking=False **挡不住** MiniMax 输出 think,
+                        # 那部分照样吃 max_tokens。宏观层要"想清楚"得更久
+                        # (184 个主题一起判断归属), 预算不该比主题层紧。
+                        max_tokens=THEME_MAP_MAX_TOKENS, timeout=300)
+        # 同主题层: 错误提示串当 JSON 解析, 会误诊成"截断"。见 _is_llm_error_response
+        api_err = _is_llm_error_response(out)
+        if api_err:
+            n_api_err += 1
+            last_err = f"LLM 调用失败: {api_err}"
+            print(f"[macro] {last_err}; 原样重试", flush=True)
+            continue
+        if not out:
+            last_err = "LLM 返回空"
+        else:
+            parsed = _parse_theme_json(out, key="macros")
+            if parsed is not None:
+                break
+            # 解析不过先抢救一次 —— 板块少一两个不该让这一整层作废
+            salvaged = _salvage_macros(out)
+            if salvaged:
+                warnings.append(
+                    f"宏观主题 JSON 被截断(返回 {len(out)} 字符), "
+                    f"抢救出 {len(salvaged)} 个完整板块")
+                break
+            last_err = f"宏观主题 JSON 解析失败 (返回 {len(out)} 字符, 疑似截断)"
+        print(f"[macro] {last_err}", flush=True)
+    if parsed is None:
+        if not salvaged:
+            if n_api_err:
+                return [], [f"{last_err} (连续 {n_api_err} 次 API 故障, "
+                            f"不是输出被截断; 重跑即可)"]
+            return [], [f"宏观主题层失败: {last_err}"]
+        parsed = {"macros": salvaged}
+
+    macros: list[dict[str, Any]] = []
+    seen_macro: set[str] = set()
+    taken: dict[str, str] = {}              # 主题名 -> 所属宏观主题名
+    for m in parsed.get("macros") or []:
+        if not isinstance(m, dict):
+            continue
+        name = (m.get("name") or "").strip()
+        if not name:
+            warnings.append("宏观板块缺 name, 已跳过")
+            continue
+        if name in seen_macro:
+            warnings.append(f"宏观板块名重复: {name}")
+            continue
+        raw = m.get("theme_names") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        kept, bad, dup = [], 0, []
+        for tn in raw:
+            tn = str(tn).strip()
+            if tn not in known:
+                bad += 1
+            elif tn in kept:
+                dup.append(tn)
+            else:
+                kept.append(tn)
+        if bad:
+            warnings.append(f"宏观板块「{name}」有 {bad} 个 theme_names 不是已有主题名, 已丢弃")
+        if dup:
+            warnings.append(f"宏观板块「{name}」重复列入主题: {'、'.join(sorted(set(dup)))}")
+        if not kept:
+            warnings.append(f"宏观板块「{name}」没有有效主题, 已跳过")
+            continue
+        if len(kept) == 1:
+            # 装 1 个主题的板块不构成"上位结构", 但也不是模型的错(语料就
+            # 这么散)。保留并说明, 不静默丢。
+            warnings.append(f"宏观板块「{name}」只含 1 个主题, 不构成上位聚类")
+        for tn in kept:
+            if tn in taken and taken[tn] != name:
+                warnings.append(f"主题「{tn}」被多个宏观板块收编(『{taken[tn]}』和『{name}』), 以后者为准")
+            taken[tn] = name
+        seen_macro.add(name)
+        macros.append({
+            "name": name,
+            "statement": (m.get("statement") or "").strip(),
+            "notes": (m.get("notes") or "").strip(),
+            "theme_names": kept,
+            "cross_notes": [x.strip() for x in (m.get("cross_notes") or [])
+                            if isinstance(x, str) and x.strip()],
+        })
+
+    if not macros:
+        return [], ["宏观主题层没产出任何板块"]
+    if len(macros) > max_macros:
+        warnings.append(f"宏观板块数 {len(macros)} 超过上限 {max_macros}, 已截断")
+        macros = macros[:max_macros]
+
+    orphan = [n for n in names if n not in taken]
+    if orphan:
+        # 不硬塞给某个板块 —— 硬塞会造出一条假的归属关系。明确说出来。
+        warnings.append(f"{len(orphan)} 个主题未归入任何宏观板块: {'、'.join(orphan)}")
+    return macros, warnings
 
 
 # ============================================================
@@ -774,8 +1265,11 @@ def write_theme_narrative(
             theme_statement=theme.get("statement", "") or "(未给出)",
             theme_notes=theme.get("notes", "") or "(无)",
             theme_relations=(
-                "\n".join(f"- 与「{r.get('to')}」是 {r.get('type')} 关系: {r.get('note')}"
-                          for r in (theme.get("relations") or []) if r.get("to"))
+                # 10-05: 不再输出"是 support 关系"这种标签 —— 它对写作没有任何
+                # 指示作用, 只把 note 那句具体的话挤到后面去。只给那句话。
+                "\n".join(f"- 与「{r.get('to')}」: {r.get('note')}"
+                          for r in (theme.get("relations") or [])
+                          if r.get("to") and r.get("note"))
                 or "(无)"
             ),
             facts_block=facts_block,
@@ -1213,8 +1707,8 @@ def condense_facts_by_paradigm(
     theme_map: dict[str, Any],
     provider: str = "minimax",
     model: str = "MiniMax-M3",
-) -> list[dict[str, Any]]:
-    """主题 -> **范式** -> 命题。**一条范式就是一条命题, 天然跨多篇论文。**
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """主题 -> **范式** -> 命题。返回 (claims, paradigms)。
 
     这是引文密度的正解。实测(10-03, 110 条真实 fact, 主题「纯态张量网络表示」):
     归属后 MPS 5 篇 / PEPS 5 篇 / MERA 2 篇, 写出来均引 **12.0/句**
@@ -1227,20 +1721,30 @@ def condense_facts_by_paradigm(
     范式层把"该按什么归类"这件事从 fact 自带的标签里拿出来, 交给模型按
     **技术路线**重新判断, 再用向量质心把 fact 落到路线上(见 _paradigm)。
 
-    范式层任何一步失败(模型没吐出 themes / 编码不可用)都返回 [] ,
+    范式层任何一步失败(模型没吐出 themes / 编码不可用)都返回 ([], {}),
     调用方退回 `condense_facts_by_theme` —— 宁可密度低, 不能丢内容。
+
+    10-05: 返回值从 `list[claims]` 改成 `(claims, paradigms)`, paradigms 是
+    `{主题名: [范式, ...]}` 供调用方落盘。以前范式只活在内存里、用完就拍扁进
+    claim 的 statement 字符串, 于是磁盘上**从来没有任何地方存过"技术路线"
+    这一层** —— 实测 10-03 走范式路线的 workspace 里 155 条命题没有一条带范式
+    签名。而 `fact -> 范式 -> 主题` 的多归属结构(一条 fact 可以落进多个范式,
+    见 `_paradigm._seed`)正是"一篇论文同时落在多个主题里"的来源, 不落盘就等于
+    这个结构不存在。
     """
     from ._paradigm import assign, build_paradigms
 
+    empty: tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]] = ([], {})
     fmap = {f["fact_id"]: f for f in facts if f.get("fact_id")}
     if not fmap:
-        return []
+        return empty
     paras = build_paradigms(list(fmap.values()), theme_map, provider, model)
     if not paras:
         print("[paradigm] 范式层没产出, 退回主题合并", flush=True)
-        return []
+        return empty
 
     all_claims: list[dict[str, Any]] = []
+    used_paradigms: dict[str, list[dict[str, Any]]] = {}
     seq = 0
     # 10-03: 范式 statement 截到 120 字。这不是省 token, 是**压输入**:
     # 思维链长度随输入复杂度增长 —— 同样的成文调用, statement 是 146 字时
@@ -1271,10 +1775,24 @@ def condense_facts_by_paradigm(
                 "theme_id": name,
                 "n_facts": len(g),
                 "theme_name": name,
+                # 10-05: 命题记着自己来自哪条范式。这是"主题 -> 范式 -> 命题"三层
+                # 结构里中间那层的连接键, 落盘后才是可用的层级, 而不是三段平铺。
+                "paradigm": pn,
+            })
+            # 10-05: 记录这个主题下实际**吃到 fact** 的范式(assign 可能把某条范式
+            # 全部判给 margin 门槛掉了, 那就不该出现在结构里)
+            used_paradigms.setdefault(name, []).append({
+                "name": pn,
+                "statement": stmt,
+                "keywords": list(meta.get("keywords") or []),
+                "n_facts": len(g),
+                "fact_ids": [f["fact_id"] for f in g if f.get("fact_id")],
+                "paper_ids": pids,
+                "claim_id": f"q{seq}",
             })
     if not all_claims:
         print("[paradigm] 归属后没有命题, 退回主题合并", flush=True)
-    return all_claims
+    return all_claims, used_paradigms
 
 
 def write_theme_narrative_from_claims(
