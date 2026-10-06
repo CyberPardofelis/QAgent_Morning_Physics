@@ -402,7 +402,8 @@ def test_write_prompt_contains_no_paper_id():
 
 
 def test_theme_map_prompt_forbids_paper_listing():
-    p = O.THEME_MAP_PROMPT.format(facts_block="[pA::0] c", n_subject_histogram="(无)")
+    p = O.THEME_MAP_PROMPT.format(facts_block="[pA::0] c", n_subject_histogram="(无)",
+                                  scope_line=O._chunk_scope_line(1, 1, 1, 1))
     assert "论文列举" in p
     assert "领域判断" in p
 

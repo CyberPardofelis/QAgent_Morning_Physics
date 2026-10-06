@@ -318,11 +318,67 @@ def _subject_histogram(clusters, top_k: int = 15) -> str:
     return "\n".join(lines)
 
 
+def _chunk_scope_line(
+    facts_n: int,
+    total_facts: int,
+    chunk_idx: int = 1,
+    n_chunks: int = 1,
+) -> str:
+    """
+    渲染 prompt 开头的【本次范围】块 —— 告诉模型它看到的到底是多少东西。
+
+    10-07 加。**为什么必须说**: 语料超 `THEME_CHUNK_CHARS` 时会切块逐块归纳,
+    但 prompt 的措辞从头到尾都是"下面是从文献中抽取的原子事实笔记", 对单块和
+    全量一模一样。模型于是合理地(但错误地)认为**这就是全部语料**:
+
+      - 它会把一块的 `subject` 分布当成全领域分布, 照着它归纳出"这个领域主要
+        在讨论 X", 而实际那 8 块的主题名复用率是 0% —— 合并层拿到 32 个互不相干
+        的名字抢 8 个名额, 10-06 那次回补的第 3~8 块最后是 0% 命中。
+      - 它会拿一块的视野对**整个文献**下判断, gaps 尤其明显: "文献没覆盖 X"
+        实际只是"这块没提到 X"。
+
+    取景要求写在开场句之后、语料分布之前 —— 分布是模型归纳时的锚, 得先让它
+    知道这个锚的覆盖范围只有 1/N, 它才知道该不该拿它当全貌。
+
+    `facts_n` 传**当前实际**条数而不是分块时的条数: 折半重试会真的砍 fact
+    (`_theme_map_retry_loop` 里的 `facts = facts[:n_now]`), 写死块大小的话
+    重试时说的就是假话。
+    """
+    if n_chunks <= 1 and facts_n >= total_facts:
+        return (
+            f"【本次范围 — 这是全部】\n"
+            f"本批 {total_facts} 条 fact 就是**全部语料**, 没有别的批次。"
+            f"你的主题地图就是完整领域结构, 不用为看不到的材料留位置。"
+        )
+    if n_chunks <= 1:
+        # 单块但**被折半过**: 语料本来就只有一块, 可这一轮模型只拿到前 facts_n 条
+        # (上一轮 JSON 被截断, 触发的折半重试)。这时候说「这是全部」是在撒谎 ——
+        # 模型会以为漏掉的那些不存在。这个分支是测试逼出来的, 不是预想的。
+        return (
+            f"【本次范围 — 只读前 {facts_n}/{total_facts} 条】\n"
+            f"全部语料共 {total_facts} 条, **你这一轮只看到了前 {facts_n} 条**"
+            f"(上一轮输出被截断, 这次只重试一部分)。"
+            f"后面 {total_facts - facts_n} 条你没看到 —— "
+            f"既不要因为没提到就断言某方向「文献没覆盖」, 也不要给看不到的部分留位置。"
+        )
+    return (
+        f"【本次范围 — 只读第 {chunk_idx}/{n_chunks} 块】\n"
+        f"你看到的 {facts_n} 条 fact 是**全库 {total_facts} 条里的第 "
+        f"{chunk_idx}/{n_chunks} 块**, 其余的块由各自独立的调用分别归纳。\n"
+        f"- 只归纳**这一块**里出现过的主题, 不要推测块外还有什么。\n"
+        f"- 下面的语料分布也**只统计了这一块** —— 它反映的是这块在谈什么,\n"
+        f"  不是全领域的分布。\n"
+        f"- 主题名用领域里通用的叫法, 不要带「本块」「第{chunk_idx}块」这类序号痕迹。"
+    )
+
+
 THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**后, 整理领域结构。
 
 下面是从文献中抽取的原子事实笔记(每条带一个 fact_id)。你的任务**不是**总结这些
 论文, 而是把这些事实**组织成一个领域的结构** —— 也就是回答: "这个领域由哪几个
 子问题构成, 它们之间是什么关系"。
+
+{scope_line}
 
 【语料分布 — 客观数据, 先看这个】
 下面的簇是按 fact 的 `subject`(核心对象)自动聚的, 反映了这批文献**实际**在讨论什么。
@@ -635,6 +691,9 @@ def _theme_map_retry_loop(
     clusters: list[tuple[str, list[dict[str, Any]]]] | list,
     paper_titles: dict[str, str],
     provider: str, model: str, temperature: float,
+    chunk_idx: int = 1,
+    n_chunks: int = 1,
+    total_facts: int = 0,
 ):
     """主题地图的调用+重试循环。返回 (facts, prompt, parsed, salvaged, last_err, n_api_err)。
 
@@ -647,12 +706,16 @@ def _theme_map_retry_loop(
         日志里还全是误导人的"疑似被 max_tokens 截断"(那段其实是错误提示字符串,
         因为 `_call_llm` 失败时不抛异常, 见 llm.py)。
       - **截断/解析失败**: 折半重试, 并先抢救一次已写完整的主题。
+
+    `chunk_idx`/`n_chunks`/`total_facts` 供【本次范围】块用(10-07)。折半之后
+    重新 format, 范围块里的条数也跟着变小 —— 它得跟着变, 说死就是撒谎。
     """
     from agent.tools.llm import _call_llm
 
     prompt = THEME_MAP_PROMPT.format(
         n_subject_histogram=_subject_histogram(clusters),
         facts_block=_facts_block(facts, paper_titles),
+        scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
     )
     parsed = None
     salvaged: list[dict[str, Any]] | None = None
@@ -701,6 +764,7 @@ def _theme_map_retry_loop(
         prompt = THEME_MAP_PROMPT.format(
             n_subject_histogram=_subject_histogram(clusters),
             facts_block=_facts_block(facts, paper_titles),
+            scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
         )
     return facts, prompt, parsed, salvaged, last_err, n_api_err
 
@@ -742,12 +806,16 @@ def organize_facts_into_themes(
             print(f"[organize]   块 {i}/{len(chunks)}: {len(ch)} 条", flush=True)
             results.append(_organize_one_chunk(
                 ch, paper_titles=paper_titles, provider=provider, model=model,
-                temperature=temperature, max_themes=max_themes))
+                temperature=temperature, max_themes=max_themes,
+                # 10-07: 把「第几块/共几块/全库多少条」喂进 prompt, 否则模型
+                # 每块都以为自己看的是全部语料。见 _chunk_scope_line。
+                chunk_idx=i, n_chunks=len(chunks), total_facts=len(facts)))
         merged = _merge_chunk_results(results, max_themes)
         return merged
     return _organize_one_chunk(
         chunks[0], paper_titles=paper_titles, provider=provider, model=model,
-        temperature=temperature, max_themes=max_themes)
+        temperature=temperature, max_themes=max_themes,
+        chunk_idx=1, n_chunks=1, total_facts=len(facts))
 
 
 def _organize_one_chunk(
@@ -757,9 +825,16 @@ def _organize_one_chunk(
     model: str = "MiniMax-M3",
     temperature: float = 0.4,
     max_themes: int = 8,
+    chunk_idx: int = 1,
+    n_chunks: int = 1,
+    total_facts: int = 0,
 ) -> dict[str, Any]:
     """单块(调用量在 max_tokens 之内)的归纳。10-05 从 organize_facts_into_themes
-    抽出来, 让上层能分块调用; 逻辑一行没改。"""
+    抽出来, 让上层能分块调用; 逻辑一行没改。
+
+    `chunk_idx`/`n_chunks`/`total_facts` 是 10-07 加的: 让 prompt 知道它是
+    第几块、全库多少条, 而不是默认自己看到的是全部。见 `_chunk_scope_line`。
+    """
     paper_titles = paper_titles or {}
     if not facts:
         return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["没有 fact"]}
@@ -772,6 +847,7 @@ def _organize_one_chunk(
     prompt = THEME_MAP_PROMPT.format(
         n_subject_histogram=_subject_histogram(clusters),
         facts_block=_facts_block(facts, paper_titles),
+        scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
     )
 
     # 9-29 实测: MiniMax 即使 enable_thinking=False 也会输出大段 <think>,
@@ -782,7 +858,8 @@ def _organize_one_chunk(
     last_err = ""
     n_api_err = 0
     facts, prompt, parsed, salvaged, last_err, n_api_err = _theme_map_retry_loop(
-        facts, clusters, paper_titles, provider, model, temperature)
+        facts, clusters, paper_titles, provider, model, temperature,
+        chunk_idx=chunk_idx, n_chunks=n_chunks, total_facts=total_facts or len(facts))
     if parsed is None:
         if not salvaged:
             if n_api_err:
