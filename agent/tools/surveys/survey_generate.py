@@ -1032,7 +1032,12 @@ def _run_write_phase(topic: str, ws, section_idx: int = -1, max_steps: int = 20)
         )
         return
 
-    # fact 里的对齐标记在 _facts.jsonl 里(旧 run 可能没有), 过滤交给渲染层兜底
+    # 10-07 修: 这句原来写的是「fact 里的对齐标记在 _facts.jsonl 里(旧 run 可能
+    # 没有)」—— **10-06 之前它一直是假的**。审查结论只改内存对象, 而 append_fact
+    # 早在抽取循环里就把 fact 写死进文件了; 实测 2786 行里 `_is_topic_aligned`
+    # 出现 0 次。现在 _extract_facts 末尾会把带标记的 fact 重写回盘, 但**旧
+    # workspace 仍然是"没有标记"**, 所以这里仍然要防一手 ——
+    # 读出来的 fact 若没有标记, 渲染层不能当成"全都通过审查"。
     if isinstance(section_idx, int) and 0 <= section_idx < len(outline_sections):
         target_desc = f"第 {section_idx} 章 [{outline_sections[section_idx].get('section_type')}]"
         outline_sections = [outline_sections[section_idx]]

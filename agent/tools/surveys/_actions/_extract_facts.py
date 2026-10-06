@@ -261,3 +261,70 @@ def action_extract_facts(args: dict[str, Any], state: dict[str, Any], ws) -> Ite
     else:
         # fact 审查关闭 或 无 fact, 不 yield 任何东西
         pass
+
+    # ========== 10-07: 把审查结论**落回磁盘**(收一个 09-30 就该做的尾) ==========
+    # 上面两次审查(落地 / 主题对齐)都只改了 `state["facts"]` 里的**内存对象**,
+    # 而 `append_fact` 早在抽取循环里(第 158 行)就把这些 dict 逐行 json.dumps
+    # 写进 `_facts.jsonl` 了 —— 写完即定型, 之后的内存修改永远回不去。
+    #
+    # **后果不是理论上的, 是实测的**: 全部 35 个 `_facts.jsonl` 共 2786 行,
+    # `_grounded: false` 出现 **0 次**, `_is_topic_aligned` 出现 **0 次**。
+    # 正常跑没问题(用内存对象), 但只要**续跑**(`resume=True` 是默认),
+    # `ws.load_facts()` 拿回来的每一条都是审查前的默认值 true,
+    # `_is_usable_fact` 对每一条都返回 True —— 落地审查 + 主题对齐审查
+    # 两次最贵的调用, 结论在续跑时 100% 丢失, 而用户看到的是
+    #     ♻️ fact 抽取: 沿用 checkpoint 的 241 条
+    #     ✅ 可用 fact: 241 条 / 共 241 条
+    # 那句「另有 N 条 fact 未通过落地审查, 已剔除」永远不会出现。
+    #
+    # `survey_generate.py` 里还有一句注释断言「对齐标记在 _facts.jsonl 里」——
+    # 和实现正好相反。注释不参与执行, 所以只能靠这里重写。
+    n_rewritten = _persist_audit_marks(ws, state["facts"])
+    if n_rewritten is None:
+        # 宁可吵: 写回失败必须说出来, 绝不能让"下轮续跑会复活被否决的 fact"
+        # 这件事变成看不见的雷
+        yield ("⚠ 审查结论未能写回 _facts.jsonl —— 本轮综述不受影响(用的是内存), "
+               "但**续跑会丢失全部审查结论**(被判定超纲/不对齐的 fact 会复活)\n")
+    elif n_rewritten != len(state["facts"]):
+        yield (f"⚠ 审查结论写回条数不符: {n_rewritten} / {len(state['facts'])}, "
+               f"续跑时可能有 fact 落到旧值\n")
+    else:
+        n_marked = sum(1 for f in state["facts"]
+                       if f.get("_grounded") is False
+                       or f.get("_is_topic_aligned") is False)
+        if n_marked:
+            yield f"📝 审查结论已落盘 ({n_marked} 条带否决标记, 续跑不会复活)\n"
+
+
+def _persist_audit_marks(ws, facts: list[dict[str, Any]]) -> int | None:
+    """把带审查标记的 fact 重写回 `_facts.jsonl`。返回写入条数, 放弃则 None。
+
+    **先校验磁盘条数 == 内存条数, 对不上就放弃重写。**
+    磁盘上不是本轮全部 fact 时重写会丢东西 —— 那比不重写糟得多(丢的是数据,
+    而不重写只是续跑时结论失效)。宁可吵, 不可静默: 放弃时由调用方 yield 出来。
+    """
+    if not facts:
+        return None
+    try:
+        n_ondisk = len(ws.load_facts())
+    except Exception as e:                              # noqa: BLE001
+        logger.warning("[extract_facts] 读 _facts.jsonl 失败, 放弃写回: %s", e)
+        return None
+    if n_ondisk != len(facts):
+        logger.warning(
+            "[extract_facts] 磁盘 %d 条 != 内存 %d 条, 放弃重写(重写会丢数据)",
+            n_ondisk, len(facts))
+        return None
+    try:
+        ws.clear_facts()
+        for f in facts:
+            ws.append_fact(f)
+        return len(ws.load_facts())
+    except Exception as e:                              # noqa: BLE001
+        logger.warning("[extract_facts] 重写 _facts.jsonl 失败: %s", e)
+        # clear 过了但写失败了 -> 磁盘现在是空的, 比原来更糟, 必须说
+        try:
+            ws.clear_facts()
+        except Exception:                               # noqa: BLE001
+            pass
+        return None
