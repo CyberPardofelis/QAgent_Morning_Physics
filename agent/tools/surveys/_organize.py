@@ -74,8 +74,17 @@ def split_fact_chunks(
     为什么生产路径要分块而不是抽样(10-05 改): 原来是"fact 数 > 200 就按 subject
     均匀抽样到 200", 被抽掉的 fact **永远不会被任何主题覆盖**。实测
     `669cfc28a53e` 有 309 条 fact, 硬上限静默丢掉 35% —— 而那正是要总结的目标
-    数据。抽样只在"一次调用吃下全部 fact"这个旧前提下才成立; 现在主题是全局
-    累积的, 分块跑完把主题按名合并即可, 一条 fact 都不丢。
+    数据。抽样只在"一次调用吃下全部 fact"这个旧前提下才成立。
+
+    ⚠️ 10-07 更正: 上面这句话原来的结尾是「分块跑完把主题按名合并即可, **一条
+    fact 都不丢**」—— **那是一句假话**, 而且它在同一个文件的运行时 print 里也
+    重复了一遍(对用户说的)。实测(中性原子综述): 422 条 fact 切 8 块, 每块各出
+    4 个主题, 合并出 32 个后要砍到 8 个 —— 尾部截断让**第 3 块往后整块归零**,
+    整体只有 23% 的 fact 进得了主题地图。
+
+    准确的说法是: **切块这一步不丢 fact**(每条 fact 都进了某一块, 每块都跑过
+    一次 LLM)。丢发生在**合并之后的主题数截断**上, 现在改成按 fact 数选而不是
+    按块序砍, 并且把丢了多少、按哪几块丢的写进 warnings。
     """
     chunks: list[list[dict[str, Any]]] = []
     cur: list[dict[str, Any]] = []
@@ -102,10 +111,13 @@ def _merge_chunk_results(
     - warnings 全部保留: 某块失败/截断必须让用户看见
     """
     by_name: dict[str, dict[str, Any]] = {}
+    # 主题名 -> 来自哪几块。**只给截断时的告警用**, 不写进 theme dict
+    # (theme 会原样落进 _thematic_map.json, 多带一个内部字段就是污染产物)。
+    chunk_of: dict[str, set[int]] = {}
     arc: list[str] = []
     gaps: list[str] = []
     warnings: list[str] = []
-    for r in results:
+    for idx, r in enumerate(results, 1):
         warnings.extend(r.get("warnings") or [])
         for x in r.get("narrative_arc") or []:
             if x not in arc:
@@ -115,6 +127,7 @@ def _merge_chunk_results(
                 gaps.append(x)
         for t in r.get("themes") or []:
             name = t["name"]
+            chunk_of.setdefault(name, set()).add(idx)
             cur = by_name.get(name)
             if cur is None:
                 by_name[name] = {
@@ -139,11 +152,76 @@ def _merge_chunk_results(
     themes = list(by_name.values())
     if len(themes) > max_themes:
         # 砍主题 = 砍 fact, 属于**有损**操作: 必须说清楚丢了多少条 fact。
-        dropped = sum(len(t["fact_ids"]) for t in themes[max_themes:])
+        #
+        # 10-07 修: 原来是 `themes[:max_themes]`, 而 by_name 是普通 dict,
+        # 插入序 = 块序 —— 于是**前面几块把名额占满, 后面几块整块归零**。
+        # 实测(中性原子综述 10-06): 422 条 fact 切 8 块, 每块各出 4 个主题
+        # (prompt 明确教「宁可 4-6 个扎实的主题」), 合并出 32 个, 砍到 8 个 ->
+        #   块1 95% / 块2 67% / 块3-8 **全部 0%**, 整体覆盖 23%。
+        # 而同一文件那句运行时 print 正在对用户说「一条 fact 都不丢」。
+        #
+        # **为什么不是简单按 fact 数降序取前 8**: 那样只是把"先来的块通吃"换成
+        # "大块通吃" —— 某几块的主题天然更大, 剩下几块照样整块归零。
+        # 所以改成**轮转**: 第 1 轮每块各交出它最大的主题, 第 2 轮各交第二个,
+        # 直到凑满 max_themes。块数 >= max_themes 时保证**每块至少活一个**;
+        # 块数 < max_themes 时保证名额在块间均分。
+        per_chunk: dict[int, list[dict[str, Any]]] = {}
+        for t in themes:
+            for c in chunk_of.get(t["name"], ()):
+                per_chunk.setdefault(c, []).append(t)
+        for lst in per_chunk.values():
+            lst.sort(key=lambda t: len(t.get("fact_ids") or []), reverse=True)
+
+        selected: list[dict[str, Any]] = []
+        picked: set[int] = set()
+        depth = 0
+        while len(selected) < max_themes:
+            progressed = False
+            for c in sorted(per_chunk):
+                lst = per_chunk[c]
+                if depth < len(lst) and id(lst[depth]) not in picked:
+                    selected.append(lst[depth])
+                    picked.add(id(lst[depth]))
+                    progressed = True
+                    if len(selected) >= max_themes:
+                        break
+            if not progressed:
+                break
+            depth += 1
+
+        dropped_themes = [t for t in themes if id(t) not in picked]
+        dropped = sum(len(t.get("fact_ids") or []) for t in dropped_themes)
+        by_chunk_dropped: dict[int, int] = {}
+        for t in dropped_themes:
+            for c in chunk_of.get(t["name"], ()):
+                by_chunk_dropped[c] = (by_chunk_dropped.get(c, 0)
+                                       + len(t.get("fact_ids") or []))
+        chunk_desc = " ".join(
+            f"块{c}={by_chunk_dropped[c]}条" for c in sorted(by_chunk_dropped))
         warnings.append(
-            f"主题数 {len(themes)} 超过上限 {max_themes}, 已截断, "
-            f"被截掉的主题涉及 {dropped} 条 fact(这些 fact 不会出现在主题地图里)")
-        themes = themes[:max_themes]
+            f"主题数 {len(themes)} 超过上限 {max_themes}, 已按块轮转保留 {len(selected)} "
+            f"个(每块优先留 fact 最多的), 被截掉的 {len(dropped_themes)} 个主题涉及 "
+            f"{dropped} 条 fact(这些 fact 不会出现在主题地图里); 按块分布: {chunk_desc}")
+        themes = selected
+
+    # 砍掉的主题会留下**悬空 relation**(别的主题 relations 里还 `to` 着它),
+    # 那些名字会被原样带进 Phase C 的 prompt。剔掉并报出来 —— 不静默。
+    #
+    # ⚠️ 只剔**指向被截掉的主题**的, 不动"模型提到但从未输出该主题"的那种。
+    # 后者在真实产出里很常见(模型写 relation 时 to 写了个自己没落成主题的名字),
+    # 那条关系本身是有信息的, 删掉是白丢。两种悬空得分开。
+    alive = {t["name"] for t in themes}
+    gone = set(by_name) - alive
+    n_dangling = 0
+    for t in themes:
+        keep = [r for r in (t.get("relations") or []) if r.get("to") not in gone]
+        n_dangling += len(t.get("relations") or []) - len(keep)
+        t["relations"] = keep
+    if n_dangling:
+        warnings.append(
+            f"{n_dangling} 条主题关系指向因超上限被截掉的主题, 已剔除"
+            f"(原样留着会让 Phase C 的 prompt 里出现不存在的主题名)")
+
     return {"themes": themes, "narrative_arc": arc, "gaps": gaps, "warnings": warnings}
 
 
@@ -645,8 +723,9 @@ def organize_facts_into_themes(
     原来是 `fact 数 > THEME_MAP_MAX_FACTS(200) 就按 subject 均匀抽样到 200`,
     被抽掉的 fact 永远不会被任何主题覆盖 —— 实测 `669cfc28a53e` 有 309 条,
     静默丢掉 35%, 而那正是要总结的目标数据。现在按字符切块(见
-    split_fact_chunks), 每块独立归纳, 最后按主题名合并(_merge_chunk_results):
-    一条 fact 都不丢, 代价是超量时多次调用。
+    split_fact_chunks), 每块独立归纳, 最后按主题名合并(_merge_chunk_results)。
+    **切块这步一条 fact 都不丢**; 主题数超过 max_themes 时仍会丢, 现在按 fact
+    数选而不是按块序砍, 丢多少/丢哪几块都进 warnings。
     """
     paper_titles = paper_titles or {}
     if not facts:
@@ -656,7 +735,8 @@ def organize_facts_into_themes(
     if len(chunks) > 1:
         print(f"[organize] {len(facts)} 条 fact 切成 {len(chunks)} 块"
               f"(每块 <= {THEME_CHUNK_CHARS} 字符 / {THEME_CHUNK_FACTS} 条), "
-              f"逐块归纳后按主题名合并 —— 一条 fact 都不丢", flush=True)
+              f"逐块归纳后按主题名合并 —— 切块这步一条 fact 都不丢"
+              f"(主题数超上限时仍会丢, 丢了多少见下面的 warnings)", flush=True)
         results = []
         for i, ch in enumerate(chunks, 1):
             print(f"[organize]   块 {i}/{len(chunks)}: {len(ch)} 条", flush=True)

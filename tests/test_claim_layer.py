@@ -11,6 +11,8 @@ test_claim_layer.py — 命题层 + 引用编号化 (9-30)
 from __future__ import annotations
 
 import importlib
+import pathlib
+import re
 import sys
 
 import pytest
@@ -23,6 +25,17 @@ def _mod(name: str):
 
 
 OG = _mod("agent.tools.surveys._organize")
+
+
+def _org_src() -> str:
+    """_organize.py 的源码文本 —— 有些断言要看**代码怎么写的**, 不看它的行为。
+
+    行为断言有个盲区: 打印文案、注释里的承诺这些东西, 改了不影响任何返回值,
+    而它们恰恰是对用户说错话的地方(10-07 那句「一条 fact 都不丢」就是)。
+    """
+    import pathlib
+
+    return pathlib.Path(OG.__file__).read_text(encoding="utf-8")
 
 
 # ============================================================
@@ -372,15 +385,19 @@ def test_organize_entry_point_chunks_instead_of_sampling(monkeypatch):
     """入口超量时必须**分块**, 不能抽样(10-05 的核心修复)。
 
     10-05 之前是 `len(facts) > 200 -> _sample_facts_for_themes(...)`,
-    实测 309 条静默丢掉 35%。这条测试 monkeypatch 掉底层调用, 数它被调了几次:
-    一次 = 单块没切开; 多次 = 走了分块路径。
+    实测 309 条静默丢掉 35%。
+
+    10-07 修: 这条测试原来还传了 `max_themes=1000`, **把截断分支变成了死代码**
+    —— 于是它压根没走过它想守护的那段路径, 却在给"一条 fact 都不丢"发绿灯。
+    现在断言的是**切块这一步**不丢 fact(合并之后的取舍由下面那条测),
+    因为「切块不丢」和「合并后不丢」是两件不同的事, 混在一条里就等于没测。
     """
     OG = _mod("agent.tools.surveys._organize")
     calls = []
 
     def fake_chunk(facts, paper_titles=None, provider="minimax", model="MiniMax-M3",
                    temperature=0.4, max_themes=8):
-        calls.append(len(facts))
+        calls.append([f["fact_id"] for f in facts])
         ids = [f["fact_id"] for f in facts]
         return {"themes": [{"name": f"T{i}", "statement": "", "fact_ids": [ids[i]],
                             "notes": "", "relations": []} for i in range(len(ids))],
@@ -389,11 +406,187 @@ def test_organize_entry_point_chunks_instead_of_sampling(monkeypatch):
     monkeypatch.setattr(OG, "_organize_one_chunk", fake_chunk)
     facts = [{"fact_id": f"f{i}", "subject": f"s{i%5}", "claim": "长" * 100,
               "paper_id": "p"} for i in range(300)]
-    out = OG.organize_facts_into_themes(facts, max_themes=1000)
+    OG.organize_facts_into_themes(facts)          # ← 不再传 max_themes=1000
     assert len(calls) > 1, f"应当分块调用, 实际只调了 {len(calls)} 次"
-    got = sorted(fid for t in out["themes"] for fid in t["fact_ids"])
-    assert got == sorted(f["fact_id"] for f in facts), \
-        f"分块后有 fact 丢了: 300 -> {len(got)}"
+    seen = [fid for batch in calls for fid in batch]
+    assert sorted(seen) == sorted(f["fact_id"] for f in facts), \
+        f"切块这步就丢了 fact: 300 -> {len(seen)}"
+
+
+def test_merge_does_not_let_early_chunks_take_all_the_slots(monkeypatch):
+    """合并后截断时**不能**让前面的块通吃名额(10-07 的核心修复)。
+
+    这条模拟的是**生产实测形态**: 主题名块块不同, 同名合并命中率 0。
+    原来的 `themes[:max_themes]` 因为 `by_name` 插入序 = 块序, 于是前两块的
+    8 个主题把名额占满, 第 3 块往后整块归零 —— 实测中性原子综述
+    422 条 fact 只有 23% 进了地图(块1 95% / 块2 67% / 块3-8 全部 0%)。
+
+    判据是"**每一块都要有 fact 活下来**", 而不是"活下来的 fact 多" ——
+    后者在"前两块刚好很大"时也会绿, 那正是原来那个 bug 的形态。
+    """
+    OG = _mod("agent.tools.surveys._organize")
+    N_CHUNKS, PER_CHUNK, N_THEMES_PER_CHUNK = 8, 60, 4
+    results = []
+    for c in range(N_CHUNKS):
+        results.append({
+            # **块块不同的主题名** —— 复刻生产的 0% 命中, 不要让测试优待它
+            "themes": [
+                {"name": f"块{c}主题{i}", "statement": "", "notes": "",
+                 "fact_ids": [f"c{c}f{i}_{j}" for j in range(PER_CHUNK // N_THEMES_PER_CHUNK)],
+                 "relations": []}
+                for i in range(N_THEMES_PER_CHUNK)
+            ],
+            "narrative_arc": [], "gaps": [], "warnings": [],
+        })
+
+    out = OG._merge_chunk_results(results, max_themes=8)
+    alive_chunks = set()
+    for t in out["themes"]:
+        for fid in t["fact_ids"]:
+            alive_chunks.add(int(fid[1:].split("f")[0]))
+    assert len(out["themes"]) == 8
+    assert alive_chunks == set(range(N_CHUNKS)), \
+        (f"只有块 {sorted(alive_chunks)} 的 fact 活下来, 块 "
+         f"{sorted(set(range(N_CHUNKS)) - alive_chunks)} 整块归零了 —— "
+         f"这就是 10-06 实测到的 23% 覆盖")
+
+
+def test_merge_warns_how_many_facts_were_dropped_and_from_which_chunks():
+    """丢了多少、丢哪几块, 必须写进 warnings —— 不然用户看不出来。"""
+    OG = _mod("agent.tools.surveys._organize")
+    results = [{
+        "themes": [{"name": f"块{c}主题{i}", "statement": "", "notes": "",
+                    "fact_ids": [f"c{c}f{i}_{j}" for j in range(15)],
+                    "relations": []} for i in range(4)],
+        "narrative_arc": [], "gaps": [], "warnings": [],
+    } for c in range(8)]
+
+    out = OG._merge_chunk_results(results, max_themes=8)
+    joined = " ".join(out["warnings"])
+    assert any("条 fact" in w for w in out["warnings"]), \
+        f"截断了却没有报丢了多少 fact: {out['warnings']}"
+    # 断言具体形态 `块N=`, 不能只查有没有"块"字 —— 写成"若干块"照样绿(反向验证 M4 踩过)
+    assert re.search(r"块\d+=\d+条", joined), \
+        f"告警里没有按块的具体分布: {out['warnings']}"
+    # 8 块各丢 45 条 = 360, 轮转下应该是均匀的
+    assert "块1=45条" in joined and "块8=45条" in joined, \
+        f"轮转下每块丢的应该一样多, 实得: {joined}"
+
+
+def test_merge_drops_dangling_relations_to_truncated_themes():
+    """被砍掉的主题会留下悬空 relation, 那些名字会被带进 Phase C 的 prompt。
+
+    指向 `主题3` 而不是 `主题0`: 轮转第 1 轮就把 8 个名额分完了(每块取
+    `主题0`), `主题1/2/3` 全被砍 —— 所以 relation 指向它们才是真悬空。
+    """
+    OG = _mod("agent.tools.surveys._organize")
+    results = [{
+        "themes": [{"name": f"块{c}主题{i}", "statement": "", "notes": "",
+                    "fact_ids": [f"c{c}f{i}_{j}" for j in range(15)],
+                    "relations": [{"to": f"块{c}主题3", "note": "n"}]}
+                   for i in range(4)],
+        "narrative_arc": [], "gaps": [], "warnings": [],
+    } for c in range(8)]
+
+    out = OG._merge_chunk_results(results, max_themes=8)
+    alive = {t["name"] for t in out["themes"]}
+    assert alive == {f"块{c}主题0" for c in range(8)}, \
+        f"轮转第 1 轮应该只留每块的主题0, 实得 {sorted(alive)}"
+    for t in out["themes"]:
+        for rel in t["relations"]:
+            assert rel["to"] in alive, \
+                f"主题 {t['name']} 的 relation 指向了已被截掉的主题 {rel['to']}"
+    assert any("被截掉" in w for w in out["warnings"]), \
+        f"剔了悬空 relation 却没有报出来: {out['warnings']}"
+
+
+def test_merge_keeps_relations_to_never_defined_themes():
+    """**不能**把"模型提到但没输出成主题"的那种 to 也删掉。
+
+    真实产出里模型经常写 relation 时 `to` 写了个自己没落成主题的名字。那条
+    关系本身是有信息的, 跟"指向被截断主题"是两回事 —— 10-07 第一版把两者
+    一起删了, 把 `test_merge_chunk_results_unions_fact_ids_by_theme_name` 弄红了。
+    """
+    OG = _mod("agent.tools.surveys._organize")
+    out = OG._merge_chunk_results([{
+        "themes": [{"name": "A", "statement": "", "notes": "",
+                    "fact_ids": ["f1"], "relations": [{"to": "B", "note": "n"}]}],
+        "narrative_arc": [], "gaps": [], "warnings": [],
+    }], max_themes=8)
+    assert len(out["themes"][0]["relations"]) == 1, \
+        "B 从来没被定义成主题, 这条关系不该被当成悬空删掉"
+
+
+def test_runtime_print_does_not_promise_losslessness():
+    """那句**直接对用户 print** 的话不许无条件宣称"一条 fact 都不丢"。
+
+    10-06 实测就是被它骗的: 运行时对用户说"逐块归纳后按主题名合并 ——
+    一条 fact 都不丢", 实际只有 23% 的 fact 进了地图。**主动的错误保证比
+    沉默更糟** —— 它让用户以为安全, 根本不会去追查。
+
+    用 ast 精确定位那个 print 调用: 全文件扫文本的话, 本函数自己的 docstring
+    里那句「一条 fact 都不丢」会把自己判红(踩过)。
+    """
+    import ast
+
+    src = _org_src()
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "print"):
+            continue
+        seg = ast.get_source_segment(src, node) or ""
+        if "逐块归纳" not in seg:
+            continue
+        assert "主题数超上限" in seg or "会丢" in seg, \
+            f"运行时 print 仍然无条件宣称不丢: {seg[:200]}"
+        return
+    pytest.fail("找不到那句切块的运行时 print —— 它被删了? 要看一眼为什么")
+
+
+def _code_only(path) -> str:
+    """只保留**代码**: 剥掉注释和所有字符串字面量(含 docstring)。
+
+    扫源码文本时必须走这个 —— 否则本文件 docstring 里为了说明问题而引用的
+    旧代码片段会把自己判红(这条已经踩了两次: 一次是 test_no_test_disables,
+    一次是 test_entry_test_does_not_pass)。
+    """
+    import io
+    import tokenize
+
+    src = pathlib.Path(path).read_text(encoding="utf-8")
+    skip = {tokenize.COMMENT, tokenize.STRING, tokenize.NL, tokenize.NEWLINE,
+            tokenize.INDENT, tokenize.DEDENT}
+    return " ".join(tok.string for tok in
+                    tokenize.generate_tokens(io.StringIO(src).readline)
+                    if tok.type not in skip)
+
+
+def _me_file():
+    """本测试文件自己的路径 —— 下面两条用它来盯"不许再开后门"。"""
+    return pathlib.Path(__file__).resolve().parent / "test_claim_layer.py"
+
+
+def test_no_test_disables_the_truncation_path():
+    """**任何测试都不许把截断分支变成死代码**。
+
+    `organize_facts_into_themes(facts, max_themes=1000)` 就是干这个的: 它让
+    `_merge_chunk_results` 里那段截断代码永远不执行, 于是"一条 fact 都不丢"
+    在两种人为优停下必然成立(截断关掉 + mock 跨块同名 100% 合并), 测试给假
+    声明发了绿灯, 而生产在丢 77%。这条盯的就是那个绿灯。
+    """
+    me = _me_file()
+    assert "max_themes = 1000" not in _code_only(me), \
+        "这个文件里又出现了 max_themes=1000 —— 截断分支被重新变成死代码"
+
+
+def test_entry_test_does_not_pass_a_custom_max_themes():
+    """入口那条测试必须走**生产默认**的 max_themes(=8), 不许自己传。"""
+    # 去掉空格再比: _code_only 用空格拼 token, 源码里的 `f(a, b)` 会变成 `f ( a , b )`
+    code = _code_only(_me_file()).replace(" ", "")
+    assert "organize_facts_into_themes(facts)" in code, \
+        "入口测试没有用默认 max_themes 调用"
+    assert "organize_facts_into_themes(facts,max_themes" not in code, \
+        "入口测试又自己传了 max_themes —— 生产默认是 8"
 
 
 def test_merge_chunk_results_unions_fact_ids_by_theme_name():
