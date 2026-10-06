@@ -21,9 +21,11 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
 SG_MOD = importlib.import_module("agent.tools.surveys.survey_generate")
 
 
@@ -626,3 +628,146 @@ def test_audit_renders_four_layers(tmp_path):
     assert "关联 → 模拟复杂度诊断" in md
     assert "关系 support" not in md and "关系 tension" not in md
     assert "未归入任何宏观板块" in md
+
+
+# ============================================================
+# 宏观层增量归类(10-06): 只聚未归类主题 + 优先并入已有板块
+# ============================================================
+
+def _existing(*names):
+    return [{"name": n, "statement": f"{n}的老领域判断。", "n_themes": 40}
+            for n in names]
+
+
+def test_macro_prompt_parts_empty_when_no_existing():
+    """没有已有板块时 prompt 块必须是空串 —— 与 10-05 的 prompt 一字不差。
+
+    这是向后兼容的硬要求: 增量逻辑不能改变**全量重聚**那条老路子的输出。
+    """
+    parts = _org()._macro_prompt_parts
+    block, hint = parts(themes=[], names=["甲", "乙", "丙", "丁"],
+                        max_macros=5, existing_macros=None)
+    assert block == "", "没有已有板块时不该注入任何块"
+    assert hint == max(2, min(5, 4 // 2)) == 2
+
+    # 空列表也要走同一条分支(existing_macros=[] 不是 None)
+    block2, hint2 = parts(themes=[], names=["甲", "乙", "丙", "丁"],
+                          max_macros=5, existing_macros=[])
+    assert block2 == "" and hint2 == 2
+
+
+def test_macro_prompt_parts_lists_existing_and_shrinks_hint():
+    """有已有板块时: 列出板块名 + 降低板块数期望值。
+
+    期望值必须降 —— 增量模式下再问"聚成 5 个", 模型会凭空造满 5 个同类板块。
+    """
+    parts = _org()._macro_prompt_parts
+    names = [f"主题{i}" for i in range(9)]
+    block, hint = parts(themes=[], names=names, max_macros=5,
+                        existing_macros=_existing("量子通信与硬件栈", "张量网络与多体模拟"))
+    assert "量子通信与硬件栈" in block and "张量网络与多体模拟" in block
+    assert "已收编 40 个主题" in block
+    # 复用规则必须写进 prompt, 否则模型无从知道"原样照抄才算复用"
+    assert "原样照抄" in block
+    assert hint == max(1, min(5, 9 // 3)) == 3
+    assert hint < max(2, min(5, 9 // 2)), "有已有板块时 n_hint 必须比全量模式小"
+
+
+def test_macro_prompt_template_actually_embeds_existing_block():
+    """模板里必须有 {existing_block} 占位符, 否则上面那个块永远进不了 prompt。"""
+    src = _org().MACRO_THEME_PROMPT
+    assert "{existing_block}" in src
+
+
+def test_cluster_marks_reused_macro(monkeypatch):
+    """模型原样照抄已有板块名 -> 该板块要标 reused=True。"""
+    resp = _macro_llm([{
+        "name": "量子通信与硬件栈", "statement": "重写过的说法",
+        "notes": "", "theme_names": ["甲", "乙"],
+        "cross_notes": [],
+    }])
+    monkeypatch.setattr(importlib.import_module("agent.tools.llm"),
+                        "_call_llm", lambda prompt, **kw: resp, raising=False)
+    macros, warns = _org().cluster_themes_into_macros(
+        [{"name": "甲", "statement": "s", "fact_ids": ["1"]},
+         {"name": "乙", "statement": "s", "fact_ids": ["2"]}],
+        existing_macros=_existing("量子通信与硬件栈"))
+    assert len(macros) == 1
+    assert macros[0]["reused"] is True, "照抄已有板块名必须标成复用"
+    assert macros[0]["theme_names"] == ["甲", "乙"]
+
+
+def test_cluster_marks_new_macro_not_reused(monkeypatch):
+    """新建的板块必须标 reused=False, 否则调用方会传空 statement 把它写空。"""
+    resp = _macro_llm([{
+        "name": "全新板块", "statement": "新领域。",
+        "notes": "n", "theme_names": ["甲", "乙"], "cross_notes": [],
+    }])
+    monkeypatch.setattr(importlib.import_module("agent.tools.llm"),
+                        "_call_llm", lambda prompt, **kw: resp, raising=False)
+    macros, _ = _org().cluster_themes_into_macros(
+        [{"name": "甲", "statement": "s", "fact_ids": ["1"]},
+         {"name": "乙", "statement": "s", "fact_ids": ["2"]}],
+        existing_macros=_existing("量子通信与硬件栈"))
+    assert macros[0]["reused"] is False
+    assert macros[0]["statement"] == "新领域。"
+
+
+def test_reused_single_theme_does_not_warn_empty_shell(monkeypatch):
+    """复用板块只装 1 个新主题**不该**报"1:1 空壳"。
+
+    增量模式下 kept 只是这批未归类主题里落在该板块的那几个, 板块里原有的
+    几十个主题根本不在输入里。按 kept 数告警是纯误报, 而且会让人以为
+    复用失败了。
+    """
+    resp = _macro_llm([{
+        "name": "量子表征与精密测量", "statement": "s", "notes": "",
+        "theme_names": ["甲"], "cross_notes": [],
+    }])
+    monkeypatch.setattr(importlib.import_module("agent.tools.llm"),
+                        "_call_llm", lambda prompt, **kw: resp, raising=False)
+    _macros, warns = _org().cluster_themes_into_macros(
+        [{"name": "甲", "statement": "s", "fact_ids": ["1"]},
+         {"name": "乙", "statement": "s", "fact_ids": ["2"]}],
+        existing_macros=_existing("量子表征与精密测量"))
+    assert not any("1 个主题" in w and "空壳" not in w and "不构成" in w
+                   for w in warns), f"复用板块不该被判成空壳: {warns}"
+    assert any("复用已有板块" in w for w in warns), f"该说明这是复用: {warns}"
+
+
+def test_new_single_theme_still_warns_empty_shell(monkeypatch):
+    """对照组: **新建**板块只装 1 个主题仍然要告警。上面那条不能把这条也吃掉。"""
+    resp = _macro_llm([{
+        "name": "全新板块", "statement": "s", "notes": "",
+        "theme_names": ["甲"], "cross_notes": [],
+    }])
+    monkeypatch.setattr(importlib.import_module("agent.tools.llm"),
+                        "_call_llm", lambda prompt, **kw: resp, raising=False)
+    _macros, warns = _org().cluster_themes_into_macros(
+        [{"name": "甲", "statement": "s", "fact_ids": ["1"]},
+         {"name": "乙", "statement": "s", "fact_ids": ["2"]}],
+        existing_macros=_existing("量子通信与硬件栈"))
+    assert any("不构成上位聚类" in w for w in warns), f"新建空壳必须告警: {warns}"
+
+
+def test_backfill_macro_only_dry_does_not_call_llm(tmp_path, monkeypatch, capsys):
+    """`--macro-only --dry` **绝不能**发请求。
+
+    实测踩过: 原来写死 `macro_layer(False)`, 把 --dry 丢了。想先看 prompt
+    估算, 结果一发就是 300 秒起步的真实调用, 而且输出跟真跑过一样, 事后
+    分不清跑没跑。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_bg_mod", ROOT / "scripts" / "backfill_graph.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    calls = []
+    monkeypatch.setattr(mod, "macro_layer",
+                        lambda dry: (calls.append(dry), 0)[1])
+    monkeypatch.setattr(mod.sys, "argv",
+                        ["backfill_graph.py", "--macro-only", "--dry"])
+    mod.main()
+    assert calls == [True], f"--dry 必须传进 macro_layer, 实际传了 {calls}"
+    assert "--dry" in capsys.readouterr().out, "dry 必须在输出里说清楚"

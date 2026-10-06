@@ -828,7 +828,7 @@ MACRO_THEME_PROMPT = """你在为一份文献综述整理**上位结构**。
 
 【已经归纳出的主题】
 {themes_block}
-
+{existing_block}
 【怎么聚】
 1. 按**研究对象/技术路线所属的板块**聚, 不是按"哪几个主题看起来像"。
    一个宏观主题至少要含 2 个主题; 只装 1 个主题的板块没有意义, 别拆。
@@ -904,11 +904,46 @@ def _salvage_macros(body: str) -> list[dict[str, Any]] | None:
             if (o.get("name") or "").strip() and o.get("theme_names")]
 
 
+def _macro_prompt_parts(
+    themes: list[dict[str, Any]],
+    names: list[str],
+    max_macros: int,
+    existing_macros: list[dict[str, Any]] | None,
+) -> tuple[str, int]:
+    """返回 (existing_block, n_macro_hint)。空板块时块是空串。
+
+    独立成函数而不是塞在 `cluster_themes_into_macros` 里: 那条链已经有解析、
+    抢救、重试三条分支, 再叠块拼装就把 C901 顶爆了(实测 34 > 30)。
+    """
+    ex_lines: list[str] = []
+    for m in existing_macros or []:
+        nm = (m.get("name") or "").strip()
+        if not nm:
+            continue
+        st = (m.get("statement") or "").strip()
+        ex_lines.append(f"- 「{nm}」(已收编 {m.get('n_themes', 0)} 个主题)"
+                        + (f": {st}" if st else ""))
+    if not ex_lines:
+        return "", max(2, min(max_macros, len(names) // 2))
+    block = (
+        "\n【已有的宏观板块 —— 优先归入这些, 不要造同类的新板块】\n"
+        + "\n".join(ex_lines)
+        + f"\n下面 {len(ex_lines)} 个板块里能收下这些主题的就收下, "
+          "**name 原样照抄**才算复用; 只有当某几个主题确实不属于任何"
+          "已有板块时才新建, 新名字不要和已有板块近义。"
+          "已有板块里原有的主题不在这次输入里, 不用管, "
+          "也不要因为看不到它们就不敢复用该板块。\n")
+    # 增量模式下"复用几个 + 新建几个"才是有意义的量; 直接拿 max_macros 去问
+    # 会诱导模型凭空造满 5 个同类板块。
+    return block, max(1, min(max_macros, len(names) // 3))
+
+
 def cluster_themes_into_macros(
     themes: list[dict[str, Any]],
     provider: str = "minimax",
     model: str = "MiniMax-M3",
     max_macros: int = 5,
+    existing_macros: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """主题 -> **宏观主题**。返回 (macros, warnings)。
 
@@ -924,6 +959,14 @@ def cluster_themes_into_macros(
     输入只有主题名 + 领域判断 + fact 数, **不喂 fact 正文**: 这一层不看细节,
     只看主题的归属关系。1 次调用, 输出很小(实测 6-8 个主题 -> 2-4 个板块),
     相比主题层的 20000+ max_tokens 预算基本可以忽略。
+
+    **`existing_macros`(10-06 加) = 增量归类模式**。宏观主题是**全局累积**的:
+    一次全量重聚看着干净, 实则有两个硬伤 ——
+      1. **prompt 撑爆**: 209 个主题全塞进去 = 19351 字符, timeout=300 秒
+         必然超时(实测 6575 字符就要 160 秒)。而且主题数只增不减, 越用越炸。
+      2. **已有结构被推翻**: 上一轮定好的板块边界, 这轮换个措辞就变了。
+    所以默认只喂**未归类**的主题, 并把已有板块名列给它, 让它优先收编 ——
+    prompt 小两个数量级, 且历史结构只增不改。
 
     失败不抛异常, 返回 ([], warnings) —— 宏观层是加法, 缺了它单层结构照样能用。
     """
@@ -944,9 +987,17 @@ def cluster_themes_into_macros(
             continue
         st = (t.get("statement") or "").strip() or "(无领域判断)"
         lines.append(f"- 「{nm}」({len(t.get('fact_ids') or [])} 条 fact): {st}")
+
+    existing_block, n_hint = _macro_prompt_parts(
+        themes=themes, names=names, max_macros=max_macros,
+        existing_macros=existing_macros)
+    ex_names = {(m.get("name") or "").strip() for m in (existing_macros or [])
+                if (m.get("name") or "").strip()}
+
     prompt = MACRO_THEME_PROMPT.format(
         themes_block="\n".join(lines),
-        n_macro_hint=max(2, min(max_macros, len(names) // 2)),
+        n_macro_hint=n_hint,
+        existing_block=existing_block,
     )
 
     parsed = None
@@ -1026,10 +1077,16 @@ def cluster_themes_into_macros(
         if not kept:
             warnings.append(f"宏观板块「{name}」没有有效主题, 已跳过")
             continue
-        if len(kept) == 1:
+        if len(kept) == 1 and name not in ex_names:
             # 装 1 个主题的板块不构成"上位结构", 但也不是模型的错(语料就
             # 这么散)。保留并说明, 不静默丢。
+            #
+            # **复用已有板块的不能这么判**(10-06): 增量模式下 kept 只是这批
+            # 未归类主题里落在该板块的那几个, 板块里原有的几十个主题根本不在
+            # 输入里。按 kept 数告警会把正常的复用报成"1:1 空壳", 是纯误报。
             warnings.append(f"宏观板块「{name}」只含 1 个主题, 不构成上位聚类")
+        elif name in ex_names:
+            warnings.append(f"宏观板块「{name}」复用已有板块, 这次新增 {len(kept)} 个主题")
         for tn in kept:
             if tn in taken and taken[tn] != name:
                 warnings.append(f"主题「{tn}」被多个宏观板块收编(『{taken[tn]}』和『{name}』), 以后者为准")
@@ -1040,6 +1097,10 @@ def cluster_themes_into_macros(
             "statement": (m.get("statement") or "").strip(),
             "notes": (m.get("notes") or "").strip(),
             "theme_names": kept,
+            # 复用已有板块时, 调用方必须知道: 它的 statement/notes 会被
+            # upsert 覆盖, 而原有的几十个主题并不在 kept 里。不标出来的话
+            # 调用方只能把"改了名字的板块"和"新建的板块"同等对待。
+            "reused": name in ex_names,
             "cross_notes": [x.strip() for x in (m.get("cross_notes") or [])
                             if isinstance(x, str) and x.strip()],
         })

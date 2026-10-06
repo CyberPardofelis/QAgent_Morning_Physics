@@ -216,53 +216,85 @@ def run_one(ws: Path, facts: list[dict], dry: bool) -> dict:
 
 
 def macro_layer(dry: bool) -> int:
-    """宏观层: 对**全局**主题跑一次(不是 per-workspace)。
+    """宏观层: **只对未归类的主题**跑一次, 并优先并入已有板块(10-06 改)。
 
     这是"主题和 workspace 无关"的直接体现 —— 宏观主题是整个语料的上位结构,
     逐 workspace 各聚一次会得到一堆互不相干的半截图。
 
-    **statement 要截断**: 184 个主题全量塞进去 prompt 约 15K 字符, 远超实测的
-    8000 字符安全线(9458 正常 / 13194 卡死)。宏观层要判断的是"哪几个主题属于
-    同一块", 靠主题名 + 领域判断的前 80 字就够, 全文只会撑爆预算。
+    **为什么从"全量重聚"改成"只聚未归类的"(10-06 实测踩的坑)**:
+    原来是 `WHERE EXISTS(...)` 全量取, 主题数只增不减 —— 209 个主题一次塞进
+    prompt = 19351 字符, 而 timeout=300 秒。实测 6575 字符就要 160 秒, 所以
+    **必然超时**, 连撞两次, 宏观板块一个没落。更糟的是这不会随时间自愈:
+    下次回填只会让 prompt 更长。
+
+    改成只取 `macro_id IS NULL` 之后, 这次的输入就是实际待归类的 28 个,
+    prompt 约 2500 字符, 一次过。附带两个好处:
+      - **历史结构只增不改**: 上一轮定好的板块边界不会被这轮换个措辞推翻。
+      - **天然幂等**: 全都归完类之后, 待处理数是 0, 直接跳过。
+
+    **statement 要截断**: 这一层要判断的是"哪几个主题属于同一块", 靠主题名
+    + 领域判断的前 80 字就够, 全文只会撑爆预算。
     """
     with connect("facts") as conn:
         rows = conn.execute("""
-            SELECT t.name, t.statement, t.macro_id,
+            SELECT t.name, t.statement,
                    (SELECT COUNT(*) FROM theme_fact tf WHERE tf.theme_id=t.id) AS n
               FROM theme t
-             WHERE EXISTS (SELECT 1 FROM theme_fact tf WHERE tf.theme_id=t.id)
+             WHERE t.macro_id IS NULL
+               AND EXISTS (SELECT 1 FROM theme_fact tf WHERE tf.theme_id=t.id)
+             ORDER BY n DESC
+        """).fetchall()
+        existing = conn.execute("""
+            SELECT m.name, m.statement,
+                   (SELECT COUNT(*) FROM theme t WHERE t.macro_id=m.id) AS n
+              FROM theme_macro m
              ORDER BY n DESC
         """).fetchall()
     themes = [{"name": r["name"],
                "statement": (r["statement"] or "")[:80],
                "n": r["n"],
                "fact_ids": [str(i)] * r["n"]} for i, r in enumerate(rows)]
+    ex = [{"name": r["name"], "statement": (r["statement"] or "")[:80],
+           "n_themes": r["n"]} for r in existing]
     if len(themes) < 2:
-        print(f"主题只有 {len(themes)} 个, 不做宏观聚类")
+        print(f"未归类主题只有 {len(themes)} 个, 不做宏观聚类"
+              f" (已有板块 {len(ex)} 个)")
         return 0
-    est = sum(len(t["name"]) + len(t["statement"]) + 40 for t in themes) + 900
-    print(f"[macro] 全局 {len(themes)} 个主题, prompt 约 {est} 字符"
-          f" (statement 已截到 80 字)")
+    est = (sum(len(t["name"]) + len(t["statement"]) + 40 for t in themes)
+           + sum(len(e["name"]) + len(e["statement"]) for e in ex) + 1200)
+    print(f"[macro] 未归类 {len(themes)} 个主题 + 已有 {len(ex)} 个板块, "
+          f"prompt 约 {est} 字符 (statement 已截到 80 字)")
     if est > 12000:
         print("[macro] ⚠ 仍偏大(安全线 8000), 这次可能因超时失败; "
               "失败会如实报告而不是挂起")
     if dry:
         return 0
-    macros, warns = O.cluster_themes_into_macros(themes, model=MODEL)
+    macros, warns = O.cluster_themes_into_macros(
+        themes, model=MODEL, existing_macros=ex)
     for w in warns:
         print(f"  ⚠ {w}")
     if not macros:
         return 0
+    n_new = n_reuse = 0
     with connect("facts") as conn:
         for m in macros:
-            mid = tg.upsert_macro(conn, m["name"], m.get("statement", ""),
-                                  m.get("notes", ""))
+            reused = bool(m.get("reused"))
+            # 复用已有板块时**传空 statement/notes = 保留原文**。upsert_macro
+            # 用 COALESCE(NULLIF(?,''), statement), 空串就等于"不改"。
+            # 这次模型只看到这批未归类主题, 看不到板块里原有的几十个主题,
+            # 它重写的 statement 必然是残缺的(只描述新增的那几个)。
+            mid = tg.upsert_macro(
+                conn, m["name"],
+                "" if reused else m.get("statement", ""),
+                "" if reused else m.get("notes", ""))
+            n_reuse += reused
+            n_new += not reused
             for tn in m["theme_names"]:
                 conn.execute(
                     "UPDATE theme SET macro_id = ?, updated_at = CURRENT_TIMESTAMP "
                     "WHERE name = ?", (mid, (tn or "").strip()))
-    print(f"[macro] 落库 {len(macros)} 个宏观板块, 覆盖 "
-          f"{sum(len(m['theme_names']) for m in macros)} 个主题")
+    print(f"[macro] 落库 板块 {len(macros)} 个 (新建 {n_new} / 复用 {n_reuse}), "
+          f"覆盖 {sum(len(m['theme_names']) for m in macros)} 个主题")
     return len(macros)
 
 
@@ -282,7 +314,14 @@ def main() -> int:
 
     tg.init_schema()
     if args.macro_only:
-        print(f"宏观板块 {macro_layer(False)} 个")
+        # 10-06 修: 原来写死 `macro_layer(False)`, **把 --dry 丢了** ——
+        # `--macro-only --dry` 会真的发请求。实测撞上过: 想先看 prompt 估算
+        # 有多大, 结果一发就是 300 秒起步的真实调用, 而"0 个板块"这个输出
+        # 看起来跟真跑过一模一样, 事后根本分不清跑没跑。
+        if not args.dry:
+            preflight(MODEL, n_calls=1)
+        n = macro_layer(args.dry)
+        print(f"宏观板块 {n} 个" + ("  (--dry: 只报估算, 没发请求)" if args.dry else ""))
         with connect("facts") as conn:
             s = tg.stats(conn)
         for k, v in s.items():
