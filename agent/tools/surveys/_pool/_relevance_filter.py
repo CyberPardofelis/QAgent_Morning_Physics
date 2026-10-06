@@ -159,12 +159,41 @@ def _relevance_filter_pool(
             flush=True,
         )
 
+    # 10-07 修: 这个"LLM 整体不可用"的保护网原来在 strict 分支**后面**, 而
+    # 唯一调用方 `_pool_audit.py:156` 传的是 `strict=True` —— 于是它在生产里
+    # **从来没被执行过**, 整段是死代码。
+    #
+    # 后果: MiniMax 挂掉时, 每批都失败 -> 每篇都打 [fallback] -> 全部被踢 ->
+    # strict 返空 -> 调用方重试三轮(每轮都同样失败) -> 最终 pool=[] ->
+    # 界面报"换个主题词(优先英文)"。**归因完全错了**: 真因是相关性审查 API 不
+    # 可用。更糟的是它**比静默更贵** —— 用户会照着错误建议去改选题。
+    #
+    # 调用方本来就有兜底(`except` 时放行全部), 但 strict 返空不抛异常, 那个兜底
+    # 永远不触发。意图和实现是打架的。
+    #
+    # 提到 strict 之前: "LLM 整体不可用"和"主题太偏"是两件不同的事, 只有前者
+    # 值得放行。真的全都不相关时(拿到了 LLM 判断)仍然按 strict 返空。
+    if pool_dict and all(
+        p.get("_relevance_reason", "").startswith(("[fallback]", "[batch_failed]"))
+        for p in pool_dict.values()
+    ):
+        msg = (
+            f"[_relevance_filter_pool] ⚠ 所有 {len(pool_dict)} 篇都是 LLM "
+            f"fallback/batch_failed 标记 -> **相关性审查整体不可用**(API 故障或超时), "
+            f"不是主题不匹配。本轮跳过相关性过滤, 原样保留全部候选"
+            f"(topic={topic[:50]!r})。"
+            f"如果最终候选池为空, 排查方向应该是 API 连通性/额度, 而不是换主题词"
+        )
+        print(msg, flush=True)
+        logger.warning(msg)
+        return dict(pool_dict)
+
     # 9-18: strict 模式 — 不 rescue 不抛错, 全 0 返空
     if strict:
         if not kept:
             print(
                 f"[_relevance_filter_pool] strict 模式: 全部 {len(pool_dict)} 篇被踢光, 返空 dict "
-                f"(topic={topic[:50]!r})",
+                f"(topic={topic[:50]!r}) —— 这些论文确实拿到了 LLM 判断且被判不相关",
                 flush=True,
             )
             return {}
@@ -177,16 +206,8 @@ def _relevance_filter_pool(
         return kept
 
     # 9-09 优化: 全部 paper 都标 [fallback] / [batch_failed] → LLM 整体失败, 不应用任何过滤
-    all_fallback = all(
-        p.get("_relevance_reason", "").startswith(("[fallback]", "[batch_failed]"))
-        for p in pool_dict.values()
-    )
-    if all_fallback:
-        logger.warning(
-            "[_relevance_filter_pool] 所有 paper 都是 LLM fallback/batch_failed 标记, "
-            "跳过 relevance 过滤, 原样返回 (LLM 整体不可用, 让 chroma/summary_items/arxiv 兜底)"
-        )
-        return dict(pool_dict)
+    # (10-07: 已提到 strict 分支之前, 那里才是它该生效的地方; 这里是 non-strict 路径的
+    #  同一层保护, 保留以防有人再挪回去)
 
     if len(kept) < 5 and len(kept) > 0:
         # 兜底: 取剩余的按 score 倒序, 补足到 5 篇 (避免下游 "候选池为空" 假阳)
