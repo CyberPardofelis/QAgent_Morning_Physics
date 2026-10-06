@@ -297,34 +297,128 @@ def test_empty_gaps_short_circuits(monkeypatch):
 
 
 # ============================================================
-# 标注: 试过的要标出来
+# 标注: 只能标"这一轮真判过"的那些原文
 # ============================================================
 
-def test_annotate_marks_filled_and_unfillable():
-    """回补跑完之后, 空白清单必须能看出哪些试过、哪些判了补不上。
+def test_gap_fill_never_labels_the_freshly_generated_gap_list():
+    """**核心护栏**: 不得拿上一轮的判定去标这一轮新生成的 gaps。
 
-    不标的话清单跟没跑过一样, 用户分不清"试过补不上"和"没人管"。
+    10-06 实测的 bug: `tmap["gaps"]` 是重跑主题地图时模型**重新生成**的一批
+    (31 → 32 条), 和第一轮的原文逐字不同的概率极高。拿第一轮的 `filled` 去标
+    它, 命中 0 → 32 条**全部**被打上"（判定补不上）", 包括刚刚真的搜成功、
+    真的加进 141 条 fact 的那 5 条。
+
+    这比静默更糟: 它看着权威、很确定、而且是错的。原来的 `_annotate_gaps`
+    单测全绿, 因为它只测"给定两个字符串集合能不能标对", 从没测过这两组
+    字符串**来自两轮独立生成** —— 那是唯一会出事的前提。
     """
-    out = SG._annotate_gaps(["A", "B", "C"], {"A"})
-    assert out[0] == "（已检索回补）A"
-    assert out[1] == "（判定补不上）B"
-    assert out[2] == "（判定补不上）C"
+    src = pathlib.Path(SG.__file__).read_text(encoding="utf-8")
+    body = src.split("def _phase_gap_fill", 1)[1].split("def _run_organize_phase", 1)[0]
+    assert "_annotate_gaps" not in body, \
+        "回补里还在调 _annotate_gaps —— 它按文本匹配标新一轮的 gaps, 会全标错"
+    assert not hasattr(SG, "_annotate_gaps"), \
+        "_annotate_gaps 这个函数本身就不该存在了(没人调用, 且按文本匹配会标错)"
+    # 正确的做法: 把真判过的原文挂成结构化字段
+    assert 'theme_map["gap_fill_rounds"]' in body, \
+        "回补结果应该挂成 gap_fill_rounds(记的是这一轮真判过的原文)"
 
 
-def test_annotate_never_shows_a_reason():
-    """标注里不能夹带模型给的理由 —— 那个字段已被证明会自相矛盾。"""
-    out = SG._annotate_gaps(["A"], set())
-    assert "：" not in out[0] and ":" not in out[0], \
-        "标注只能有固定前缀, 不能回显模型理由"
+def test_gap_fill_record_carries_the_round_we_actually_judged(monkeypatch):
+    """挂上去的必须是**第一轮的原文**, 带检索式和分数, 而不是新一轮的 gaps。"""
+    real = ["第一轮空白甲", "第一轮空白乙"]
+    verdict = {
+        "fillable": [{"gap": "第一轮空白甲", "query": "q for 甲 neutral atom",
+                      "score": 9}],
+        "unfillable": ["第一轮空白乙"], "ok": True, "error": "",
+    }
+
+    class _W:
+        """够用的假 workspace: 只提供被调用到的那两个方法。"""
+        path = pathlib.Path(".")
+
+        def __init__(self):
+            self.saved_pool = None
+
+        def save_pool(self, pool):
+            self.saved_pool = len(pool)
+
+    # 把两个 action 换成不花钱的假货
+    import agent.tools.surveys._actions as _actions
+
+    def _fake_search(args, state, ws):
+        state["pool"].append({"paper_id": "NEW-1", "title": "新论文"})
+        yield "   找到 1 篇"
+
+    def _fake_extract(args, state, ws):
+        state["facts"].append({"fact_id": "F-NEW", "claim": "新 fact",
+                               "type": "finding", "subject": "s",
+                               "is_about_topic": True, "usable": True})
+        yield "   抽完 1 篇"
+
+    monkeypatch.setattr(_actions, "action_search_more", _fake_search)
+    monkeypatch.setattr(_actions, "action_extract_facts", _fake_extract)
+
+    seen = {}
+
+    def _fake_organize(usable, paper_titles=None, **kw):
+        # 模拟"重跑生成了全新一批 gaps, 跟第一轮一个词都不重合"。
+        # **故意给 3 条而不是 2 条**: 条数必须跟第一轮不同, 否则
+        # `n_judged` 断言在"挂错了列表"的情况下也会凑巧相等 —— 那样这条
+        # 护栏就是空壳(反向验证 G18 踩过: 首轮 19/22, 这条改坏了仍然绿)。
+        seen["gaps"] = ["第二轮重新生成的空白 1", "第二轮重新生成的空白 2",
+                        "第二轮重新生成的空白 3"]
+        return {"themes": [{"name": "新主题", "fact_ids": ["F-NEW"],
+                            "statement": "", "notes": "", "relations": []}],
+                "narrative_arc": [], "gaps": list(seen["gaps"]), "warnings": []}
+
+    from agent.tools.surveys import _organize as ORG
+    monkeypatch.setattr(ORG, "organize_facts_into_themes", _fake_organize)
+    monkeypatch.setattr(ORG, "save_thematic_map", lambda ws, tm: None)
+
+    # gaps_to_queries 直接返回我们准备好的判定
+    monkeypatch.setattr("agent.tools.surveys._pool._query_expand.gaps_to_queries",
+                        lambda topic, gaps, max_queries=4: verdict)
+
+    ws = _W()
+    gen = SG._phase_gap_fill("t", ws, {"themes": [{"name": "旧主题"}],
+                                       "gaps": list(real)},
+                             [{"paper_id": "OLD"}], [], [], "sig")
+    out = None
+    try:
+        while True:
+            next(gen)
+    except StopIteration as e:
+        out = e.value
+    assert out is not None, "生成器没跑完"
+
+    new_map, _pool, _usable, fill_log = out
+    # ① 新生成的 gaps 一个字都不能被加前缀
+    assert new_map["gaps"] == seen["gaps"], \
+        f"新一轮的 gaps 被贴了上一轮的标签: {new_map['gaps']}"
+    # ② 真判过的那批原文在结构化字段里, 且带检索式/分数
+    rounds = new_map.get("gap_fill_rounds") or []
+    assert len(rounds) == 1, f"应该记 1 轮回补, 实际 {len(rounds)}"
+    r0 = rounds[0]
+    assert r0["n_judged"] == 2, r0
+    assert [a["gap"] for a in r0["acted"]] == ["第一轮空白甲"], r0
+    assert r0["acted"][0]["query"] == "q for 甲 neutral atom"
+    assert r0["judged_not_acted"] == ["第一轮空白乙"], r0
 
 
-def test_annotate_empty_is_empty():
-    assert SG._annotate_gaps([], set()) == []
+def test_zero_name_overlap_is_loud():
+    """按名合并命中 0 必须喊出来。
 
+    之前那行只中性地说"(新增 8, 保留 0)", 看着像正常结果。实测 0/8 是**异常**:
+    主题名模型每轮重新生成, 逐字相同的概率极低, 所以"新 fact 并进已有主题"
+    实际上没有发生, 依赖旧主题名的下游产物会接不上。
+    """
+    src = pathlib.Path(SG.__file__).read_text(encoding="utf-8")
+    body = src.split("def _phase_gap_fill", 1)[1].split("def _run_organize_phase", 1)[0]
+    assert "if not kept:" in body, "合并命中 0 没有单独的警告分支"
+    seg = body.split("if not kept:", 1)[1][:400]
+    assert "命中 0" in seg, "警告文案没说清这是异常"
+    assert "接不上" in seg, "警告没说清后果(下游产物接不上)"
 
-# ============================================================
-# 接线与开关
-# ============================================================
 
 def test_gap_fill_wired_after_theme_map_before_macros():
     """回补必须在**主题地图之后、宏观层之前**。
@@ -342,15 +436,15 @@ def test_gap_fill_wired_after_theme_map_before_macros():
         "三个阶段标记没找全(顺序标记可能改了写法)"
     assert i_b < i_fill < i_macro, \
         f"顺序错了: theme_map({i_b}) < gap_fill({i_fill}) < macros({i_macro})"
-    # 空白标注也必须真的挂在回补里 —— 直接调 _annotate_gaps 的单测盖不住"忘了接线"。
-    # 注意它写在 _phase_gap_fill **函数体内**(704 行), 而不是那个 yield from(856 行),
-    # 所以只能按"落在函数体内"来判, 不能按全局偏移比大小。
+    # 空白回补记录也必须真的挂在回补里。**必须落在 _phase_gap_fill 函数体内**
+    # —— 注意它写在函数体里(700 行附近), 而那个 `yield from _phase_gap_fill(`
+    # 的调用点在 800 行附近, 找 def 或按全局偏移比大小都会判错。
     i_def = src.find("def _phase_gap_fill")
-    i_next_def = src.find("def _annotate_gaps")
-    i_anno = src.find('tmap["gaps"] = _annotate_gaps(')
-    assert i_anno != -1, "回补后没给空白打标记, 清单跟没跑过一样"
-    assert i_def < i_anno < i_next_def, \
-        f"标注调用({i_anno})必须落在 _phase_gap_fill({i_def})函数体内"
+    i_next_def = src.find("def _run_organize_phase")
+    i_rec = src.find('theme_map["gap_fill_rounds"]')
+    assert i_rec != -1, "回补结果没挂到主题地图上, 渲染层看不到这轮干了什么"
+    assert i_def < i_rec < i_next_def, \
+        f"挂载点({i_rec})必须落在 _phase_gap_fill({i_def})函数体内"
 
 
 def test_gap_fill_prompt_demands_english_query():

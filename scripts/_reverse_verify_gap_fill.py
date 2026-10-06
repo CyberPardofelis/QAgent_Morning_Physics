@@ -23,9 +23,9 @@ TEST = "tests/test_survey_gap_fill.py"
 # (编号, 说明, 文件, 变异前, 变异后, 期望失败的测试名片段)
 MUTATIONS = [
     # ---------- 解析层: NUL / think / 重试 ----------
-    ("G1", "NUL 字节不再洗掉 —— 10-06 实测 6/6 次调用全中招, 整轮回补静默消失",
+    ("G1", "_parse_gap_verdict 不再清洗 —— 10-06 实测 6/6 次调用全中招, 整轮回补静默消失",
      QE,
-     '    if "\\x00" in raw:\n        raw = raw.replace("\\x00", "")',
+     "    raw = sanitize_llm_text(raw)",
      "    pass",
      "test_real_raw_parses_to_all_31_gaps"),
 
@@ -128,24 +128,22 @@ MUTATIONS = [
      "        if False:\n            new_papers = new_papers",
      "test_gap_fill_caps_papers"),
 
-    ("G17", "空白标注被拿掉 —— 跑完之后清单跟没跑过一样, 用户分不清试过没试过",
+    ("G17", "回补结果不挂到主题地图上 —— 渲染层看不到这轮干了什么",
      SG,
-     '        tmap["gaps"] = _annotate_gaps(tmap.get("gaps") or [], filled_gaps)',
-     '        tmap["gaps"] = list(tmap.get("gaps") or [])',
+     '        theme_map["gap_fill_rounds"] = prev + fill_log[-1:]',
+     "        pass",
      "test_gap_fill_wired_after_theme_map_before_macros"),
 
-    ("G18", "标注里改回回显模型理由 —— 实测那个理由会跟\"补不上\"自相矛盾",
+    ("G18", "回补记录挂的是新一轮的 gaps 而不是真判过的原文 —— 记的东西是假的",
      SG,
-     '    return [f"（已检索回补）{g}" if g in filled else f"（判定补不上）{g}"\n'
-     "            for g in gaps]",
-     '    return [f"（已检索回补）{g}: {filled_reason}" if g in filled '
-     'else f"（判定补不上）{g}: {filled_reason}"\n            for g in gaps]',
-     "test_annotate_never_shows_a_reason"),
+     '                         "n_judged": len(gaps)})',
+     '                         "n_judged": len(tmap.get("gaps") or [])})',
+     "test_gap_fill_record_carries_the_round_we_actually_judged"),
 
     ("G19", "三个闸门放开区间 —— 12 条检索式 × 200 篇是四位数次调用",
      CFG,
-     '    "QAGENT_SURVEY_GAP_FILL_QUERIES", 3, 1, 12)',
-     '    "QAGENT_SURVEY_GAP_FILL_QUERIES", 3, 1, 99)',
+     '    "QAGENT_SURVEY_GAP_FILL_PAPERS", 20, 1, 200)',
+     '    "QAGENT_SURVEY_GAP_FILL_PAPERS", 20, 1, 999)',
      "test_gap_fill_bounds"),
 
     ("G20", "回补轮数上限放开 —— 多轮换不来东西, 第二轮的空白往往还是补不上",

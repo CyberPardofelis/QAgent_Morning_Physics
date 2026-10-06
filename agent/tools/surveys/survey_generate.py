@@ -693,7 +693,7 @@ def _phase_gap_fill(topic: str, ws, theme_map: dict[str, Any],
         # _extract_facts.py:158 就 `ws.append_fact(f)` 逐条落盘了,
         # 主线 `_stage_facts`(415-425 行)同样从不单独存 fact。
 
-        # ---- 重跑主题地图 (分块 + 按名合并, 新 fact 自动并进已有主题) ----
+        # ---- 重跑主题地图 (分块归纳, 新 fact 自动进入新地图) ----
         titles = {p["paper_id"]: (p.get("title") or "") for p in pool}
         from ._organize import organize_facts_into_themes, save_thematic_map
         tmap = organize_facts_into_themes(usable, paper_titles=titles)
@@ -702,33 +702,38 @@ def _phase_gap_fill(topic: str, ws, theme_map: dict[str, Any],
             break
         old_names = {t["name"] for t in theme_map.get("themes") or []}
         new_names = {t["name"] for t in tmap["themes"]}
-        # 本轮真去搜过的空白标"已回补", 其余标"判定补不上"。模型给的判定理由
-        # **不回显** —— 实测它会写出"这方向的文献存在"这种跟"补不上"自相矛盾
-        # 的句子, 出现在最终综述里比没有理由更糟(见 _query_expand.gaps_to_queries)。
-        filled_gaps = {f["gap"] for f in fillable}
-        tmap["gaps"] = _annotate_gaps(tmap.get("gaps") or [], filled_gaps)
+        kept = len(new_names & old_names)
         theme_map = tmap
         save_thematic_map(ws, theme_map)
         yield (f"   主题地图重跑: {len(old_names)} → {len(new_names)} 个主题"
-               f"(新增 {len(new_names - old_names)}, 保留 {len(new_names & old_names)})\n")
+               f"(新增 {len(new_names - old_names)}, 按名合并命中 {kept})\n")
+        if not kept:
+            # 「宁可吵, 不可静默」: 之前这里只中性地说"新增 8, 保留 0",
+            # 看着像正常结果。实测(10-06 中性原子综述)就是 0/8 —— 主题名是模型
+            # 每轮重新生成的, 逐字相同的概率极低, 所以"新 fact 并进已有主题"
+            # 实际上**没有发生**。依赖旧主题名的下游产物(_claims /
+            # _narratives / surveys.db 的 survey_section)会接不上, 必须说。
+            yield ("   ⚠ 按名合并命中 0: 主题名被整批换掉了(不是新增 fact 落在\n"
+                   "     孤立主题里, 是旧主题名一个都没保住)。依赖旧主题名的下游\n"
+                   "     产物(_claims / _narratives / survey_section)会接不上。\n")
         fill_log.append({"round": rnd, "n_new_papers": len(new_papers),
                          "n_new_facts": len(new_facts),
                          "n_themes": len(new_names),
-                         "filled": [f["gap"] for f in fillable],
-                         "queries": [f["query"] for f in fillable]})
+                         "n_kept_by_name": kept,
+                         "acted": [{"gap": f["gap"], "query": f["query"],
+                                    "score": f["score"]} for f in fillable],
+                         "judged_not_acted": list(verdict.get("unfillable") or []),
+                         "n_judged": len(gaps)})
+        # 把**这一轮真的判过、真的搜过的那些空白原文**挂到主题地图上。
+        # 注意挂的是**第一轮的原文**, 不是 tmap["gaps"] —— 后者是重跑后模型
+        # **重新生成**的一批, 和第一轮逐字不同的概率极高。
+        # 10-06 实测踩过: 拿第一轮的 filled 去标第二轮的列表, 命中 0,
+        # 32 条**全部**被打上"判定补不上", 包括刚搜成功的 5 条。那比静默更糟 ——
+        # 它看着权威、很确定、而且是错的。
+        prev = theme_map.get("gap_fill_rounds") or []
+        theme_map["gap_fill_rounds"] = prev + fill_log[-1:]
 
     return theme_map, pool, usable, fill_log
-
-
-def _annotate_gaps(gaps: list[str], filled: set[str]) -> list[str]:
-    """给回补后的空白打标记: 本轮真去搜过的 / 判定补不上的。
-
-    **不标的后果**: 回补跑完之后空白清单看起来跟没跑过一样, 用户分不清
-    "这些是试过补不上的" 还是 "这些压根没人管" —— 这正是「宁可吵不可静默」
-    要防的那种沉默。
-    """
-    return [f"（已检索回补）{g}" if g in filled else f"（判定补不上）{g}"
-            for g in gaps]
 
 
 def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,

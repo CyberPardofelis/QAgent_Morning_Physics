@@ -2298,6 +2298,25 @@ def render_survey(
     gaps = theme_map.get("gaps") or []
     if gaps:
         body_parts.append("## 文献覆盖的空白\n\n" + "\n".join(f"- {g}" for g in gaps))
+    # 10-06 加: 覆盖空白回补的记录。
+    # **只报这一轮真的判过、真的搜过的那些空白原文**(theme_map.gap_fill_rounds),
+    # 绝不把上一轮的判定贴到这一轮重新生成的 gaps 上 —— 实测那样会 32 条全部
+    # 标成"判定补不上", 包括刚搜成功的那几条。看着权威但全错, 比静默更糟。
+    for r in theme_map.get("gap_fill_rounds") or []:
+        acted = r.get("acted") or []
+        not_acted = r.get("judged_not_acted") or []
+        body_parts.append(
+            f"## 覆盖空白回补(第 {r.get('round', '?')} 轮)\n\n"
+            f"针对上一轮归纳出的 {r.get('n_judged', '?')} 条空白打分后, "
+            f"回补 {len(acted)} 条, 新增 {r.get('n_new_papers', 0)} 篇论文 / "
+            f"{r.get('n_new_facts', 0)} 条 fact。"
+            + (f"\n\n判定为补不上、本轮没去搜的 {len(not_acted)} 条: "
+               + "\n".join(f"- {g}" for g in not_acted) if not_acted else "")
+            + "\n\n本轮实际检索的空白:\n"
+            + "\n".join(
+                f"- {a.get('score', '?')} 分 · {a.get('gap', '')}\n"
+                f"  → 检索式 `{a.get('query', '')}`"
+                for a in acted))
     # 9-30: 正文先拼好(此时引用还是 [paper_id]), **一次性编号化**,
     # 同一张映射表交给参考文献表 —— 之前两边各自编号, 格式对不上。
     body, pid2num = renumber_citations("\n\n".join(body_parts))
