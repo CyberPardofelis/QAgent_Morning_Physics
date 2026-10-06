@@ -151,6 +151,45 @@ _SURVEY_EXPAND_MAX_ADD = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_MAX_AD
 _SURVEY_EXPAND_REQUESTS = _resolve_survey_expand_int("QAGENT_SURVEY_EXPAND_REQUESTS", 12, 1, 200)
 
 
+# ============================================================
+# Survey 工具: Phase A LLM 查询扩展 (2026-10-06 加)
+# ============================================================
+# 背景: 10-06 实测 topic="neutral atom quantum computing" —— OpenAlex 全库
+# 命中 8 万+, 本地语料 247 篇里 0 篇相关, 最终候选池只有 39 篇。原因是三路
+# 外部召回全都拿 topic **原词**搜, 每路 k<=30 封顶。检索面就那么大, 跟领域
+# 实际大小无关。
+#
+# 这一步花 1 次 LLM 调用把主题拆成细分方向 + 英文检索式, 拿检索式再打一轮。
+# 顺带产出的细分方向就是综述的主题骨架(见 _query_expand 模块头注释)。
+#
+#   QAGENT_SURVEY_QUERY_EXPAND=0   关掉查询扩展(默认开)
+#   QAGENT_SURVEY_QUERY_EXPAND_N=N 拆几个细分方向/检索式, 默认 6
+#   QAGENT_SURVEY_QUERY_EXPAND_K=N 每条检索式每源取几篇, 默认 4
+#
+# 括号里是**合法区间**, 不是夹取边界: 越界的值回落到默认值
+# (`_resolve_survey_expand_int` 是 `lo <= v <= hi ? v : default`)。
+# 设 N=999 拿到的是 6, 不是 12。
+#
+# K 故意压小: 召回进来的每一篇都要过 LLM 相关性审查(5 篇一次调用), 拉一大坨
+# 进来比省下的 HTTP 时间贵得多。
+_SURVEY_QUERY_EXPAND_ENABLED = os.getenv(
+    "QAGENT_SURVEY_QUERY_EXPAND", "1").strip() not in ("0", "false", "False")
+_SURVEY_QUERY_EXPAND_N = _resolve_survey_expand_int(
+    "QAGENT_SURVEY_QUERY_EXPAND_N", 6, 1, 12)
+_SURVEY_QUERY_EXPAND_K = _resolve_survey_expand_int(
+    "QAGENT_SURVEY_QUERY_EXPAND_K", 4, 1, 20)
+
+
+def get_query_expand_n() -> int:
+    """LLM 拆几个细分方向。0 = 关掉查询扩展。"""
+    return _SURVEY_QUERY_EXPAND_N if _SURVEY_QUERY_EXPAND_ENABLED else 0
+
+
+def get_query_expand_k() -> int:
+    """每条检索式、每个外部源取几篇。"""
+    return _SURVEY_QUERY_EXPAND_K
+
+
 def get_survey_expand() -> dict:
     """引文图扩展配置 (见本节上方的环境变量说明)."""
     return {

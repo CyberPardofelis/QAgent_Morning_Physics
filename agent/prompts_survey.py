@@ -960,6 +960,49 @@ search_more 多源 (9-18 user 拍板):
 #   - 显式强调"X 本身" vs "X 的子方向" vs "邻近子领域" 三档
 #   - is_about_topic bool: 跟 score 冗余但 LLM 表达更清晰, 严判字段
 #   - is_adjacent_field bool: 跟 mechanism B fact review 配套, audit 用
+SURVEY_QUERY_EXPAND_PROMPT = """你是文献检索词规划助手。
+
+【综述主题】: {topic}
+
+【任务】: 把这个主题**拆成若干个细分研究方向**, 并为每个方向写一条**英文检索式**。
+
+检索式是喂给 arxiv / OpenAlex 的, 它们都是英文 API, 所以 queries **必须是英文**。
+
+【为什么要拆】
+一个宏观主题直接拿去检索, 召回的是这个领域最表层的那批论文, 而且各方向
+的论文混在一起分不开。拆成细分方向之后:
+  - 每个检索式单独打一个方向, 召回的面窄但准
+  - 细分方向名本身就是综述的主题骨架, 后面 Phase B 归纳主题时能用
+
+【怎么拆】
+1. 按**该领域真实存在的子方向**拆, 不是按你想象的分类树。回忆这个领域
+   实际发论文时分的那些小方向。
+2. 每个方向 4-12 个英文单词, 包含该方向**特有的技术术语**, 越具体越好。
+   "quantum error correction" 太宽, "surface code decoding with neutral atom
+   processors" 才是能召回论文的检索式。
+3. **不要**把原主题原样重复一遍当一条 query。
+4. 如果主题本身已经是个细分方向, 就拆它的更细的子项(方法/平台/度量的细分)。
+5. 方向数 {n} 个左右。宁可少而准, 不要多而泛。
+
+【输出格式】严格 JSON, 不要 markdown 包裹:
+{{
+  "sub_directions": [
+    {{"name": "细分方向名(可以用中文)", "why": "这个方向研究什么(一句话)"}}
+  ],
+  "queries": [
+    {{"direction": "对应的细分方向名(和上面一致)", "q": "英文检索式"}}
+  ]
+}}
+
+queries 一条对应一个细分方向, 数量和 sub_directions 一致。
+只输出 JSON。"""
+
+
+def build_query_expand_prompt(topic: str, n: int = 6) -> str:
+    """构造查询扩展 prompt。检索式必须是英文 —— arxiv / OpenAlex 都是英文 API。"""
+    return SURVEY_QUERY_EXPAND_PROMPT.format(topic=topic or "(未指定主题)", n=n)
+
+
 SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
 
 【综述主题】: {topic}

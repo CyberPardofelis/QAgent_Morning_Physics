@@ -13,12 +13,21 @@ from agent.infra.console import safe_print  # 控制台 cp936 编不了 emoji �
 from agent.tools.config import (
     get_chroma_sim_threshold,
     get_min_pool_papers,
+    get_query_expand_k,
+    get_query_expand_n,
     get_relevance_threshold,
 )
 
 from .._paper_id import dedup_key, normalize_arxiv_id
-from ._openalex import _openalex_aps_search, _openalex_iop_search
+from ._arxiv import _arxiv_search_batch
+from ._openalex import (
+    _openalex_aps_search,
+    _openalex_aps_search_batch,
+    _openalex_iop_search,
+    _openalex_iop_search_batch,
+)
 from ._pool_audit import _audit_pool_with_retry
+from ._query_expand import expand_queries
 from ._topic_match import entry_text, qualifies
 from ._utils import _arxiv_author_name
 
@@ -191,6 +200,44 @@ def _build_candidate_pool(
     # 9-18 user 拍板: "survey 工具应该用搜索工具搜索, 不要总用 arxiv".
     external_status: dict[str, str] = {}  # 每路状态: skipped / 0_results / success / exception:...
 
+    # ========== 3z. LLM 查询扩展 (10-06 加) ==========
+    # **只在真的要靠外部召回时才付这 1 次 LLM**: 本地池已经够大就不扩, 免得
+    # 每次都白花一次调用。实测(中性原子) 本地语料 247 篇里 0 篇相关, 所以
+    # 这里几乎必然触发 —— 正是它该触发的场合。
+    #
+    # 扩展出来的**细分方向**也一并留着, 它不只是检索词: 它就是综述的主题
+    # 骨架。宏观主题直接跑出来"章节区分度低", 根因就是没拆过细分方向。
+    # (用户 10-06 实测: 细分方向上这个工具的效果明显好于宏观方向)
+    qexp: dict[str, Any] = {"queries": [], "sub_directions": [],
+                            "ok": False, "error": ""}
+    _n_expand = get_query_expand_n()
+    if _n_expand <= 0:
+        safe_print(
+            "[_build_candidate_pool] 查询扩展 skipped  (QAGENT_SURVEY_QUERY_EXPAND=0)",
+            flush=True,
+        )
+    elif len(pool_dict) < _MIN_POOL:
+        safe_print(
+            f"[_build_candidate_pool] 查询扩展 start  本地池 {len(pool_dict)}<{_MIN_POOL}, "
+            f"拿 LLM 拆细分方向", flush=True,
+        )
+        qexp = expand_queries(topic, n=_n_expand)
+        if not qexp.get("ok"):
+            safe_print(
+                f"[_build_candidate_pool] ⚠ 查询扩展没成功 ({qexp.get('error')}), "
+                f"回退用原 topic 检索 —— 召回面会比正常情况窄",
+                flush=True,
+            )
+    else:
+        safe_print(
+            f"[_build_candidate_pool] 查询扩展 skipped  (本地池已够大 "
+            f"{len(pool_dict)}>={_MIN_POOL})", flush=True,
+        )
+
+    # 3a/3b/3c 三路单 query 召回**已经各自跑过原 topic 了**, 所以这里只用扩展
+    # 出来的那些, 不重复拿原词再搜一遍。
+    _qexp_queries = [q for q in (qexp.get("queries") or []) if q and q != topic]
+
     # ========== 3a. APS (OpenAlex, PRL/PRA/PRXQuantum/PRX/RMP) ==========
     if len(pool_dict) < _MIN_POOL:
         # 9-18: 优先 APS 召回. 一次拉足 min_pool 篇, 不要稀稀拉拉 5 篇.
@@ -311,6 +358,63 @@ def _build_candidate_pool(
         external_status["arxiv"] = "skipped"
         safe_print(f"[_build_candidate_pool] arxiv 兜底 skipped  (pool 已够大 {len(pool_dict)}>={_MIN_POOL})", flush=True)
 
+    # ========== 3d. 细分检索式批量召回 (10-06 加) ==========
+    # 3a/3b/3c 三路全部拿 `topic` **原词**搜, 召回面就那么大(实测 39 篇, 而
+    # OpenAlex 全库 8 万+)。这里用扩展出来的细分检索式再打一轮。
+    #
+    # 用的是 9-09 就写好、但一直没接线的三个 `_search_batch`(见各函数
+    # docstring 的"未来 wire in")—— 当时缺的就是这一步的 LLM 扩展。
+    #
+    # **放在 3a/3b/3c 之后**: 原词召回的已经被去重登记了, 这里只算增量。
+    # 每条 query 只取 k_per_query 篇, 宁可多花几次 HTTP 也不要一次拉一大坨
+    # —— 一大坨全要过 LLM 相关性审查(每 5 篇一次调用), 那才是真的贵。
+    if _qexp_queries:
+        k_pq = get_query_expand_k()
+        safe_print(
+            f"[_build_candidate_pool] 细分检索式批量召回 start  "
+            f"{len(_qexp_queries)} 条 query × k={k_pq}  pool={len(pool_dict)}",
+            flush=True,
+        )
+        for label, fn in (
+            ("aps_batch", _openalex_aps_search_batch),
+            ("iop_batch", _openalex_iop_search_batch),
+            ("arxiv_batch", _arxiv_search_batch),
+        ):
+            try:
+                batch = fn(_qexp_queries, k_pq)
+                added = 0
+                for p in batch:
+                    pid = p.get("paper_id", "")
+                    if not pid or dedup_key(pid) in seen_ids:
+                        continue
+                    e = dict(p)
+                    # _search_batch 返回的字段名比单 query 版少, 补齐成
+                    # pool entry 的形状 —— 后面 relevance 审查和 fact 抽取
+                    # 都按这些键取值, 缺了就静默拿到空串。
+                    e.setdefault("journal", "")
+                    e.setdefault("core_method", "")
+                    e.setdefault("core_contrib", "")
+                    e.setdefault("outlook", "")
+                    e.setdefault("year", "")
+                    e.setdefault("keywords", "")
+                    e["_match_score"] = 0
+                    e["_source"] = f"{label}_expanded_query"
+                    add_pool_entry(e)
+                    added += 1
+                external_status[label] = "success" if added else "0_results"
+                safe_print(
+                    f"[_build_candidate_pool] {label} +{added} 篇  pool={len(pool_dict)}",
+                    flush=True,
+                )
+            except Exception as e:                      # noqa: BLE001
+                # 单路挂了就少一路, 绝不能因为一个源失败就丢掉另外两个的结果
+                external_status[label] = f"exception:{type(e).__name__}:{str(e)[:80]}"
+                safe_print(
+                    f"[_build_candidate_pool] {label} ❌ "
+                    f"{type(e).__name__}: {str(e)[:70]}", flush=True,
+                )
+                logger.warning("[_build_candidate_pool] %s 批量召回失败: %s", label, e)
+
     # ========== 4. 9-18 加: audit retry loop (严格筛选 + 自动重搜) ==========
     # 9-18 user 拍板: 在构建候选池的时候就严格审核, 不通过的 paper 全部踢掉 (不再 rescue),
     #                 pool 不够 min_pool 时自动 retry (换 query / 换 source), 直到找到足够多合格论文.
@@ -335,6 +439,11 @@ def _build_candidate_pool(
         "openalex_forward_api": 4,   # 9-30 引文图前向(谁引用了种子)
         "openalex_backward_api": 5,  # 9-30 引文图后向(种子的参考文献)
         "arxiv_api_fallback": 6,
+        # 10-06 细分检索式召回: 排在单 query 外部源**之后** —— 同一批候选里,
+        # 靠原词召回来的通常更贴题, 扩展召回的排前面会把边角料顶上去。
+        "aps_batch_expanded_query": 7,
+        "iop_batch_expanded_query": 8,
+        "arxiv_batch_expanded_query": 9,
     }
     def _sort_key(x: dict[str, Any]) -> tuple:
         rel = x.get("_relevance_score")
@@ -349,4 +458,13 @@ def _build_candidate_pool(
         "arxiv_status": arxiv_status,
         "external_status": external_status,
         "audit_state": audit_state["summary"],
+        # 10-06: 检索式 + 细分方向必须**留在 build_status 里**。两个用处:
+        #   1. 用户看得见"到底拿哪几条检索式搜的"(宁可吵不可静默)
+        #   2. 下游(Phase B 归纳主题 / 未来的 gaps 回环)拿得到细分方向
+        "query_expansion": {
+            "ok": bool(qexp.get("ok")),
+            "error": qexp.get("error", ""),
+            "queries": _qexp_queries,
+            "sub_directions": qexp.get("sub_directions") or [],
+        },
     }
