@@ -18,6 +18,11 @@ from collections.abc import Iterator
 from typing import Any
 
 from agent.infra.survey_workspace import SurveyWorkspace, hash_topic
+from agent.tools.config import (
+    get_gap_fill_max_papers,
+    get_gap_fill_max_queries,
+    get_gap_fill_rounds,
+)
 from agent.tools.registry import register_tool
 
 from ._actions import (
@@ -574,6 +579,158 @@ def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
     return claims, from_stage
 
 
+def _phase_gap_fill(topic: str, ws, theme_map: dict[str, Any],
+                    pool: list[dict[str, Any]],
+                    facts: list[dict[str, Any]],
+                    usable: list[dict[str, Any]], sig: str):
+    """Phase B1: 拿 Phase B 的覆盖空白再检索一轮, 重跑主题地图(10-06 加)。
+
+    **这是"评阅结果回不到主循环"的修复**
+    organize 路线没有 ReAct 循环(见 `survey_generate` 开头 `phase == "organize"`
+    那个 early return), 而老路线的 `section_gaps -> action_search_more` 只认
+    `write_section` 里的 `<!-- QAgent: missing_queries -->` 标记。于是 Phase B
+    吐出来的空白只能进渲染文件, 永远变不成"再检索一轮"。
+
+    实测(10-06, neutral atom quantum computing): Phase B 给出 31 条空白, 里面
+    有一条 "Atom transport / rearrangement protocols are absent from this corpus"
+    —— 这正是"再多拉一批原子输运论文就能补上"的那种, 但工具读到它的时候综述
+    已经写完了, 那条空白就只是一行字。
+
+    **一轮就够, 而且默认只跑 1 轮**: 每轮的成本是
+    1 次判定 + N 次检索 HTTP + M 篇 summarize + M 次 fact 抽取 + 一次主题重跑。
+    M 取 20 的话一轮约 40 次调用, 已经跟整个 Phase 2 (39 篇 × 2 轮审查) 一个量级。
+    回补两轮以上时**新增的空白往往还是补不上**(那说明缺的是别的领域), 多花一轮
+    换不来东西, 所以 `QAGENT_SURVEY_GAP_FILL_ROUNDS` 默认 1。
+
+    返回 (theme_map, pool, usable, fill_log)
+    """
+    rounds_max = get_gap_fill_rounds()
+    fill_log: list[dict[str, Any]] = []
+    theme_map = dict(theme_map)
+
+    for rnd in range(1, rounds_max + 1):
+        gaps = [g for g in (theme_map.get("gaps") or []) if (g or "").strip()]
+        if not gaps:
+            yield f"\n🩹 覆盖空白回补: 第 {rnd} 轮, 但没有空白, 跳过\n"
+            break
+
+        yield (f"\n🩹 覆盖空白回补 第 {rnd}/{rounds_max} 轮 "
+               f"({len(gaps)} 条空白, 看哪些补得上)...\n")
+        from ._pool._query_expand import gaps_to_queries
+        verdict = gaps_to_queries(topic, gaps, max_queries=get_gap_fill_max_queries())
+        if not verdict.get("ok"):
+            yield f"   ⚠ 判定失败 ({verdict.get('error')}), 本轮不回补\n"
+            break
+        fillable = verdict.get("fillable") or []
+        unfillable = verdict.get("unfillable") or []
+        if unfillable:
+            yield (f"   打分后取前 {len(fillable)} 条回补, "
+                   f"其余 {len(unfillable)} 条判定补不上(如实留在清单里)\n")
+        if not fillable:
+            yield "   没有可回补的空白, 结束回补\n"
+            break
+
+        # ---- 检索 + 逐篇 summarize + 进池 (复用老路线那个 action) ----
+        from ._actions import action_extract_facts, action_search_more
+        before_ids = {p.get("paper_id") for p in pool}
+        gstate = {
+            "topic": topic, "pool": list(pool), "facts": [],
+            "errors": [], "step": 0, "finish_requested": False, "max_steps": 1,
+        }
+        cap = get_gap_fill_max_papers()
+        for item in fillable:
+            q = item["query"]
+            yield f"   → 检索「{q[:64]}」\n"
+            try:
+                for line in action_search_more(
+                        {"query": q, "k": max(2, cap // len(fillable)),
+                         "source": "all"}, gstate, ws):
+                    if line and line.startswith(("⚠", "👁", "🔎")):
+                        yield f"   {line}"
+            except Exception as e:                      # noqa: BLE001
+                yield f"   ⚠ 检索「{q[:48]}」失败: {type(e).__name__}: {str(e)[:80]}\n"
+
+        new_papers = [p for p in gstate["pool"]
+                      if p.get("paper_id") not in before_ids]
+        # 超上限就砍: 后面每篇都要 summarize + 抽 fact, 这里不设闸会失控
+        if len(new_papers) > cap:
+            yield f"   (候选 {len(new_papers)} 篇 > 上限 {cap}, 只取前 {cap} 篇)\n"
+            new_papers = new_papers[:cap]
+        if not new_papers:
+            yield "   没召回到新论文, 结束回补\n"
+            break
+
+        pool = list(gstate["pool"])
+        ws.save_pool(pool)
+        yield f"   新论文 {len(new_papers)} 篇已入池\n"
+
+        # ---- 对新论文抽 fact ----
+        before_facts = len(facts)
+        estate = {
+            "topic": topic, "pool": pool, "facts": [],
+            "errors": [], "step": 0, "finish_requested": False, "max_steps": 1,
+        }
+        try:
+            for line in action_extract_facts(
+                    {"paper_ids": [p["paper_id"] for p in new_papers]}, estate, ws):
+                if line and line.startswith(("👁", "✅", "📚")):
+                    yield f"   {line}"
+        except Exception as e:                          # noqa: BLE001
+            yield f"   ⚠ 新论文 fact 抽取失败: {type(e).__name__}: {str(e)[:80]}\n"
+
+        new_facts = estate.get("facts") or []
+        if not new_facts:
+            yield "   新论文一条 fact 都没抽出来, 结束回补\n"
+            break
+        facts = facts + new_facts
+        usable = [f for f in facts if _fact_is_usable(f)]
+        yield (f"   fact {before_facts} → {len(facts)} 条 "
+               f"(可用 {len(usable)})\n")
+        # **不要再调 ws.save_facts(facts)** —— 10-06 实测这行必崩:
+        # SurveyWorkspace 根本没有 save_facts 方法(全仓库只有这一处提到它),
+        # AttributeError 正好砸在"回补真的抽到了 fact"这一刻 —— 也就是回补
+        # 唯一有价值的时刻。而且它是多余的: action_extract_facts 自己在
+        # _extract_facts.py:158 就 `ws.append_fact(f)` 逐条落盘了,
+        # 主线 `_stage_facts`(415-425 行)同样从不单独存 fact。
+
+        # ---- 重跑主题地图 (分块 + 按名合并, 新 fact 自动并进已有主题) ----
+        titles = {p["paper_id"]: (p.get("title") or "") for p in pool}
+        from ._organize import organize_facts_into_themes, save_thematic_map
+        tmap = organize_facts_into_themes(usable, paper_titles=titles)
+        if not tmap.get("themes"):
+            yield "   ⚠ 重跑主题地图失败, 沿用上一轮结果\n"
+            break
+        old_names = {t["name"] for t in theme_map.get("themes") or []}
+        new_names = {t["name"] for t in tmap["themes"]}
+        # 本轮真去搜过的空白标"已回补", 其余标"判定补不上"。模型给的判定理由
+        # **不回显** —— 实测它会写出"这方向的文献存在"这种跟"补不上"自相矛盾
+        # 的句子, 出现在最终综述里比没有理由更糟(见 _query_expand.gaps_to_queries)。
+        filled_gaps = {f["gap"] for f in fillable}
+        tmap["gaps"] = _annotate_gaps(tmap.get("gaps") or [], filled_gaps)
+        theme_map = tmap
+        save_thematic_map(ws, theme_map)
+        yield (f"   主题地图重跑: {len(old_names)} → {len(new_names)} 个主题"
+               f"(新增 {len(new_names - old_names)}, 保留 {len(new_names & old_names)})\n")
+        fill_log.append({"round": rnd, "n_new_papers": len(new_papers),
+                         "n_new_facts": len(new_facts),
+                         "n_themes": len(new_names),
+                         "filled": [f["gap"] for f in fillable],
+                         "queries": [f["query"] for f in fillable]})
+
+    return theme_map, pool, usable, fill_log
+
+
+def _annotate_gaps(gaps: list[str], filled: set[str]) -> list[str]:
+    """给回补后的空白打标记: 本轮真去搜过的 / 判定补不上的。
+
+    **不标的后果**: 回补跑完之后空白清单看起来跟没跑过一样, 用户分不清
+    "这些是试过补不上的" 还是 "这些压根没人管" —— 这正是「宁可吵不可静默」
+    要防的那种沉默。
+    """
+    return [f"（已检索回补）{g}" if g in filled else f"（判定补不上）{g}"
+            for g in gaps]
+
+
 def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
                         target_chars: int = 0, resume: bool = True):
     """
@@ -689,6 +846,25 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
                     else f"       ↔ 「{rel.get('to')}」(无说明)\n")
     for w in theme_map.get("warnings", []):
         yield f"   ⚠ {w}\n"
+
+    # ---- Phase B1: 覆盖空白回补 (10-06 加) ----
+    # 这是"评阅完不回传给主循环"的修复。organize 路线是**直线管线**, 没有 ReAct
+    # 循环可回(见本文件 survey_generate 开头 phase=="organize" 那个 early return),
+    # 而老路线那套 section_gaps -> search_more 机制只认 write_section 里的
+    # `<!-- QAgent: missing_queries -->` 标记。于是 Phase B 归纳出的 31 条空白
+    # 全部只能进渲染, 一条都没转化成"再检索一轮" —— 实测跑完还是那 39 篇。
+    #
+    # 这里补上那一段: 空白 -> 判定可补不可补 -> 可补的配英文检索式 -> 检索 +
+    # 逐篇 summarize -> 对新论文抽 fact -> **重跑主题地图** -> 再算宏观层。
+    # 主题地图本身是分块 + 按名合并的, 重跑会自动把新 fact 并进已有主题。
+    if get_gap_fill_rounds() > 0:
+        theme_map, pool, usable, fill_log = yield from _phase_gap_fill(
+            topic, ws, theme_map, pool, facts, usable, _sig)
+    else:
+        fill_log = []
+    if fill_log:
+        yield (f"\n🩹 覆盖空白回补: {fill_log[0]['n_new_papers']} 篇新论文, "
+               f"{fill_log[0]['n_new_facts']} 条新 fact\n")
 
     # ---- Phase B1.5: 宏观主题层 (10-05 加) ----
     yield from _phase_macros(ws, theme_map)

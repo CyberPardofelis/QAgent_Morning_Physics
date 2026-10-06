@@ -190,6 +190,46 @@ def get_query_expand_k() -> int:
     return _SURVEY_QUERY_EXPAND_K
 
 
+# ============================================================
+# Survey 工具: 覆盖空白回补 (2026-10-06 加)
+# ============================================================
+# 背景: organize 路线是直线管线, **没有 ReAct 循环** —— Phase B 归纳出的 gaps
+# 只能进渲染文件, 变不成"再检索一轮"。老路线那套 section_gaps -> search_more
+# 只认 write_section 里的 `<!-- QAgent: missing_queries -->` 标记, 管不到这里。
+# 实测 10-06: Phase B 给了 31 条空白, 跑完还是那 39 篇。
+#
+#   QAGENT_SURVEY_GAP_FILL_ROUNDS=N  回补几轮, 0 = 关掉, 默认 1
+#   QAGENT_SURVEY_GAP_FILL_QUERIES=N 一轮最多配几条检索式, 默认 5
+#   QAGENT_SURVEY_GAP_FILL_PAPERS=N  一轮最多吃进多少篇新论文, 默认 20
+#
+# **一轮 60 次调用量级**(N=5, M=20): 1 次判定 + 5 条检索式的 HTTP + M 篇
+# summarize + M 次 fact 抽取 + 一次主题重跑。这跟 Phase 2 本身(每篇 2 次审查)
+# 是同一个量级, 所以默认只跑 1 轮 —— 第二轮新增的空白往往还是补不上, 那说明
+# 缺的是别的领域, 多花一轮换不来东西。
+#
+# 检索式 3 → 5 是 10-06 用户拍板的: 31 条空白里实测有 8-10 条真能补, 每条
+# 检索式 = 几次 HTTP + 若干篇 summarize + fact 抽取, 成本线性涨但产出也线性涨。
+_SURVEY_GAP_FILL_ROUNDS = _resolve_survey_expand_int(
+    "QAGENT_SURVEY_GAP_FILL_ROUNDS", 1, 0, 5)
+_SURVEY_GAP_FILL_QUERIES = _resolve_survey_expand_int(
+    "QAGENT_SURVEY_GAP_FILL_QUERIES", 5, 1, 12)
+_SURVEY_GAP_FILL_PAPERS = _resolve_survey_expand_int(
+    "QAGENT_SURVEY_GAP_FILL_PAPERS", 20, 1, 200)
+
+
+def get_gap_fill_rounds() -> int:
+    """回补几轮。0 = 关掉。"""
+    return _SURVEY_GAP_FILL_ROUNDS
+
+
+def get_gap_fill_max_queries() -> int:
+    return _SURVEY_GAP_FILL_QUERIES
+
+
+def get_gap_fill_max_papers() -> int:
+    return _SURVEY_GAP_FILL_PAPERS
+
+
 def get_survey_expand() -> dict:
     """引文图扩展配置 (见本节上方的环境变量说明)."""
     return {

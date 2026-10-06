@@ -26,7 +26,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
-from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 # 确保 QApplication 已创建 (QSettings 在 Windows 用注册表需要)
@@ -37,24 +36,24 @@ from agent.cost_guard import CostGuard  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolated_cost_guard():
-    """每个测试用独立 QSettings Organization/AppName, 避免污染全局"""
-    # 用临时 organization 隔离
-    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-    QSettings.setPath(
-        QSettings.Format.IniFormat,
-        QSettings.Scope.UserScope,
-        QStandardPaths_writableLocation(),  # noqa: F821
-    )
-    # 用 pytest tmp_path 风格的 org/app name
+    """每个测试用独立的 CostGuard 实例, 计数从 0 开始。
+
+    ⚠️ 10-06 修: 原来这个 fixture 里有一套
+    `QSettings.setDefaultFormat(IniFormat)` + `setPath(...)` 的"隔离",
+    看着像把测试的写入导到临时目录 —— **实际是空操作**。Qt 的
+    `QSettings(org, app)` 双参构造写死走 NativeFormat, 不看 setDefaultFormat
+    (那只对无参构造生效), 于是 `guard.reset()` 一直直接写 Windows 注册表,
+    把用户真实的 LLM 日计数器清零(实测 4242 → 1), 而且**测试全绿**。
+
+    现在这里的分工是:
+      - 本 fixture: 只管语义 —— 每个测试**从 0 开始**
+      - conftest 的 `_protect_user_settings`: 管安全 —— 退出时原样还原
+    `reset()` 本身必须留着: 它读的是用户真实计数(可能是 4242), 不清零的话
+    `test_first_call_under_limit` 这类会直接撞上限。
+    """
     guard = CostGuard()
-    guard.reset()  # 每次测试前重置
-    yield guard
-
-
-def QStandardPaths_writableLocation():  # helper, 避免 lint 报错
-    """返回临时目录路径用于 QSettings"""
-    import tempfile
-    return tempfile.mkdtemp(prefix="qagent_cost_guard_test_")
+    guard.reset()
+    return guard
 
 
 @pytest.fixture(autouse=True)

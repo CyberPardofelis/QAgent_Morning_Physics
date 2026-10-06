@@ -16,6 +16,7 @@ import time  # noqa: E402
 from collections.abc import Iterator  # noqa: E402
 
 from agent.cost_guard import get_cost_guard  # noqa: E402
+from agent.infra.text_clean import sanitize_llm_text  # noqa: E402
 from agent.llm_clients import (  # noqa: E402
     PROVIDERS,
     LLMClientError,
@@ -601,7 +602,10 @@ def run_agent_stream(
         for tool_call in assistant_msg["tool_calls"]:
             fn_name = tool_call["function"]["name"]
             try:
-                args = json.loads(tool_call["function"]["arguments"])
+                # 10-06: 工具参数也来自模型输出流, 同样可能混进 NUL。
+                # 这里不走 _call_llm 的出口清洗(那是工具内部的路径), 所以就地洗一次。
+                args = json.loads(
+                    sanitize_llm_text(tool_call["function"]["arguments"]))
             except json.JSONDecodeError as e:
                 yield NEW_BUBBLE
                 yield f"[工具 {fn_name} 参数解析失败: {e}]"

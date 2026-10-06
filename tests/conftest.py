@@ -25,6 +25,51 @@ import pytest
 
 
 # ============================================================
+# 2.5 保护用户真实设置 (10-06 加)
+# ============================================================
+# 背景: tests/test_cost_guard.py 跑一次就把用户真实的 LLM 日计数器清零。
+# 实测 4242 → 1(不是 0, 因为最后一个用例自己 increment 了一次)。
+#
+# **原以为有隔离, 其实从来没有**(踩坑记录):
+#   `_isolated_cost_guard` 里那套 `QSettings.setDefaultFormat(IniFormat)` +
+#   `setPath(IniFormat, UserScope, tmpdir)` 是**空操作**。Qt 的
+#   `QSettings(org, app)` 双参构造**写死用 NativeFormat**, 不看
+#   `setDefaultFormat()` —— 后者只对无参 `QSettings()` 生效。实测:
+#       setDefaultFormat 之后 defaultFormat = IniFormat
+#       但 get_settings().fileName() 仍是 \HKEY_CURRENT_USER\Software\...
+#   所以 `guard.reset()` 一直直接写 Windows 注册表, 而且是**静默**写坏:
+#   测试全绿, 用户的额度显示归零, 已花掉的次数再也看不到了。
+#
+# 修法: 不去改 `get_settings()`(那是生产代码, 两参构造改格式会影响真实用户),
+# 而是在这里对**每个测试**快照/还原这两个键。测试可以随便改, 退出时原样写回。
+@pytest.fixture(autouse=True)
+def _protect_user_settings():
+    """快照并还原用户真实设置里最容易被测试写坏的那几个键。
+
+    目前只管 cost_guard 的两个键 —— 实测只有它们会被测试写坏。
+    新增测试如果开始写别的用户设置, **必须在这里加键**, 否则同样会静默
+    污染用户设置(这是本条存在的意义: 让"测试污染用户数据"变成一件
+    在 conftest 里看得见的事, 而不是散落在各个测试文件里的隐形副作用)。
+    """
+    from agent.cost_guard import CostGuard
+    from config.settings import get_settings
+
+    guard_keys = (CostGuard.KEY_DATE, CostGuard.KEY_COUNT)
+    s = get_settings()
+    saved = {k: s.value(k, None) for k in guard_keys}
+    try:
+        yield
+    finally:
+        s = get_settings()          # 重新拿, 避免复用测试里被换掉的实例
+        for k, v in saved.items():
+            if v is None:
+                s.remove(k)
+            else:
+                s.setValue(k, v)
+        s.sync()                     # 不 sync 的话跨进程读到的还是旧值
+
+
+# ============================================================
 # 1. 检测 QApplication 是否能创建
 # ============================================================
 def _can_create_qapplication() -> bool:

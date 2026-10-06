@@ -22,6 +22,7 @@ import logging
 import threading
 
 from agent.cost_guard import charge as cost_guard_charge
+from agent.infra.text_clean import sanitize_llm_text
 from agent.llm_clients import (
     PROVIDERS,
     classify_llm_error,
@@ -248,6 +249,12 @@ def _call_llm(
             if rc and rc.strip():
                 out = rc
                 _log(f"[llm] _call_llm fallback: content 空 → reasoning_content ({len(rc)} 字符)")
+        # 10-06: **在出口洗掉 NUL / 控制字符**, 而不是给二十多个解析点各打一个补丁。
+        # 实测 MiniMax-M3 连着 6 次输出 6 次混进 \x00(`Toffoli` → `Toff\x00oli`),
+        # 症状是所有 JSON 解析点随机失败, 而根因只有一个 —— 输出流在字节层面
+        # 被破坏。`json.loads(strict=False)` 治不了(strict=False 只放行 \n \t \r)。
+        # 这里洗一次, 下面所有工具的 JSON 解析全部受益。详见 infra/text_clean.py。
+        out = sanitize_llm_text(out)
         _log(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符")
         return out
     except Exception as e:

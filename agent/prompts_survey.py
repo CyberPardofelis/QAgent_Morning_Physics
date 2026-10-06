@@ -1003,6 +1003,52 @@ def build_query_expand_prompt(topic: str, n: int = 6) -> str:
     return SURVEY_QUERY_EXPAND_PROMPT.format(topic=topic or "(未指定主题)", n=n)
 
 
+SURVEY_GAP_FILL_PROMPT = """你在为一份文献综述做**覆盖空白回补**。
+
+【综述主题】: {topic}
+
+【这一轮归纳出的覆盖空白】
+{gaps_block}
+
+【任务】给每条空白打一个分数: **再多检索一批本主题的论文, 有多大可能把它补上?**
+0-10 分, 打高分的优先处理。
+
+打分参考:
+  8-10 = 缺的就是"这个主题下某个具体子方向没有论文进来", 搜得到, 应该补
+  5-7  = 半个, 得看运气; 同主题里可能有零星几篇
+  0-4  = 补不了。只有这两种情况够得上低分:
+         (a) 缺的是**另一个领域**的论文 —— "与超导/离子阱的横向对比" 那种, 检索本
+             主题永远召不回来;
+         (b) 缺的是**领域现状**而不是文献 —— "领域内对 X 的优势边界尚无共识", 那是
+             事实不是缺口。
+
+**每条都要给一条英文检索式**, 不管分数高低 —— 最后只挑分数高的几条真去搜。
+检索式要求: 5-12 个英文单词, 带该子方向特有的技术术语, 不要重复。
+(arxiv / OpenAlex 都是英文 API, 中文检索式等于没搜)
+
+【输出格式】严格 JSON, 不要 markdown 包裹:
+{{
+  "gaps": [
+    {{"idx": 1, "score": 8, "query": "英文检索式"}}
+  ]
+}}
+
+`idx` 是这条空白在上面的**编号**, 原样填。**不要改写 gap 文本** —— 我们的程序靠
+编号把判定对回原始空白, 你把原文重写一遍(截断、换标点、漏字)就对不上了。
+score 是 0-10 的整数。
+**只输出 JSON, 不要解释, 不要其它文字。"""
+
+
+def build_gap_fill_prompt(topic: str, gaps: list[str], max_queries: int = 4) -> str:
+    """构造覆盖空白回补 prompt。`gaps` 是模型上一轮吐出来的原话, 原样喂回去。"""
+    block = "\n".join(f"{i}. {g}" for i, g in enumerate(gaps, 1))
+    return SURVEY_GAP_FILL_PROMPT.format(
+        topic=topic or "(未指定主题)",
+        gaps_block=block or "(无)",
+        n=max_queries,
+    )
+
+
 SURVEY_RELEVANCE_SCORE_PROMPT = """你是综述主题相关性严判助手。
 
 【综述主题】: {topic}
