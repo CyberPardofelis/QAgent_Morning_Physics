@@ -46,7 +46,32 @@ from agent.tools.facts import fact_id_for  # noqa: E402
 from agent.tools.surveys import _organize as O  # noqa: E402
 
 WS_ROOT = ROOT / "data" / "surveys" / "working"
-MODEL = "MiniMax-M3.1-Flash-Preview"
+
+# 2026-10-06 修: 原来硬编码 "MiniMax-M3.1-Flash-Preview", **不在白名单里**
+# (白名单只有 M2 / M2.1 / M2.5 / M2.7 / M3)。写错不会立刻暴露 —— 每次调用都
+# 400, 而 cost_guard 是"先计费再发请求", 于是整轮跑完额度就没了, 一条主题都
+# 没落库。这跟 10-05 去重脚本踩的是同一个坑。
+MODEL = "MiniMax-M3"
+
+
+def preflight(model: str, n_calls: int = 1) -> None:
+    """发第一条之前先验模型名和额度, 否则跑砸掉的是一整天的预算。"""
+    from agent.llm_clients import MINIMAX_VALID_MODELS
+    if model not in MINIMAX_VALID_MODELS:
+        raise SystemExit(
+            f"[中止] 模型名 {model!r} 不在 MiniMax 白名单里。\n"
+            f"  有效: {', '.join(MINIMAX_VALID_MODELS)}\n"
+            f"  写错不会立刻暴露 —— 每次调用都 400, 而 cost_guard 先计费,\n"
+            f"  整轮跑完额度就没了还一条主题都没落库。")
+    from agent.cost_guard import get_cost_guard
+    from config import Config
+    used, ceil = get_cost_guard().current_count(), Config.get_cost_ceiling_daily()
+    left = max(0, ceil - used)
+    print(f"[preflight] 模型 {model} ✓ · 今日额度 {used}/{ceil}, 剩余 {left}")
+    if n_calls and left < n_calls:
+        raise SystemExit(
+            f"[中止] 剩余额度 {left} < 预计至少要发的 {n_calls} 次。\n"
+            f"  先调高 cost_ceiling_daily 再跑, 或者用 --limit 少跑几个。")
 
 # **按字符分块, 不按条数。** 实测(m3.1 flash):
 #     3360 字符 (23 条)  ->  82s  成功
@@ -242,13 +267,18 @@ def macro_layer(dry: bool) -> int:
 
 
 def main() -> int:
+    # 必须先声明再读: 下面 add_argument(default=MODEL) 已经用到它了
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 个")
     ap.add_argument("--skip-macro", action="store_true")
     ap.add_argument("--macro-only", action="store_true",
                     help="只跑宏观层(回填已完成的场合用)")
+    ap.add_argument("--model", default=MODEL, help=f"默认 {MODEL}")
     args = ap.parse_args()
+
+    MODEL = args.model
 
     tg.init_schema()
     if args.macro_only:
@@ -271,6 +301,10 @@ def main() -> int:
     if args.limit:
         todo = todo[:args.limit]
     print(f"待回填 workspace {len(todo)} 个 (已入库 {len(done)} 个)\n")
+
+    if not args.dry and not args.skip_macro:
+        # 粗估: 每个 workspace 至少 1 次主题归纳, 再加 1 次宏观聚类
+        preflight(MODEL, n_calls=len(todo) + 1)
 
     t0 = time.time()
     for i, d in enumerate(todo, 1):
