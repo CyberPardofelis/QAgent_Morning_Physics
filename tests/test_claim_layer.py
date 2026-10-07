@@ -396,7 +396,8 @@ def test_organize_entry_point_chunks_instead_of_sampling(monkeypatch):
     calls = []
 
     def fake_chunk(facts, paper_titles=None, provider="minimax", model="MiniMax-M3",
-                   temperature=0.4, max_themes=8, chunk_idx=1, n_chunks=1, total_facts=0):
+                   temperature=0.4, max_themes=8, chunk_idx=1, n_chunks=1,
+                   total_facts=0, skeleton=None):
         calls.append([f["fact_id"] for f in facts])
         ids = [f["fact_id"] for f in facts]
         return {"themes": [{"name": f"T{i}", "statement": "", "fact_ids": [ids[i]],

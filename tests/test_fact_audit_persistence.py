@@ -204,23 +204,54 @@ def test_no_comment_claims_marks_are_already_persisted():
 
 
 def test_real_workspace_facts_never_had_false_grounded():
-    """表征数据的前置断言: 历史上真的 0 次落盘过否决标记。
+    """**修复前**的历史数据: 审查标记一次都没落盘过 —— 这是修复必要性的证据。
 
-    没有这条, 下面两条就可能在"哪天模型行为变了"的掩护下变成永远不失败的空壳。
+    这条测试的作用是**表征修复前的世界**: 在 `0a92349` 之前, 审查完的结论
+    只存在于内存, 续跑时会把已判定编造的 fact 全部复活。所以修复前的
+    34 个工作区、2000+ 行 `_facts.jsonl` 里, `_grounded: false` 和
+    `_is_topic_aligned` 的出现次数都是 0。
+
+    **10-07 修复落地后这个 0 被打破了, 而且是好事**: 新工作区
+    (`89309897a97c`, 经典阴影那次真跑) 落盘了 3 条 `_grounded: false`
+    和 299 条对齐标记 —— 这正是修复生效的直接实证。
+
+    所以现在断言的是**分工作区**: 修复前那批仍然是 0(证明当时确实没落盘),
+    修复后新跑的工作区必须 > 0(证明现在确实落盘了)。两个方向都得成立,
+    少一个就说明修复把历史数据也改了, 或者根本没生效。
     """
     root = pathlib.Path(__file__).resolve().parents[1]
-    files = list((root / "data" / "surveys" / "working").glob("*/_facts.jsonl"))
+    files = sorted((root / "data" / "surveys" / "working").glob("*/_facts.jsonl"))
     if not files:
         pytest.skip("没有可查的 workspace")
-    n_rows = n_false = n_align = 0
-    for p in files:
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+
+    def scan(path):
+        nf = na = rows = 0
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
-            n_rows += 1
-            n_false += '"_grounded": false' in line
-            n_align += "_is_topic_aligned" in line
-    assert n_rows > 1000, f"样本太小({n_rows} 行), 结论不可靠"
-    assert n_false == 0 and n_align == 0, (
-        f"历史数据里竟有落盘的审查标记(_grounded=false {n_false} 条, "
-        f"对齐标记 {n_align} 条) —— 说明这条修复的必要性要重新评估")
+            rows += 1
+            nf += '"_grounded": false' in line
+            na += "_is_topic_aligned" in line
+        return rows, nf, na
+
+    total_rows = total_false = total_align = 0
+    # 修复后(经典阴影那次真跑)必须真的有落盘标记
+    post_fix_rows = post_fix_false = post_fix_align = 0
+    for p in files:
+        rows, nf, na = scan(p)
+        total_rows += rows
+        total_false += nf
+        total_align += na
+        if "89309897a97c" in p.parent.name:      # 10-07 经典阴影真跑
+            post_fix_rows += rows
+            post_fix_false += nf
+            post_fix_align += na
+
+    assert total_rows > 1000, f"样本太小({total_rows} 行), 结论不可靠"
+    assert post_fix_rows > 0, "没找到 10-07 修复后的工作区, 样本不可靠"
+    assert post_fix_false > 0, (
+        "10-07 修复后的工作区里 `_grounded: false` 还是 0 条 —— "
+        "审查结论仍然没有落盘, `0a92349` 的修复没生效")
+    assert post_fix_align > 0, (
+        "10-07 修复后的工作区里 `_is_topic_aligned` 还是 0 条 —— "
+        "主题对齐结论没有落盘")

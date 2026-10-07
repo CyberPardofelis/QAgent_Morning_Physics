@@ -56,6 +56,26 @@ def _theme_json(facts: list[dict]) -> str:
     }, ensure_ascii=False)
 
 
+def _skeleton_json() -> str:
+    return json.dumps({
+        "themes": [{
+            "name": "骨架任务一", "task": "解什么问题",
+            "belongs": "线索A / 线索B", "not_belongs": "别混这个",
+        }],
+        "structure_note": "骨架关系说明",
+    }, ensure_ascii=False)
+
+
+def _is_skeleton_prompt(p: str) -> bool:
+    """阶段一(骨架)和阶段二(块内)的 prompt 长得不一样, 按内容区分。
+
+    10-07 晚加了骨架阶段, 于是分块时**多一次** LLM 调用 —— 之前这组测试
+    假设 seen[N] 就是第 N 块的 prompt, 现在第 0 次是骨架。靠内容认比靠
+    序号认稳(顺序将来再变一次, 这些测试就会集体误判)。
+    """
+    return "结构骨架" in p or "极简摘要" in p
+
+
 def _capture_llm(monkeypatch):
     """把发给 LLM 的 prompt 全存下来, 返回列表。"""
     import agent.tools.llm as llm_mod
@@ -64,10 +84,15 @@ def _capture_llm(monkeypatch):
 
     def _fake(prompt, *args, **kwargs):
         seen.append(prompt)
-        return _theme_json(_facts(1))   # 只写 1 条, 避免 fact_id 校验问题
+        return _skeleton_json() if _is_skeleton_prompt(prompt) else _theme_json(_facts(1))
 
     monkeypatch.setattr(llm_mod, "_call_llm", _fake)
     return seen
+
+
+def _chunk_prompts(seen: list[str]) -> list[str]:
+    """从所有调用里挑出块内归纳的那几次(排除骨架)。"""
+    return [p for p in seen if not _is_skeleton_prompt(p)]
 
 
 # ============================================================
@@ -114,7 +139,7 @@ def test_scope_line_appears_in_actual_prompt(monkeypatch):
     seen = _capture_llm(monkeypatch)
     OG.organize_facts_into_themes(_facts(50))
 
-    assert len(seen) == 1, "50 条应该走单块"
+    assert len(_chunk_prompts(seen)) == 1, "50 条应该走单块"
     assert "【本次范围" in seen[0], "范围块没进真实 prompt"
 
 
@@ -135,10 +160,12 @@ def test_every_chunk_gets_its_own_index(monkeypatch):
     facts = _facts(200)
     OG.organize_facts_into_themes(facts)
 
+    prompts = _chunk_prompts(seen)
     n_chunks = len(OG.split_fact_chunks(facts))
-    assert len(seen) == n_chunks > 1, f"应当逐块调用, 实际 {len(seen)} 次 / {n_chunks} 块"
+    assert len(prompts) == n_chunks > 1, \
+        f"应当逐块调用, 实际 {len(prompts)} 次 / {n_chunks} 块"
 
-    for i, prompt in enumerate(seen, 1):
+    for i, prompt in enumerate(prompts, 1):
         assert f"第 {i}/{n_chunks} 块" in prompt, f"第 {i} 块的 prompt 没写自己的序号"
         assert "200" in prompt, f"第 {i} 块的 prompt 没说全库总数"
 
@@ -149,9 +176,11 @@ def test_first_and_last_chunk_report_different_indexes(monkeypatch):
     seen = _capture_llm(monkeypatch)
     OG.organize_facts_into_themes(_facts(200))
 
-    assert "第 1/" in seen[0]
-    assert f"第 {len(seen)}/" in seen[-1]
-    assert seen[0].split("【本次范围")[1][:12] != seen[-1].split("【本次范围")[1][:12]
+    prompts = _chunk_prompts(seen)
+    assert "第 1/" in prompts[0]
+    assert f"第 {len(prompts)}/" in prompts[-1]
+    assert (prompts[0].split("【本次范围")[1][:12]
+            != prompts[-1].split("【本次范围")[1][:12])
 
 
 # ============================================================
@@ -182,11 +211,12 @@ def test_scope_line_follows_actual_count_after_halving(monkeypatch):
     说假话 —— 模型会以为自己看全了。"""
     monkeypatch.setattr(OG, "THEME_CHUNK_FACTS", 1000)   # 强制单块
     monkeypatch.setattr(OG, "THEME_CHUNK_CHARS", 100000)
-    calls: list[tuple[int, str]] = []
+    calls: list[str] = []
 
     def _fake(prompt, *args, **kwargs):
-        calls.append((1, prompt))
-        if len(calls) == 1:
+        calls.append(prompt)
+        chunk_calls = [p for p in calls if not _is_skeleton_prompt(p)]
+        if len(chunk_calls) == 1:
             return "这不是 JSON"          # 触发折半
         return _theme_json(_facts(1))
 
@@ -195,8 +225,9 @@ def test_scope_line_follows_actual_count_after_halving(monkeypatch):
 
     OG.organize_facts_into_themes(_facts(100))
 
-    assert len(calls) == 2, f"应当折半重试一次, 实际 {len(calls)} 次"
-    scope2 = calls[1][1].split("【本次范围")[1].split("】")[0]
+    chunk_prompts = _chunk_prompts(calls)
+    assert len(chunk_prompts) == 2, f"应当折半重试一次, 实际 {len(chunk_prompts)} 次"
+    scope2 = chunk_prompts[1].split("【本次范围")[1].split("】")[0]
     assert "50" in scope2, f"折半后范围块应写 50 条(实际看到的条数), 原文: {scope2}"
     assert "这是全部" not in scope2, f"折半后仍声称是全部语料, 原文: {scope2}"
 
@@ -216,6 +247,10 @@ def test_every_format_call_site_passes_scope_line():
     src = inspect.getsource(OG)
     n_format = src.count("THEME_MAP_PROMPT.format(")
     n_scope = src.count("scope_line=_chunk_scope_line(")
+    n_skel = src.count("skeleton_block=_render_skeleton(")
     assert n_format == 3, f"预期 3 处 format 调用, 实际 {n_format}"
     assert n_scope == n_format, \
         f"有 format 调用没传 scope_line ({n_scope}/{n_format}) —— 某条路径上模型看不到范围"
+    assert n_skel == n_format, \
+        f"有 format 调用没传 skeleton_block ({n_skel}/{n_format}) —— " \
+        "那条路径上模型看不到全局骨架, 会退回块级命名"

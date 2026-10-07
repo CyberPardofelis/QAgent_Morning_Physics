@@ -45,6 +45,7 @@ import logging
 import re
 from typing import Any
 
+from agent.infra.console import safe_print
 from agent.prompts_survey import (
     CLAIM_CONDENSE_PROMPT,
     THEME_WRITE_FROM_CLAIMS_PROMPT,
@@ -101,8 +102,268 @@ def split_fact_chunks(
     return chunks
 
 
+THEME_SKELETON_PROMPT = """你在为一个领域建立**结构骨架**, 供后续分块精读时挂靠。
+
+你会看到这批文献笔记的**极简摘要**(每条一行: 核心对象 + 事实开头, 不给全文)。
+摘要是压缩过的, 但**每一条事实都在里面**, 语料的完整覆盖范围你能看个大概。
+
+你的任务**不是**总结这些论文, 而是回答一个问题:
+**"这个领域由哪几个任务构成, 每个任务分别要解决什么问题。"**
+
+【极要紧的一条】按**任务/问题**分类, **不要**按技术分类。
+- 反例(按技术切): "浅电路阴影" / "纠缠基测量" / "Pauli 不变酉" —— 这是手段,
+  同一个任务可以用好几套手段, 按手段切会把同一个任务劈成好几块。
+- 正例(按任务切): "从少量测量预测大量可观测量" / "重建完整密度矩阵" /
+  "验证制备的态确实是目标态" —— 这是目的, 什么手段都在服务它。
+判断标准: 如果 A 和 B 是"同一件事的两种做法", 它们必须落在**同一个**主题里。
+
+【语料分布 — 客观数据, 先看这个】
+下面的簇是按 fact 的 `subject`(核心对象)自动聚的, 反映了这批文献**实际**在讨论什么。
+{n_subject_histogram}
+
+**这是提示, 不是硬约束**: 真实的领域结构经常横跨几个对象, 你可以跨簇组合主题。
+但它比"凭印象总结"可靠 —— 如果你归纳出的任务和这个分布严重脱节, 说明你漏读了材料。
+
+【铁律】
+1. **5-8 个任务**, 宁少勿多。任务之间要是真正并列的, 不要互相包含。
+2. 每个主题必须给出 **task**(这个任务要解决什么) 和 **belongs**(什么样的事实属于
+   它 —— 后续分块精读时会拿这句话判断归属, 所以要写得可判定, 别写"相关的事实")。
+3. 必须给出 **not_belongs**(不要混入什么) —— 用来划清相邻任务的边界。没有边界的话
+   后续精读会把所有东西都塞进第一个主题。
+4. `name` 用**任务名**(12 字以内), 不要带技术名词, 更不要带"本块""第k块"。
+
+【fact 摘要】共 {n_facts} 条
+{facts_digest}
+
+【输出格式】严格 JSON, 不要 markdown 包裹:
+{{
+  "themes": [
+    {{
+      "name": "任务名(12 字以内)",
+      "task": "这个任务要解决什么问题(1-2 句)",
+      "belongs": "什么样的事实属于这个任务(可判定的线索, 2-3 个具体对象/指标)",
+      "not_belongs": "相邻但**不要**混进来的东西(1 句)"
+    }}
+  ],
+  "structure_note": "这几个任务之间是什么关系(谁是谁的基础/谁给了谁什么工具/存在什么张力)"
+}}
+
+只输出 JSON。"""
+
+
+def _fact_digest(facts: list[dict[str, Any]], claim_chars: int = 60) -> str:
+    """把 fact 压成一行摘要, 给骨架阶段用。
+
+    **每一条 fact 都出现, 一条不丢** —— 这是「全局骨架」能成立的前提。
+    丢的是 claim 的后半截, 不是 fact 的存在。阶段 2 读全文时再补回来。
+
+    不给 fact_id: 骨架阶段不需要回头定位具体条目, 给了反而占预算。
+    """
+    out = []
+    for i, f in enumerate(facts, 1):
+        subj = (f.get("subject") or "").strip()[:16]
+        claim = (f.get("claim") or "").strip().replace("\n", " ")[:claim_chars]
+        out.append(f"[{i}] {subj} | {claim}")
+    return "\n".join(out)
+
+
+def _render_skeleton(skeleton: dict[str, Any] | None) -> str:
+    """把骨架渲染成注入阶段 2 prompt 的块。有骨架才渲染, 没骨架返回空串。"""
+    themes = (skeleton or {}).get("themes") or []
+    if not themes:
+        return ""
+    lines = [
+        "【全局骨架 — 领域由这几个任务构成, 你的主题名必须从这里面选】",
+        "这是**先于细读**得出的结构: 你看到的每一块事实, 都是在这几个任务之下产生的。",
+        "",
+    ]
+    for i, t in enumerate(themes, 1):
+        lines.append(f"({i}) {t.get('name')}")
+        if t.get("task"):
+            lines.append(f"    要解决: {t['task']}")
+        if t.get("belongs"):
+            lines.append(f"    归属线索: {t['belongs']}")
+        if t.get("not_belongs"):
+            lines.append(f"    不要混入: {t['not_belongs']}")
+    note = (skeleton or {}).get("structure_note")
+    if note:
+        lines += ["", f"任务之间的关系: {note}", ""]
+    lines += [
+        "**你这一块产出的每个主题, name 必须与上面某一条完全一致**(逐字照抄, "
+        "不要改写、不要加限定词、不要自己另起名字)。",
+        "判不准归哪个任务时, 挂到最接近的那个, 并在 notes 里说明为什么",
+        "—— 归属不准可以改, 名字对不上会让整个领域结构散架。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _build_skeleton(
+    facts: list[dict[str, Any]],
+    clusters: list[tuple[str, list[dict[str, Any]]]] | list,
+    provider: str = "minimax",
+    model: str = "MiniMax-M3",
+    temperature: float = 0.4,
+) -> dict[str, Any]:
+    """阶段一: 全部 fact 的极简摘要 → 全局任务骨架。永不抛异常。
+
+    失败时返回空 dict, 调用方回退到「无骨架」模式 —— 那就是今天之前的块级行为,
+    不比现状更差。
+    """
+    from agent.tools.llm import _call_llm
+
+    if not facts:
+        return {}
+    prompt = THEME_SKELETON_PROMPT.format(
+        n_subject_histogram=_subject_histogram(clusters),
+        facts_digest=_fact_digest(facts),
+        n_facts=len(facts),
+    )
+    try:
+        out = _call_llm(prompt, provider=provider, model=model,
+                        enable_thinking=False, temperature=temperature,
+                        max_tokens=8000, timeout=240)
+    except Exception as e:                                  # noqa: BLE001
+        safe_print(f"[skeleton] LLM 调用异常: {type(e).__name__}: {str(e)[:80]}", flush=True)
+        return {}
+    api_err = _is_llm_error_response(out or "")
+    if api_err:
+        safe_print(f"[skeleton] ❌ {api_err}, 回退到无骨架的块级归纳", flush=True)
+        return {}
+    parsed = _parse_theme_json(out or "", key="themes")
+    if not parsed:
+        safe_print("[skeleton] ❌ 骨架 JSON 解析失败, 回退到无骨架的块级归纳", flush=True)
+        return {}
+
+    themes = []
+    seen: set[str] = set()
+    for t in parsed.get("themes") or []:
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        themes.append({
+            "name": name,
+            "task": (t.get("task") or "").strip(),
+            "belongs": (t.get("belongs") or "").strip(),
+            "not_belongs": (t.get("not_belongs") or "").strip(),
+        })
+    if not themes:
+        safe_print("[skeleton] ❌ 没解析出骨架主题, 回退到无骨架的块级归纳", flush=True)
+        return {}
+
+    safe_print(
+        f"[skeleton] ✅ 全局骨架 {len(themes)} 个任务 "
+        f"(来自 {len(facts)} 条 fact 的摘要):\n"
+        + "".join(f"    ({i}) {t['name']}\n" for i, t in enumerate(themes, 1)),
+        flush=True)
+    return {"themes": themes,
+            "structure_note": (parsed.get("structure_note") or "").strip()}
+
+
+_NAME_NOISE = re.compile(r"[\s\u3000()（）\[\]【】:：,，、。.·\-—_/\\|]+")
+
+
+def _norm_name(s: str) -> str:
+    return _NAME_NOISE.sub("", (s or "").strip().lower())
+
+
+def _align_to_skeleton(
+    themes: list[dict[str, Any]],
+    skeleton: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """把块主题名归一到骨架主题名。返回 (归一后的 themes, 映射表)。
+
+    **为什么必须做这一步**: 阶段 2 的 prompt 已经要求「name 必须与骨架某一条逐字
+    一致」, 但模型不是百分百听话 —— 它可能写「经典阴影估计(通用)」或者把名字换个
+    说法。只要有一块不听话, 合并层就把它当成**全新主题**, 于是骨架被撑破, 27 个
+    块级主题抢名额的老问题原样复发。这里做一层兜底对齐。
+
+    对齐优先级(从严到松):
+      1. 规范化后完全相同(去空格/标点/大小写)  —— 覆盖「加了个括号」这类最常见偏差
+      2. 一方是另一方的前缀/后缀包含        —— 覆盖「层析」vs「经典阴影层析」这类缩写
+      3. 骨架的 belongs 线索词命中 >= 2 个     —— 最后兜底
+
+    对齐不上的主题原样保留, 不强制塞进某个骨架 —— 宁可多一个块级主题,
+    也不要错误合并两个不同的东西。
+    """
+    sk_themes = (skeleton or {}).get("themes") or []
+    if not sk_themes or not themes:
+        return themes, {}
+
+    norm_to_sk: dict[str, dict[str, Any]] = {}
+    for st in sk_themes:
+        n = _norm_name(st["name"])
+        if n and n not in norm_to_sk:
+            norm_to_sk[n] = st
+
+    # belongs 线索 -> 候选特异词
+    #
+    # **只收 >= 4 字的词**: 中文 belongs 写的是**完整短语**(「误差缓解 /
+    # 去偏置 / 鲁棒协议」), 不是英文那种空格分词。4 字以上的中文短语
+    # (「误差缓解」「密度矩阵重构」)和 4 字母以上的缩写本身足够特异, 命中 1 个
+    # 就该认; 3 字以内的(「去偏置」「MPS」)太泛, 命中 1 个就归类是在赌。
+    #
+    # 想过「短词要求命中 2 个」, 但**做不到** —— 判断是 `w in blob` 这种
+    # 子串包含, 只有 True/False, 同一个词无法计两次。所以直接按长度筛,
+    # 而不是引入一个表达不了的门槛(那会变成看着像分级、实际是放行)。
+    clue_words: list[tuple[str, list[str]]] = []
+    for st in sk_themes:
+        raw = (st.get("belongs") or "").strip()
+        cands = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", raw)
+        cands += re.split(r"[、,，/／;；\s]+", raw)
+        words = [w.strip().lower() for w in dict.fromkeys(cands) if len(w.strip()) >= 4]
+        if words:
+            clue_words.append((st["name"], words))
+
+    mapping: dict[str, str] = {}
+    renamed = 0
+    for t in themes:
+        name = t.get("name") or ""
+        n = _norm_name(name)
+        if not n:
+            continue
+        target = ""
+        if n in norm_to_sk:
+            target = norm_to_sk[n]["name"]
+        else:
+            # 2. 前/后缀包含 —— 模型常把骨架名缩写成「层析」「噪声缓解」这种短形式。
+            #    **同时命中多个骨架时不走这条**: 「经典阴影」既是「经典阴影估计」
+            #    也是「经典阴影层析」的子串, 拿哪个都是猜。这种泛化名本来就该交给
+            #    规则 3 的线索词或保持原样, 不是靠字符串包含硬塞。
+            containers = [sk_norm for sk_norm in norm_to_sk
+                          if len(sk_norm) >= 4 and len(n) >= 2
+                          and (n in sk_norm or sk_norm in n)]
+            if len(containers) == 1:
+                target = norm_to_sk[containers[0]]["name"]
+            else:
+                # 3. 线索词兜底 —— 命中 1 个特异词(>=4 字)即认
+                blob = f"{name} {t.get('statement') or ''}".lower()
+                best, best_hits = "", 0
+                for sk_name, words in clue_words:
+                    hits = sum(1 for w in words if w in blob)
+                    if hits > best_hits:
+                        best, best_hits = sk_name, hits
+                if best_hits >= 1:
+                    target = best
+
+        # 名字本来就等于骨架名 = **没有发生任何改名**, 不算进映射表。
+        # 否则告警会说「3/3 个主题已归并」而其实一个都没并 —— 虚高比不说更糟。
+        if target and target != name:
+            mapping[name] = target
+            renamed += 1
+
+    if not mapping:
+        return themes, {}
+    return [{**t, "name": mapping.get(t.get("name") or "", t.get("name") or "")}
+            for t in themes], mapping
+
+
 def _merge_chunk_results(
-        results: list[dict[str, Any]], max_themes: int) -> dict[str, Any]:
+        results: list[dict[str, Any]], max_themes: int,
+        skeleton: dict[str, Any] | None = None) -> dict[str, Any]:
     """把多个块的主题结果合并成一张图。
 
     - 同名主题**并集** fact_ids(同名即同一主题, 这与 theme 表按 name upsert 一致)
@@ -117,6 +378,23 @@ def _merge_chunk_results(
     arc: list[str] = []
     gaps: list[str] = []
     warnings: list[str] = []
+
+    # 先把每块的主题名归一到骨架名, **再做同名合并** —— 顺序反了就白做:
+    # 先合并的话「噪声下的经典阴影」和「经典阴影」是两个主题, 归一已经晚了。
+    align_map: dict[str, str] = {}
+    if skeleton:
+        aligned_results = []
+        for r in results:
+            th, m = _align_to_skeleton(list(r.get("themes") or []), skeleton)
+            if m:
+                align_map.update(m)
+            aligned_results.append({**r, "themes": th})
+        results = aligned_results
+        if align_map:
+            warnings.append(
+                f"主题名对齐到全局骨架: {len(align_map)} 个块内叫法改写成骨架名, "
+                f"例: " + "、".join(f"{k}→{v}" for k, v in list(align_map.items())[:3]))
+
     for idx, r in enumerate(results, 1):
         warnings.extend(r.get("warnings") or [])
         for x in r.get("narrative_arc") or []:
@@ -165,15 +443,34 @@ def _merge_chunk_results(
         # 所以改成**轮转**: 第 1 轮每块各交出它最大的主题, 第 2 轮各交第二个,
         # 直到凑满 max_themes。块数 >= max_themes 时保证**每块至少活一个**;
         # 块数 < max_themes 时保证名额在块间均分。
+        #
+        # 10-07 晚(两阶段骨架): **有骨架时改用骨架保底**, 轮转降为补位手段。
+        # 轮转的语义是"每块保一个", 而块本身是**技术视角**的切片 —— 保证每块
+        # 活一个, 等于保证图里塞满了块级视角, 全局结构反而被挤掉。骨架才是全局
+        # 结构本身, 它的每个任务都该有事实支撑, 所以它保底、块级主题补位。
+        sk_names = [st["name"] for st in ((skeleton or {}).get("themes") or [])]
+        selected: list[dict[str, Any]] = []
+        picked: set[int] = set()
+
+        if sk_names:
+            by_norm = {_norm_name(t["name"]): t for t in themes}
+            for nm in sk_names:
+                t = by_norm.get(_norm_name(nm))
+                if t is not None and id(t) not in picked:
+                    selected.append(t)
+                    picked.add(id(t))
+                    if len(selected) >= max_themes:
+                        break
+
         per_chunk: dict[int, list[dict[str, Any]]] = {}
         for t in themes:
+            if id(t) in picked:
+                continue
             for c in chunk_of.get(t["name"], ()):
                 per_chunk.setdefault(c, []).append(t)
         for lst in per_chunk.values():
             lst.sort(key=lambda t: len(t.get("fact_ids") or []), reverse=True)
 
-        selected: list[dict[str, Any]] = []
-        picked: set[int] = set()
         depth = 0
         while len(selected) < max_themes:
             progressed = False
@@ -198,9 +495,11 @@ def _merge_chunk_results(
                                        + len(t.get("fact_ids") or []))
         chunk_desc = " ".join(
             f"块{c}={by_chunk_dropped[c]}条" for c in sorted(by_chunk_dropped))
+        how = (f"先给骨架 {len(sk_names)} 个任务各保底 1 个名额, 余下按块轮转(每块优先留 fact 最多的)"
+               if sk_names else "按块轮转保留, 每块优先留 fact 最多的")
         warnings.append(
-            f"主题数 {len(themes)} 超过上限 {max_themes}, 已按块轮转保留 {len(selected)} "
-            f"个(每块优先留 fact 最多的), 被截掉的 {len(dropped_themes)} 个主题涉及 "
+            f"主题数 {len(themes)} 超过上限 {max_themes}, 已保留 {len(selected)} "
+            f"个({how}), 被截掉的 {len(dropped_themes)} 个主题涉及 "
             f"{dropped} 条 fact(这些 fact 不会出现在主题地图里); 按块分布: {chunk_desc}")
         themes = selected
 
@@ -222,7 +521,8 @@ def _merge_chunk_results(
             f"{n_dangling} 条主题关系指向因超上限被截掉的主题, 已剔除"
             f"(原样留着会让 Phase C 的 prompt 里出现不存在的主题名)")
 
-    return {"themes": themes, "narrative_arc": arc, "gaps": gaps, "warnings": warnings}
+    return {"themes": themes, "narrative_arc": arc, "gaps": gaps,
+            "warnings": warnings, "skeleton": skeleton or {}}
 
 
 # ============================================================
@@ -379,7 +679,7 @@ THEME_MAP_PROMPT = """你是一位资深研究者在通读一批文献**笔记**
 子问题构成, 它们之间是什么关系"。
 
 {scope_line}
-
+{skeleton_block}
 【语料分布 — 客观数据, 先看这个】
 下面的簇是按 fact 的 `subject`(核心对象)自动聚的, 反映了这批文献**实际**在讨论什么。
 {n_subject_histogram}
@@ -694,6 +994,7 @@ def _theme_map_retry_loop(
     chunk_idx: int = 1,
     n_chunks: int = 1,
     total_facts: int = 0,
+    skeleton: dict[str, Any] | None = None,
 ):
     """主题地图的调用+重试循环。返回 (facts, prompt, parsed, salvaged, last_err, n_api_err)。
 
@@ -716,6 +1017,7 @@ def _theme_map_retry_loop(
         n_subject_histogram=_subject_histogram(clusters),
         facts_block=_facts_block(facts, paper_titles),
         scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
+        skeleton_block=_render_skeleton(skeleton),
     )
     parsed = None
     salvaged: list[dict[str, Any]] | None = None
@@ -765,6 +1067,7 @@ def _theme_map_retry_loop(
             n_subject_histogram=_subject_histogram(clusters),
             facts_block=_facts_block(facts, paper_titles),
             scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
+            skeleton_block=_render_skeleton(skeleton),
         )
     return facts, prompt, parsed, salvaged, last_err, n_api_err
 
@@ -801,6 +1104,19 @@ def organize_facts_into_themes(
               f"(每块 <= {THEME_CHUNK_CHARS} 字符 / {THEME_CHUNK_FACTS} 条), "
               f"逐块归纳后按主题名合并 —— 切块这步一条 fact 都不丢"
               f"(主题数超上限时仍会丢, 丢了多少见下面的 warnings)", flush=True)
+
+        # ---- 阶段一: 全局骨架 ----
+        # 10-07 晚。**为什么必须有这一步** —— 见 THEME_SKELETON_PROMPT 的说明。
+        # 简版: 分块让每块只看到 1/N, 于是每块各自按**技术**切 4-5 个主题,
+        # 6 块就是 27 个块级主题抢 8 个名额, 留下的全是块级视角。实测今天这次:
+        #   进主题地图的论文 37%、每主题平均覆盖 2.8 篇论文;
+        # 10-03 没有分块(一次 LLM 看全部), 同一指标是 69% / 5.1 篇。
+        # 也就是说分块把"领域结构"降级成了"技术罗列"。骨架负责把它找回来。
+        clusters_all = cluster_by_subject(facts)
+        skeleton = _build_skeleton(
+            facts, clusters_all, provider=provider, model=model,
+            temperature=temperature)
+
         results = []
         for i, ch in enumerate(chunks, 1):
             print(f"[organize]   块 {i}/{len(chunks)}: {len(ch)} 条", flush=True)
@@ -809,8 +1125,9 @@ def organize_facts_into_themes(
                 temperature=temperature, max_themes=max_themes,
                 # 10-07: 把「第几块/共几块/全库多少条」喂进 prompt, 否则模型
                 # 每块都以为自己看的是全部语料。见 _chunk_scope_line。
-                chunk_idx=i, n_chunks=len(chunks), total_facts=len(facts)))
-        merged = _merge_chunk_results(results, max_themes)
+                chunk_idx=i, n_chunks=len(chunks), total_facts=len(facts),
+                skeleton=skeleton))
+        merged = _merge_chunk_results(results, max_themes, skeleton=skeleton)
         return merged
     return _organize_one_chunk(
         chunks[0], paper_titles=paper_titles, provider=provider, model=model,
@@ -828,6 +1145,7 @@ def _organize_one_chunk(
     chunk_idx: int = 1,
     n_chunks: int = 1,
     total_facts: int = 0,
+    skeleton: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """单块(调用量在 max_tokens 之内)的归纳。10-05 从 organize_facts_into_themes
     抽出来, 让上层能分块调用; 逻辑一行没改。
@@ -848,6 +1166,7 @@ def _organize_one_chunk(
         n_subject_histogram=_subject_histogram(clusters),
         facts_block=_facts_block(facts, paper_titles),
         scope_line=_chunk_scope_line(len(facts), total_facts or len(facts), chunk_idx, n_chunks),
+        skeleton_block=_render_skeleton(skeleton),
     )
 
     # 9-29 实测: MiniMax 即使 enable_thinking=False 也会输出大段 <think>,
@@ -859,7 +1178,8 @@ def _organize_one_chunk(
     n_api_err = 0
     facts, prompt, parsed, salvaged, last_err, n_api_err = _theme_map_retry_loop(
         facts, clusters, paper_titles, provider, model, temperature,
-        chunk_idx=chunk_idx, n_chunks=n_chunks, total_facts=total_facts or len(facts))
+        chunk_idx=chunk_idx, n_chunks=n_chunks, total_facts=total_facts or len(facts),
+        skeleton=skeleton)
     if parsed is None:
         if not salvaged:
             if n_api_err:
