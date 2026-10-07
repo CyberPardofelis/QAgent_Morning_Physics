@@ -199,7 +199,43 @@ def _call_llm(
         "max_tokens": max_tokens,
     }
 
-    if enable_thinking:
+    # ---- 2026-07-07 修: MiniMax 的 thinking 开关 ----
+    #
+    # **原来这里有个 bug, 让所有工具调用都在为无用的思考烧 token。**
+    #
+    # 之前 `enable_thinking=False` 时**什么都不传**, 于是 MiniMax-M3 用它自己的
+    # 默认值 —— 而 M3 默认是 **adaptive thinking**。也就是说: 工具里写
+    # `enable_thinking=False` 期望"别思考, 直接给答案", 实际拿到的是
+    # **96% 都是 <think>...</think> 的返回串**。
+    #
+    # 实测(10-07, 经典阴影综述的骨架 prompt, 31722 字符):
+    #   不传 flag:      content=33715 字符, completion_tokens=10761, 105s
+    #   type=disabled:  content= 1090 字符, completion_tokens=  499,  14s
+    # JSON 解析结果两边一模一样(都是 7 个骨架任务) —— 也就是说那 97% 的输出
+    # 和 87% 的等待时间**全是白花的**。
+    #
+    # 真正咬人的地方是**它吃 max_tokens**: 骨架原来给 `max_tokens=8000`,
+    # 96% 被 think 占掉, 答案 JSON 挤在最后被截断, `_parse_theme_json` 对
+    # "截在字符串中间"无解 -> 第二轮退回无骨架的块级归纳, 第一轮建好的领域
+    # 结构被整块丢弃(实测 10-07 经典阴影第二轮)。
+    #
+    # `agent/controller.py` 早就写对了这条分支(主界面对话路径), 但**工具内部
+    # 调用路径一直漏着**。这里对齐它。
+    #
+    # ⚠ 顺带修掉第二个 bug: `thinking.type` 对 M3 只接受 `"disabled"`,
+    #   传 `"enabled"` 直接 400(`invalid thinking.type: "enabled"`)——
+    #   实测确认过。所以 minimax + enable_thinking=True 时**不能**走上面那
+    #   个 `enabled` 分支, 要用它的默认 adaptive 行为。
+    # ⚠ 顺序有讲究: 先按 enable_thinking 统一填, **再**按 provider 裁剪。
+#   第一版把 minimax 整条拆成独立分支, 结果 `else` 那个填 penalty 的分支只有
+#   非 minimax 才走得到, 后面那两个 pop 就成了**死代码** —— 反向验证 M11
+#   「不再为 minimax 剥 penalty」改坏了却测不出来, 因为压根没往里塞过。
+#   回归测试 test_no_penalties_for_minimax 也是这么"绿得毫无意义"的。
+#
+    # `enable_thinking and provider != "minimax"`: M3 显式 "enabled" 会 400
+    # (实测 `invalid thinking.type: "enabled"`), 所以 minimax 走它自己的默认
+    # adaptive 行为, 不塞 extra_body。
+    if enable_thinking and provider != "minimax":
         kwargs["reasoning_effort"] = reasoning_effort
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     else:
@@ -210,10 +246,13 @@ def _call_llm(
             "presence_penalty": presence_penalty,
         })
 
-    # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限,统一剥离避免 400。
     if provider == "minimax":
+        # MiniMax 接口对 frequency_penalty / presence_penalty 支持有限, 统一剥离避免 400。
         kwargs.pop("frequency_penalty", None)
         kwargs.pop("presence_penalty", None)
+        if not enable_thinking:
+            # ↓ 这一行才是本 bug 的正事: 不显式关, M3 就在思考(见上面的实测数据)
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     # 2026-09-04 P0 fix:把 timeout 传给 client.chat.completions.create()
     # 之前 timeout 是 _call_llm 的入参但没被透传 — daily summary 类工具传 timeout=600

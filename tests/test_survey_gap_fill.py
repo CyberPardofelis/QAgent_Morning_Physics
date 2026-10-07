@@ -420,6 +420,29 @@ def test_zero_name_overlap_is_loud():
     assert "接不上" in seg, "警告没说清后果(下游产物接不上)"
 
 
+def test_gap_fill_uses_incremental_merge_not_full_rerun():
+    """回补轮必须走**增量并入**, 不能拿全部 fact 从零重跑。
+
+    10-07 实测这是「83 篇候选池最后只引用 19 篇」的直接原因: 从零重跑时
+    353 条 fact 里 LLM 归纳出 **34 个主题**, 撞 max_themes=8 -> 26 个主题
+    连带 **223 条 fact(63%)被整块截掉**, 这些 fact 再没机会进命题层/参考文献。
+
+    增量并入只归纳本轮新增的 fact, 骨架沿用上一轮的, 旧主题一条都不砍。
+    反向验证 M8 就是把 `induce_facts=` 删掉, 这个测试必须变红。
+    """
+    src = pathlib.Path(SG.__file__).read_text(encoding="utf-8")
+    body = src.split("def _phase_gap_fill", 1)[1].split("def _run_organize_phase", 1)[0]
+    # 锚点必须带赋值前缀: 上面那段解释性**注释**里也写了
+    # `organize_facts_into_themes(usable, ...)`, 直接按函数名切会切到注释上
+    # (第一版就这么写错了, 断言拿注释当代码判, 报了个看不懂的失败)。
+    call = body.split("tmap = organize_facts_into_themes(", 1)[1][:400]
+    assert "prev_map=theme_map" in call, "回补轮没把上一轮地图传进去(= 不可能增量)"
+    assert "induce_facts=" in call, (
+        "回补轮没传 induce_facts —— 会拿全部 usable fact 从零重跑, "
+        "实测 34 个主题撞上限 8, 63% 的 fact 被截掉, 参考文献只剩 19 篇")
+    assert "new_usable" in call, "induce_facts 应该是本轮新增的 fact(且已过滤可用)"
+
+
 def test_gap_fill_wired_after_theme_map_before_macros():
     """回补必须在**主题地图之后、宏观层之前**。
 

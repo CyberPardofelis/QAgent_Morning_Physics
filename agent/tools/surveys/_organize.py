@@ -140,15 +140,16 @@ THEME_SKELETON_PROMPT = """你在为一个领域建立**结构骨架**, 供后�
   "themes": [
     {{
       "name": "任务名(12 字以内)",
-      "task": "这个任务要解决什么问题(1-2 句)",
-      "belongs": "什么样的事实属于这个任务(可判定的线索, 2-3 个具体对象/指标)",
-      "not_belongs": "相邻但**不要**混进来的东西(1 句)"
+      "task": "这个任务要解决什么问题(**不超过 40 字**)",
+      "belongs": "什么样的事实属于这个任务(可判定的线索, **2-3 个具体对象/指标, 总共不超过 60 字**)",
+      "not_belongs": "相邻但**不要**混进来的东西(**不超过 30 字**)"
     }}
   ],
-  "structure_note": "这几个任务之间是什么关系(谁是谁的基础/谁给了谁什么工具/存在什么张力)"
+  "structure_note": "这几个任务之间是什么关系(谁是谁的基础/谁给了谁什么工具/存在什么张力), **不超过 80 字**"
 }}
 
-只输出 JSON。"""
+⚠ **每个字段都有字数上限, 超了会被截断, 整个 JSON 解析失败, 这一轮全白跑。**
+写紧凑, 不要展开论述。只输出 JSON。"""
 
 
 def _fact_digest(facts: list[dict[str, Any]], claim_chars: int = 60) -> str:
@@ -198,69 +199,127 @@ def _render_skeleton(skeleton: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def _looks_truncated(out: str) -> bool:
+    """粗判输出是不是被 max_tokens 砍了尾巴。
+
+    真跑实测(10-07 经典阴影): 骨架 JSON 解析失败时, 返回串尾部是**半个字符串
+    值**(没有一个完整的右花括号)。`_parse_theme_json` 的截断抢救能处理"缺右括号",
+    但处理不了"断在字符串中间" —— 后者 json.loads 必炸, 只能靠调大 max_tokens
+    从源头避免。
+    """
+    s = (out or "").rstrip()
+    if not s:
+        return False
+    if s.endswith("```"):
+        s = s[:-3].rstrip()
+    return not s.endswith("}")
+
+
 def _build_skeleton(
     facts: list[dict[str, Any]],
     clusters: list[tuple[str, list[dict[str, Any]]]] | list,
     provider: str = "minimax",
     model: str = "MiniMax-M3",
     temperature: float = 0.4,
+    prev_skeleton: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """阶段一: 全部 fact 的极简摘要 → 全局任务骨架。永不抛异常。
 
-    失败时返回空 dict, 调用方回退到「无骨架」模式 —— 那就是今天之前的块级行为,
-    不比现状更差。
+    **10-07 修(真跑实测出的截断)**: 原来 `max_tokens` 写死 8000。实测 8000 tokens
+    ≈ 23637 字符(约 2.95 字符/token), 第一轮 282 条 fact 的输出 23637 字符, 刚好
+    卡在上限内, 解析成功。但 gap-fill 回补后 fact 涨到 353 条, 同一 prompt 输出涨到
+    **29573 字符 ≈ 10024 tokens, 超上限被服务端截断**, JSON 解析失败 ——
+    于是第二轮退回无骨架的块级归纳, 第一轮建好的领域结构被整块丢弃。
+
+    三处加固:
+      1. `max_tokens` 跟块级归纳对齐(`THEME_MAP_MAX_TOKENS`, 32000)
+      2. prompt 里给每个字段加字数上限 —— 从源头压输出长度, 比单纯加额度更省
+      3. 解析失败**重试 1 次**(追加更严格的长度要求)
+
+    `prev_skeleton` 非空时**直接沿用, 一次 LLM 都不发** —— 增量并入轮的领域结构
+    本来就不该被新论文改写(实测从零重建正是 10-07 第二轮丢掉骨架的原因)。
+    没有 prev 时才真的去构建。
     """
     from agent.tools.llm import _call_llm
 
     if not facts:
         return {}
-    prompt = THEME_SKELETON_PROMPT.format(
+
+    # 增量并入轮: 沿用上一轮骨架, 不重建。
+    if prev_skeleton and (prev_skeleton.get("themes") or []):
+        safe_print(
+            f"[skeleton] ♻️ 沿用上一轮骨架 {len(prev_skeleton['themes'])} 个任务 "
+            f"(增量并入不重建领域结构)",
+            flush=True)
+        return prev_skeleton
+
+    base_prompt = THEME_SKELETON_PROMPT.format(
         n_subject_histogram=_subject_histogram(clusters),
         facts_digest=_fact_digest(facts),
         n_facts=len(facts),
     )
-    try:
-        out = _call_llm(prompt, provider=provider, model=model,
-                        enable_thinking=False, temperature=temperature,
-                        max_tokens=8000, timeout=240)
-    except Exception as e:                                  # noqa: BLE001
-        safe_print(f"[skeleton] LLM 调用异常: {type(e).__name__}: {str(e)[:80]}", flush=True)
-        return {}
-    api_err = _is_llm_error_response(out or "")
-    if api_err:
-        safe_print(f"[skeleton] ❌ {api_err}, 回退到无骨架的块级归纳", flush=True)
-        return {}
-    parsed = _parse_theme_json(out or "", key="themes")
-    if not parsed:
-        safe_print("[skeleton] ❌ 骨架 JSON 解析失败, 回退到无骨架的块级归纳", flush=True)
-        return {}
 
-    themes = []
-    seen: set[str] = set()
-    for t in parsed.get("themes") or []:
-        if not isinstance(t, dict):
+    out = ""
+    for attempt in (1, 2):
+        # 第 2 次追加硬约束: 第 1 次的长度要求模型没遵守, 直接把上限再说一遍。
+        prompt = base_prompt if attempt == 1 else (
+            base_prompt
+            + "\n\n【重试 — 上一次输出超长被截断】这次把 task 压到 20 字以内、"
+              "belongs 压到 30 字以内、not_belongs 压到 15 字以内、structure_note 省略。"
+              "宁可短, 不可长。"
+        )
+        try:
+            out = _call_llm(prompt, provider=provider, model=model,
+                            enable_thinking=False, temperature=temperature,
+                            max_tokens=THEME_MAP_MAX_TOKENS, timeout=240)
+        except Exception as e:                                  # noqa: BLE001
+            safe_print(f"[skeleton] LLM 调用异常: {type(e).__name__}: {str(e)[:80]}",
+                       flush=True)
+            out = ""
+        api_err = _is_llm_error_response(out or "") if out else "调用失败(空返回)"
+        if api_err:
+            safe_print(f"[skeleton] ❌ {api_err}", flush=True)
             continue
-        name = (t.get("name") or "").strip()
-        if not name or name in seen:
+        parsed = _parse_theme_json(out or "", key="themes")
+        if not parsed:
+            tail = (out or "").rstrip()[-60:].replace("\n", " ")
+            safe_print(
+                f"[skeleton] ❌ 骨架 JSON 解析失败(第 {attempt} 次)"
+                + (f", 疑似被 max_tokens 截断, 返回 {len(out)} 字符, 尾部: {tail!r}"
+                   if _looks_truncated(out) else f", 返回 {len(out)} 字符"),
+                flush=True)
             continue
-        seen.add(name)
-        themes.append({
-            "name": name,
-            "task": (t.get("task") or "").strip(),
-            "belongs": (t.get("belongs") or "").strip(),
-            "not_belongs": (t.get("not_belongs") or "").strip(),
-        })
-    if not themes:
-        safe_print("[skeleton] ❌ 没解析出骨架主题, 回退到无骨架的块级归纳", flush=True)
-        return {}
 
-    safe_print(
-        f"[skeleton] ✅ 全局骨架 {len(themes)} 个任务 "
-        f"(来自 {len(facts)} 条 fact 的摘要):\n"
-        + "".join(f"    ({i}) {t['name']}\n" for i, t in enumerate(themes, 1)),
-        flush=True)
-    return {"themes": themes,
-            "structure_note": (parsed.get("structure_note") or "").strip()}
+        themes = []
+        seen: set[str] = set()
+        for t in parsed.get("themes") or []:
+            if not isinstance(t, dict):
+                continue
+            name = (t.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            themes.append({
+                "name": name,
+                "task": (t.get("task") or "").strip(),
+                "belongs": (t.get("belongs") or "").strip(),
+                "not_belongs": (t.get("not_belongs") or "").strip(),
+            })
+        if not themes:
+            safe_print(f"[skeleton] ❌ 没解析出骨架主题(第 {attempt} 次)", flush=True)
+            continue
+
+        safe_print(
+            f"[skeleton] ✅ 全局骨架 {len(themes)} 个任务 "
+            f"(来自 {len(facts)} 条 fact 的摘要):\n"
+            + "".join(f"    ({i}) {t['name']}\n" for i, t in enumerate(themes, 1)),
+            flush=True)
+        return {"themes": themes,
+                "structure_note": (parsed.get("structure_note") or "").strip()}
+
+    # 两次都失败 -> 退回无骨架块级归纳(= 改前的行为, 不比现状更差)。
+    safe_print("[skeleton] ❌ 两次都失败, 回退到无骨架的块级归纳", flush=True)
+    return {}
 
 
 _NAME_NOISE = re.compile(r"[\s\u3000()（）\[\]【】:：,，、。.·\-—_/\\|]+")
@@ -523,6 +582,59 @@ def _merge_chunk_results(
 
     return {"themes": themes, "narrative_arc": arc, "gaps": gaps,
             "warnings": warnings, "skeleton": skeleton or {}}
+
+
+def _merge_into_prev_map(
+    prev_map: dict[str, Any],
+    results: list[dict[str, Any]],
+    skeleton: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """增量并入: 新归纳出的主题按名并进上一轮地图, **旧主题一条都不砍**。
+
+    为什么单独写一个函数而不复用 `_merge_chunk_results` 的上限逻辑:
+
+    `_merge_chunk_results` 存在的唯一理由是「6 块各出 4-5 个技术主题, 抢 8 个名额」,
+    必须砍。增量轮的语义完全相反 —— 上一轮的主题是**已经确认过的领域结构**,
+    新 fact 只是往里填料。把它们丢掉的代价(整块 fact 进不了参考文献)远大于
+    多几个章节的代价(写长一点)。
+
+    实测代价(10-07 经典阴影第二轮): 从零重跑时 LLM 从 353 条 fact 归纳出 34 个
+    主题, 撞上限 8 -> 26 个主题连带 **223 条 fact(63%)被截掉**, 83 篇池最后只
+    引用 19 篇。增量轮不会有这个问题: 旧 6 个主题 + 新归纳出的(对齐到骨架后通常
+    就落在旧主题里), 主题数基本不变。
+
+    保留 `max_themes` 只作为**新增主题**的软预算: 新主题多于旧主题 + 预算时才截,
+    且只截新增的 —— 旧主题永远在保底名单里。
+    """
+    prev_themes = list(prev_map.get("themes") or [])
+    prev_names = {t.get("name") for t in prev_themes}
+
+    # 旧主题当成"第 0 块"喂进同一套合并逻辑, 这样 relations / narrative_arc /
+    # gaps 的去重合并行为与全量重跑完全一致, 不会分叉出第二套语义。
+    combined: list[dict[str, Any]] = [{
+        "themes": prev_themes,
+        "narrative_arc": prev_map.get("narrative_arc") or [],
+        "gaps": prev_map.get("gaps") or [],
+        "warnings": [],
+    }] + list(results)
+
+    n_new = sum(len(r.get("themes") or []) for r in results)
+    # 上限只用来约束**新增**主题: 给到"旧主题数 + 新归纳出的主题数"这个上界,
+    # 正常情况下根本触发不了; 万一新 fact 带出一堆全新结构, 也在保底名单里保住旧主题。
+    merged = _merge_chunk_results(combined, len(prev_names) + n_new, skeleton=skeleton)
+
+    kept_old = [t for t in merged.get("themes") or [] if t.get("name") in prev_names]
+    dropped_old = sorted(prev_names - {t.get("name") for t in merged.get("themes") or []})
+    if dropped_old:
+        merged.setdefault("warnings", []).append(
+            f"[!] 增量并入时丢了 {len(dropped_old)} 个旧主题: "
+            + "、".join(dropped_old[:5])
+            + ("…" if len(dropped_old) > 5 else ""))
+    merged["warnings"].append(
+        f"增量并入: 旧 {len(prev_themes)} 个主题保留 {len(kept_old)} 个, "
+        f"新增 {len(merged.get('themes') or []) - len(kept_old)} 个 "
+        f"(归纳了 {n_new} 个候选主题名, 按骨架对齐后并入)")
+    return merged
 
 
 # ============================================================
@@ -1079,6 +1191,8 @@ def organize_facts_into_themes(
     model: str = "MiniMax-M3",
     temperature: float = 0.4,
     max_themes: int = 8,
+    prev_map: dict[str, Any] | None = None,
+    induce_facts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Phase B: 把 fact 组织成主题地图。
@@ -1093,14 +1207,42 @@ def organize_facts_into_themes(
     split_fact_chunks), 每块独立归纳, 最后按主题名合并(_merge_chunk_results)。
     **切块这步一条 fact 都不丢**; 主题数超过 max_themes 时仍会丢, 现在按 fact
     数选而不是按块序砍, 丢多少/丢哪几块都进 warnings。
+
+    **10-07 晚加: 增量并入(`induce_facts` + `prev_map` 同时给)。**
+
+    背景: gap-fill 回补会拿到新论文新 fact, 然后**从零重跑整张地图**。实测这个
+    「重跑」有两个致命问题(10-07 经典阴影第二轮):
+      - 353 条 fact 里 LLM 归纳出 **34 个主题**, 撞 `max_themes=8` 上限 ->
+        26 个主题连带 **223 条 fact(63%)被整块截掉**, 这些 fact 永远进不了
+        参考文献 —— 这就是「83 篇池子最后只引用 19 篇」的直接原因;
+      - 主题名每轮重新生成, 按名合并命中经常是 0, 旧主题名一个都保不住,
+        依赖主题名的下游产物(_claims / _narratives / survey_section)全接不上。
+
+    增量模式下只归纳 `induce_facts`(新 fact), 骨架沿用 `prev_map` 的(领域结构
+    不该被新论文改写), 结果按名并进旧主题 —— **旧主题一条都不砍**。
     """
     paper_titles = paper_titles or {}
     if not facts:
         return {"themes": [], "narrative_arc": [], "gaps": [], "warnings": ["没有 fact"]}
 
-    chunks = split_fact_chunks(facts)
+    # ---- 增量并入 ----
+    # `induce_facts is not None`(而不是 truthy)是刻意的: 传了空列表表示
+    # 「本轮没有新 fact」, 此时该原样返回上一轮, 而不是退化成全量重跑。
+    incremental = (prev_map is not None and bool(prev_map.get("themes"))
+                   and induce_facts is not None)
+    work = list(induce_facts) if incremental else facts
+    if incremental:
+        print(f"[organize] ♻️ 增量并入: 只归纳新增 {len(work)} 条 fact "
+              f"(全库 {len(facts)} 条), 结果并进上一轮 "
+              f"{len(prev_map['themes'])} 个主题 —— 不重跑旧主题, 不重建骨架",
+              flush=True)
+        if not work:
+            safe_print("[organize] ♻️ 没有新增 fact, 直接沿用上一轮地图", flush=True)
+            return dict(prev_map)
+
+    chunks = split_fact_chunks(work)
     if len(chunks) > 1:
-        print(f"[organize] {len(facts)} 条 fact 切成 {len(chunks)} 块"
+        print(f"[organize] {len(work)} 条 fact 切成 {len(chunks)} 块"
               f"(每块 <= {THEME_CHUNK_CHARS} 字符 / {THEME_CHUNK_FACTS} 条), "
               f"逐块归纳后按主题名合并 —— 切块这步一条 fact 都不丢"
               f"(主题数超上限时仍会丢, 丢了多少见下面的 warnings)", flush=True)
@@ -1112,10 +1254,14 @@ def organize_facts_into_themes(
         #   进主题地图的论文 37%、每主题平均覆盖 2.8 篇论文;
         # 10-03 没有分块(一次 LLM 看全部), 同一指标是 69% / 5.1 篇。
         # 也就是说分块把"领域结构"降级成了"技术罗列"。骨架负责把它找回来。
-        clusters_all = cluster_by_subject(facts)
-        skeleton = _build_skeleton(
-            facts, clusters_all, provider=provider, model=model,
-            temperature=temperature)
+        prev_skeleton = (prev_map or {}).get("skeleton") or None
+        if incremental and (prev_skeleton or {}).get("themes"):
+            # 增量轮直接沿用, 一次 LLM 都不发(领域结构不该被新论文改写)
+            skeleton = prev_skeleton
+        else:
+            skeleton = _build_skeleton(
+                facts, cluster_by_subject(facts), provider=provider, model=model,
+                temperature=temperature, prev_skeleton=prev_skeleton)
 
         results = []
         for i, ch in enumerate(chunks, 1):
@@ -1127,8 +1273,17 @@ def organize_facts_into_themes(
                 # 每块都以为自己看的是全部语料。见 _chunk_scope_line。
                 chunk_idx=i, n_chunks=len(chunks), total_facts=len(facts),
                 skeleton=skeleton))
+        if incremental:
+            return _merge_into_prev_map(prev_map, results, skeleton)
         merged = _merge_chunk_results(results, max_themes, skeleton=skeleton)
         return merged
+    if incremental:
+        one = _organize_one_chunk(
+            chunks[0], paper_titles=paper_titles, provider=provider, model=model,
+            temperature=temperature, max_themes=max_themes,
+            chunk_idx=1, n_chunks=1, total_facts=len(facts),
+            skeleton=(prev_map or {}).get("skeleton") or None)
+        return _merge_into_prev_map(prev_map, [one], (prev_map or {}).get("skeleton"))
     return _organize_one_chunk(
         chunks[0], paper_titles=paper_titles, provider=provider, model=model,
         temperature=temperature, max_themes=max_themes,

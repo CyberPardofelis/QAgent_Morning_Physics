@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # **改了任何 prompt 常量 / 阶段顺序 / 合并逻辑, 就把这个日期往后挪一天。**
 # 代价是所有现存 checkpoint 作废(从头重跑一次); 不挪的代价是静默产出
 # 上一个版本的结论。后者贵得多。
-PROMPT_VERSION = "2026-10-04"
+PROMPT_VERSION = "2026-10-07b"
 
 
 @register_tool(name="survey_generate", is_streaming=True, cost_tier="L2")
@@ -693,10 +693,22 @@ def _phase_gap_fill(topic: str, ws, theme_map: dict[str, Any],
         # _extract_facts.py:158 就 `ws.append_fact(f)` 逐条落盘了,
         # 主线 `_stage_facts`(415-425 行)同样从不单独存 fact。
 
-        # ---- 重跑主题地图 (分块归纳, 新 fact 自动进入新地图) ----
+        # ---- 重跑主题地图(10-07 改: 增量并入, 不再从零重跑) ----
+        #
+        # 原来这里是 `organize_facts_into_themes(usable, ...)` —— 拿**全部** fact
+        # 从零归纳一遍。实测(10-07 经典阴影第二轮)这是「83 篇池最后只引用 19 篇」
+        # 的直接原因:
+        #   353 条 fact 里 LLM 归纳出 **34 个主题**, 撞 max_themes=8 上限 ->
+        #   26 个主题连带 **223 条 fact(63%)被整块截掉**, 这些 fact 再也没机会
+        #   进命题层/参考文献。而且主题名每轮重新生成, 按名合并命中经常是 0。
+        # 现在只归纳**这一轮新增的** fact, 骨架沿用上一轮的, 结果按名并进旧主题,
+        # 旧主题一条都不砍。见 organize_facts_into_themes 的 prev_map/induce_facts。
         titles = {p["paper_id"]: (p.get("title") or "") for p in pool}
         from ._organize import organize_facts_into_themes, save_thematic_map
-        tmap = organize_facts_into_themes(usable, paper_titles=titles)
+        new_usable = [f for f in new_facts if _fact_is_usable(f)]
+        tmap = organize_facts_into_themes(
+            usable, paper_titles=titles,
+            prev_map=theme_map, induce_facts=new_usable)
         if not tmap.get("themes"):
             yield "   ⚠ 重跑主题地图失败, 沿用上一轮结果\n"
             break
@@ -705,16 +717,12 @@ def _phase_gap_fill(topic: str, ws, theme_map: dict[str, Any],
         kept = len(new_names & old_names)
         theme_map = tmap
         save_thematic_map(ws, theme_map)
-        yield (f"   主题地图重跑: {len(old_names)} → {len(new_names)} 个主题"
+        yield (f"   主题地图增量并入: {len(old_names)} → {len(new_names)} 个主题"
                f"(新增 {len(new_names - old_names)}, 按名合并命中 {kept})\n")
         if not kept:
-            # 「宁可吵, 不可静默」: 之前这里只中性地说"新增 8, 保留 0",
-            # 看着像正常结果。实测(10-06 中性原子综述)就是 0/8 —— 主题名是模型
-            # 每轮重新生成的, 逐字相同的概率极低, 所以"新 fact 并进已有主题"
-            # 实际上**没有发生**。依赖旧主题名的下游产物(_claims /
-            # _narratives / surveys.db 的 survey_section)会接不上, 必须说。
-            yield ("   ⚠ 按名合并命中 0: 主题名被整批换掉了(不是新增 fact 落在\n"
-                   "     孤立主题里, 是旧主题名一个都没保住)。依赖旧主题名的下游\n"
+            # 「宁可吵, 不可静默」。增量模式下这条基本不该触发(旧主题原样保留),
+            # 触发就说明旧主题真的一条都没保住, 下游产物会接不上。
+            yield ("   ⚠ 按名合并命中 0: 旧主题名一个都没保住。依赖主题名的下游\n"
                    "     产物(_claims / _narratives / survey_section)会接不上。\n")
         fill_log.append({"round": rnd, "n_new_papers": len(new_papers),
                          "n_new_facts": len(new_facts),
