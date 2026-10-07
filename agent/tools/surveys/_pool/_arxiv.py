@@ -25,6 +25,14 @@ def _arxiv_search(query: str, k: int = 5) -> list[dict[str, Any]]:
     for r in client.results(search):
         out.append({
             "paper_id": normalize_arxiv_id(r.entry_id),  # 10-04: 见 _paper_id
+            # 10-07 加: 读 arXiv Atom feed 里的 <arxiv:doi>。已发表的论文这一栏
+            # 就是期刊版的 DOI, 和 OpenAlex 侧的 doi **逐字相同** —— 于是同一篇
+            # 的预印本和期刊版能落到同一个身份键上被折叠, **零额外 API 成本**。
+            # 以前没读这个字段, 于是 `2110.03629`(arXiv) 和
+            # `10.1103/physreva.107.042403`(OpenAlex) 被当成两篇不同的文献,
+            # 各抽一遍 fact, 参考文献里出现重复条目。
+            "doi": (getattr(r, "doi", "") or "").strip(),
+            "arxiv_id": normalize_arxiv_id(r.entry_id),
             "title": r.title or "",
             "year": str(r.published.year) if r.published else "",
             "authors": ", ".join([_arxiv_author_name(a) for a in (r.authors or [])[:5]]),
@@ -76,6 +84,9 @@ def _arxiv_search_batch(queries: list[str], k_per_query: int = 3) -> list[dict[s
                 seen.add(pid)
                 out.append({
                     "paper_id": pid,
+                    # 10-07: 同 _arxiv_search, 读出 DOI 才能和 OpenAlex 版折叠
+                    "doi": (getattr(r, "doi", "") or "").strip(),
+                    "arxiv_id": pid,
                     "title": r.title or "",
                     "year": str(r.published.year) if r.published else "",
                     "authors": ", ".join([a.name for a in (r.authors or [])[:5]]),

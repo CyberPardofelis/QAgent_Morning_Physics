@@ -41,8 +41,11 @@ from ._utils import (
     _arxiv_author_name,
     _audit_section_paper_ids,
     _extract_paper_ids,
+    _identity_key,
     _safe_json_loads_array,
     _safe_paper_id,
+    dedup_across_sources,
+    dedup_existing,
 )
 
 __all__ = [
@@ -51,6 +54,10 @@ __all__ = [
     "_extract_paper_ids",
     "_audit_section_paper_ids",
     "_safe_paper_id",
+    # 10-07 加: 跨来源去重(同一篇的 arXiv 预印本 <-> OpenAlex DOI 版)
+    "_identity_key",
+    "dedup_across_sources",
+    "dedup_existing",
     "_PAPER_ID_SIMPLE_RE",
     "_PAPER_ID_ARXIV_RE",
     "_PAPER_ID_PAPERS_MD_RE",

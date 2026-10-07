@@ -11,7 +11,9 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
+from .._paper_id import dedup_key, looks_like_doi
 from .._pool import _arxiv_search, _openalex_aps_search, _openalex_iop_search
+from .._pool._utils import dedup_across_sources
 from ._helpers import _friendly_error
 
 logger = logging.getLogger(__name__)
@@ -64,7 +66,6 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
     raw_papers: list[dict[str, Any]] = []
     per_source_count: dict[str, int] = {}
     per_source_journal: dict[str, str] = {}
-    seen_in_search: set = set()
     # 9-18 修: 给每个 paper 标 _src 标签 (arxiv / aps / iop), 后面 journal 标签检测用这个,
     # 不要用 per_source_journal.get("aps") 这种全局判断 (会误把 IOP paper 标成 APS)
     for src in sources:
@@ -83,9 +84,8 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
             added = 0
             for p in papers:
                 pid = p.get("paper_id", "")
-                if not pid or pid in seen_in_search:
+                if not pid:
                     continue
-                seen_in_search.add(pid)
                 # 9-18 修: 在 paper dict 上贴 _src 标签, 后面检测用这个
                 p["_src"] = src
                 raw_papers.append(p)
@@ -106,6 +106,50 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
                 f"[action_search_more] {src} ❌ {friendly}",
                 flush=True,
             )
+
+    # ---- 10-07 修: 去重必须在 **summarize 之前**, 否则重复论文照样各烧一次 LLM ----
+    #
+    # 实测(10-07 经典阴影 v3): 这条路径把同一个 paper_id 往池子里塞了 8 次
+    # (`2107.04817`), 每一次都重新调了一次 summarize LLM。池子标称 123 篇,
+    # 唯一 paper_id 只有 87 个 —— 28% 是纯重复。
+    #
+    # 两个独立的问题, 都要在这里堵:
+    #   1. **本次召回内部重复**: 三路各自召回, 同一篇会被各收一次。
+    #   2. **跟已有池子重复**: 以前的 `seen_in_search` 每次调用都重置, 完全
+    #      不看 `state["pool"]` 里已经有什么 —— gap fill 连打 5 次检索,
+    #      每次都把同样那批论文再塞一遍。
+    #
+    # 跨来源折叠见 _utils.dedup_across_sources: 同一篇的 arXiv 预印本
+    # (`2110.03629`) 与 OpenAlex 期刊版 (`10.1103/physreva.107.042403`)
+    # 合并成一条, **以 OpenAlex 的 DOI 版为准**(user 2026-10-07 拍板)。
+    raw_papers, dd = dedup_across_sources(raw_papers)
+
+    # 再跟已有池子比一次: 池子里的条目可能没有 doi 字段(旧数据), 所以两个键都查
+    pool_keys = set()
+    for p in (state.get("pool") or []):
+        if p.get("paper_id"):
+            pool_keys.add(dedup_key(p["paper_id"]))
+            if p.get("doi"):
+                pool_keys.add(dedup_key(p["doi"]))
+    already = 0
+    fresh: list[dict[str, Any]] = []
+    for p in raw_papers:
+        pid = p.get("paper_id", "")
+        keys = {dedup_key(pid)}
+        if p.get("doi"):
+            keys.add(dedup_key(p["doi"]))
+        if keys & pool_keys:
+            already += 1
+            continue
+        fresh.append(p)
+    raw_papers = fresh
+    if dd["n_in"] != dd["n_out"] or already:
+        print(
+            f"[action_search_more] 去重: 本次 {dd['n_in']}->{dd['n_out']} "
+            f"(跨来源折叠 {dd['n_arxiv_to_doi']}, 同形态重复 {dd['n_dedup_same']}), "
+            f"池里已有 {already} 篇跳过",
+            flush=True,
+        )
 
     if not raw_papers:
         sources_label = "+".join(sources)
@@ -180,6 +224,10 @@ def action_search_more(args: dict[str, Any], state: dict[str, Any], ws) -> Itera
             # 加进 state['pool'], 沿用 Phase A 候选池 dict 格式
             new_pool.append({
                 "paper_id": paper_id,
+                # 10-07: doi 必须带进池子, 否则下次追加时无法跟新召回的跨来源
+                # 条目认成同一篇(见上面去重段的说明)。旧条目没有这个字段,
+                # 去重那边对它们退回只按 paper_id 比, 不会误杀。
+                "doi": p.get("doi") or (paper_id if looks_like_doi(paper_id) else ""),
                 "title": p.get("title", ""),
                 "year": str(p.get("year", "")),
                 "journal": journal_label,

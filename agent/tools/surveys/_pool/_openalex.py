@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .._paper_id import normalize_doi
 from ._utils import _safe_paper_id
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,12 @@ def _openalex_work_to_pool_entry(work: dict, source_tag: str) -> dict[str, Any]:
 
     return {
         "paper_id": paper_id,
+        # 10-07 加: 显式带 DOI。`_safe_paper_id` 已按 DOI 优先, 所以这里多数
+        # 情况 paper_id 本身就是 DOI; 但纯预印本的 work 没有 DOI, 这时
+        # OpenAlex ID / arXiv id 也得留着, 身份键才认得出它。
+        # 跨来源折叠(见 _utils.dedup_across_sources)靠的就是这个 doi 字段把
+        # arXiv 版和 OpenAlex 版认成同一篇。
+        "doi": normalize_doi(work.get("doi") or ""),
         "title": title,
         "year": str(work.get("publication_year") or ""),
         "journal": journal_name,

@@ -13,12 +13,146 @@ from typing import Any
 from .._paper_id import (
     ARXIV_ID_ALT,
     dedup_key,
+    looks_like_doi,
     normalize_arxiv_id,
     normalize_doi,
     normalize_paper_id,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 跨来源去重 (10-07 加)
+# ============================================================
+
+def _identity_key(entry: dict[str, Any]) -> str:
+    """这条 pool entry 的**实体身份**, 而不是它的 paper_id。
+
+    为什么不能直接拿 paper_id 当身份: 同一篇论文从 arXiv API 召回是 arXiv id
+    (`2110.03629`), 从 OpenAlex(APS/IOP) 召回是正式发表的 DOI
+    (`10.1103/physreva.107.042403`)。两个字符串不同, 但说的是同一篇 ——
+    `dedup_key` 折不出来, 于是参考文献里出现重复条目, 而且同一篇被重复抽
+    一遍 fact。
+
+    所以身份取 **DOI 优先**: entry 自带 `doi` 字段就用它, 否则 paper_id 本身
+    是 DOI 也用它, 都没有才退回 arXiv id。这样两条召回路径落到同一个身份键。
+
+    **零额外 API 成本** —— arXiv 的 Atom feed 对已发表论文本来就带
+    `<arxiv:doi>`, OpenAlex 的 work 也带 `doi`, 只是以前都没读。读出来就够。
+    """
+    doi = normalize_doi(entry.get("doi") or "")
+    if not doi:
+        pid = entry.get("paper_id") or ""
+        if looks_like_doi(pid):
+            doi = normalize_doi(pid)
+    if doi:
+        return "doi:" + dedup_key(doi)
+    return "ax:" + dedup_key(entry.get("paper_id") or "")
+
+
+def _entry_rank(entry: dict[str, Any]) -> tuple[int, int]:
+    """同身份时谁胜出: **DOI 形态优先**, 其次信息更全的。
+
+    user 2026-10-07 拍板: 「以 OpenAlex 的为准, arxiv 的可能是发表前挂上去的」。
+    OpenAlex 条目的 paper_id 就是 DOI(见 _safe_paper_id 的优先级), 所以
+    「paper_id 本身是 DOI」== 「来自 OpenAlex」。
+    """
+    is_doi_form = 1 if looks_like_doi(entry.get("paper_id") or "") else 0
+    filled = sum(1 for k in ("title", "abstract", "authors", "journal", "year")
+                 if (entry.get(k) or "").strip())
+    return (is_doi_form, filled)
+
+
+def _fill_gaps(base: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
+    """把 other 里 base 没有的非空字段补进 base 的副本。paper_id 永不覆盖。"""
+    out = dict(base)
+    for k, v in (other or {}).items():
+        if k == "paper_id":
+            continue
+        cur = out.get(k)
+        empty = (not str(cur or "").strip()) if isinstance(cur, str) else (cur is None)
+        if empty and v is not None:
+            out[k] = v
+    return out
+
+
+def dedup_across_sources(
+    entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """跨来源折叠同一篇论文, 返回 (保留的条目, 统计)。
+
+    **不丢任何一篇** —— 被折叠的条目信息会并进胜出者, 被丢弃的标识记进
+    `aliases`(原样保留, 不改 paper_id, 所以不引入数据迁移)。理由: 折叠错一次
+    的代价是永久少一篇文献, 而多一条 alias 只是多一个字符串。
+
+    统计字段:
+      n_in / n_out     进出行数 / 出行数
+      n_arxiv_to_doi   **期刊版吸收了预印本**的次数(赢的是 OpenAlex 的 DOI,
+                       输的是 arXiv id)—— 就是 user 说的"以 OpenAlex 为准"
+      n_dedup_same     同形态重复(同一个 paper_id 出现多次, 或两条都是预印本)
+    """
+    best: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    stats = {"n_in": len(entries), "n_out": 0, "n_arxiv_to_doi": 0, "n_dedup_same": 0}
+    anon = 0
+
+    for e in entries:
+        k = _identity_key(e)
+        if not k or k == "ax:":
+            # 没身份键的条目原样放行, 不猜(宁可多留一条也不误杀)
+            order.append(f"__keep__{anon}")
+            best[f"__keep__{anon}"] = dict(e)
+            anon += 1
+            continue
+        cur = best.get(k)
+        if cur is None:
+            best[k] = dict(e)
+            order.append(k)
+            continue
+
+        # 同身份: DOI 形态优先, 其次信息更全的; 落败方并进胜出方
+        if _entry_rank(cur) >= _entry_rank(e):
+            winner, loser = cur, e
+        else:
+            winner, loser = e, cur
+        # ⚠ 合并和 alias **两个分支都要做**。第一版写在 else 里, 于是"旧的那条
+        # 恰好更好"时(预印本摘要更全、OpenAlex 侧摘要空)落败方信息直接蒸发。
+        merged = _fill_gaps(winner, loser)
+        aliases = list(cur.get("aliases") or []) + list(e.get("aliases") or [])
+        if loser.get("paper_id"):
+            aliases.append(loser["paper_id"])
+        if aliases:
+            merged["aliases"] = sorted(set(aliases))
+        best[k] = merged
+
+        # 统计: **期刊版吸收了预印本**才算一次跨来源折叠, 其余都是同形态重复。
+        # 不能看身份键前缀 —— arXiv 侧读了 <arxiv:doi> 之后, 预印本和期刊版
+        # 落在同一个 `doi:` 键上, 前缀本来就一样(第一版按前缀分, 结果
+        # n_arxiv_to_doi 恒为 0)。判据只能是**胜出方的 paper_id 形态**:
+        # 赢的是 DOI(= 来自 OpenAlex)而输的是 arXiv id(= 预印本), 才是用户
+        # 说的那种"以 OpenAlex 为准"。
+        if looks_like_doi(winner.get("paper_id") or "") and \
+                not looks_like_doi(loser.get("paper_id") or ""):
+            stats["n_arxiv_to_doi"] += 1
+        else:
+            stats["n_dedup_same"] += 1
+
+    out = [best[k] for k in order]
+    stats["n_out"] = len(out)
+    return out, stats
+
+
+def dedup_existing(
+    entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """给**存量池子**用的一行版: 返回 (去重后的列表, 折掉了几条)。
+
+    `action_search_more` / `_phase_gap_fill` 往池子里加东西时要跟已有池子比,
+    那条路径只需要知道折掉了几条, 不需要分类统计。
+    """
+    out, st = dedup_across_sources(entries)
+    return out, st["n_in"] - st["n_out"]
 
 # paper_id 抽取用 regex
 #
