@@ -1158,6 +1158,50 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         }
     },
 
+    "research_lean": {
+        "type": "function",
+        "function": {
+            "name": "research_lean",
+            "description": (
+                "用 Lean 4 kernel 验证形式化证明 (L0 档, 0 LLM 调用)。"
+                "★ 这是**最强的一档机器判定**: kernel 验证的是证明项本身"
+                "(proof term), 检查每个推理步骤的合法性, 而不是代码逻辑。"
+                "sympy 验的是『我对这个式子的化简』, Lean 验的是『整个推理链合法』。"
+                "\n\n★ 什么时候该用它 ★\n"
+                "· 需要全域/无穷层面的结论时(有限枚举证明不了『对所有 n』)\n"
+                "· 命题能写成形式化陈述时(定理、性质、算法正确性)\n"
+                "· 想要比符号化简更强的保证时\n\n"
+                "★ 什么时候不该用 ★\n"
+                "· 数值计算 / 具体反例搜索 → 用 research_run_code 或 research_enumerate\n"
+                "· 开放式问题(如哥德巴赫猜想本身)→ Lean 也证不了\n"
+                "· 需要 Mathlib 的大型定理(费马小定理、sqrt2 无理)→ 当前环境 Mathlib 未就绪\n"
+                "\n★ 极其重要 ★\n"
+                "Lean 遇到 `sorry` 会**报 warning 但编译通过, 退出码仍是 0**。"
+                "所以本工具单独检查 sorry: 返回里 sorry_used=true 表示"
+                "证明**没有写完**, verdict 会降级成 inconclusive。"
+                "不要看到编译成功就当它证明了。"
+                "\n不依赖 Mathlib 的核心定理可以直接用, 例如:\n"
+                "    theorem t (a : Nat) : a + 0 = a := Nat.add_zero a"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Lean 4 源码, 若干 theorem 声明。"
+                            "不依赖 Mathlib 的核心定理可直接用(Nat.add_zero / decide 等); "
+                            "需要 import Mathlib 的定理当前环境跑不了。"
+                        )
+                    },
+                    "claim": {"type": "string", "description": "这段代码想证明的命题(进证据记录, 供报告引用)"},
+                    "timeout": {"type": "integer", "description": "编译硬超时秒数, 默认 300"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+
     "research_enumerate": {
         "type": "function",
         "function": {

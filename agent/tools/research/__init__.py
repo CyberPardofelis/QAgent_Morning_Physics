@@ -50,6 +50,7 @@ from agent.infra.research_workspace import (  # noqa: E402
 from ._claim import audit_claims, normalize_claim, render_report
 from ._enumerate import GRAPH_PROPERTIES, SEQUENCE_PROPERTIES
 from ._flags import RESEARCH_EXPOSED
+from ._lean import LeanResult, check_lean, lean_available, lean_version
 from ._loop import decide_next, new_state, run_loop
 from ._provenance import VERDICTS, build_evidence, claim_id_for, judge_verdict, record
 from ._retrieve import lookup as oeis_lookup
@@ -60,6 +61,7 @@ from ._z3_tools import solve as z3_solve
 from .research_audit import research_audit
 from .research_enumerate import research_enumerate
 from .research_investigate import research_investigate
+from .research_lean import research_lean
 from .research_oeis import research_oeis
 from .research_plan import research_plan
 from .research_refute import research_refute
@@ -73,12 +75,14 @@ __all__ = [
     # LLM 工具
     "research_run_code", "research_verify", "research_sympy",
     "research_z3", "research_enumerate", "research_oeis", "research_refute",
+    "research_lean",
     "research_plan", "research_investigate", "research_report", "research_audit",
     # 内部 API
     "run_code", "SandboxResult", "SandboxRejected",
     "sympy_op", "judge_verdict", "build_evidence", "record", "claim_id_for", "VERDICTS",
     "extract_code",
     "z3_solve", "Z3Error", "oeis_lookup",
+    "check_lean", "lean_available", "lean_version", "LeanResult",
     "GRAPH_PROPERTIES", "SEQUENCE_PROPERTIES",
     "normalize_claim", "render_report", "audit_claims",
     "decide_next", "new_state", "run_loop",
