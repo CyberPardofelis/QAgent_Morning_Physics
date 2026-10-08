@@ -2398,7 +2398,6 @@ def _merge_same_paper_within_theme(
 def condense_facts_by_paradigm(
     facts: list[dict[str, Any]],
     theme_map: dict[str, Any],
-    paper_titles: dict[str, str] | None = None,
     provider: str = "minimax",
     model: str = "MiniMax-M3",
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
@@ -2426,7 +2425,7 @@ def condense_facts_by_paradigm(
     见 `_paradigm._seed`)正是"一篇论文同时落在多个主题里"的来源, 不落盘就等于
     这个结构不存在。
     """
-    from ._paradigm import assign, build_paradigms, filter_claim_support
+    from ._paradigm import assign, build_paradigms
 
     empty: tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]] = ([], {})
     fmap = {f["fact_id"]: f for f in facts if f.get("fact_id")}
@@ -2486,21 +2485,6 @@ def condense_facts_by_paradigm(
             })
     if not all_claims:
         print("[paradigm] 归属后没有命题, 退回主题合并", flush=True)
-    else:
-        # 10-08: 收紧出处。范式层给的是"这条技术路线涉及的所有论文", 但
-        # 命题陈述是**路线级概括** —— 一条陈述的出处应该是"支撑这句话的论文",
-        # 不是"这条路线上干过活的论文"。实测 q1 一句话挂 20 篇, 其中 16 篇
-        # 只是拿那个协议去做别的事。详见 _paradigm.filter_claim_support。
-        # 失败一律原样返回(宁可保留过度归属, 不可静默丢出处)。
-        #
-        # 标题要一并喂进去: "A Bayesian analysis of classical shadows" 本身就
-        # 说明了这篇在**分析**而不是**提出**, 不给标题模型只能从 fact 正文猜。
-        # fact 记录里没有标题(只有 paper_id), 只能由调用方从池子传进来。
-        try:
-            all_claims = filter_claim_support(
-                all_claims, list(fmap.values()), paper_titles=paper_titles)
-        except Exception as e:
-            logger.warning("[paradigm] 支撑过滤异常, 原样保留出处: %s", e)
     return all_claims, used_paradigms
 
 

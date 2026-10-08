@@ -541,9 +541,7 @@ def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
         yield "\n🔗 归纳技术路线并合并成命题...\n"
         from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
         try:
-            claims, paradigms = condense_facts_by_paradigm(
-                usable, theme_map, paper_titles=paper_titles,
-            )
+            claims, paradigms = condense_facts_by_paradigm(usable, theme_map)
         except Exception as e:
             logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
             claims, paradigms = [], {}
@@ -906,9 +904,7 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
     # 10-08: 把论文标题传下去 —— 支撑判定("这篇是在提出还是在使用那个技术")
     # 靠标题判断最准, "A Bayesian analysis of classical shadows" 本身就说清了。
     claims, from_stage = yield from _phase_claims(
-        ws, usable, theme_map, from_stage, _sig,
-        paper_titles={p["paper_id"]: (p.get("title") or "") for p in pool},
-    )
+        ws, usable, theme_map, from_stage, _sig)
 
     # ---- Phase C: 逐主题写叙述 ----
     yield "\n✍️ 按主题写叙述...\n"
