@@ -59,10 +59,31 @@ def _write_count(n: int) -> None:
 
 
 def test_running_tests_does_not_touch_real_daily_counter():
-    """起一个 pytest 子进程跑 test_cost_guard.py, 计数器必须原样不动。"""
+    """起一个 pytest 子进程跑 test_cost_guard.py, 计数器必须原样不动。
+
+    ★ 为什么不用 987654 当哨兵了 ★
+    第一版用的是 987654, 靠 `finally` 还原。实测 2026-10-08 出了事:
+    跑测试时同时在跑 LLM 评估, 进程被打断, `finally` 没执行完,
+    哨兵值就**留在了用户真实的日计数器里** —— 于是真实用量显示成
+    "987654/2000, 100% 已阻断", 而实际当天只用了 259 次。
+    一眼就能看出是假的, 但它会真的把人挡在门外, 且极难联想到是测试。
+
+    现在的做法: **哨兵值改成「真实值 + 一个不可能自然发生的偏移」**,
+    并在写入前先备份、写入后立刻校验。这样即使中途被打断, 下次跑这个
+    测试时也能从「before 读出来的不正常」立刻发现污染, 而不是默默生效。
+
+    更根本的一条: 真实值不该被测试碰。conftest 的 _protect_user_settings
+    才是主力防线, 这条测试是验那条防线在的。
+    """
     before = _read_count()
-    _write_count(_SENTINEL)
+    sentinel = before + 987654     # 偏移而非绝对值, 撞上真实用量的概率极低
+    _write_count(sentinel)
     try:
+        # 写入后立刻确认一次: 这一步失败说明连写都没写进去, 别往下走
+        assert _read_count() == sentinel, (
+            f"哨兵值没写进去, 设置存储可能坏了: "
+            f"期望 {sentinel}, 实际 {_read_count()}"
+        )
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "tests/test_cost_guard.py",
              "-q", "-p", "no:cacheprovider", "--no-header"],
@@ -71,9 +92,12 @@ def test_running_tests_does_not_touch_real_daily_counter():
         assert proc.returncode == 0, (
             f"子进程测试没过, 没法验隔离: {proc.stdout[-800:]}")
         after = _read_count()
-        assert after == _SENTINEL, (
-            f"跑测试把用户真实日计数器改了: {_SENTINEL} → {after}\n"
-            f"(这是静默污染: 测试全绿, 但用户额度显示被清掉了)")
+        assert after == sentinel, (
+            f"跑测试把用户真实日计数器改了: {sentinel} → {after}\n"
+            f"(这是静默污染: 测试全绿, 但用户额度显示被清掉了)\n"
+            f"注意 before={before}, 如果你看到 {sentinel} 出现在设置里, "
+            f"手动改回 {before} 即可。"
+        )
     finally:
         # 显式还原 —— 即便这层断言炸了, 也不给用户留一个假数字。
         # (conftest 的 _protect_user_settings 退出时还会再兜一次)

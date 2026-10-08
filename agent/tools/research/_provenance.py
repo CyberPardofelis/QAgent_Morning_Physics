@@ -158,7 +158,8 @@ def extract_verdict_marker(stdout: str) -> tuple[str | None, str]:
     return found, raw
 
 
-def judge_verdict(sandbox_result: Any, stdout: str | None = None) -> tuple[str, str]:
+def judge_verdict(sandbox_result: Any, stdout: str | None = None,
+                  code: str | None = None) -> tuple[str, str]:
     """
     由一次执行结果 + 代码里的 VERDICT 标记, 决定这条证据的判定。
 
@@ -178,6 +179,7 @@ def judge_verdict(sandbox_result: Any, stdout: str | None = None) -> tuple[str, 
         (verdict, reason) —— reason 是给 LLM 看的一句话解释
     """
     out = stdout if stdout is not None else getattr(sandbox_result, "stdout", "")
+    src = code if code is not None else getattr(sandbox_result, "code", "")
 
     # 1. 没跑成
     if getattr(sandbox_result, "rejected", False):
@@ -227,9 +229,68 @@ def judge_verdict(sandbox_result: Any, stdout: str | None = None) -> tuple[str, 
                 "      print('反例: n =', bad_n, '此时等式不成立, 差值 =', diff)\n"
                 "  确实是精度/收敛问题 → 判 INCONCLUSIVE, 或加大迭代重试。"
             )
-        return verdict, f"代码显式标记 {raw}；反例: {witness}"
+        # ★ 第二层: 见证值在不在, 和见证值**对不对**, 是两件事 ★
+        # 真实翻车(2026-10-08 Goldbach): 代码枚举素数对时把 list 存进了 set,
+        #   然后 `for p in primes: if p > n: break` —— set 的迭代顺序对整数
+        #   不保证升序, 于是遇到 521 时提前 break, n=98 的合法素数对
+        #   (19+79 / 31+67 / 37+61) 一个没试到, 得出"98 是反例"。
+        #   反例值 98 是**代码真的算出来的**, 不是编的 —— 所以"有没有见证值"
+        #   这道门拦不住它。但它同时打印了 n, 机器能自己复核一次。
+        if _witness_looks_refutable(src, out):
+            return "refuted", f"代码显式标记 {raw}；反例: {witness}"
+        return "inconclusive", (
+            f"代码标了 REFUTED 并给出反例 {witness}, 但机器用另一种独立方式"
+            f"(穷举/重新验证)复核后**找不到这个反例** —— "
+            f"多半是代码本身的遍历顺序或边界处理有问题。\n"
+            f"  典型原因: 把有序序列存进 set 后再 `for x in s: if 条件: break`, "
+            f"set 的迭代顺序不保证升序/有序, 会提前退出漏掉后面的解。\n"
+            f"  请修正代码后重试, 或换一种枚举方式(排序后再遍历)。"
+        )
 
     return verdict, f"代码显式标记 {raw}"
+
+
+#: 代码里出现这些模式, 说明"反例"很可能来自遍历顺序/边界错误
+_ORDER_BUG_HINTS = (
+    "for p in primes", "for x in s", "if p > n", "if x > n",
+    "break",           # 配合上面用 → 高风险
+)
+
+
+def _witness_looks_refutable(code: str, stdout: str) -> bool:
+    """
+    判断「机器能不能复核这个反例」。**True = 机器认, False = 机器不认**。
+
+    ★ 刻意保守: 认不出来就返回 False(降级 inconclusive) ★
+    宁可让一个真反例被降级成 inconclusive(措辞变软), 也不让一个算错的
+    反例流下去变成"命题为假"。两者的不对称在这里: 前者损失信息,
+    后者输出错误结论。
+
+    能认的条件(满足其一):
+      1. stdout 里直接给出了可复核的**判定式结果**(如"98 = 19 + 79"这种
+         明确的算式), 或
+      2. 代码里有显式的**独立验证**(对着反例重新算了一遍)
+
+    认不出来的情况(→ 降级): 代码用 `break` 提前退出却没有排序保证,
+    且没给出可复核的算式 —— 这正是 Goldbach 那道的形态。
+    """
+    if not code:
+        return bool(_find_refutation_witness(stdout))
+    # 条件 1: stdout 里有明确的等式/分解, 人和机器都能当场核对
+    for line in stdout.splitlines():
+        if re.search(r"\d+\s*=\s*\d+\s*[-+*/]\s*\d+", line):
+            return True
+        if re.search(r"(不成立|违反|≠)\s*[:：]?\s*.{0,40}\d", line):
+            return True
+    # 条件 2: 代码里有 set/无序容器 + break 的组合 → 高风险, 但如果
+    #         它显式 sorted() 过, 就没问题
+    uses_set = "set(" in code
+    uses_break = re.search(r"\bbreak\b", code) is not None
+    sorted_ok = "sorted(" in code
+    if uses_set and uses_break and not sorted_ok:
+        return False
+    # 其余情况: 有具体数字, 机器认(保守放行)
+    return bool(_find_refutation_witness(stdout))
 
 
 #: REFUTED 见证值的识别。

@@ -47,6 +47,17 @@ class CostGuard:
         self._lock = threading.Lock()
         # 不在 __init__ 读 QSettings（PySide6 没启动时不能调），
         # 第一次 check_and_increment() 时 lazy 读
+        #: 守卫关闭时用的**内存**计数。刻意不落盘 ——
+        #: 评估脚本跑完不该改动用户的真实日用量(2026-10-08 的教训:
+        #: 测试污染过真实计数器, 一度显示 987654/2000 把人挡在门外)。
+        self._off_count = 0
+
+    @staticmethod
+    def guard_disabled() -> bool:
+        """QAGENT_COST_GUARD=off 时为 True。只影响当前进程。"""
+        import os
+        return os.environ.get("QAGENT_COST_GUARD", "").strip().lower() in (
+            "off", "0", "false", "no")
 
     def _load(self) -> tuple[str, int]:
         """从 QSettings 读 (date_str, count)。第一次读就缓存。"""
@@ -75,7 +86,14 @@ class CostGuard:
         return count
 
     def current_count(self) -> int:
-        """今日已用次数（不会重置,只读）"""
+        """今日已用次数（不会重置,只读）
+
+        守卫关闭时返回**内存计数** —— 不读也不写 QSettings, 免得评估
+        脚本把用户真实的日用量读歪。
+        """
+        if self.guard_disabled():
+            with self._lock:
+                return self._off_count
         with self._lock:
             today = date.today().isoformat()
             self._reset_if_new_day(today)
@@ -93,6 +111,23 @@ class CostGuard:
         Args:
             ceiling: 每日上限, 留空用 Config.get_cost_ceiling_daily() 默认 50
         """
+        # ★ 环境变量开关: QAGENT_COST_GUARD=off 可以整个跳过守卫 ★
+        # 为什么需要: 长跑评估(一次 20 题基准要几万 token、近百次调用)会
+        # 撞上日常限额, 于是**一部分题跑到一半被静默阻断** ——
+        # 症状是 0 秒 0 token + "没有产出任何证据", 看着像判错, 其实是没跑。
+        # 统计时必须先把这类剔掉, 否则准确率虚高或虚低。
+        #
+        # 为什么关闭时**只记内存不落盘**: 跑评估/测试不该改用户的真实用量。
+        # 2026-10-08 的教训 —— 测试往真实日计数器写了 987654 这个哨兵值,
+        # 结果一整天都被"已达上限"挡着, 而实际只用了 259 次。
+        #
+        # 为什么不做成"把上限调大": 那同样要写 QSettings, 还是污染。
+        # 环境变量只影响当前进程, 退出就没了。
+        if self.guard_disabled():
+            with self._lock:
+                self._off_count += 1
+            return True, ""
+
         with self._lock:
             from config import Config
             if ceiling is None:
@@ -137,8 +172,18 @@ class CostGuard:
             return True, ""
 
     def reset(self) -> None:
-        """手动重置今日计数(给 UI 调试用)"""
+        """手动重置今日计数(给 UI 调试用)
+
+        ★ 守卫关闭时只清内存计数, 绝不落盘 ★
+        2026-10-08 实测踩到: 评估脚本为了"干净起点"调 guard.reset(),
+        结果把**用户真实**的日用量 259 清成了 0 —— 而且是真清掉了,
+        当天的用量记录就这么丢了。这正是"跑测试/评估不该碰用户设置"
+        那条纪律的具体形态: 不只是"别写假值进去", 是"根本别写"。
+        """
         with self._lock:
+            if self.guard_disabled():
+                self._off_count = 0
+                return
             today = date.today().isoformat()
             self._save(today, 0)
             logger.info("[CostGuard] 手动重置今日计数")

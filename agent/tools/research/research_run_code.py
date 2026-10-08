@@ -62,7 +62,9 @@ def _execute(
         ws.append_evidence(ev)
         return None, ev
 
-    verdict, reason = judge_verdict(result)
+    # code 必须显式传: judge_verdict 的第二层门(复核 REFUTED 的反例是否
+    # 真成立)要看代码形态才能发现遍历顺序类 bug。
+    verdict, reason = judge_verdict(result, code=code)
     ev = build_evidence(
         index,
         kind=kind,

@@ -57,6 +57,28 @@ def extract_code(text: str) -> str:
     return ""
 
 
+#: LLM 调用被上游挡住时返回的**错误字符串**特征。这些不是代码,
+#: extract_code 抽出来必然是空串 —— 关键是要区分"模型没写代码"和
+#: "请求压根没发出去", 两者的处置完全不同(后者重试毫无意义)。
+_BLOCKED_MARKERS = (
+    "[CostGuard]",
+    "cost_guard 阻断",
+    "未发出 LLM 请求",
+    "未知 LLM provider",
+    "429",
+    "rate limit",
+    "insufficient",
+)
+
+
+def _is_blocked(raw: str) -> bool:
+    """判断 LLM 输出是不是「上游把请求挡住了」而不是「模型没给代码」。"""
+    if not raw:
+        return False
+    low = raw.lower()
+    return any(m.lower() in low for m in _BLOCKED_MARKERS)
+
+
 # ============================================================
 # 内部: 生成验证代码
 # ============================================================
@@ -129,6 +151,7 @@ def research_verify(
     attempts = ws.load_attempts()
     last_ev: dict[str, Any] | None = None
     used_llm = 0
+    blocked_reason = ""     # 上游阻断(cost_guard/限流)时的原因; 非空 = 压根没跑
     # 成本要真数字。之前 cost.tokens 硬编码 0 —— 成本统计骗人会让人以为
     # 跑 20 道题不花钱, 而「先量再优化」要求用量可见。取本次调用前后的
     # 差值, 这样单题成本独立于别的工具调用。
@@ -152,6 +175,22 @@ def research_verify(
             cur_code, raw = _generate_code(claim, scope, how, retry_context=retry_ctx)
             used_llm += 1
             if not cur_code:
+                # ★ 阻断要当场停, 不能当"代码没生成出来"空转 ★
+                # 真实事故(2026-10-08): cost_guard 配额耗尽时, _call_llm
+                # 返回的是一段**错误字符串**(不是代码)。extract_code 对它
+                # 返回 "", 于是走 NoCode 分支 —— 但那不是"模型没写出来",
+                # 重试也没用(配额不会因为重试而恢复)。于是白白空转 3 轮,
+                # 最后报 "没有产出任何证据"。
+                #
+                # 后果是评估数据被污染: 12 道题记成判错, 实际是没跑。
+                # **"没跑"和"判错"必须分开统计**, 否则准确率虚高或虚低。
+                if _is_blocked(raw):
+                    attempts.append({"attempt": attempt, "error_type": "Blocked",
+                                     "stderr": raw[:500]})
+                    ws.append_attempt(attempts[-1])
+                    last_ev = None
+                    blocked_reason = raw[:300]
+                    break
                 attempts.append({"attempt": attempt, "error_type": "NoCode",
                                  "stderr": f"LLM 没输出可执行代码:\n{raw[:500]}"})
                 ws.append_attempt(attempts[-1])
@@ -201,6 +240,30 @@ def research_verify(
     verdict = last_ev["verdict"] if last_ev else "inconclusive"
     if verdict not in VERDICTS:      # 防御: judge_verdict 已保证合法, 这里兜底
         verdict = "untested"
+
+    # ★ blocked: 上游把请求挡住了, 压根没跑 ★
+    # 单独标出来而不是混进 inconclusive —— 统计准确率时必须能把
+    # 「没跑」和「判错」分开, 否则数字没意义。
+    if blocked_reason:
+        return {
+            "ok": False,
+            "verdict": "blocked",
+            "blocked": True,
+            "blocked_reason": blocked_reason,
+            "evidence": [],
+            "all_evidence_ids": [],
+            "summary": f"请求被上游阻断, 没有真的跑过: {blocked_reason}",
+            "attempt_count": len(attempts),
+            "workspace": str(ws.path),
+            "env": {},
+            "cost": {
+                "tokens": _u_after["total_tokens"] - _u_before["total_tokens"],
+                "prompt_tokens": _u_after["prompt_tokens"] - _u_before["prompt_tokens"],
+                "completion_tokens": _u_after["completion_tokens"] - _u_before["completion_tokens"],
+                "llm_calls": used_llm,
+                "elapsed_ms": 0,
+            },
+        }
 
     return {
         "ok": verdict in ("proved", "refuted"),

@@ -76,6 +76,11 @@ def main() -> None:
             "gold": GOLD,
             "verdict": verdict,
             "match": verdict == GOLD,
+            # ★ blocked: 上游把请求挡住了(配额/限流), 压根没跑 ★
+            # 必须单独统计 —— 混进"判错"会让准确率虚高或虚低。
+            # 2026-10-08 实踩: 12 道记成判错, 读 _attempts.jsonl 才发现
+            # 因果链是 cost_guard 阻断 -> extract_code 返回空 -> 空转三轮。
+            "blocked": bool(out.get("blocked", False)),
             "seconds": round(dt, 1),
             "tokens": cost.get("tokens", 0),
             "llm_calls": cost.get("llm_calls", 0),
@@ -92,17 +97,40 @@ def main() -> None:
         # 长跑任务必须增量写, 否则失败一次等于没跑。
         _dump(results, n_ok=sum(1 for r in results if r["match"]))
 
-    n_ok = sum(1 for r in results if r["match"])
+    # ★ 统计口径: 「没跑」和「判错」必须分开 ★
+    # 2026-10-08 的教训: 12 道题被 cost_guard 阻断(0秒0token), 我按
+    # "判错" 统计, 于是报出 8/20 —— 那个数字既不是真实能力也不是真实
+    # 通过率, 是把两种东西混在一起的产物。混起来报还有个更坏的后果:
+    # 数字看起来低, 会让人以为要继续加防线, 而实际上代码一个字都不用改。
+    ran = [r for r in results if not r.get("blocked")]
+    blocked = [r for r in results if r.get("blocked")]
+    n_ok = sum(1 for r in ran if r["match"])
     total_tok = sum(r["tokens"] for r in results)
-    print(f"\n=== {n_ok}/{len(results)} 与 gold({GOLD}) 一致, 共 {total_tok} tokens, {time.time()-t_all:.0f}s ===")
-    for r in results:
+    print(f"\n{'='*70}")
+    print(f"总题数        {len(results)}")
+    print(f"  被上游阻断   {len(blocked)}  ← 压根没跑, 不算判错也不算对")
+    print(f"  实际跑了     {len(ran)}")
+    print(f"  其中答对     {n_ok}  → 准确率 {n_ok}/{len(ran)}"
+          + (f" = {n_ok/len(ran)*100:.0f}%" if ran else ""))
+    print(f"总耗时 {time.time()-t_all:.0f}s, 共 {total_tok} tokens")
+    print(f"{'='*70}")
+    if blocked:
+        print(f"\n被阻断的 {len(blocked)} 道: {', '.join(r['id'] for r in blocked[:5])}"
+              + (" ..." if len(blocked) > 5 else ""))
+        print("  原因通常是 cost_guard 配额 —— 长跑评估前先设 QAGENT_COST_GUARD=off")
+    for r in ran:
         if not r["match"]:
-            print(f"  MISS {r['id']}: got={r['verdict']} tok={r['tokens']} {r['error'] or r['summary'][:120]}")
+            print(f"  MISS {r['id']}: got={r['verdict']} tok={r['tokens']} "
+                  f"{(r['error'] or r['summary'])[:120]}")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with io.open(OUT, "w", encoding="utf-8") as f:
-        json.dump({"n_ok": n_ok, "total": len(results), "tokens": total_tok,
-                   "gold": GOLD, "partial": False, "results": results}, f, ensure_ascii=False, indent=2)
+        json.dump({"n_ok": n_ok, "total": len(results),
+                   "n_blocked": len(blocked), "n_ran": len(ran),
+                   "accuracy_over_ran": (n_ok / len(ran)) if ran else None,
+                   "tokens": total_tok,
+                   "gold": GOLD, "partial": False, "results": results},
+                  f, ensure_ascii=False, indent=2)
     print(f"\n明细写入 {OUT}")
 
 
