@@ -2488,6 +2488,106 @@ def condense_facts_by_paradigm(
     return all_claims, used_paradigms
 
 
+# ============================================================
+# 写作层篇幅配额 (10-08)
+# ============================================================
+# 真跑实测(workspace 22cb70452a69, 量子纠错编码理论)发现模型会**自造省略
+# 占位符**: 「解码算法设计」章末尾出现
+#     "把复杂度从 O(d²R) 降到 O(k), 在统一线…(后续略,以命题覆盖为准) [pid]"
+# 那句带引用、完整过了校验(dopped_sentences=0), 所以**静默通过** —— 正文里
+# 完全看不出这里省略了内容。
+#
+# 根因不是模型偷懒, 是两条要求打架:
+#   - prompt 铁律「N 条命题必须全部写到, 一条都不能丢」
+#   - 配额「本节目标约 300 字符」
+# 而 300 这个数是算出来的: target_chars = max(1200, 263*0.32) -> 撞 1200 下限;
+# per_theme = max(300, 1200//7) -> 撞 300 下限。两处下限各吃掉 14 倍和 1.8 倍。
+# 7 条命题(每条都是独立技术点)挤 300 字符, 写不下 -> 模型自造台阶糊过去。
+#
+# 下面两个函数把配额从"按主题数摊"改成"**按命题数兜底**": 每条命题保底
+# CHARS_PER_CLAIM 字符, 再和按主题摊出来的结果取大。
+
+# 每条命题保底多少字符。实测 7 条命题挤 300 字符(每条 43)会触发省略;
+# 每条给 110 字符是个实测过的宽裕值 —— 一条命题通常是一句话, 一句话
+# 中文 40-90 字符, 110 留了展开空间又不会把正文撑爆。
+CHARS_PER_CLAIM = 110
+
+# target_chars 的反推系数。原来的 0.32 实测**永远撞下限**: 263 条 fact
+# * 0.32 = 84, 远小于 1200, 于是 target_chars 恒等于下限, fact 再多也没用。
+# 现在按"每条可用 fact 约 X 字符正文"反推, 且给上下限夹住。
+CHARS_PER_FACT = 9.0        # 263 * 9 = 2367, 不再撞 1200 下限
+TARGET_CHARS_MIN = 1500
+TARGET_CHARS_MAX = 24000
+
+
+def derive_target_chars(n_usable_facts: int) -> int:
+    """由可用 fact 数反推全文目标篇幅(夹在上下限之间)。"""
+    if n_usable_facts <= 0:
+        return TARGET_CHARS_MIN
+    v = int(n_usable_facts * CHARS_PER_FACT)
+    return max(TARGET_CHARS_MIN, min(TARGET_CHARS_MAX, v))
+
+
+def per_theme_target_chars(target_chars: int, n_themes: int, n_claims: int) -> int:
+    """单主题配额 = max(按主题摊, 按命题数保底)。
+
+    `n_claims` 是**这个主题**的命题数, 不是全库的 —— 用全库数会让每个主题
+    都拿到远超需要的配额。
+    """
+    n_themes = max(1, int(n_themes))
+    by_theme = int(target_chars) // n_themes if target_chars else 0
+    by_claim = max(1, int(n_claims)) * CHARS_PER_CLAIM
+    return max(300, by_theme, by_claim)
+
+
+# 模型自造省略标记时会用到的说法。这里只列**有把握**的 —— 宁可漏判也不
+# 误伤正常句子(正文里出现"其余"「略」这类词是合法的)。
+_PLACEHOLDER_PAT = re.compile(
+    r"(后续略|以命题覆盖为准|后略|详见下|以下略|（略）|\(略\)|余略|此处省略|省略号代替)")
+
+
+def _placeholder_spans(text: str) -> list[str]:
+    """返回正文里所有省略占位符的片段(没有则空列表)。
+
+    只用来判断"这句是不是在糊弄", 不做替换 —— 处理交给
+    `_strip_placeholder_sentences`, 那里按句丢弃。
+    """
+    if not text:
+        return []
+    return [m.group(0) for m in _PLACEHOLDER_PAT.finditer(text)]
+
+
+def _strip_placeholder_sentences(text: str) -> tuple[str, int]:
+    """把带省略占位符的句子剔除, 返回 (剩余正文, 剔除句数)。
+
+    为什么宁可丢句也不能留着: 占位符会让读者以为那篇论文只讲了个开头,
+    综述看起来完整, 实际上内容被吞了 —— 这正是本模块开头"宁可吵, 不可
+    静默"要防的那一类。丢掉之后 `dropped_sentences` 会把它计入, 用户看
+    得见。
+    """
+    if not text or not _placeholder_spans(text):
+        return text or "", 0
+    kept_lines, dropped = [], 0
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            kept_lines.append(line)
+            continue
+        kept_sents = []
+        for sent in _SENT_SPLIT.split(line):
+            if not sent.strip():
+                continue
+            if _placeholder_spans(sent):
+                dropped += 1
+                continue
+            kept_sents.append(sent)
+        if kept_sents:
+            kept_lines.append("".join(kept_sents))
+    body = "\n".join(kept_lines)
+    if dropped:
+        logger.warning("[write] %d 句含省略占位符被剔除(如「后续略」)", dropped)
+    return body, dropped
+
+
 def write_theme_narrative_from_claims(
     theme: dict[str, Any],
     claims: list[dict[str, Any]],
@@ -2609,6 +2709,11 @@ def write_theme_narrative_from_claims(
         kept, dropped = _drop_unattributed(out)
         body, unres = _render_claim_citations_or_drop(kept, claim2pids)
         dropped_total += dropped + unres
+        # 10-08: 模型在配额写不下时会自造「…(后续略)」这类占位符, 带着引用
+        # 完整通过上面的校验, 于是**静默**留在正文里(实测 22cb70452a69)。
+        # 这里按句剔除并计入 dropped —— 宁可少一句, 不要假装写完了。
+        body, ph = _strip_placeholder_sentences(body)
+        dropped_total += ph
         if body:
             paras.append(body)
         for m in _ANNOT_RE.findall(kept):

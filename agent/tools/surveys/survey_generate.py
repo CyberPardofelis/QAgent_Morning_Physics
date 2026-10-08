@@ -293,13 +293,27 @@ def _phase_write(ws, theme_map, order, by_theme, facts, usable,
     成文是最慢的一段(v60d 实测 26 次调用 / 1720 秒), 所以按**主题**逐个存 ——
     挂在第 5 个主题时崩了, 前 4 个主题的正文不用重写。
     """
-    from ._organize import write_theme_narrative, write_theme_narrative_from_claims
+    from ._organize import (derive_target_chars, per_theme_target_chars,
+                            write_theme_narrative,
+                            write_theme_narrative_from_claims)
 
-    n_themes = max(1, len(theme_map["themes"]))
+    themes = theme_map["themes"]
+    n_themes = max(1, len(themes))
     if target_chars <= 0:
-        target_chars = max(1200, int(len(usable) * 0.32))
-    per_theme_chars = max(300, target_chars // n_themes)
-    yield f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题, 每主题约 {per_theme_chars} 字符\n"
+        # 10-08: 原来写死 `max(1200, len(usable) * 0.32)`, 实测**永远撞下限**
+        # (263 条 fact * 0.32 = 84 -> target 恒等于 1200), 于是 fact 再多配额
+        # 也不涨, 写作层在配额上写不下 -> 模型自造「(后续略)」占位符糊过去。
+        target_chars = derive_target_chars(len(usable))
+    # 配额**逐主题**算: 各主题命题数不同, 用同一个值会让命题多的章再次写不下
+    # (实测「解码算法设计」7 条命题被按 1 条的配额写)。
+    quota = {
+        (t.get("name") or "").strip(): per_theme_target_chars(
+            target_chars, n_themes, len(by_theme.get(t.get("name") or "") or []))
+        for t in themes
+    }
+    yield (f"🎯 目标篇幅 {target_chars} 字符, 分 {n_themes} 个主题 "
+           f"(配额按各主题命题数在 {min(quota.values()) if quota else 300}"
+           f"~{max(quota.values()) if quota else 300} 字符之间)\n")
 
     narratives: dict[str, dict[str, Any]] = {}
     # 10-04 修: 原来只判 `== "done"`, 而 save_checkpoint("done") 全仓库从来没
@@ -320,7 +334,9 @@ def _phase_write(ws, theme_map, order, by_theme, facts, usable,
                 yield f"      ⚠ {w}\n"
             continue
         tclaims = by_theme.get(name) or []
-        r = (write_theme_narrative_from_claims(theme, tclaims, target_chars=per_theme_chars)
+        # 配额逐主题取, 别用全局单值
+        r = (write_theme_narrative_from_claims(
+                theme, tclaims, target_chars=quota.get(name, 300))
              if tclaims else write_theme_narrative(theme, facts))
         narratives[name] = r
         ws.save_narratives(narratives)      # 每写完一个主题就落盘
