@@ -1043,6 +1043,284 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             }
         }
     },
+
+    # ================================================================
+    # 2026-10-08 P0 加: P7 科研验证闭环 (research_*)
+    #
+    # 这批工具全部 exposed=False(见 registry.ToolDef.exposed), 只注册不暴露:
+    # ToolRegistry.get() 拿得到 handler, 但 list_schemas() 默认跳过它们,
+    # 所以 LLM 看不见。要打开需设环境变量 QAGENT_RESEARCH_EXPOSE=1,
+    # 由 agent/tools/research/_flags.py 读取。
+    #
+    # 为什么这么绕: 闭环的价值全在"结论靠不靠谱"上。在评估集测出来之前
+    # 放给 LLM, 等于让它拿着一个可能硬吹的工具去回答用户。
+    # 详见 docs/RESEARCH_CLOSED_LOOP_PLAN.md §16。
+    # ================================================================
+
+    "research_run_code": {
+        "type": "function",
+        "function": {
+            "name": "research_run_code",
+            "description": (
+                "在受限沙箱里执行一段 Python 并返回输出 + 证据编号 (L0 档, 0 LLM 调用)。"
+                "沙箱有 AST 白名单门 + 子进程隔离 + 超时杀进程树, "
+                "只防手滑(误删文件/死循环), 不是安全边界。"
+                "★ 纪律: 判定结论不靠你读 stdout, 而靠代码里 print('VERDICT: PROVED'/'REFUTED'/"
+                "'PARTIAL'/'INCONCLUSIVE') 标记。没有这个标记一律判 untested —— "
+                "代码跑通不等于命题验证了。"
+                "允许 import: math/sympy/numpy/scipy/networkx/z3/itertools/functools/re 等。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "要执行的 Python 源码, 不要 markdown 代码块包裹"},
+                    "purpose": {"type": "string", "description": "这段代码要验什么(一句话, 进证据记录)"},
+                    "timeout": {"type": "integer", "description": "硬超时秒数, 默认 20"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+
+    "research_verify": {
+        "type": "function",
+        "function": {
+            "name": "research_verify",
+            "description": (
+                "验证一条命题并返回带证据的结论 (L1 档, 会调一次 LLM 生成验证代码)。"
+                "流程: 把命题和范围喂给 LLM → 拿到验证代码 → 沙箱执行 → "
+                "按 VERDICT 标记落证据。verdict 只有 6 档: "
+                "proved / refuted / partial / failed / inconclusive / untested。"
+                "★ partial = 有限范围抽查通过, 不等于证明了 —— 有限枚举永远只能给 partial。"
+                "不给 code 时会请 LLM 生成; 自己已经写好验证代码就用 code 直接传(省一次 LLM)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string", "description": "要验证的命题, 写成可判定的形式(带明确范围)"},
+                    "scope": {"type": "string", "description": "变量范围, 如 'n=2..100' / 'n 为正整数'"},
+                    "how": {"type": "string", "description": "symbolic(默认) / enumerate, 提示 LLM 该用什么手法"},
+                    "timeout": {"type": "integer", "description": "代码执行硬超时秒数, 默认 20"},
+                    "task_hash": {"type": "string", "description": "复用已有工作区; 不传按 claim 自动生成"},
+                    "code": {"type": "string", "description": "自己写好的验证代码(可选)。传了就跳过 LLM 生成"},
+                    "dry_run": {"type": "boolean", "description": "True = 只跑沙箱门不真执行, 默认 False"}
+                },
+                "required": ["claim"]
+            }
+        }
+    },
+
+    "research_sympy": {
+        "type": "function",
+        "function": {
+            "name": "research_sympy",
+            "description": (
+                "做一次符号计算并落一条证据 (L0 档, 0 LLM 调用)。"
+                "适合恒等式化简、微积分、化简到 0 判等、极限这类一步到位的符号题。"
+                "返回 {result, verdict, evidence_id}, result 是化简后的字符串。"
+                "想验恒等式, op 传 'simplify' 再看 result 是否等于 0。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expr": {"type": "string", "description": "sympy 表达式源码, 如 '(x**2+2*x+1)'"},
+                    "op": {"type": "string", "description": "simplify(默认) / diff / integrate / limit / factor / expand"},
+                    "params": {"type": "string", "description": "op 的参数, 如 integrate 传 'x', limit 传 'x,0,1'"},
+                    "timeout": {"type": "integer", "description": "硬超时秒数, 默认 20"}
+                },
+                "required": ["expr"]
+            }
+        }
+    },
+
+    "research_z3": {
+        "type": "function",
+        "function": {
+            "name": "research_z3",
+            "description": (
+                "求解 SMT-LIB2 约束并落证据 (L0 档, 0 LLM 调用)。"
+                "goal='sat' 找一组满足约束的解; goal='prove' 走『前提(命题成立) ∧ 结论(命题不成立)』:"
+                "unsat → proved(无反例即成立), sat → refuted(模型本身就是反例)。"
+                "★ goal='prove' 是唯一能给全域级结论的工具 —— 枚举再大也只是 partial。"
+                "constraints 是完整的 SMT-LIB2 文本, 如 "
+                "'(declare-const x Int)(assert (> x 41))(assert (< x 43))'。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "constraints": {"type": "string", "description": "SMT-LIB2 约束文本(含 declare-const)"},
+                    "goal": {"type": "string", "description": "sat(默认, 找解) / prove(证命题成立)"},
+                    "timeout_ms": {"type": "integer", "description": "求解超时毫秒, 默认 5000"},
+                    "claim": {"type": "string", "description": "这条约束对应哪个命题(进证据记录)"}
+                },
+                "required": ["constraints"]
+            }
+        }
+    },
+
+    "research_enumerate": {
+        "type": "function",
+        "function": {
+            "name": "research_enumerate",
+            "description": (
+                "在可穷举对象上检查性质并找反例 (L0 档, 0 LLM 调用)。"
+                "task='graph' 遍历非同构图(用 networkx graph atlas, n_max<=7 时是穷尽的), "
+                "task='sequence' 检查素数/斐波那契等序列的前缀。"
+                "★ 枚举找到反例是 refuted(真反例); **枚举找不到反例只能给 partial**, "
+                "永远不能给 proved —— 有限枚举证明不了全域。"
+                "返回里 atlas_exhaustive=True 表示这次是穷尽性搜索, 不是抽样。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prop": {"type": "string", "description": "要检查的性质名, 如 bipartite / triangle_free / connected / is_prime"},
+                    "task": {"type": "string", "description": "graph(默认) / sequence"},
+                    "n_max": {"type": "integer", "description": "图枚举的顶点数上限, 默认 7; >7 只抽样不穷尽"},
+                    "kind": {"type": "string", "description": "task=sequence 时的序列名: primes / fibonacci / partition_count / squares"},
+                    "n_terms": {"type": "integer", "description": "task=sequence 时的项数, 默认 20"},
+                    "claim": {"type": "string", "description": "这条检查对应哪个命题(进证据记录)"}
+                },
+                "required": ["prop"]
+            }
+        }
+    },
+
+    "research_oeis": {
+        "type": "function",
+        "function": {
+            "name": "research_oeis",
+            "description": (
+                "查 OEIS 并逐项对账, 返回最强匹配 (L0 档, 0 LLM 调用)。"
+                "★ 搜索接口对任何序列都返一堆模糊匹配, 所以本工具**逐项比对**"
+                "前 keep 项是否真的吻合, 返回精确命中的那条。"
+                "适用: 用户给你一串数问'这是什么序列'。"
+                "注意: OEIS 是整数序列词典, 不是文献库 —— 找论文用别的工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sequence": {"type": "string", "description": "逗号分隔的整数, 如 '1,2,4,8,16'"},
+                    "max_terms": {"type": "integer", "description": "拿前几项去搜, 默认 10"},
+                    "keep": {"type": "integer", "description": "返回前几条候选, 默认 5"},
+                    "claim": {"type": "string", "description": "对应哪个命题(进证据记录)"}
+                },
+                "required": ["sequence"]
+            }
+        }
+    },
+
+    "research_refute": {
+        "type": "function",
+        "function": {
+            "name": "research_refute",
+            "description": (
+                "依次尝试图枚举 → Z3 找反例, 找到立刻返回 (L0 档, 0 LLM 调用)。"
+                "两条路都给: graphs 走图性质枚举, constraints 走 SMT。"
+                "适合'我想推翻这个说法'的场景。找到反例返回 refuted 并附反例本身;"
+                "两条路都没找到, 返回 partial —— **不是 proved**, 换更强的工具(Z3 goal=prove)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string", "description": "要反驳的命题"},
+                    "graphs": {"type": "string", "description": "图性质名(空则跳过图枚举这一路)"},
+                    "constraints": {"type": "string", "description": "SMT-LIB2 约束(空则跳过 Z3 这一路)"},
+                    "n_max": {"type": "integer", "description": "图枚举上限, 默认 7"},
+                    "timeout_ms": {"type": "integer", "description": "Z3 超时毫秒"}
+                },
+                "required": ["claim"]
+            }
+        }
+    },
+
+    "research_plan": {
+        "type": "function",
+        "function": {
+            "name": "research_plan",
+            "description": (
+                "把研究问题拆成机器可判定的原子命题 (L1 档, 调一次 LLM)。"
+                "返回 {specs: [{claim_text, scope, how, decidable}], undecidable: [...]}。"
+                "★ 关键设计: 拆不出来的东西**不许硬拆**。像'这段证明是优美的'、"
+                "'最小的不存在的素数是多少'这种, 应该进 undecidable 而不是编一个可判定命题。"
+                "认输比硬答有价值。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "研究问题(自然语言)"},
+                    "task_hash": {"type": "string", "description": "复用已有工作区; 不传按 question 自动生成"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+
+    "research_investigate": {
+        "type": "function",
+        "function": {
+            "name": "research_investigate",
+            "description": (
+                "跑一次完整研究任务(流式, L2 档)。建模 → 逐条命题生成验证代码 → 沙箱执行 → "
+                "失败自动带上下文重试 → 落报告。决策用规则不用 LLM, 所以可预测。"
+                "★ 这是唯一会自己花不少 token 的入口, 用户问的是真问题时才用。"
+                "plan_only=True 可只建模不验证。"
+                "★ 已知局限: '用户问题 → 命题'这段没有验证器, 量词可能被误读"
+                "(把『存在 n 使 X』读成『所有 n』)。结论出来后建议自己核一眼量词。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "研究问题"},
+                    "max_rounds": {"type": "integer", "description": "最多验证几轮(每轮一条命题), 默认 3"},
+                    "task_hash": {"type": "string", "description": "复用工作区; 不传按 question 生成"},
+                    "plan_only": {"type": "boolean", "description": "True = 只建模不验证, 默认 False"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+
+    "research_report": {
+        "type": "function",
+        "function": {
+            "name": "research_report",
+            "description": (
+                "渲染某个任务的报告 (L0 档, 0 LLM 调用)。"
+                "报告会显式分出『已验证区 / 未验证区』—— 没有证据支撑的断言不许进前者。"
+                "task_hash 从 research_verify / research_investigate 的返回里拿。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_hash": {"type": "string", "description": "工作区的 task_hash"},
+                    "fmt": {"type": "string", "description": "md(默认) / json"},
+                    "save": {"type": "boolean", "description": "True = 同时写回 workspace 的 _report.md, 默认 True"}
+                },
+                "required": ["task_hash"]
+            }
+        }
+    },
+
+    "research_audit": {
+        "type": "function",
+        "function": {
+            "name": "research_audit",
+            "description": (
+                "对已完成任务跑证据链审计 (L0 档, 0 LLM 调用)。"
+                "查的是: 有没有无证据的结论、证据链断没断、code 和 verdict 对不对得上。"
+                "★ 0 LLM —— prompt 是软约束, 审计才是硬约束。"
+                "翻车复盘 / 出报告前自查时用这个。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_hash": {"type": "string", "description": "单个任务; 留空则审计该工作区 _specs 里的全部"},
+                    "task_hash_list": {"type": "string", "description": "逗号分隔的多个 task_hash(审计'结论翻车'的推荐用法)"}
+                },
+                "required": []
+            }
+        }
+    },
 }
 
 

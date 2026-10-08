@@ -21,6 +21,10 @@ from . import (
     knowledge,
     llm,  # _call_llm 内部使用（不注册工具）
     pdf_utils,  # extract_text_from_pdf（不注册工具）
+    # 2026-10-08 P0 加: P7 科研闭环。必须 import 才会跑 @register_tool,
+    # 但这批工具 exposed=False, 所以只是注册进 registry、不会出现在
+    # list_schemas() 里, LLM 看不见。评估集和测试走 ToolRegistry.get() 直接调。
+    research,
     surveys,
 )
 from .aps import (

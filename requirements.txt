@@ -134,6 +134,11 @@ SQLAlchemy==2.0.46
 starlette==0.52.1
 striprtf==0.0.26
 sympy==1.14.0
+# P7 科研验证闭环: SMT 求解器。research_z3 / research_refute 靠它给全域级结论
+# (goal=prove 时 unsat → proved), 是唯一不靠抽样就能判"对所有 n"的工具。
+# ★ 版本必须锁: 不同 z3-solver 版本对同一约束的判定、超时后的 unknown 行为
+#   都可能不一样 —— 证据里记了版本号但环境对不上, 结论就复现不了。
+z3-solver==5.1.0.0
 tenacity==9.1.4
 threadpoolctl==3.6.0
 tiktoken==0.12.0

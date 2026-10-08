@@ -39,6 +39,18 @@ class ToolDef:
     # ROADMAP_NEXT §2: 防止给课题组用时 token 爆钱
     # 默认 L1(单次 LLM),纯本地/SQL/下载工具显式标 L0,ReAct/综述类标 L2
     cost_tier: str = "L1"
+    # 2026-10-08 P0 加: 是否暴露给 LLM。
+    #
+    # 默认 True —— 现有工具行为不变, 这条是纯增量。
+    #
+    # P7 科研闭环用: 工具要**先注册、暂不给 LLM 看**(exposed=False),
+    # 等评估集验证通过再打开。隐藏 ≠ 不可用, ToolRegistry.get() 照常拿得到
+    # handler, 所以评估集和测试可以直接调用它们。
+    #
+    # 为什么不复用 cost_tier 当闸门: 那是**成本**闸门(按预算过滤),
+    # 这个是**功能成熟度**闸门(还没准备好上线)。两件事解耦, 否则以后想
+    # 调成本档位会顺手把未验证的工具也放出去。
+    exposed: bool = True
 
 
 class ToolRegistry:
@@ -60,12 +72,15 @@ class ToolRegistry:
         return list(cls._tools.values())
 
     @classmethod
-    def list_schemas(cls) -> list[dict[str, Any]]:
+    def list_schemas(cls, include_hidden: bool = False) -> list[dict[str, Any]]:
         """导出 OpenAI function calling 格式的 schema 列表（给 LLM 看）
 
         2026-09-02 P0.7 加:在 function dict 顶层透传 x_cost_tier 元数据字段,
         供 controller 按当前档位过滤。LLM 看不到 x_cost_tier (OpenAI schema 不识别,
         但也不报错,只忽略未知字段)。
+
+        2026-10-08 P0 加: 默认**跳过** exposed=False 的工具。
+        include_hidden=True 时不过滤 —— 只给测试/评估集用, controller 不要传。
         """
         return [
             {
@@ -75,9 +90,11 @@ class ToolRegistry:
                     "description": t.description,
                     "parameters": t.parameters,
                     "x_cost_tier": t.cost_tier,
+                    "x_exposed": t.exposed,
                 }
             }
             for t in cls._tools.values()
+            if include_hidden or t.exposed
         ]
 
     @classmethod
@@ -167,6 +184,7 @@ def register_tool(
     name: str | None = None,
     is_streaming: bool = False,
     cost_tier: str = "L1",
+    exposed: bool = True,
 ):
     """
     装饰器：把一个 Python 函数注册为 LLM 工具。
@@ -184,6 +202,11 @@ def register_tool(
             - "L0": 纯本地/SQL/下载,无 LLM 调用
             - "L1": 单次 LLM 调用(默认)
             - "L2": 重型多轮(ReAct 调研 / 综述生成,P4 / P6 实现后才有)
+        exposed: 是否出现在 LLM 的工具列表里 (2026-10-08 P0 加, 默认 True)
+            - True(默认): 行为与从前完全一致
+            - False: 只注册不暴露。ToolRegistry.get() 仍能拿到 handler,
+              所以测试和评估集可以直接调, 只是 LLM 看不见。
+              P7 科研闭环的工具在评估通过前都走这条路。
 
     约束：
         - 必须在 agent/tool_definitions.py 的 TOOL_SCHEMAS 字典中先注册 schema
@@ -193,6 +216,7 @@ def register_tool(
         raise ValueError(
             f"工具 {name or '?'!r} 的 cost_tier={cost_tier!r} 无效, 只接受 L0/L1/L2"
         )
+
     def decorator(func: Callable) -> Callable:
         tool_name = name or func.__name__
 
@@ -213,6 +237,7 @@ def register_tool(
             handler=func,
             is_streaming=is_streaming,
             cost_tier=cost_tier,
+            exposed=exposed,
         ))
         return func
     return decorator
