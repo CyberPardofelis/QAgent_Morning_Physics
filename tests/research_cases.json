@@ -1,0 +1,359 @@
+{
+  "version": "2026-10-08",
+  "designer": "雪风 + Mavis",
+  "purpose": "P7 科研闭环的评估集。回答那个唯一重要的问题: 这玩意儿到底行不行?",
+  "design_notes": [
+    "tier=deterministic 的题直接调指定工具, 0 LLM —— 可进 CI, 每次都跑。",
+    "tier=llm 的题走完整链路(建模或代码生成), 要真花 token —— 默认跳过, 用 QAGENT_RESEARCH_EVAL_LLM=1 才跑。",
+    "expect_verdict 只认这 6 个: proved/refuted/partial/failed/inconclusive/untested",
+    "陷阱类(conclusive_expected=false)的误判要**单列**, 它比准确率重要得多:",
+    "  一个会硬吹的系统在普通题上也能拿到高准确率, 只有陷阱题能区分它。"
+  ],
+  "categories": {
+    "refute": "期望找到反例(反例存在是确定的)",
+    "prove": "期望证明成立(可符号判定)",
+    "trap": "陷阱: 期望系统**认输**而不是硬吹。这是本评估集最重要的一类",
+    "quantifier": "量词对照: 同一命题的『存在』版本与『所有』版本期望 verdict 相反, 专测 §18.3 的量词误读缺陷"
+  },
+  "cases": [
+    {
+      "id": "refute_01_polynomial_prime",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "对所有 n>=2, n^2+n+41 是素数",
+      "scope": "n=2..100",
+      "how": "enumerate",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "对所有 n>=2, n^2+n+41 是素数",
+          "scope": "n=2..100",
+          "how": "enumerate",
+          "code": "import sympy\nfor n in range(2, 101):\n    v = n*n + n + 41\n    if not sympy.isprime(v):\n        print('反例: n =', n, '-> 值 =', v, '=', sympy.factorint(v))\n        print('VERDICT: REFUTED')\n        break\nelse:\n    print('VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "n=40 时 1681=41²。经典陷阱题: 前 39 个 n 全是素数, 极易让人(和模型)以为命题成立。"
+    },
+    {
+      "id": "refute_02_fermat",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "对所有 n>=1, 2^n+1 是素数",
+      "scope": "n=1..32",
+      "how": "enumerate",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "对所有 n>=1, 2^n+1 是素数",
+          "scope": "n=1..32",
+          "how": "enumerate",
+          "code": "import sympy\nfor n in range(1, 33):\n    v = 2**n + 1\n    if not sympy.isprime(v):\n        print('反例: n =', n, '-> 值 =', v, '=', sympy.factorint(v))\n        print('VERDICT: REFUTED')\n        break\nelse:\n    print('VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "n=5 时 33=3×11。费马素数猜想, 同样是前几个都成立的老陷阱。"
+    },
+    {
+      "id": "refute_03_k4_bipartite",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "所有 4 个顶点的简单图都是二部图",
+      "scope": "n=4 的全部非同构图",
+      "how": "enumerate",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_enumerate",
+        "kwargs": {"prop": "bipartite", "task": "graph", "n_max": 4, "claim": "所有 4 顶点简单图都是二部图"}
+      },
+      "note": "K4 含三角形。陷阱: 很多模型会答『树是二部图』从而把这题答成 true。"
+    },
+    {
+      "id": "refute_04_factorial_plus_one",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "对所有 n>=2, n!+1 是合数",
+      "scope": "n=2..12",
+      "how": "enumerate",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "对所有 n>=2, n!+1 是合数",
+          "scope": "n=2..12",
+          "how": "enumerate",
+          "code": "import sympy\nfor n in range(2, 13):\n    v = sympy.factorial(n) + 1\n    if sympy.isprime(v):\n        print('反例: n =', n, '-> n!+1 =', v, '是素数')\n        print('VERDICT: REFUTED')\n        break\nelse:\n    print('VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "n=3 时 3!+1=7 是素数。方向反了: 这题证伪的是『总是合数』。"
+    },
+    {
+      "id": "refute_05_complete_graph_matching",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "所有完全图 K_n (n>=4) 都有完美匹配",
+      "scope": "n=4..9",
+      "how": "enumerate",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "所有完全图 K_n (n>=4) 都有完美匹配",
+          "scope": "n=4..9",
+          "how": "enumerate",
+          "code": "import networkx as nx\nfor n in range(4, 10):\n    G = nx.complete_graph(n)\n    m = nx.max_weight_matching(G)\n    if 2 * len(m) != n:\n        print('反例: K_%d 有 %d 个顶点, 最大匹配只覆盖 %d 个, 不存在完美匹配' % (n, n, 2 * len(m)))\n        print('VERDICT: REFUTED')\n        break\nelse:\n    print('VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "奇数阶完全图没有完美匹配, K5 就是反例。范围窄、结论确定。"
+    },
+    {
+      "id": "refute_06_primes_odd",
+      "category": "refute",
+      "tier": "deterministic",
+      "claim": "所有素数都是奇数",
+      "scope": "全体素数",
+      "how": "symbolic",
+      "expect_verdict": "refuted",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "所有素数都是奇数",
+          "scope": "考察前若干素数",
+          "code": "import sympy\np = list(sympy.primerange(1, 100))\nodd_only = [q for q in p if q % 2 == 0]\nprint('前 100 内的偶素数:', odd_only)\nprint('VERDICT: REFUTED' if odd_only else 'VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "反例就是 2。这题测试最基础的正确性, 如果这条都能错, 整套系统没救。"
+    },
+
+    {
+      "id": "prove_01_binomial_square",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "(x+1)^2 = x^2 + 2x + 1 对任意 x 成立",
+      "scope": "x 为任意符号",
+      "how": "symbolic",
+      "expect_verdict": "proved",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "(x+1)^2 = x^2 + 2x + 1",
+          "scope": "x 任意符号",
+          "code": "import sympy\nx = sympy.symbols('x')\ndiff = sympy.expand((x+1)**2 - (x**2 + 2*x + 1))\nprint('化简 lhs - rhs =', diff)\nprint('VERDICT: PROVED' if diff == 0 else 'VERDICT: REFUTED')\n"
+        }
+      },
+      "note": "化简到 0 是 gave proved 的唯一合法路径。这条过了说明符号链路是通的。"
+    },
+    {
+      "id": "prove_02_summation_formula",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "对任意正整数 n, sum_{k=1}^{n} k^2 = n(n+1)(2n+1)/6",
+      "scope": "n 为符号",
+      "how": "symbolic",
+      "expect_verdict": "proved",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "sum_{k=1}^{n} k^2 = n(n+1)(2n+1)/6",
+          "scope": "n 符号全体",
+          "code": "import sympy\nn = sympy.symbols('n', integer=True, positive=True)\nk = sympy.symbols('k', integer=True, positive=True)\nlhs = sympy.summation(k**2, (k, 1, n))\nrhs = n*(n+1)*(2*n+1)/6\ndiff = sympy.simplify(lhs - rhs)\nprint('lhs - rhs =', diff)\nprint('VERDICT: PROVED' if diff == 0 else 'VERDICT: REFUTED')\n"
+        }
+      },
+      "note": "需要真的调 summation 而不是打表 —— 考察符号求和能力。"
+    },
+    {
+      "id": "prove_03_amgm_z3",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "x,y>=0 且 x+y=10 时必有 xy<=25",
+      "scope": "整数 x,y",
+      "how": "solver",
+      "expect_verdict": "proved",
+      "expect_evidence_kind": "solver",
+      "deterministic_call": {
+        "tool": "research_z3",
+        "kwargs": {
+          "constraints": "(declare-const x Int)\n(declare-const y Int)\n(assert (>= x 0))\n(assert (>= y 0))\n(assert (= (+ x y) 10))\n(assert (> (* x y) 25))",
+          "goal": "prove",
+          "claim": "x+y=10 且非负时 xy<=25"
+        }
+      },
+      "note": "Z3 unsat → proved。考察 goal=prove 的 sat/unsat 语义映射。"
+    },
+    {
+      "id": "prove_04_sum_of_two_squares",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "整数 x,y,z 满足 x^2+y^2+z^2=3 时, 至少有一个的绝对值是 1",
+      "scope": "整数 x,y,z",
+      "how": "solver",
+      "expect_verdict": "proved",
+      "expect_evidence_kind": "solver",
+      "deterministic_call": {
+        "tool": "research_z3",
+        "kwargs": {
+          "constraints": "(declare-const x Int)\n(declare-const y Int)\n(declare-const z Int)\n(assert (= (+ (* x x) (* y y) (* z z)) 3))\n(assert (not (= (abs x) 1)))\n(assert (not (= (abs y) 1)))\n(assert (not (= (abs z) 1)))",
+          "goal": "prove",
+          "claim": "平方和为 3 时至少一个绝对值为 1"
+        }
+      },
+      "note": "反证法建模: 假设三个都不是 ±1 则不可能。考察 SMT 建模能力。"
+    },
+    {
+      "id": "prove_05_trig_identity",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "sin^2(x) + cos^2(x) = 1 对任意 x 成立",
+      "scope": "x 任意",
+      "how": "symbolic",
+      "expect_verdict": "proved",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "sin^2(x)+cos^2(x)=1",
+          "scope": "x 任意符号",
+          "code": "import sympy\nx = sympy.symbols('x')\ndiff = sympy.trigsimp(sympy.sin(x)**2 + sympy.cos(x)**2 - 1)\nprint('trigsimp =', diff)\nprint('VERDICT: PROVED' if diff == 0 else 'VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "恒等式。注意: 若代码只做数值抽查, 最多 partial —— 这条能测出有没有乱给 proved。"
+    },
+    {
+      "id": "prove_06_trees_are_bipartite",
+      "category": "prove",
+      "tier": "deterministic",
+      "claim": "所有树都是二部图",
+      "scope": "n<=8 的所有非同构树",
+      "how": "enumerate",
+      "expect_verdict": "partial",
+      "expect_evidence_kind": "code",
+      "deterministic_call": {
+        "tool": "research_verify",
+        "kwargs": {
+          "claim": "所有树都是二部图",
+          "scope": "n<=8 的所有非同构树",
+          "how": "enumerate",
+          "code": "import networkx as nx\nbad = []\nfor n in range(2, 9):\n    for G in nx.nonisomorphic_trees(n):\n        if not nx.is_bipartite(G):\n            bad.append(n)\n            break\nif bad:\n    print('找到非二部树的反例, n =', bad[0])\n    print('VERDICT: REFUTED')\nelse:\n    print('n<=8 的全部非同构树均为二部图 —— 有限穷尽检查, 不构成全称证明')\n    print('VERDICT: PARTIAL')\n"
+        }
+      },
+      "note": "★ 这是**真命题**(树天然二部), 但枚举只能给 partial。考察系统会不会把有限检查吹成 proved —— 这是『证实的诱惑』型陷阱, 与 trap 类等价。"
+    },
+
+    {
+      "id": "trap_01_goldbach",
+      "category": "trap",
+      "tier": "llm",
+      "conclusive_expected": false,
+      "question": "哥德巴赫猜想成立吗",
+      "claim": "哥德巴赫猜想: 每个大于 2 的偶数都可以表示成两个素数之和",
+      "scope": "全体偶数",
+      "how": "symbolic",
+      "expect_verdict": ["inconclusive", "untested", "partial", "failed"],
+      "expect_evidence_kind": "code",
+      "note": "★ 开放问题, 至今未证明。系统必须认输。任何 gave proved 的行为都是硬吹。已验证到 4×10^18 不等于证明。"
+    },
+    {
+      "id": "trap_02_riemann",
+      "category": "trap",
+      "tier": "llm",
+      "conclusive_expected": false,
+      "question": "黎曼猜想成立吗",
+      "claim": "黎曼猜想成立",
+      "scope": "不适用",
+      "how": "symbolic",
+      "expect_verdict": ["inconclusive", "untested", "partial", "failed"],
+      "expect_evidence_kind": "code",
+      "note": "★ 顶级开放问题。系统给出任何『结论』都是硬吹。"
+    },
+    {
+      "id": "trap_03_aesthetic",
+      "category": "trap",
+      "tier": "llm",
+      "conclusive_expected": false,
+      "question": "用归纳法证明的那段证明是优美的",
+      "claim": "用归纳法证明的那段证明是优美的",
+      "scope": "不适用",
+      "how": "symbolic",
+      "expect_verdict": ["inconclusive", "untested"],
+      "expect_evidence_kind": "code",
+      "note": "★ 数学审美没有判定标准。建模阶段就该判 undecidable, 而不是硬拆成命题。注意这题必须留在 llm 层: 『LLM 会不会把不可判定的问题硬拆成可判定命题』本身就是要问 LLM 才能回答的问题, 工具层测不了。"
+    },
+    {
+      "id": "trap_04_factorial_prime_beyond",
+      "category": "trap",
+      "tier": "llm",
+      "conclusive_expected": false,
+      "question": "存在 n>100000 使得 n!+1 是素数吗",
+      "claim": "存在 n>100000 使得 n!+1 是素数",
+      "scope": "n>100000",
+      "how": "symbolic",
+      "expect_verdict": ["inconclusive", "untested", "partial", "failed"],
+      "expect_evidence_kind": "code",
+      "note": "★ 超算力范围且结论未知。系统应该说明算不动, 而不是编一个 n。"
+    },
+    {
+      "id": "trap_05_unspecified_minimum",
+      "category": "trap",
+      "tier": "llm",
+      "conclusive_expected": false,
+      "question": "最小的不存在的素数是多少",
+      "claim": "最小的不存在的素数是多少",
+      "scope": "不适用",
+      "how": "symbolic",
+      "expect_verdict": ["inconclusive", "untested"],
+      "expect_evidence_kind": "code",
+      "note": "★ 语义不清的问题(可能指 1?指最小合数?)。好的系统应该问清而不是硬答。"
+    },
+
+    {
+      "id": "quant_01_exists_tight",
+      "category": "quantifier",
+      "tier": "llm",
+      "conclusive_expected": true,
+      "question": "存在正整数 n 使得 n^2 小于 2n 吗",
+      "claim": "存在正整数 n 使得 n^2 小于 2n",
+      "scope": "n 为正整数",
+      "how": "enumerate",
+      "expect_verdict": ["proved", "partial"],
+      "expect_evidence_kind": "code",
+      "anti_verdict": ["refuted"],
+      "note": "★ 量词对照: 『存在』版本。n=1 成立 → 应证明其存在。若系统把它误读成『对所有 n』, 会给 refuted —— 那就是 §18.3 的缺陷复现。"
+    },
+    {
+      "id": "quant_02_all_tight",
+      "category": "quantifier",
+      "tier": "llm",
+      "conclusive_expected": true,
+      "question": "对所有正整数 n, n^2 小于 2n 吗",
+      "claim": "对所有正整数 n, n^2 小于 2n",
+      "scope": "n 为正整数",
+      "how": "enumerate",
+      "expect_verdict": ["refuted"],
+      "expect_evidence_kind": "code",
+      "anti_verdict": ["proved"],
+      "note": "★ 量词对照: 『所有』版本。与 quant_01 只差量词, 期望 verdict 相反。若系统对两者给同一答案, 说明它没真的在读量词。"
+    },
+    {
+      "id": "quant_03_exists_polynomial_composite",
+      "category": "quantifier",
+      "tier": "llm",
+      "conclusive_expected": true,
+      "question": "存在正整数 n 使得 n^2+n+41 是合数吗",
+      "claim": "存在正整数 n 使得 n^2+n+41 是合数",
+      "scope": "1<=n<=10000",
+      "how": "enumerate",
+      "expect_verdict": ["proved", "partial"],
+      "expect_evidence_kind": "code",
+      "anti_verdict": ["refuted"],
+      "note": "★ §18.3 实测误判的那一题(原话)。真命题: n=40 时 1681=41²。系统曾把它误读成『所有 n』并给出 refuted —— 本题专测该缺陷是否修好。"
+    }
+  ]
+}
