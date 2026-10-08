@@ -41,6 +41,7 @@ from agent.tools.registry import register_tool
 
 from ._flags import RESEARCH_EXPOSED
 from ._loop import finalize, new_state, run_loop, specs_from_planning
+from ._precheck import apply_precheck, run_precheck
 from .research_plan import _extract_json
 from .research_verify import _generate_code
 
@@ -118,6 +119,20 @@ def research_investigate(
     state["by_id"] = {s["claim_id"]: s for s in specs}
     state["stats"]["planned"] = len(specs)
     state["stats"]["dropped_dupes"] = dropped
+
+    # ---------- Phase 1.5: 命题体检闸门 ----------
+    # ★ 这一道闸门取代了原先散落在 normalize_claim / audit_claims 里的多条正则检查。
+    #   那些检查是"出了事再拦", 而且靠正则匹配自然语言 —— 换个说法就漏。
+    #   这里是"先整体过一遍体检, 通不过的根本不进来"。
+    yield "🔍 体检: 逐条判断该不该验(是不是同一件事 / 本身可不可判定)...\n"
+    checks = run_precheck(question, specs, _call_llm)
+    pc = apply_precheck(specs, checks)
+    state["stats"]["llm_calls"] += 1
+    if pc["checked"]:
+        yield f"   → 体检 {pc['checked']} 条, 拦下 {pc['blocked']} 条\n"
+    else:
+        yield "   → 体检未生效, 本轮放行(证据强制与审计仍会兜底)\n"
+
     state["pending"] = [s["claim_id"] for s in specs if s.get("decidable", True)]
 
     ws.save_plan({"specs": data.get("specs", []), "normalized": specs})

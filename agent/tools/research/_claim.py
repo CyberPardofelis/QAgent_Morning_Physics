@@ -52,11 +52,10 @@ _QUANT_LABEL: dict[str, str] = {
     "none": "∄ **不存在** n 使其成立",
 }
 
-#: 不可判定的典型信号 —— 建模阶段用它们做启发式判定(§8 条款 3 的坏命题列表)
-UNDECIDABLE_MARKERS: tuple[str, ...] = (
-    "有趣", "优美", "优雅", "最优算法", "本质", "哲学", "直觉上",
-    "是否应该", "值不值得", "open problem", "未知问题",
-)
+# ~~UNDECIDABLE_MARKERS~~ 已于 P4.5 第三轮删除(关键词黑名单, 见上方 1b-2 说明段)。
+# 保留它就等于保留一条"漏得比不拦还危险"的防线: 真实翻车里最刁钻的几道
+# (「最小的不存在的素数」「n>100000 的阶乘」「哥德巴赫猜想成立吗」)
+# 一个标记词都不含, 全都放行。
 
 _EVIDENCE_REF = re.compile(r"\bev_\d{4}\b")
 
@@ -143,153 +142,36 @@ def quantifier_conflict(question: str, claim_text: str, explicit: str = "") -> t
 
 
 # ============================================================
-# 1b-2. 范围 —— 第五道防线(量词对了, 范围照样能被偷换)
+# 1b-2. ~~范围 / 阈值检查~~ —— 已于 P4.5 第三轮删除
 # ============================================================
-# ★ P4.5 第二轮实测失效现场:
-#     问: "存在 n>100000 使得 n^2+n+41 是素数吗"  (实际问的是阶乘, 一字之差)
-#     跑: "存在 n, 200 < n <= 500, 使得 n!+1 是素数"   → proved
+# 这里原来有两道防线, 现在**故意留空**:
+#   scope_conflict()    从文本正则解析范围上下界, 比对有没有缩到问题之外
+#   threshold_conflict() 从文本正则解析"至少 N 组"这类阈值, 比对有没有被加码
 #
-#   量词是 exists, 和问题的 exists **完全一致**, 量词防线一点没报警。
-#   但 scope 从 ">100000" 被缩到了 "200..500" —— n=200~500 确实有 n!+1 是素数的例子,
-#   所以判 proved 逻辑上没错, 错在验的根本不是用户问的那一段范围。
+# 删掉的理由不是它们没抓到问题(它们确实抓到了 trap_04 和 goldbach), 而是:
+#   1. 正则不懂语义。"存在至少 1000 组素数对"里哪个数字是"原问题没要求的限定",
+#      靠模式只能猜 —— 换个说法("不少于一千组")就漏。
+#   2. 它们在错误的层。这些检查都在问"这条命题长得对不对",
+#      而真正该问的是"**这条命题该不该被验证**", 那是流程问题。
+#      用模式匹配去解流程问题, 天生就是打补丁。
+#   3. 阈值黑名单只会越长, 加到没人敢动为止。
 #
-#   **结论: 量词对 ≠ 命题对。scope 是和 claim_text 同等重要的另一半。**
-
-#: 范围下限: n>100000 / n>=100001 / n=100001.. / 100001<=n
-_RANGE_MIN_RE = re.compile(
-    r"(?:[nN]\s*[>≥]=?\s*(\d+))"          # n>100000
-    r"|(\d+)\s*\.\.\s*\d+"                 # 100001..200000
-    r"|(\d+)\s*[<≤]=?\s*[nN]"              # 100001<=n
-)
-#: 范围上限: n<=500 / n<501 / 200..500
-_RANGE_MAX_RE = re.compile(
-    r"(?:[nN]\s*[<≤]=?\s*(\d+))"           # n<=500
-    r"|\d+\s*\.\.\s*(\d+)"                 # 200..500
-    r"|[nN]\s*[>≥]=?\s*\d+\s*\.\.\s*(\d+)"  # n>100..500
-)
-
-
-def _range_bounds(text: str) -> tuple[int | None, int | None]:
-    """从一段文本里抽 (下界, 上界)。抽不到就是 None。"""
-    lo = hi = None
-    m = _RANGE_MIN_RE.search(text or "")
-    if m:
-        raw = next((g for g in m.groups() if g), None)
-        if raw:
-            lo = int(raw)
-            # n>=100001 写成 ">100000" 时, +1 让它成为包含端
-            if ">" in m.group(0) and ">=" not in m.group(0):
-                lo += 1
-    m = _RANGE_MAX_RE.search(text or "")
-    if m:
-        raw = next((g for g in m.groups() if g), None)
-        if raw:
-            hi = int(raw)
-    return (lo, hi)
-
-
-def scope_conflict(question: str, scope: str) -> str | None:
-    """
-    spec 的范围有没有缩到**问题要求的范围之外**。缩了就返回说明, 否则 None。
-
-    判据只用"完全不相交"这一条, 不做更细的比较:
-      问题要求 n > 100000(即下界 100001), scope 却写 200..500(上界 500)
-      → 500 < 100001, 两个区间根本没有交集 → 必然是换了范围
-
-    为什么不查"部分重叠"(比如问题 n>100, scope 写 1..200):
-      那种情况只是**验证范围更宽**, 结论仍然覆盖问题要求的区间, 属于合理保守。
-      只有完全不相交才是硬的答非所问。宁可漏检也不误伤 —— 误报会让人把这个告警当噪声。
-
-    Args:
-        question: 原始研究问题
-        scope: spec 声明的变量域
-    """
-    q_lo, q_hi = _range_bounds(question)
-    s_lo, s_hi = _range_bounds(scope)
-    if s_lo is None and s_hi is None:
-        return None                       # scope 没写数字, 查不了
-
-    # spec 完全落在问题下界之下
-    if q_lo is not None and s_hi is not None and s_hi < q_lo:
-        return (f"范围冲突: 问题要求从 {q_lo} 起, spec 的范围却是「{scope}」"
-                f"(上界 {s_hi} < {q_lo}) —— 验的根本不是问题问的那一段")
-    # spec 完全落在问题上界之上
-    if q_hi is not None and s_lo is not None and s_lo > q_hi:
-        return (f"范围冲突: 问题要求不超过 {q_hi}, spec 的范围却是「{scope}」"
-                f"(下界 {s_lo} > {q_hi}) —— 验的不是问题问的那一段")
-    return None
-
-
-# ============================================================
-# 1b-3. 阈值 —— 第八道防线(范围外的另一种偷换)
-# ============================================================
-# ★ P4.5 第三轮实测失效现场:
-#     问: 哥德巴赫猜想成立吗(每个大偶数 = 两个素数之和, 即**至少 1 组**)
-#     跑: 拆成 "对所有偶数 n 满足 4<=n<=200000, **存在至少 1000 组**素数对"
-#         → 代码发现 n=4 只有 1 组 → VERDICT: REFUTED
+# 现在由 _precheck.run_precheck() 在建模后、验证前做**整道闸门**:
+# 让 LLM 逐条做语义对照("这和原问题是同一件事吗" + "它本身可判定吗"),
+# 不该验的根本不进验证循环。那是"该验才验", 而不是"出了事再拦"。
 #
-#   逻辑上一点没错: n=4 确实凑不出 1000 组。但哥德巴赫猜想问的是"至少 1 组",
-#   而拆出来的命题问的是"至少 1000 组" —— **给原问题加了一个它没有要求的限定**,
-#   再拿这个加强版去反驳, 然后理直气壮地宣布"哥德巴赫被驳倒了"。
-#
-#   范围防线(scope_conflict)抓不到这个: 4..200000 完全在问题范围内, 是合理的。
-#
-#   ★ 偷换不一定发生在范围上, 也可能发生在**数量阈值**上。
-
-#: 只认**显式阈值语境**里的数字。"n^2+n+41" 里的 41 不算阈值, 不该被当成偷换。
-_THRESHOLD_RE = re.compile(
-    r"(?:至少|不少于|不小于|超过|大于|多达|多达)\s*(\d+)"
-    r"|(\d+)\s*(?:组|个解|个例子|种方式|次)"
-)
+# 判据: **"结论对不对"可以问 LLM, "结论有没有证据"必须问机器。**
+# 所以量词作为结构化字段、证据强制、0 LLM 审计这三条留在代码层不动 ——
 
 
-def threshold_conflict(question: str, claim_text: str) -> str | None:
-    """
-    命题有没有给原问题**加一个它没有要求的数量阈值**。加了就返回说明。
-
-    只在三种情形报警:
-      a. 命题里的阈值词 + 数字, 而问题里**完全没有**这个数字
-      b. 问题里有阈值词, 但数字不一样(至少 1 组 → 至少 1000 组)
-      c. 问题没有阈值语境, 命题却有(这是 a 的特例)
-
-    为什么保守: "n^2+n+41" 这类命题自带数字很常见, 不该被当成偷换。
-    所以只在**阈值语境**里查数字 —— 宁可漏检也不误伤, 误报多了就没人看这个告警了。
-    """
-    q_th = {int(g) for m in _THRESHOLD_RE.finditer(question or "") for g in m.groups() if g}
-    c_th = {int(g) for m in _THRESHOLD_RE.finditer(claim_text or "") for g in m.groups() if g}
-
-    if not c_th:
-        return None                                  # 命题没有阈值语境, 查不了
-    extra = c_th - q_th
-    if extra:
-        return (f"阈值偷换: 命题引入了原问题没有的阈值「至少/超过 {sorted(extra)}」—— "
-                f"给原问题加了它没要求的限定, 再拿加强版去验, 等于答非所问")
-    if q_th and not (c_th & q_th):
-        return (f"阈值不一致: 问题的阈值 {sorted(q_th)} 在命题里消失了 —— 限定条件被丢掉了")
-    return None
-
-
-def question_is_undecidable(question: str) -> str | None:
-    """
-    原始问题本身就不可判定时, 返回命中的标记词; 否则 None。
-
-    ★ 为什么这条必须存在(P4.5 实测):
-    量词防线挡住了"同一个断言换了量词", 但挡不住**另一种偷换** ——
-    一边说"『优美』是主观审美判断, 不可判定", 一边又拆出
-    "sum(k=1..n) k² = n(n+1)(2n+1)/6" 和"归纳步 k→k+1" 去验证, 最后判 proved。
-
-    也就是说: 模型**自己知道**原问题不可判定, 但仍然去验了它的组成部分。
-    对用户来说那个 proved 依然是答非所问 —— 而且因为混在一堆 undecidable 里面,
-    比纯粹的硬吹更容易蒙混过关。
-
-    所以拦的不是"命题", 是"原问题": 问题既然不可判定, 就不该有任何 spec
-    进验证循环。
-    """
-    low = (question or "").lower()
-    for marker in UNDECIDABLE_MARKERS:
-        if marker.lower() in low:
-            return marker
-    return None
+# ~~question_is_undecidable()~~ 已于 P4.5 第三轮删除。
+# 它靠 UNDECIDABLE_MARKERS 关键词黑名单判断问题是否不可判定, 两个致命问题:
+#   1. 黑名单只会越长 —— "优美/有趣/最优算法" 之后必然要加"最小的""不存在的""超算力",
+#      加到某个长度就没人敢动它。
+#   2. **漏得比不拦还危险**。真实翻车里最刁钻的几道一个标记词都不含:
+#      「最小的不存在的素数」「存在 n>100000 使 n!+1 是素数」(超算力)、
+#      「哥德巴赫猜想成立吗」(开放问题) —— 全部放行。
+# 现在这些交给 _precheck 闸门: 问 LLM"它本身可判定吗/是不是同一件事", 是语义判断。
 
 
 
@@ -309,7 +191,9 @@ def normalize_claim(
     把一条(可能很粗糙的)命题整理成标准 spec。
 
     判定不可判定的两条依据:
-      a. 显式标记 —— how 传 "undecidable", 或文本里出现 UNDECIDABLE_MARKERS
+      a. 显式标记 —— 建模阶段自己填 how='undecidable'。
+       这是模型的结构化输出, 不是我们对文本的猜测, 可以信。
+       (原来还有一条"文本命中关键词黑名单"的启发式, 已删 —— 见 1b-2)
       b. 缺 scope —— 完全没有变量域的命题基本没法写成断言, 但**不直接判死**,
          只标 warning 让调用方决定(用户可能就是要验一个不带范围的简单命题)
 
@@ -342,19 +226,15 @@ def normalize_claim(
         warn.append(f"quantifier={q_explicit!r} 不是合法值(应为 {'/'.join(QUANTIFIERS)}), 改从文本抽取")
         q_explicit = ""
     q_final = q_explicit or detect_quantifier(text) or ""
+    # ★ 这里只剩量词一道。范围和阈值曾经也在这拦, 但那两道是拿正则匹配自然语言,
+    #   换个说法就漏, 且属于"出了事再拦"的思路 —— 已删, 改由 _precheck 闸门在
+    #   建模后统一判断(见上方 1b-2 的说明段)。
     conflict = quantifier_conflict(question, text, q_explicit) if question else None
-    # ---- 范围(P4.5 第二轮加) ----
-    # 和量词同级: 量词对但 scope 缩了, 验的仍然是别的范围
-    s_conflict = scope_conflict(question, scope_s) if question else None
-    t_conflict = threshold_conflict(question, text) if question else None
-    if conflict or s_conflict or t_conflict:
-        q_from, q_to, msg = conflict if conflict else ("", "", "")
-        # 量词/范围/阈值被偷换都是**硬伤**: 命题验得再对, 验的也不是用户问的那个。
-        # 直接判 undecidable —— 让它进"需人判断"区, 而不是白跑一轮验证。
+    if conflict:
+        q_from, q_to, msg = conflict
+        # 量词被偷换是硬伤: 命题验得再对, 验的也不是用户问的那个。
+        # 判 undecidable —— 让它进"需人判断"区, 而不是白跑一轮验证。
         warn.append(msg)
-        for extra_msg in (s_conflict, t_conflict):
-            if extra_msg:
-                warn.append(extra_msg)
         return {
             "claim_text": text,
             "scope": scope_s,
@@ -368,15 +248,13 @@ def normalize_claim(
             **extra,
         }
 
-    # 不可判定启发式: 只在**没有明确 scope** 时才敢这么判, 否则误伤
+    # 不可判定的判定**不在这里做**。
+    # 原来是"没有 scope + 文本命中 UNDECIDABLE_MARKERS 关键词" —— 已删, 因为:
+    #   1. 关键词黑名单只会越长;
+    #   2. 而"这条到底该不该验"是语义问题, 由 _precheck 闸门问 LLM 更准。
+    # 这里只认一个**显式**信号: 建模阶段自己说 how='undecidable'。
+    # 显式信号是模型的结构化输出, 不是我们对文本的猜测 —— 可以信。
     undecidable = how_s == "undecidable"
-    if not undecidable and not scope_s:
-        low = text.lower()
-        for marker in UNDECIDABLE_MARKERS:
-            if marker.lower() in low:
-                undecidable = True
-                warn.append(f"命题含不可判定表述「{marker}」且没给范围 → 按 undecidable 处理")
-                break
 
     # claim_id 允许调用方显式传入(从 _specs.jsonl 重建时要沿用原 id, 不能重算,
     # 否则审计时新旧 id 对不上, 证据会被误判成孤儿)。

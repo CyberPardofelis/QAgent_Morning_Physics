@@ -348,7 +348,7 @@ def specs_from_planning(
     Returns:
         (specs, 重复条数)
     """
-    from ._claim import dedupe_claims, question_is_undecidable
+    from ._claim import dedupe_claims
 
     raw_specs = planning.get("specs") or []
     specs = []
@@ -366,22 +366,11 @@ def specs_from_planning(
         if isinstance(u, str) and u.strip():
             specs.append(normalize_claim(u.strip(), how="undecidable", question=question))
 
+    # ★ 这里原本还有一道"原问题含 UNDECIDABLE_MARKERS 就整条拦下"的防线, 已删。
+    #   它靠关键词黑名单判断问题是否不可判定("优美/有趣/最优算法/本质上") ——
+    #   而黑名单只会越长, 且漏得比不拦还危险: 「最小的不存在的素数」「n>100000
+    #   的阶乘」这类根本不含任何标记词, 照样放行。
+    #   现在统一由 _precheck 闸门在建模后逐条判断(问 LLM "它和原问题是同一件事吗"
+    #   + "它本身可判定吗"), 那是语义判断, 不是关键词匹配。
     specs, dropped = dedupe_claims(specs)
-
-    # ★ 防线四(P4.5 实测加): 原问题本身就不可判定 → 一条都不许进验证循环。
-    #   失效现场: 「这段证明是优美的」被拆成
-    #     - undecidable: "'优美'是主观审美判断, 不存在可形式化的真假判据"  ← 模型知道
-    #     - proved:     "sum(k=1..n) k² = n(n+1)(2n+1)/6"               ← 却还是验了
-    #   模型一边承认原问题不可判定, 一边去验它某个"组成部分"。对用户来说那个
-    #   proved 依然是答非所问 —— 而且因为混在一堆 undecidable 里, 比纯硬吹更隐蔽。
-    marker = question_is_undecidable(question) if question else None
-    if marker:
-        for s in specs:
-            if s.get("decidable", True):
-                s["decidable"] = False
-                s["state"] = "undecidable"
-                s["warn"] = list(s.get("warn") or []) + [
-                    f"原问题含不可判定表述「{marker}」, 整条不自动验证 —— "
-                    f"验证它的组成部分同样是答非所问"
-                ]
     return specs, dropped

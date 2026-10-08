@@ -34,6 +34,7 @@ PROVENANCE = ROOT / "agent" / "tools" / "research" / "_provenance.py"
 REGISTRY = ROOT / "agent" / "tools" / "registry.py"
 CLAIM = ROOT / "agent" / "tools" / "research" / "_claim.py"
 LOOP = ROOT / "agent" / "tools" / "research" / "_loop.py"
+PRECHECK = ROOT / "agent" / "tools" / "research" / "_precheck.py"
 
 
 def _run(test: str) -> tuple[bool, str]:
@@ -131,11 +132,27 @@ def build() -> list[Mutation]:
             expect_substring="",
         ),
         Mutation(
-            name="防线四失效 —— 不可判定的问题又能拆出可判定命题去验",
-            path=LOOP,
-            old="    marker = question_is_undecidable(question) if question else None",
-            new="    marker = None  # MUTANT: 防线四关掉",
-            test="tests/test_research_quantifier.py::TestUndecidableQuestionBlocksEverything",
+            name="闸门失效 —— 体检判 not same_question 也照样进验证循环",
+            path=PRECHECK,
+            old="        if not res[\"same_question\"]:",
+            new="        if False:  # MUTANT: 不看 same_question",
+            test="tests/test_research_quantifier.py::TestPrecheckGate",
+            expect_substring="",
+        ),
+        Mutation(
+            name="闸门失效 —— 体检判不可判定也不拦",
+            path=PRECHECK,
+            old="        if not res[\"decidable\"]:",
+            new="        if False:  # MUTANT: 不看 decidable",
+            test="tests/test_research_quantifier.py::TestPrecheckGate",
+            expect_substring="",
+        ),
+        Mutation(
+            name="闸门接错位置 —— 体检跑在验证循环之后(只是事后拦)",
+            path=ROOT / "agent" / "tools" / "research" / "research_investigate.py",
+            old="    checks = run_precheck(question, specs, _call_llm)",
+            new="    checks = {}  # MUTANT: 体检挪到 run_loop 之后再跑就晚了",
+            test="tests/test_research_quantifier.py::TestRemovedDefensesStayRemoved",
             expect_substring="",
         ),
         Mutation(
@@ -152,27 +169,23 @@ def build() -> list[Mutation]:
             expect_substring="",
         ),
         Mutation(
-            name="防线五失效 —— scope 从 >100000 缩到 200..500 也不再报警",
-            path=CLAIM,
-            old="if q_lo is not None and s_hi is not None and s_hi < q_lo:",
-            new="if False:  # MUTANT: 范围检查关掉",
-            test="tests/test_research_quantifier.py::TestScopeGuard",
-            expect_substring="",
-        ),
-        Mutation(
             name="防线六失效 —— 空 stdout 的 proved 也算证明",
             path=CLAIM,
             old='add("error", "proved_without_support",',
             new='add("warn", "proved_without_support",  # MUTANT: 降级为警告',
-            test="tests/test_research_quantifier.py::TestProvedNeedsSupport",
+            test="tests/test_research_quantifier.py::TestHardContractsStay",
             expect_substring="",
         ),
         Mutation(
-            name="防线八失效 —— 至少 1000 组 能拿去反驳哥德巴赫",
+            name="防线五/六/八 又被悄悄加回来 —— 正则防线复活",
             path=CLAIM,
-            old="    if not c_th:\n        return None                                  # 命题没有阈值语境, 查不了",
-            new="    if c_th:\n        return None  # MUTANT: 阈值检查关掉",
-            test="tests/test_research_quantifier.py::TestThresholdGuard",
+            # 这三条 P4.5 第三轮已删(靠正则匹配自然语言, 换个说法就漏)。
+            # 变异的意义是: 如果有人"顺手加回来", 这条变异会让删除变成
+            # 一个**不可悄悄回退**的决定, 而不是一句注释。
+            old="# ~~question_is_undecidable()~~ 已于 P4.5 第三轮删除。",
+            new=("def question_is_undecidable(question):\n"
+                 "    return '优美' if '优美' in question else None  # MUTANT: 黑名单复活"),
+            test="tests/test_research_quantifier.py::TestRemovedDefensesStayRemoved",
             expect_substring="",
         ),
     ]

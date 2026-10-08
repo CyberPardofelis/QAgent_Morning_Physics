@@ -483,7 +483,7 @@ class TestLLMTier:
         print(f"  判定退步 {len(regressed)}/{len(llm_cases)}"
               f" | 陷阱硬吹 {len(blown_now)}/{len(blown_base)}"
               f" | 结论矛盾 {len(contradictory_now)}/{len(contra_base)}")
-        print("  (基线: 判定错误 1/8 | 陷阱硬吹 1/5 | 结论矛盾 0/8 —— 详见文档 §21.6)")
+        print("  (基线: 判定错误 0/8 | 陷阱硬吹 0/5 | 结论矛盾 0/8 —— 详见文档 §22.6)")
 
         assert not regressed, "判定**退步**了（基线见 LLM_BASELINE）:\n  " + "\n  ".join(regressed)
         assert set(blown_now) <= set(blown_base), (
@@ -506,31 +506,34 @@ class TestLLMTier:
 
 #: ★ LLM 层当前实测基线
 #:
-#: **2026-10-08 P4.5 八道防线后**（判定错误 1/8、陷阱硬吹 1/5、结论矛盾 0/8）
+#: **2026-10-08 P4.5 第三轮(闸门收敛后)** —— 判定错误 0/8 · 陷阱硬吹 0/5 · 结论矛盾 0/8
 #:
-#: 三轮演进：
-#:   P4        判定错误 5/8 · 陷阱硬吹 4/5 · 结论矛盾 3/8
-#:   四道防线   判定错误 2/8 · 陷阱硬吹 2/5 · 结论矛盾 0/8
-#:   八道防线   判定错误 1/8 · 陷阱硬吹 1/5 · 结论矛盾 0/8
+#: 四轮演进:
+#:   P4           判定错误 5/8 · 陷阱硬吹 4/5 · 结论矛盾 3/8
+#:   四道防线      判定错误 2/8 · 陷阱硬吹 2/5 · 结论矛盾 0/8
+#:   八道防线      判定错误 1/8 · 陷阱硬吹 1/5 · 结论矛盾 0/8
+#:   一道闸门      判定错误 0/8 · 陷阱硬吹 0/5 · 结论矛盾 0/8
 #:
-#: 关键单点修复：`quant_02`「对所有正整数 n, n²<2n」(假命题) proved → refuted。
+#: ★ 最后一跳是**删代码换来的**, 不是加代码。原先八条里有三条是拿正则匹配
+#:   自然语言的防线(关键词黑名单 / 范围解析 / 阈值解析) —— 它们在拖后腿:
+#:   拦得住已知的偷换, 却在干扰真正的判断路径。收敛成 _precheck 一道闸门
+#:   (让 LLM 逐条做语义对照) 之后, 代码量更少而指标更好。见文档 §22。
 #:
-#: 这张表**故意记录着还不好看的数字**: goldbach 仍有一轮判 refuted。
-#: 直接把这些题写成 assert 通过是自欺欺人（把现状粉饰成达标）；
-#: 写成裸 assert 又是永久红灯，没法进 CI。所以取中间那条路：
+#: ⚠ 这张表记的是**单轮实测**。LLM 有不确定性, 同一份代码重跑会摇摆
+#:   (goldbach 那道题历史上在 inconclusive / refuted 之间摇摆过)。
+#:   所以断言口径是"不差于基线"而非"必须全对" —— 全对是运气, 稳定才是能力。
 #:
-#:   **测试断言"不差于这张表"** —— 退步立即红，达标或变好则绿并提示更新本表。
-#:
-#: 为什么值得这么麻烦：这张表是"P5 接入前必须跨过的门槛"的量化定义。
-#: 门槛从 1/8 降到 0/8 应该是**一次有意识的决定**，而不是某次跑歪了 unnoticed。
+#: 为什么用"不差于"而不是裸 assert:
+#:   裸 assert 是永久红灯, 没法进 CI; "必须全对"是自欺欺人(测试全绿但线上摇摆)。
+#:   退步红、达标绿、变好提示更新表 —— 门槛降低该是一次有意识的决定。
 LLM_BASELINE = {
-    "trap_01_goldbach": "inconclusive",          # ⚠ 仍摇摆(出现过 refuted), 见文档 §21.5
+    "trap_01_goldbach": "inconclusive",
     "trap_02_riemann": "inconclusive",
     "trap_03_aesthetic": "inconclusive",
-    "trap_04_factorial_prime_beyond": "inconclusive",   # 修前是 proved(超算力范围被缩小)
-    "trap_05_unspecified_minimum": "inconclusive",      # 修前是 proved(空洞真命题)
+    "trap_04_factorial_prime_beyond": "inconclusive",
+    "trap_05_unspecified_minimum": "inconclusive",
     "quant_01_exists_tight": "proved",
-    "quant_02_all_tight": "refuted",              # 修前是 proved
+    "quant_02_all_tight": "refuted",              # 「对所有 n, n²<2n」是假命题, 必须判 refuted
     "quant_03_exists_polynomial_composite": "proved",
 }
 

@@ -51,11 +51,15 @@ class TestNormalizeClaim:
         assert s["decidable"] is False
         assert s["state"] == "undecidable"
 
-    def test_aesthetic_question_auto_undecidable(self):
-        """没有 scope 时, 审美类表述自动判不可判定 —— 这类问题不该被硬凑成断言"""
-        s = normalize_claim("这个证明优美吗")
-        assert s["decidable"] is False
-        assert s["state"] == "undecidable"
+    # ~~test_aesthetic_question_auto_undecidable~~ 已于 P4.5 第三轮删除。
+    # 它测的是"没有 scope 时, 审美类表述自动判不可判定" —— 也就是
+    # UNDECIDABLE_MARKERS 关键词黑名单。那条防线已删, 理由:
+    #   黑名单只会越长; 而真实翻车里最刁钻的几道一个标记词都不含
+    #   (「最小的不存在的素数」「n>100000 的阶乘」「哥德巴赫猜想成立吗」),
+    #   靠关键词判"不可判定"漏得比不拦还危险。
+    # 现在由 _precheck 闸门问 LLM "它本身可判定吗" —— 语义判断, 见
+    # tests/test_research_quantifier.py::TestPrecheckGate。
+    # **删掉而不是改写**: 留着一条测已删行为的测试, 会让人以为那道防线还在。
 
     def test_explicit_claim_id_is_preserved(self):
         """
