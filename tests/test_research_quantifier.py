@@ -170,6 +170,31 @@ class TestPrecheckGate:
         apply_precheck(specs, checks)
         assert specs[0]["decidable"] is False
 
+    def test_vacuous_truth_not_skipped_by_conditional_gate(self):
+        """★ 条件触发不能把空洞真命题当干净放过去 ★
+
+        真实退化过一次: 给 run_precheck 加了 only_suspicious(本地筛一遍,
+        干净的跳过 LLM 复读)之后, 这条命题的量词是 none、措辞也正常,
+        于是被 _looks_clean 判为"干净"直接放行 —— 闸门形同虚设,
+        而 test_blocks_vacuous_truth 当场就红了。
+
+        空洞真命题的量词/措辞都看不出问题, 只有对照 scope 才暴露。
+        这条测试钉住的是那个修复, 防止"加优化"时再次悄悄拆掉防线。
+        """
+        from agent.tools.research._precheck import _looks_clean
+
+        spec = normalize_claim("不存在 m 使 2^m-1 是素数且 n<2", scope="n<2")
+        assert _looks_clean("最小的不存在的素数是多少", spec) is False, (
+            "空洞真命题被当成干净放行了 —— 条件触发削弱了闸门"
+        )
+
+        # 对照: 量词一致、scope 正常、措辞中性 —— 这种不该被送去问 LLM
+        ok = normalize_claim("对所有偶数 n 满足 4<=n<=1000 存在素数 p,q 使 p+q=n",
+                             scope="4<=n<=1000")
+        assert _looks_clean("对所有偶数 n 在 4..1000 内, 是否都能表示为两个素数之和", ok) is True, (
+            "干净的命题被误判为可疑 —— 条件触发没省下任何成本"
+        )
+
     def test_good_claim_passes(self):
         from agent.tools.research._precheck import apply_precheck, run_precheck
 

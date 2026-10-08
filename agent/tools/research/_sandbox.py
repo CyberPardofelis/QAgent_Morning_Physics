@@ -148,7 +148,20 @@ class SandboxResult:
 # ============================================================
 
 def _check_import(node: ast.Import | ast.ImportFrom) -> None:
-    """校验 import 的每个根模块在白名单里"""
+    """校验 import 的每个根模块在白名单里, 且**被导入的符号真实存在**。
+
+    为什么要查符号名 (2026-10-08 加):
+        `from sympy import maximize` 的根模块 `sympy` 是白名单里的, 根名校验
+        放行 —— 但 SymPy **根本没有** maximize 这个名字。它是
+        `sympy.optimize` 都不提供的功能, 正确做法是顶点枚举 / linprog。
+        结果: 整份本来完全正确的顶点枚举验证器, 因为多 import 一个不存在的
+        名字直接 ImportError 崩掉, verdict 变 failed。
+        这类错误**不赌 LLM 服从力就能拦死** —— 机器查一下就知道。
+
+        之前只能靠运行时崩溃 + 重试兜住, 纯属侥幸: 沙箱 `except` 抓到
+        ImportError, research_verify 对 failed 重试, LLM 恰好改了。
+        换个题目换个写法就未必救得回来。
+    """
     if isinstance(node, ast.Import):
         roots = [(a.name or "").split(".")[0] for a in node.names]
     else:
@@ -161,6 +174,69 @@ def _check_import(node: ast.Import | ast.ImportFrom) -> None:
                 f"line {node.lineno}: 模块 `{root}` 不在沙箱白名单内。"
                 f"可用模块: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS))}"
             )
+
+    # ---- 符号存在性检查 (只对 from-import 且有确切模块名的情形) ----
+    if not isinstance(node, ast.ImportFrom):
+        return
+    module = node.module or ""
+    root = module.split(".")[0]
+    if root not in _ALLOWED_IMPORT_ROOTS or not module:
+        return          # 相对导入 / 根模块本身 —— 上面已处理或该拦
+    # 相对层级导入(..x)不在沙箱模型内, 不查
+    if module.startswith("."):
+        return
+    for alias in node.names:
+        if alias.name == "*":
+            continue    # 星号导入没法静态展开, 交给运行时
+        _check_symbol_exists(module, alias.name, node.lineno)
+
+
+def _check_symbol_exists(module: str, symbol: str, lineno: int) -> None:
+    """确认 `from <module> import <symbol>` 里的 symbol 真的存在。
+
+    ★ 查不到就放行 ★ 理由: 解析失败(模块装不上/懒加载/平台差异)时宁可
+    交给运行时 ImportError, 也不要在这里误杀一段其实能跑的代码。误杀的
+    代价(正确代码被拒)比漏放的代价(崩溃后重试)大 —— 这是取舍不是疏忽。
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module(module)
+    except Exception:
+        return          # 解析不了 -> 放行, 运行时再说
+    if not hasattr(mod, symbol):
+        # 给出替代建议, 而不是只说"不存在" —— LLM 拿到能改对
+        hint = ""
+        for cand in _NAME_HINTS.get((module, symbol), ()):
+            if hasattr(mod, cand):
+                hint = f" 试试 `{cand}`?"
+                break
+        raise SandboxRejected(
+            f"line {lineno}: `{module}` 里没有 `{symbol}` 这个名字"
+            f"(ImportError 的常见来源)。{hint}"
+            f"可用: {', '.join(sorted(_public_names(mod))[:12])}"
+        )
+
+
+def _public_names(mod) -> set[str]:
+    """模块的公开名字 —— 排除下划线开头的, 那是私有。"""
+    return {n for n in dir(mod) if not n.startswith("_")}
+
+
+#: 已知写错时的替代建议。键是 (模块, 错误名), 值是候选正确名。
+#: 收录标准: 实战里 LLM 真的写错过, 且大概率是"想当然"记错了。
+#: 不是黑名单 —— 不在表里的写错照样会被 _check_symbol_exists 拦下,
+#: 这张表只是让报错信息更有用。
+_NAME_HINTS: dict[tuple[str, str], tuple[str, ...]] = {
+    # SymPy 没有 maximize/minimize(那是 scipy.optimize.linprog 的活)。
+    # 实战: 线性规划题顶点枚举思路完全正确, 就栽在这个 import 上。
+    ("sympy", "maximize"): ("symbols", "solve", "lambdify"),
+    ("sympy", "minimize"): ("symbols", "solve", "lambdify"),
+    ("sympy", "optimize"): ("sympy",),
+    # nroots 返回的是数值近似根, 没有 is_real 属性可用 —— 那是复数对象的
+    # 可靠判据是 abs(imag) < eps
+    ("sympy", "is_real"): ("re", "im"),
+}
 
 
 def check_code(code: str) -> None:

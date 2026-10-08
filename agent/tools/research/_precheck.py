@@ -134,6 +134,8 @@ def run_precheck(
     question: str,
     specs: list[dict[str, Any]],
     call_llm,
+    *,
+    only_suspicious: bool = True,
 ) -> dict[int, dict[str, Any]]:
     """
     跑一遍体检。返回 {index(从1起): {same_question, decidable, why}}。
@@ -146,8 +148,37 @@ def run_precheck(
     """
     if not specs:
         return {}
+
+    # ---- 条件触发 (2026-10-08 加): 本地筛一遍, 只对可疑的问 LLM ----
+    #
+    # 为什么要这一步: 体检问的「换量词/换范围/加限定/不可判定」这几条,
+    # 建模 prompt 的五条纪律里**已经逐条讲过**(prompts_research.py:145-200)。
+    # 让 LLM 在同一次任务里把刚写完的命题再自评一遍, 是「自评有偏袒」的:
+    # 刚拆完命题的模型倾向于说「我没偷换」。而每次复读都是真金白银 ——
+    # 实测一次 1~1.2k prompt + 最多 2k 输出, 占单次验证 3 次 LLM 里的 1 次。
+    #
+    # 所以: **先用 0 LLM 的结构检查筛, 干净的就直接放行, 别问。**
+    # 留 only_suspicious=False 走老路(全量体检), 供对比与回归用。
+    targets = list(range(1, len(specs) + 1))
+    skipped_clean = 0
+    if only_suspicious:
+        targets, skipped_clean = [], 0
+        for i, spec in enumerate(specs, 1):
+            if _looks_clean(question, spec):
+                skipped_clean += 1
+            else:
+                targets.append(i)
+        if skipped_clean:
+            logger.info(
+                "[research.precheck] %d/%d 条本地检查干净, 跳过 LLM 复读",
+                skipped_clean, len(specs),
+            )
+    if not targets:
+        return {}
+
+    subset = [specs[i - 1] for i in targets]
     try:
-        raw = call_llm(build_precheck_prompt(question, specs), temperature=0.0,
+        raw = call_llm(build_precheck_prompt(question, subset), temperature=0.0,
                        max_tokens=2000, timeout=120)
     except Exception as e:
         logger.warning("[research.precheck] 体检调用失败, 本轮放行: %s", e)
@@ -167,18 +198,101 @@ def run_precheck(
             idx = int(row.get("index", 0))
         except (TypeError, ValueError):
             continue
-        if idx < 1 or idx > len(specs):
+        # idx 是**子集内**的序号, 要映射回原始 specs 的下标 ——
+        # 否则只查了第 3、5 条时, 返回的 1、2 会被错当成原来的第 1、2 条。
+        if idx < 1 or idx > len(subset):
             continue
-        out[idx] = {
+        orig = targets[idx - 1]
+        out[orig] = {
             "same_question": bool(row.get("same_question", True)),
             "decidable": bool(row.get("decidable", True)),
             "why": str(row.get("why", "")).strip(),
         }
 
-    if len(out) < len(specs):
+    if len(out) < len(subset):
         logger.warning("[research.precheck] 只体检到 %d/%d 条, 缺的按放行处理",
-                       len(out), len(specs))
+                       len(out), len(subset))
     return out
+
+
+def _looks_clean(question: str, spec: dict[str, Any]) -> bool:
+    """0 LLM 地判断这条命题有没有可疑之处。**没有可疑才返回 True。**
+
+    ★ 这里刻意用「有疑问才问」而不是「检查通过才问」 ★
+    宁可漏检(放行一条可疑命题, 顶多结论错一次), 不可误杀(把干净的命题
+    送去问 LLM, 白花 token)。理由与"闸门失灵倒向放行"一致。
+
+    看的是**结构**, 不是语义 —— 正则不碰"这句话说的是不是同一件事",
+    只看明显不对劲的地方。语义那一半仍然交给 LLM 复读。
+
+    四类可疑(与建模 prompt 的五条纪律一一对应):
+      1. 量词与原问题冲突        → quantifier_conflict 已经在做, 这里兜住
+      2. 没填 quantifier 字段    → 靠"看着像"的措辞猜, 容易猜反
+      3. 命题里有评价性/无判据词 → "优美/有趣/本质" 这类没法写成断言
+      4. 命题短到不像断言        → 多半是"不存在的""最小的"这种空指代
+    """
+    from ._claim import detect_quantifier, quantifier_conflict
+
+    claim = str(spec.get("claim_text") or spec.get("text") or "").strip()
+    if not claim:
+        return False                     # 空命题一定可疑
+
+    # 1+2: 量词
+    explicit = str(spec.get("quantifier") or "").strip().lower()
+    if explicit not in ("forall", "exists", "none"):
+        return False                     # 没填量词, 值得问一句
+    try:
+        if quantifier_conflict(question, claim, explicit):
+            return False
+    except Exception:
+        return False                     # 结构闸门自己出错 → 宁可去问 LLM
+
+    # 3: 评价性/无判据表述 —— 判 True 之前必然可疑
+    low = claim.lower()
+    for w in _SUBJECTIVE_MARKERS:
+        if w in low:
+            return False
+
+    # 3b: 空洞真命题 —— 约束弱到没有反例空间。
+    # 这类不是靠量词或措辞能看出来的, 只有对照 scope 才暴露:
+    #   命题 "不存在 m 使 2^m-1 是素数且 n<2" 的量词是 none, 看起来很正常,
+    #   但 scope "n<2" 压根没几个数 —— 它为真只因为反例空间是空的。
+    # 这条是实测真实案例, 曾被闸门正确拦下; 加条件触发时差点漏掉。
+    scope = str(spec.get("scope") or "").strip()
+    if scope and _scope_too_narrow(scope):
+        return False
+
+    # 4: 短得不像断言
+    if len(claim) < 12:
+        return False
+
+    return True
+
+
+def _scope_too_narrow(scope: str) -> bool:
+    """scope 小到几乎没有取值 —— 这种"为真"是空洞真, 不是真。
+
+    只认明确写死小上界的形式(如 n<2 / n<=1 / n=0), **刻意保守**:
+    拿不准就放行去问 LLM。误杀的代价(好命题被白白问一次)远小于
+    漏放的代价(空洞真命题被当成已证)。
+    """
+    import re
+
+    # n<2 / n <= 1 / n=0 / n ∈ {0} 这类
+    m = re.search(r"[a-z]\s*(?:<|<=|=)\s*(\d+)\s*$", scope.strip())
+    if m and int(m.group(1)) <= 2:
+        return True
+    if re.search(r"范围\s*(?:为|是|=)\s*\{\s*0\s*\}", scope):
+        return True
+    return False
+
+
+#: 主观/无判据词 —— 这些词出现在命题里, 说明问的不是"成不成立"而是
+#: "好不好"。范围刻意窄, 因为宁可漏检不可误杀(见 _looks_clean 的说明)。
+_SUBJECTIVE_MARKERS = (
+    "优美", "优雅", "有趣", "本质", "巧妙", "精妙", "值得", "更好",
+    "漂亮", "优雅地", "直觉", "启发式地",
+)
 
 
 def apply_precheck(specs: list[dict[str, Any]], checks: dict[int, dict[str, Any]]) -> dict[str, int]:
