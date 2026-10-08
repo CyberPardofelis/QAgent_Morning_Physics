@@ -75,16 +75,24 @@ VERDICT_CONTRACT = """【VERDICT 契约 — 必须遵守, 否则结论作废】
      sat = satisfiable(Not(Equivalent(lhs, rhs)))   # False = 无反例, None = 有反例
    跨类型比较失败是纯 API 误用, 与命题真假无关 —— 但它会让本该 PROVED 的题
    变成 INCONCLUSIVE/REFUTED, 所以写完先检查这一类错误。
-5. ★ REFUTED 只有一个含义: 找到了**具体的反例** ★
+5. ★ REFUTED 只有一个含义: 找到了**具体的反例**, 而且必须把它打印出来 ★
    REFUTED = 「存在一个具体的 n/输入使命题不成立」。
    它**不**表示「我的实现不够准」或「没验出来」。两者必须分开:
 
-     错误: 二分法迭代 19 次后残差 6e-6 > 1e-6 精度要求 → REFUTED
+     错误: 二分法迭代 20 次后残差 6.2e-6 > 1e-6 精度要求 → REFUTED
            (这是"我的迭代不够多", 不是"根不存在"。多迭代几次就到了。)
      正确: 这种情况判 INCONCLUSIVE, 或者**加大迭代次数直到达标**再判 PROVED。
 
-   判据: 你能打印出一个具体的、明确违反命题的值吗?
-     能 → REFUTED(把这个值 print 出来)
+   ★ 而且必须把反例打印出来 ★ 机器会独立复核: 代码里标了 REFUTED,
+   但输出里找不到具体的反例值时, **判定会被否决并降级成 INCONCLUSIVE**。
+   格式要求(照抄这个骨架):
+
+     print("反例: n =", bad_n, "此时等式不成立, 差值 =", diff)
+     print("VERDICT: REFUTED")
+
+   光打印"发现反例"而没有具体数值不行 —— 机器只认带数字的那行。
+   判据一句话: 你能打印出一个**具体的、明确违反命题的值**吗?
+     能 → 打印它, 然后 REFUTED
      不能, 只是没达到精度/没跑完/超时 → INCONCLUSIVE
 
    同理: 代码报错(TypeError/ImportError)→ 那是 failed 不是 REFUTED。

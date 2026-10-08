@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import platform
+import re
 import sys
 from typing import Any
 
@@ -196,7 +197,101 @@ def judge_verdict(sandbox_result: Any, stdout: str | None = None) -> tuple[str, 
             "代码跑通了, 但输出里没有 `VERDICT: PROVED/REFUTED/PARTIAL` 标记 —— "
             "**跑通不等于证明成立**。请在验证代码末尾显式 print 出判定依据。"
         )
+
+    # ★ 3b. REFUTED 必须附具体反例 —— 裁决权在机器, 不在 LLM 手里的字面量 ★
+    #
+    # 为什么必须有这道: 用户的要求是「结论对不对」和「结论有没有证据」
+    # **最后都必须问机器**。而 REFUTED 之前是"代码里写什么就是什么"
+    # (:199 直接 return), 等于让被审者自己填结论。
+    #
+    # 真实翻车(连续三轮判同一道二分法题 refuted, 加 prompt 措辞完全无效):
+    #   二分法跑了 20 次迭代, 残差 6.2e-6 刚好超过 1e-6 要求, 代码走
+    #   `else: print('VERDICT: REFUTED')`。命题完全正确(根是 2.09455148...),
+    #   一个反例都没有 —— 它判的是「我的实现不够准」, 不是「命题为假」。
+    #
+    # 逻辑上这是不对称的两件事:
+    #   找到反例  → 可以证明假(有证书)
+    #   没找到    → **不能**证明真, 更不能证明假
+    # 所以 REFUTED 不附见证值时, 机器必须否决它 —— 宁可降级成
+    # inconclusive, 也不能让一个没有证书的"假"结论流下去。
+    if verdict == "refuted":
+        witness = _find_refutation_witness(out)
+        if witness is None:
+            return "inconclusive", (
+                "代码标了 REFUTED, 但输出里**找不到任何具体的反例值** —— "
+                "机器无法复核这个判定。\n"
+                "  REFUTED 的唯一含义是「存在一个具体的输入使命题不成立」, "
+                "它不表示「我的实现不够准」「没验出来」「超时」。\n"
+                "  请在代码里 print 出那个反例本身(具体的 n / 具体的数值对), "
+                "例如:\n"
+                "      print('反例: n =', bad_n, '此时等式不成立, 差值 =', diff)\n"
+                "  确实是精度/收敛问题 → 判 INCONCLUSIVE, 或加大迭代重试。"
+            )
+        return verdict, f"代码显式标记 {raw}；反例: {witness}"
+
     return verdict, f"代码显式标记 {raw}"
+
+
+#: REFUTED 见证值的识别。
+#:
+#: 第一版只认「反例/counterexample 关键词 + 数字」这种窄写法, 结果把
+#: `print('前 100 内的偶素数:', [2])` 这种**同样给出了反例**的输出误杀了 ——
+#: 而 2 就是「所有素数都是奇数」的反例。**误杀真反例比放过假反例更糟**:
+#: 放过 = 一个假结论流出去; 误杀 = 一个真结论被降级成 inconclusive。
+#:
+#: 所以放宽成两条任一命中即可:
+#:   1. 明确标记了「反例」且附近有数字  —— 最强信号
+#:   2. 提到了违反的对象(偶素数/不成立/违反...)  且同行有数字 —— 次强信号
+#: 仍然要求**有数字**: 只喊口号("发现反例了")不算数。
+_WITNESS_STRONG = re.compile(
+    r"(?:反例|counter-?example|witness|见证值|违反)\s*[:：]?[^\n]{0,80}?"
+    r"(-?\d+\.?\d*(?:[eE][-+]?\d+)?)",
+    re.IGNORECASE,
+)
+
+#: 列出「违反命题的东西」的措辞 —— 这些行里出现的数字就是候选反例。
+_WITNESS_WEAK = re.compile(
+    r"(?:偶素数|反例|违反|不成立|不合|odd_only|bad_n|counter)\S*"
+    r"[^\n]{0,80}?(-?\d+\.?\d*(?:[eE][-+]?\d+)?)",
+    re.IGNORECASE,
+)
+
+#: 纯数字行(如 "[2]" 或 "n = 2")。这条最宽 —— 任何含数字的行都算。
+#: 之所以敢放宽到这一步: 这道门只回答「机器能不能复核」, 不回答
+#: 「命题是真是假」。命题真假由代码里的实际运算决定, 这道门只确认
+#: **输出里有具体的值可供人/机核对**。所以宁可宽, 不可窄。
+_WITNESS_ANY = re.compile(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?")
+
+
+def _find_refutation_witness(stdout: str) -> str | None:
+    """
+    从 stdout 里找 REFUTED 的具体反例值。找不到返回 None。
+
+    ★ 为什么用正则而不是让 LLM 声明字段 ★
+    这道门的作用是「机器能不能复核」。正则只用来确认反例确实带着具体
+    数值, **不用来判断命题真假** —— 后者由代码里的实际运算结果决定。
+    所以正则在这里是够的。
+
+    刻意保守的方向只有一条: **没有数字就不算见证**。"发现反例了" 这种
+    纯口号一律降级。反过来, 只要输出里有具体数值就认 —— 误杀真反例
+    (把 `偶素数: [2]` 这种合法输出判成没见证) 比放过假反例更糟。
+    """
+    if not stdout:
+        return None
+    lines = stdout.splitlines()
+    # 先找强信号
+    for rx in (_WITNESS_STRONG, _WITNESS_WEAK):
+        for line in lines:
+            if rx.search(line):
+                return line.strip()[:200]
+    # 兜底: 输出里任何带数字的行都算可复核(限定在 VERDICT 之前, 避免
+    # 把 VERDICT 行自己当反例)
+    for line in lines:
+        if _MARKER_PREFIX in line.upper():
+            continue
+        if _WITNESS_ANY.search(line):
+            return line.strip()[:200]
+    return None
 
 
 # ============================================================
