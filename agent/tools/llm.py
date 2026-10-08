@@ -135,6 +135,55 @@ def _resolve_chat_mode_params() -> tuple:
     return (provider_name, model, think)
 
 
+_USAGE_LOCK = threading.Lock()
+_LAST_USAGE: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0,
+                               "total_tokens": 0, "calls": 0}
+
+
+def _record_usage(resp) -> None:
+    """把 API 响应里的 usage 记进进程级计数器。
+
+    为什么需要它: _call_llm 原本只返回文本, usage 就丢了, 于是
+    research_verify 的 cost.tokens 只能硬编码 0 —— 成本统计骗人, 会
+    让人以为跑 20 道题不花钱。**先量, 再优化** 这条纪律要求用量可见。
+
+    为什么是全局而不是返回值: 二十多个工具调用点都只拿字符串, 改
+    返回值签名会波及全部调用方。这里用「记录」而非「返回」, 让
+    现有调用方零改动就能读到统计, 事后真要精确计费再改签名。
+
+    计费语义是 provider 相关的(prompt/completion 单价不同), 这里只
+    记 token 数不做金额换算 —— 换算规则属于 cost_guard 的事。
+    """
+    try:
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        pt = int(getattr(u, "prompt_tokens", 0) or 0)
+        ct = int(getattr(u, "completion_tokens", 0) or 0)
+        tt = int(getattr(u, "total_tokens", 0) or 0) or (pt + ct)
+        with _USAGE_LOCK:
+            _LAST_USAGE["prompt_tokens"] += pt
+            _LAST_USAGE["completion_tokens"] += ct
+            _LAST_USAGE["total_tokens"] += tt
+            _LAST_USAGE["calls"] += 1
+    except Exception as e:
+        # 统计失败绝不能影响主流程 —— 这里吞掉是刻意的, 且只吞统计本身。
+        _log(f"[llm] _record_usage 失败(已忽略): {e}")
+
+
+def usage_snapshot() -> dict[str, int]:
+    """取当前进程累计的 LLM 用量快照。"""
+    with _USAGE_LOCK:
+        return dict(_LAST_USAGE)
+
+
+def reset_usage() -> None:
+    """清零累计用量 —— 长跑评估脚本每题之间调一次, 好算单题成本。"""
+    with _USAGE_LOCK:
+        for k in _LAST_USAGE:
+            _LAST_USAGE[k] = 0
+
+
 def _call_llm(
         prompt: str,
         model: str = None,   # 2026-09-04 改:None 表示跟主界面 chat mode
@@ -295,6 +344,7 @@ def _call_llm(
         # 这里洗一次, 下面所有工具的 JSON 解析全部受益。详见 infra/text_clean.py。
         out = sanitize_llm_text(out)
         _log(f"[llm] _call_llm done  耗时 {_t.time()-_t0:.1f}s  返回 {len(out or '')} 字符")
+        _record_usage(resp)
         return out
     except Exception as e:
         _log(f"[llm] _call_llm 失败: {e}")

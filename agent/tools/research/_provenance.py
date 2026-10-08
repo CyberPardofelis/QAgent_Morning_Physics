@@ -104,12 +104,23 @@ def env_fingerprint() -> dict[str, str]:
         "python": sys.version.split()[0],
         "platform": f"{platform.system()}-{platform.machine()}",
     }
-    for mod in ("sympy", "numpy", "scipy", "networkx", "z3"):
+    for mod in ("sympy", "numpy", "scipy", "networkx"):
         try:
             m = __import__(mod)
             fp[mod] = getattr(m, "__version__", "unknown")
         except Exception:
             fp[mod] = "absent"
+
+    # z3 特判: 它**没有** __version__ 属性, 版本只从 get_full_version() 拿。
+    # 用通用 getattr 写法的后果是指纹里永远记成 "unknown" —— 而 z3 恰恰是
+    # P1 里唯一能给全域结论的求解器, 一条 unsat->proved 没记版本就不可复现。
+    # 这个 bug 真实发生过: 跑完 20 题基准才发现指纹里 z3=unknown。
+    try:
+        import z3 as _z3
+
+        fp["z3"] = _z3.get_full_version()
+    except Exception:
+        fp["z3"] = "absent"
 
     _FINGERPRINT_CACHE = fp
     return dict(fp)

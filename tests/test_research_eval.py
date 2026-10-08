@@ -349,6 +349,10 @@ class TestEvidenceMandatory:
         for mod in ("sympy", "numpy", "networkx", "z3"):
             assert fp.get(mod), f"指纹缺 {mod}(值不能为空)"
             assert fp[mod] != "absent", f"{mod} 没装? 结论却下出来了"
+            # "unknown" 非空, 所以上面那条查不出它。这个 bug 真实存在过:
+            # z3 包没有 __version__, 通用 getattr 写法让指纹里的 z3 永远是
+            # unknown —— 而 z3 恰恰是唯一能给全域结论的求解器。
+            assert fp[mod] != "unknown", f"{mod} 版本没记上, 等于没记: {fp[mod]!r}"
 
     def test_z3_evidence_carries_z3_version(self, tmp_path, monkeypatch):
         """Z3 结论的证据里必须能查到 z3 版本号。"""
@@ -363,6 +367,213 @@ class TestEvidenceMandatory:
         ev = (got.get("evidence") or [{}])[0]
         env = ev.get("env") or {}
         assert env.get("z3"), f"Z3 证据缺 z3 版本: env={env}"
+        # 上一条断言只查「非空」, 而 "unknown" 恰好非空 —— 所以它一直绿着,
+        # 直到跑 20 题基准才发现指纹里 z3 一直是 unknown。
+        # z3 没有 __version__, 版本只在 get_full_version() 里, 通用
+        # getattr 写法必然拿不到。这里查「是不是真版本号」。
+        assert env["z3"] != "unknown", (
+            f"z3 版本记成了 unknown, 等于没记: env={env}"
+        )
+        assert any(ch.isdigit() for ch in env["z3"]), (
+            f"z3 版本不像版本号: {env['z3']!r}"
+        )
+
+    def test_env_fingerprint_z3_is_real_version_not_unknown(self):
+        """z3 版本必须是真版本号, 不能是 'unknown'。
+
+        这个 bug 真实存在过: env_fingerprint 用统一的
+        getattr(mod, '__version__') 取版本, 但 z3 包**没有**这个属性,
+        于是每条 Z3 证据的指纹里 z3 永远是 'unknown' —— 而 z3 恰恰是
+        唯一能给全域结论 (unsat -> proved) 的求解器。没记版本 = 结论
+        不可复现, 且测试只查「非空」时完全发现不了。
+        """
+        from agent.tools.research._provenance import env_fingerprint
+
+        fp = env_fingerprint()
+        assert fp["z3"] != "unknown", f"z3 版本没记上: {fp['z3']!r}"
+        assert fp["z3"] != "absent", "z3 没装 —— P1 的核心依赖缺失"
+        assert "Z3" in fp["z3"], f"z3 版本格式不对: {fp['z3']!r}"
+        # 对照组: 普通库仍走 __version__, 别为了 z3 把它们弄坏
+        assert fp["sympy"] != "unknown", "sympy 版本也被弄坏了"
+
+    def test_llm_usage_is_recorded_not_discarded(self):
+        """0 LLM 部分: usage 记录器本身要能把 token 累加起来。
+
+        这个 bug 真实存在过: _call_llm 只返回文本, API 响应里的 usage
+        就丢了, 于是 research_verify 的 cost.tokens 只能硬编码 0 ——
+        成本统计骗人, 会让人以为跑 20 道题不花钱。「先量, 再优化」
+        这条纪律要求用量可见, 所以这里用假响应单测累加逻辑,
+        真调 LLM 的那条另见 test_cost_tokens_is_real_when_llm_called。
+        """
+        from agent.tools import llm as llm_mod
+
+        class _U:
+            prompt_tokens = 100
+            completion_tokens = 30
+            total_tokens = 130
+
+        class _Resp:
+            usage = _U()
+
+        llm_mod.reset_usage()
+        llm_mod._record_usage(_Resp())
+        llm_mod._record_usage(_Resp())
+        s = llm_mod.usage_snapshot()
+        assert s["calls"] == 2, f"调用数没记对: {s}"
+        assert s["total_tokens"] == 260, f"总 token 没累加: {s}"
+        assert s["prompt_tokens"] == 200 and s["completion_tokens"] == 60, s
+        llm_mod.reset_usage()
+        assert llm_mod.usage_snapshot()["calls"] == 0, "reset_usage 没清零"
+
+    def test_record_usage_survives_broken_response(self):
+        """响应对象畸形时不能抛 —— 统计失败绝不能带崩主流程。"""
+        from agent.tools import llm as llm_mod
+
+        class _Bad:
+            @property
+            def usage(self):
+                raise RuntimeError("boom")
+
+        llm_mod.reset_usage()
+        llm_mod._record_usage(_Bad())          # 不抛就算过
+        llm_mod._record_usage(object())        # 没有 usage 属性
+        s = llm_mod.usage_snapshot()
+        assert s["calls"] == 0, f"畸形响应不该被计入: {s}"
+        llm_mod.reset_usage()
+
+    @pytest.mark.skipif(
+        os.environ.get(ENV_LLM_EVAL) != "1",
+        reason="要真调 LLM 才测得到 cost.tokens(会花 token)",
+    )
+    def test_cost_tokens_is_real_when_llm_called(self, tmp_path, monkeypatch):
+        """★ 真跑一次: cost.tokens 必须是真实数字, 不是硬编码 0。
+
+        这是 0 LLM 测试组查不出来的部分 —— 记录器逻辑对, 但如果
+        research_verify 没去取快照, 它照样返回 0。所以必须真调一次。
+        """
+        monkeypatch.chdir(tmp_path)
+        import agent.tools  # noqa: F401
+        from agent.tools.llm import reset_usage, usage_snapshot
+        from agent.tools.registry import ToolRegistry
+
+        reset_usage()
+        got = ToolRegistry.get("research_verify").handler(
+            claim="验证 1 到 100 中不能被 2、3、5 整除的数的个数是 26。",
+            task_hash="costtok_probe",
+            timeout=120,
+        )
+        assert usage_snapshot()["calls"] >= 1, "LLM 没被调到"
+        cost = got.get("cost") or {}
+        assert cost["tokens"] > 0, f"cost.tokens 仍是 0, 成本统计在骗人: {cost}"
+        assert cost["llm_calls"] >= 1, f"llm_calls 没对上: {cost}"
+        reset_usage()
+
+    def test_cost_tokens_zero_when_code_supplied(self, tmp_path, monkeypatch):
+        """传了 code(跳过 LLM)时 cost.tokens 必须是 0 —— 不是没统计, 是真没花。"""
+        monkeypatch.chdir(tmp_path)
+        import agent.tools  # noqa: F401
+        from agent.tools.registry import ToolRegistry
+
+        got = ToolRegistry.get("research_verify").handler(
+            claim="验证 1 到 100 中不能被 2、3、5 整除的数的个数是 26。",
+            code=(
+                "cnt = sum(1 for k in range(1, 101) if k % 2 and k % 3 and k % 5)\n"
+                "print('count:', cnt)\n"
+                "print('VERDICT: PROVED' if cnt == 26 else 'VERDICT: REFUTED')\n"
+            ),
+        )
+        cost = got.get("cost") or {}
+        assert cost["tokens"] == 0, f"没调 LLM 却报了 token: {cost}"
+        assert cost["llm_calls"] == 0, f"没调 LLM 却报了调用数: {cost}"
+
+    def test_verify_actually_wires_usage_into_cost(self):
+        """★ 0 LLM 能查的那一半: verify 有没有真的把用量接进 cost。
+
+        为什么需要这条: 上一条 test_cost_tokens_is_real_when_llm_called
+        要花 token, 默认 skip —— 于是「cost.tokens 又变回硬编码 0」这件
+        事在 CI 里完全没人管。反向验证时亲眼见到: 把接线退回去, pytest
+        依然 rc=0。**默认跳过的测试等于没有测试**, 所以接线本身要有一条
+        0 LLM 的结构断言。
+
+        用 AST 而不是文本匹配: 注释里出现 "tokens": 0 这类字符串会误伤。
+        """
+        import ast
+        import io as _io
+        import os as _os
+
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        path = _os.path.join(root, "agent", "tools", "research", "research_verify.py")
+        with _io.open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        fn = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "research_verify"),
+            None,
+        )
+        assert fn is not None, "找不到 research_verify"
+
+        # cost 字典里 tokens 的值必须是 BinOp(减法), 不能是常量 0
+        tokens_vals = []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Dict):
+                continue
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == "tokens":
+                    tokens_vals.append(v)
+        assert tokens_vals, "cost 字典里没有 tokens 字段"
+        # dry_run 分支的 tokens=0 是合法的(不执行也不调 LLM),
+        # 由 test_dry_run_branch_may_report_zero_tokens 单独覆盖。
+        # 这里只要求: 主路径那处必须是真实用量, 不能是常量。
+        literal_zeroes = [
+            v for v in tokens_vals
+            if isinstance(v, ast.Constant) and v.value == 0
+        ]
+        computed = [v for v in tokens_vals if isinstance(v, ast.BinOp)]
+        assert computed, (
+            f"cost.tokens 没有任何一处参与运算 —— 全是常量, 等于没接用量: "
+            f"{[type(v).__name__ for v in tokens_vals]}"
+        )
+        # 常量 0 的数量不该超过 dry_run 分支那一处
+        assert len(literal_zeroes) <= 1, (
+            f"cost.tokens 出现 {len(literal_zeroes)} 处硬编码 0, "
+            f"除了 dry_run 那一处不该有别的"
+        )
+        # 还要确认真的调了 usage_snapshot —— 否则上面那个 BinOp 哪来的
+        calls = {
+            n.func.id for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        assert "usage_snapshot" in calls, "research_verify 没调 usage_snapshot"
+
+    @pytest.mark.skipif(
+        os.environ.get(ENV_LLM_EVAL) != "1",
+        reason="dry_run 仍要调 LLM 生成代码(会花 token)",
+    )
+    def test_dry_run_branch_may_report_zero_tokens(self):
+        """dry_run 分支报 tokens=0 是**合法**的, 不是硬编码偷懒。
+
+        这条与上面那条配套: 上一条要求 cost.tokens 必须是真实用量, 但
+        dry_run 不执行代码, 报 0 是对的。两条一起才完整 —— 只查「非 0」
+        会误伤合法分支, 只查「接线」会放过偷懒的分支。
+
+        ★ 故意不 chdir 到 tmp ★ dry_run 仍要调 LLM 生成代码, 而 _call_llm
+        要从项目根读配置 —— chdir 过去后 LLM 调不通, 会落到 inconclusive
+        分支, 测的就不是 dry_run 了。
+        """
+        import agent.tools  # noqa: F401
+        from agent.tools.registry import ToolRegistry
+
+        got = ToolRegistry.get("research_verify").handler(
+            claim="验证 1 到 100 中不能被 2、3、5 整除的数的个数是 26。",
+            dry_run=True,
+        )
+        assert got.get("verdict") == "untested", (
+            f"dry_run 应返回 untested, 实得 {got.get('verdict')} —— "
+            f"多半是 LLM 生成代码失败落到了 inconclusive: "
+            f"{str(got.get('summary'))[:120]}"
+        )
+        assert (got.get("cost") or {}).get("tokens") == 0, "dry_run 不该报 token"
 
 
 

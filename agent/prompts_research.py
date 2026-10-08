@@ -34,10 +34,29 @@ VERDICT_CONTRACT = """【VERDICT 契约 — 必须遵守, 否则结论作废】
 
     VERDICT: PROVED      命题在给定范围内被证明成立(符号计算/精确判定)
     VERDICT: REFUTED     找到了反例
-    VERDICT: PARTIAL     有限范围检查通过, 但不构成全域证明
+    VERDICT: PARTIAL     有限范围检查通过, 但不构成全域证明(见下面第 0 条)
     VERDICT: INCONCLUSIVE 验了但定不了
 
-三条硬规则:
+0. ★ 先判断这个范围是不是题目自己写的 ★
+   PARTIAL 的前提是「你只查了一部分, 但命题要求全域」。
+   **如果题目本身就把范围写死了** —— 例如「n=0 到 39」「4 到 1000 的所有偶数」
+   「对 n<=20 成立」「n 层汉诺塔, n<=10」—— 那么**穷举完这个范围就是 PROVED**,
+   不是 PARTIAL。此时 PARTIAL 的前提根本不成立。
+
+   判据一句话: **题目要求的范围 == 你检查的范围, 且该范围是有限可枚举的 → PROVED**;
+   题目要求的是「对所有 n」(没给上界) 而你只查了有限个 → PARTIAL。
+
+   反例(实测真实失败, 别踩):
+     题目: 「验证 n^2+n+41 在 n=0 到 39 时全为素数, 并检查 n=40 时的值」
+     错误写法: 因为"有限范围"就给 PARTIAL
+     正确写法: n=0..39 是题目指定的范围, 逐个验完全对 → 那个子命题 PROVED;
+               n=40 的值 1681=41^2 是可直接算出的事实 → 也是 PROVED。
+               整个合取命题成立 → PROVED
+   同样地: 「对 4..1000 的所有偶数找素数和」验完就是 PROVED, 不是 PARTIAL。
+
+   ★ 合取命题(A 且 B)的判定: 分别判 A 和 B, 两个都 PROVED 合起来才是 PROVED。
+     不要因为"A 和 B 都只验了有限范围"就把整体降级 —— 各自范围合法就不是降级理由。
+
 1. **没有 VERDICT 标记 = 判定为 untested**, 哪怕 stdout 里全是 True。
    "代码跑通"不等于"命题成立", 不要用 print 掩盖判定。
 2. VERDICT 的值必须由代码里**真实的计算结果**推出, 不许直接写死。
@@ -48,6 +67,30 @@ VERDICT_CONTRACT = """【VERDICT 契约 — 必须遵守, 否则结论作废】
    反例(禁止):
        print("VERDICT: PROVED")     # 这叫编造, 不叫证明
 3. 多种标记同时出现时, **以最后一行**为准 —— 探索过程可以先打标记, 但最后要有定论。
+4. ★ 别用 `is` 比较 sympy 的对象 ★
+   `simplify_logic()` 返回的是 sympy 的 BooleanTrue, **不是** Python 的 True,
+   所以 `simp is True` 恒为 False; 同理 `sympy.Or(...) - sympy.Or(...)` 会抛
+   TypeError(布尔对象不支持减法)。
+   正解: 用 `==` / `bool()` 转换, 或直接用真值表枚举、satisfiable()。
+     sat = satisfiable(Not(Equivalent(lhs, rhs)))   # False = 无反例, None = 有反例
+   跨类型比较失败是纯 API 误用, 与命题真假无关 —— 但它会让本该 PROVED 的题
+   变成 INCONCLUSIVE/REFUTED, 所以写完先检查这一类错误。
+5. ★ REFUTED 只有一个含义: 找到了**具体的反例** ★
+   REFUTED = 「存在一个具体的 n/输入使命题不成立」。
+   它**不**表示「我的实现不够准」或「没验出来」。两者必须分开:
+
+     错误: 二分法迭代 19 次后残差 6e-6 > 1e-6 精度要求 → REFUTED
+           (这是"我的迭代不够多", 不是"根不存在"。多迭代几次就到了。)
+     正确: 这种情况判 INCONCLUSIVE, 或者**加大迭代次数直到达标**再判 PROVED。
+
+   判据: 你能打印出一个具体的、明确违反命题的值吗?
+     能 → REFUTED(把这个值 print 出来)
+     不能, 只是没达到精度/没跑完/超时 → INCONCLUSIVE
+
+   同理: 代码报错(TypeError/ImportError)→ 那是 failed 不是 REFUTED。
+   一行 import 写错会让整份验证器崩掉, 那是你的 bug 不是命题的结论。
+   多 import 一个不存在的东西(如 `from sympy import maximize` —— SymPy 没有
+   这个名字)会让本来正确的顶点枚举整体崩掉, 少写就够。
 """
 
 #: 数值 vs 证明 —— 借鉴 prompts_survey.POOL_SAMPLING_RULE 的思路(限定范围话术)
@@ -176,7 +219,9 @@ spec 的 scope 必须**覆盖**问题要求的那个范围, 不许缩小到其�
 #: 「对所有 n, n²<2n」被判 proved 的直接原因(代码对着存在版在跑)。
 _QUANTIFIER_HINTS: dict[str, str] = {
     "forall": "`forall` —— 对**所有** n 成立。找到一个违反的 n → REFUTED; "
-               "范围内全过 → PARTIAL(有限枚举永远只是 PARTIAL, 不能 PROVED)。",
+               "范围内全过 → 判据取决于范围是题目给的还是你自选的: "
+               "题目写死了上界(如「对 n<=20」「n=0..39」)→ 验完就是 PROVED; "
+               "题目要求全域但你只查了有限个 → PARTIAL。",
     "exists": "`exists` —— **存在** n 使其成立。找到一个见证值 → PROVED; "
                "没找到 → INCONCLUSIVE(绝不能 REFUTED: 没搜到不等于不存在)。",
     "none": "`none` —— **不存在** n 使其成立。找到见证值 → REFUTED; "
@@ -293,6 +338,9 @@ print("化简(lhs - rhs) =", diff)
 print("VERDICT: PROVED" if diff == 0 else "VERDICT: REFUTED")
 ''',
     "enumerate": '''# 小范围枚举找反例
+# ★ 先问一句: 题目自己写死了范围吗(如「n<=20」「n=0..39」「4..1000 的偶数」)?
+#   写死了 → 下面的循环范围就是全域, else 分支要打 PROVED 而不是 PARTIAL。
+#   没写死 → 你自选的 1..200 只是抽查, PARTIAL 才是对的。
 found = None
 for n in range(1, 201):
     if <该 n 下命题不成立>:
@@ -302,7 +350,8 @@ if found:
     print("找到反例:", found)
     print("VERDICT: REFUTED")
 else:
-    print("n=1..200 范围内未发现反例 —— 这只是有限检查, 不构成全域证明")
+    print("n=1..200 范围内未发现反例")
+    # ★ 范围是题目给的 → PROVED; 范围是你自选的抽查 → PARTIAL
     print("VERDICT: PARTIAL")
 ''',
     "numeric": '''# 数值抽查: 只能支持 PARTIAL, 不能支持 PROVED

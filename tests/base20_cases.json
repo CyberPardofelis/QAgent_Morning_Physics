@@ -1,0 +1,197 @@
+{
+  "_comment": "small-math-agent-benchmark 20 题 —— 确定性层评估集 (0 LLM)。gold 全是 proved: 这 20 题要么「验证某恒等式/性质」要么「求出某确定值」, 目标都是证明题成立。probes 字段是 0 LLM 的标准验证代码, 用来先确认沙箱+sympy/networkx 本身能算对 —— 这一层测的是工具能力, 与 LLM 水平无关。",
+  "_source": "用户提供的 baseproblems.txt (small-math-agent-benchmark v1.0.0)",
+  "_gold_caveat": "gold=proved 是这批题目的性质, 不是通用规则。别拿它套 P4 的 8 道陷阱题 —— 那批的 gold 是「认输」。",
+  "cases": [
+    {
+      "id": "num-001-euler-prime-polynomial",
+      "domain": "number_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "partial",
+      "llm_failure_mode": "合取命题: 题目要求「n=0..39 全素数」且「n=40 的值」。LLM 给两个子命题各打 PARTIAL, 合取自然是 PARTIAL。但两个子命题其实都是穷尽验证。",
+      "verifier": "python",
+      "probes": [
+        "n^2+n+41 在 n=0..39 全为素数, 且 n=40 时为 41^2",
+        "n=40: 40^2+40+41 = 1681 = 41^2"
+      ]
+    },
+    {
+      "id": "num-002-goldbach-small",
+      "domain": "number_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "partial",
+      "llm_failure_mode": "同 Euler: 有限范围但穷尽的验证被当成了抽查。区间 [4,1000] 是写死在题目里的, 验完就是 proved。",
+      "verifier": "python",
+      "probes": [
+        "对每个偶数 n in [4,1000], 存在素数 p,q 使 p+q=n",
+        "找出任何没有素数对表示的偶数"
+      ]
+    },
+    {
+      "id": "num-003-carmichael-561",
+      "domain": "number_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": [
+        "561 是合数",
+        "对所有与 561 互素的 a in 1..560, a^560 mod 561 == 1"
+      ]
+    },
+    {
+      "id": "num-004-100-factorial-trailing-zeros",
+      "domain": "number_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["100! 末尾有 24 个 0", "floor(100/5)+floor(100/25) = 24"]
+    },
+    {
+      "id": "num-005-inclusion-exclusion-100",
+      "domain": "combinatorics",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["1..100 中不被 2,3,5 整除的数有 26 个"]
+    },
+    {
+      "id": "alg-006-fibonacci-matrix",
+      "domain": "linear_algebra",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "partial",
+      "llm_failure_mode": "SymPy 化简不动一般 n 的矩阵幂 (M**n - expected 化不成零矩阵), 于是符号路走不通就退化成只信 n<=20 的抽样。",
+      "verifier": "python",
+      "probes": ["[[1,1],[1,0]]^n == [[F(n+1),F(n)],[F(n),F(n-1)]] 对 n=1..20 成立"]
+    },
+    {
+      "id": "alg-007-am-gm",
+      "domain": "inequality",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "inconclusive",
+      "llm_failure_mode": "跨类型比较: 用 == 判断 sympy 表达式, 或用 `is True` 比较 sympy 的 BooleanTrue (它不是 Python 的 True)。这类 bug 与命题真假无关, 纯粹是 API 误用。",
+      "verifier": "python",
+      "probes": ["对任意 a,b>0, (a+b)/2 >= sqrt(ab)", "等价: ((a+b)/2)^2 - ab = (a-b)^2/4 >= 0"]
+    },
+    {
+      "id": "alg-008-circle-max-linear-sum",
+      "domain": "optimization",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["x^2+y^2=1 下 x+y 的最大值是 sqrt(2)", "取到最大值的点是 (1/sqrt(2), 1/sqrt(2))"]
+    },
+    {
+      "id": "alg-009-determinant-multiplicative",
+      "domain": "linear_algebra",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["随机 100 组 3x3 整数矩阵, |det(AB) - det(A)det(B)| < 1e-9"]
+    },
+    {
+      "id": "comb-010-eight-queens",
+      "domain": "combinatorics",
+      "difficulty": "medium",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["8x8 棋盘 8 皇后问题的解数是 92"]
+    },
+    {
+      "id": "logic-011-de-morgan",
+      "domain": "logic",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "failed + refuted (两次跑结果不同)",
+      "llm_failure_mode": "两次跑出来两个不同结果: 一次 simplify_logic 返回 sympy BooleanTrue, 代码写 `simp1 is True` 判 False -> 误报 REFUTED; 另一次用 `Not(Or(...))` 相减触发 TypeError -> failed。同题两次不同结果本身就是不稳定性的证据。",
+      "verifier": "python",
+      "probes": [
+        "not(A and B) == (not A) or (not B) 对所有 A,B 成立",
+        "not(A or B) == (not A) and (not B) 对所有 A,B 成立"
+      ]
+    },
+    {
+      "id": "opt-012-small-lp",
+      "domain": "optimization",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["max x+y s.t. x+2y<=4, 3x+y<=6, x,y>=0 的最优值是 14/5", "最优点 (8/5, 6/5)"]
+    },
+    {
+      "id": "comb-013-hanoi",
+      "domain": "combinatorics",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["n 层汉诺塔最少步数 2^n-1, 对 n=1..10 成立"]
+    },
+    {
+      "id": "graph-014-ramsey-3-3",
+      "domain": "graph_theory",
+      "difficulty": "medium",
+      "gold": "proved",
+      "llm_failed_as": "partial",
+      "llm_failure_mode": "合取命题: (a) K6 全染色有单色三角形 (b) K5 存在反例。两个子命题都是穷尽的, 但 LLM 给 (a) 打了 PARTIAL, 于是合取降级。",
+      "verifier": "python",
+      "probes": [
+        "K6 的 32768 种红蓝染色全部含单色三角形",
+        "K5 存在不含单色三角形的染色 (实测 12 种)"
+      ]
+    },
+    {
+      "id": "graph-015-labeled-trees-5",
+      "domain": "graph_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["5 个标号顶点上的树有 125 棵 (Cayley: 5^3)"]
+    },
+    {
+      "id": "graph-016-petersen-properties",
+      "domain": "graph_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["Petersen 图: 10 个顶点", "3-正则", "直径 2", "围长 5"]
+    },
+    {
+      "id": "prob-017-birthday-paradox",
+      "domain": "probability",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["23 人至少两人生日相同的概率 = 0.5072972343239854", "大于 1/2"]
+    },
+    {
+      "id": "prob-018-two-dice-expectation",
+      "domain": "probability",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["两个公平六面骰点数和的期望 = 7"]
+    },
+    {
+      "id": "alg-019-pythagorean-formula",
+      "domain": "number_theory",
+      "difficulty": "easy",
+      "gold": "proved",
+      "verifier": "python",
+      "probes": ["a=m^2-n^2, b=2mn, c=m^2+n^2 满足 a^2+b^2=c^2"]
+    },
+    {
+      "id": "num-020-bisection-root",
+      "domain": "numerical_analysis",
+      "difficulty": "easy",
+      "gold": "proved",
+      "llm_failed_as": "refuted (连续三轮, 判据修改对它无效)",
+      "llm_failure_mode": "★已知未解, 不要指望加 prompt 判据能修★ 迭代次数被写死成 20 次, 而停止条件与 1e-6 精度要求不自洽 —— tol 参数传进去了但循环里没用它控制退出。结果区间半长 9.5e-7、残差 6.2e-6 刚好超标, 它就走了 else 分支。\n\n为什么加判据无效: 第一轮已明确告知「精度不够不等于命题为假, 应判 INCONCLUSIVE 或加大迭代次数」。第二轮它照样判 REFUTED —— else 分支的字面量写的是 REFUTED, 措辞没能改掉代码里的硬编码分支。这是**代码结构问题**, 不是措辞问题: 判定分支由 LLM 写死的字面量决定, prompt 只能影响它怎么写, 管不住它已经写下的分支。\n\n真要修得从工具侧下手(比如给数值类任务一个专用的收敛检查, 而不是让 LLM 自己拼 while 循环), 那属于加功能, 不是这一轮的范围。",
+      "known_unresolved": true,
+      "verifier": "python",
+      "probes": ["x^3-2x-5=0 在 [2,3] 的根 = 2.0945514815423265", "残差 |f(root)| < 1e-6"]
+    }
+  ]
+}

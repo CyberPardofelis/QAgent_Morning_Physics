@@ -25,7 +25,7 @@ from typing import Any
 
 from agent.infra.research_workspace import ResearchWorkspace, hash_question
 from agent.prompts_research import build_code_prompt, format_attempts, template_for
-from agent.tools.llm import _call_llm
+from agent.tools.llm import _call_llm, usage_snapshot
 from agent.tools.registry import register_tool
 
 from ._flags import RESEARCH_EXPOSED, RESEARCH_MAX_RETRY, RESEARCH_SANDBOX_TIMEOUT
@@ -129,6 +129,10 @@ def research_verify(
     attempts = ws.load_attempts()
     last_ev: dict[str, Any] | None = None
     used_llm = 0
+    # 成本要真数字。之前 cost.tokens 硬编码 0 —— 成本统计骗人会让人以为
+    # 跑 20 道题不花钱, 而「先量再优化」要求用量可见。取本次调用前后的
+    # 差值, 这样单题成本独立于别的工具调用。
+    _u_before = usage_snapshot()
 
     # 用户显式传了 code → 不该让 LLM 插手重写他写的代码(那是他自己的东西, 他自己改)。
     # 2026-10-08 实测踩坑: 无条件 `code = ""` 导致手写代码失败后偷偷去调 LLM 重新生成。
@@ -193,6 +197,7 @@ def research_verify(
 
     # ---- 3. 汇总 ----
     all_ev = ws.load_evidence()
+    _u_after = usage_snapshot()
     verdict = last_ev["verdict"] if last_ev else "inconclusive"
     if verdict not in VERDICTS:      # 防御: judge_verdict 已保证合法, 这里兜底
         verdict = "untested"
@@ -207,7 +212,9 @@ def research_verify(
         "workspace": str(ws.path),
         "env": last_ev.get("env", {}) if last_ev else {},
         "cost": {
-            "tokens": 0,
+            "tokens": _u_after["total_tokens"] - _u_before["total_tokens"],
+            "prompt_tokens": _u_after["prompt_tokens"] - _u_before["prompt_tokens"],
+            "completion_tokens": _u_after["completion_tokens"] - _u_before["completion_tokens"],
             "llm_calls": used_llm,
             "elapsed_ms": last_ev.get("elapsed_ms", 0) if last_ev else 0,
         },
