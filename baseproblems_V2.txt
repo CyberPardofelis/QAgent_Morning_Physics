@@ -1,0 +1,470 @@
+{
+  "name": "small-math-agent-benchmark-hard",
+  "version": "1.0.0",
+  "description": "进阶版数学 agent 基准集：大整数、精确证明、搜索、形式化、跨工具协作。",
+  "difficulty_scale": "hard",
+  "items": [
+    {
+      "id": "hard-001-pell-61",
+      "domain": "number_theory",
+      "prompt": "求 Pell 方程 x^2 - 61 y^2 = 1 的最小正整数解 (x,y)。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "x": 1766319049,
+          "y": 226153980
+        },
+        "detail": "经典大解 Pell 方程，暴力搜索不可行，必须用连分数或 LLL。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_01_pell_61.py",
+        "pass_condition": "x*x - 61*y*y == 1 and x>0 and y>0 and no smaller solution exists",
+        "params": {
+          "D": 61
+        }
+      },
+      "recommended_tools": ["python", "sympy", "gmpy2"],
+      "difficulty": "hard",
+      "tags": ["pell", "continued_fraction", "bigint"],
+      "notes": "最小性验证要对连分数收敛子序列做检查，不能只验等式。"
+    },
+    {
+      "id": "hard-002-partition-p100",
+      "domain": "combinatorics",
+      "prompt": "计算整数分拆数 p(100) 的精确值。",
+      "expected": {
+        "type": "number",
+        "value": 190569292,
+        "detail": "p(100)=190569292。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_02_partition.py",
+        "pass_condition": "p(100) == 190569292 and recomputed via generating function or Euler pentagonal recurrence",
+        "params": {
+          "n": 100
+        }
+      },
+      "recommended_tools": ["python", "sympy", "functools"],
+      "difficulty": "hard",
+      "tags": ["partition", "generating_function", "euler_pentagonal"],
+      "notes": "用五边形数定理递推，避免指数级枚举。"
+    },
+    {
+      "id": "hard-003-sum-of-three-cubes-33",
+      "domain": "number_theory",
+      "prompt": "求整数 x,y,z 使 x^3 + y^3 + z^3 = 33。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "x": 8866128975287528,
+          "y": -8778405442862239,
+          "z": -2736111468807040
+        },
+        "detail": "2019 年发现的经典解，暴力搜索不可能。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_03_three_cubes_33.py",
+        "pass_condition": "x**3 + y**3 + z**3 == 33",
+        "params": {
+          "target": 33
+        }
+      },
+      "recommended_tools": ["python", "gmpy2"],
+      "difficulty": "hard",
+      "tags": ["diophantine", "bigint"],
+      "notes": "重点不是重现发现过程，而是能表达出精确解并验证。"
+    },
+    {
+      "id": "hard-004-catalan-50",
+      "domain": "combinatorics",
+      "prompt": "计算第 50 个 Catalan 数 C_50 的精确值。",
+      "expected": {
+        "type": "number",
+        "value": 1978261657756160653623774456,
+        "detail": "C_n = (2n)! / (n!(n+1)!)。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_04_catalan.py",
+        "pass_condition": "catalan(50) == 1978261657756160653623774456",
+        "params": {
+          "n": 50
+        }
+      },
+      "recommended_tools": ["python", "math", "gmpy2"],
+      "difficulty": "hard",
+      "tags": ["catalan", "bigint"],
+      "notes": "必须精确大整数，浮点会丢精度。"
+    },
+    {
+      "id": "hard-005-collatz-up-to-1e6",
+      "domain": "number_theory",
+      "prompt": "验证 Collatz 猜想对所有 1 <= n <= 10^6 都最终到达 1，并给出最长链的起点和步数。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "max_start": 837799,
+          "max_steps": 525
+        },
+        "detail": "经典计算题，需要记忆化避免超时。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_05_collatz.py",
+        "pass_condition": "all(n terminates at 1 for n<=1e6) and argmax steps == 837799",
+        "params": {
+          "n_max": 1000000
+        }
+      },
+      "recommended_tools": ["python", "functools.lru_cache"],
+      "difficulty": "hard",
+      "tags": ["collatz", "memoization", "performance"],
+      "notes": "纯递归会爆栈，必须用字典记忆化或迭代。"
+    },
+    {
+      "id": "hard-006-mersenne-127",
+      "domain": "number_theory",
+      "prompt": "用 Lucas-Lehmer 检验证明 2^127 - 1 是素数。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "2^127-1 是已知 Mersenne 素数。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_06_mersenne_127.py",
+        "pass_condition": "lucas_lehmer(127) == True and isprime(2**127-1)",
+        "params": {
+          "p": 127
+        }
+      },
+      "recommended_tools": ["python", "sympy", "gmpy2"],
+      "difficulty": "hard",
+      "tags": ["mersenne", "lucas_lehmer", "primality"],
+      "notes": "Lucas-Lehmer 递推 s_{k+1}=s_k^2-2 mod M_p，必须用大整数模。"
+    },
+    {
+      "id": "hard-007-ramsey-3-4",
+      "domain": "graph_theory",
+      "prompt": "验证 R(3,4)=9：证明任意 9 个顶点的红蓝完全图必有红色三角形或蓝色 K4，并给出 8 个顶点无反例的着色。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "R(3,4)=9。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_07_ramsey_34.py",
+        "pass_condition": "all K9 colorings have red K3 or blue K4, and exists K8 coloring avoiding both",
+        "params": {
+          "n9": 9,
+          "n8": 8
+        }
+      },
+      "recommended_tools": ["python", "networkx", "itertools", "z3"],
+      "difficulty": "hard",
+      "tags": ["ramsey", "sat", "graph_coloring"],
+      "notes": "K9 有 2^36 种染色，不能裸枚举，必须用对称性剪枝或 SAT/Z3。"
+    },
+    {
+      "id": "hard-008-twin-primes-1e7",
+      "domain": "number_theory",
+      "prompt": "统计 1 到 10^7 之间的孪生素数对 (p, p+2) 的数量。",
+      "expected": {
+        "type": "number",
+        "value": 58980,
+        "detail": "1e7 内孪生素数对数量。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_08_twin_primes.py",
+        "pass_condition": "count == 58980",
+        "params": {
+          "n_max": 10000000
+        }
+      },
+      "recommended_tools": ["python", "numpy", "sympy"],
+      "difficulty": "hard",
+      "tags": ["sieve", "twin_primes", "performance"],
+      "notes": "用埃氏筛，注意 p+2 越界。"
+    },
+    {
+      "id": "hard-009-smallest-factorial-over-1e1000",
+      "domain": "number_theory",
+      "prompt": "求最小的正整数 n 使 n! > 10^1000。",
+      "expected": {
+        "type": "number",
+        "value": 450,
+        "detail": "n=450 时 n! 首次超过 10^1000。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_09_factorial_threshold.py",
+        "pass_condition": "factorial(n) > 10**1000 and factorial(n-1) <= 10**1000",
+        "params": {
+          "threshold": "1e1000"
+        }
+      },
+      "recommended_tools": ["python", "math", "decimal"],
+      "difficulty": "hard",
+      "tags": ["factorial", "bigint", "search"],
+      "notes": "可以二分搜索 + 大整数，或用斯特林公式估计后精确验证。"
+    },
+    {
+      "id": "hard-010-squarefree-1e6",
+      "domain": "number_theory",
+      "prompt": "统计 1 到 10^6 中无平方因子数的个数。",
+      "expected": {
+        "type": "number",
+        "value": 607926,
+        "detail": "用 Möbius 函数求和：sum_{d<=sqrt(n)} mu(d) * floor(n/d^2)。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_10_squarefree.py",
+        "pass_condition": "count == 607926",
+        "params": {
+          "n_max": 1000000
+        }
+      },
+      "recommended_tools": ["python", "sympy", "numpy"],
+      "difficulty": "hard",
+      "tags": ["mobius", "squarefree", "sieve"],
+      "notes": "裸枚举分解会慢，用 Möbius 筛。"
+    },
+    {
+      "id": "hard-011-petersen-chromatic-3",
+      "domain": "graph_theory",
+      "prompt": "证明 Petersen 图的色数是 3：给出 3 着色，并证明不能 2 着色。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "Petersen 图含奇环，非二分图；同时可 3 着色。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_11_petersen_chromatic.py",
+        "pass_condition": "exists 3-coloring and no 2-coloring",
+        "params": {
+          "graph": "petersen"
+        }
+      },
+      "recommended_tools": ["python", "networkx", "z3"],
+      "difficulty": "hard",
+      "tags": ["chromatic_number", "coloring", "sat"],
+      "notes": "2 着色不可行可用奇环论证或用 SAT 穷举。"
+    },
+    {
+      "id": "hard-012-erdos-straus-1000",
+      "domain": "number_theory",
+      "prompt": "验证 Erdos-Straus 猜想对 2 <= n <= 1000 成立：4/n = 1/x + 1/y + 1/z 有正整数解。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "每个 n 给出具体 (x,y,z)。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_12_erdos_straus.py",
+        "pass_condition": "for each n in [2,1000], exists x,y,z>0 with 4/n == 1/x+1/y+1/z",
+        "params": {
+          "n_max": 1000
+        }
+      },
+      "recommended_tools": ["python", "fractions", "sympy"],
+      "difficulty": "hard",
+      "tags": ["erdos_straus", "diophantine", "search"],
+      "notes": "必须用 Fraction 精确比较，不能浮点。"
+    },
+    {
+      "id": "hard-013-bbp-pi-hex-digit",
+      "domain": "numerical_analysis",
+      "prompt": "用 BBP 公式计算 pi 的十六进制展开中第 10^6 位数字。",
+      "expected": {
+        "type": "number",
+        "value": "待跑脚本确认",
+        "detail": "BBP 允许不求出前面所有位，直接算第 n 位十六进制。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_13_bbp_pi.py",
+        "pass_condition": "hex_digit == reference_value_from_independent_implementation",
+        "params": {
+          "position": 1000000,
+          "base": 16
+        }
+      },
+      "recommended_tools": ["python", "mpmath", "decimal"],
+      "difficulty": "hard",
+      "tags": ["bbp", "pi", "numerical"],
+      "notes": "基准值要用两套独立实现交叉验证，防止脚本自嗨。"
+    },
+    {
+      "id": "hard-014-sum-cubes-1000",
+      "domain": "algebra",
+      "prompt": "验证 1^3 + 2^3 + ... + n^3 = (n(n+1)/2)^2 对 n=1000 成立，并给出两边精确大整数。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "lhs": 250500250000,
+          "rhs": 250500250000
+        },
+        "detail": "大整数必须精确相等。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_14_sum_cubes.py",
+        "pass_condition": "sum(i**3 for i in 1..1000) == (1000*1001//2)**2",
+        "params": {
+          "n": 1000
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "hard",
+      "tags": ["identity", "bigint"],
+      "notes": "可要求同时给出 SymPy 符号归纳证明。"
+    },
+    {
+      "id": "hard-015-fermat-little-lean",
+      "domain": "formal_math",
+      "prompt": "在 Lean 4 + Mathlib 中形式化并证明费马小定理：若 p 为素数且 p 不整除 a，则 a^(p-1) ≡ 1 mod p。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "Mathlib 已有现成定理，agent 需正确找到并组装证明。"
+      },
+      "verifier": {
+        "type": "lean",
+        "entrypoint": "verifiers/lean/Hard15Fermat.lean",
+        "pass_condition": "lean exits 0 and no sorry in proof body",
+        "params": {
+          "forbid_sorry": true
+        }
+      },
+      "recommended_tools": ["lean4", "mathlib", "loogle", "leansearch"],
+      "difficulty": "hard",
+      "tags": ["lean", "formalization", "fermat"],
+      "notes": "重点是能检索 Mathlib 并正确实例化，不是从零发明。"
+    },
+    {
+      "id": "hard-016-sqrt2-irrational-lean",
+      "domain": "formal_math",
+      "prompt": "在 Lean 4 + Mathlib 中形式化并证明 sqrt(2) 是无理数。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "Mathlib 有 irrational_sqrt_two。"
+      },
+      "verifier": {
+        "type": "lean",
+        "entrypoint": "verifiers/lean/Hard16Sqrt2.lean",
+        "pass_condition": "lean exits 0 and no sorry",
+        "params": {
+          "forbid_sorry": true
+        }
+      },
+      "recommended_tools": ["lean4", "mathlib"],
+      "difficulty": "hard",
+      "tags": ["lean", "irrational", "sqrt2"],
+      "notes": "考察形式化检索和 API 使用。"
+    },
+    {
+      "id": "hard-017-100-queens-sat",
+      "domain": "logic",
+      "prompt": "用 Z3 或 SAT 求解器求 100 皇后问题的一个解，并验证无冲突。",
+      "expected": {
+        "type": "condition",
+        "value": "存在一个 100 皇后合法布局。",
+        "detail": "搜索空间巨大，必须用约束求解。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_17_100_queens.py",
+        "pass_condition": "solution is valid 100-queens placement",
+        "params": {
+          "n": 100,
+          "solver": "z3"
+        }
+      },
+      "recommended_tools": ["python", "z3"],
+      "difficulty": "hard",
+      "tags": ["sat", "queens", "constraint"],
+      "notes": "回溯也能做，但要合理剪枝；Z3 更稳。"
+    },
+    {
+      "id": "hard-018-zeta2-pi2-6",
+      "domain": "analysis",
+      "prompt": "数值验证 Basel 问题：sum_{n=1}^{N} 1/n^2 收敛到 pi^2/6，取 N=10^7，误差小于 1e-6。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "sum": "approx 1.644933...",
+          "pi2_over_6": 1.6449340668482264,
+          "error": "< 1e-6"
+        },
+        "detail": "直接求和收敛慢，需要加速或大 N。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_18_basel.py",
+        "pass_condition": "abs(partial_sum - pi**2/6) < 1e-6 and N>=1e7",
+        "params": {
+          "N": 10000000,
+          "tol": 1e-6
+        }
+      },
+      "recommended_tools": ["python", "numpy", "mpmath"],
+      "difficulty": "hard",
+      "tags": ["basel", "series", "numerical"],
+      "notes": "也可用 Euler 加速或积分表示。"
+    },
+    {
+      "id": "hard-019-no-flt-n3-small",
+      "domain": "number_theory",
+      "prompt": "验证不存在正整数 a,b,c < 1000 满足 a^3 + b^3 = c^3。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "n=3 的费马大定理在 1000 以内穷举。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_19_flt_n3.py",
+        "pass_condition": "no triple (a,b,c) with a,b,c<1000 and a**3+b**3==c**3",
+        "params": {
+          "bound": 1000,
+          "exponent": 3
+        }
+      },
+      "recommended_tools": ["python", "numpy", "set"],
+      "difficulty": "hard",
+      "tags": ["fermat", "enumeration", "number_theory"],
+      "notes": "用集合存 c^3 加速；也可用模 9 剪枝。"
+    },
+    {
+      "id": "hard-020-min-n-with-n-divisors",
+      "domain": "number_theory",
+      "prompt": "求最小的正整数 n，使 n 恰好有 1000 个正因子。",
+      "expected": {
+        "type": "number",
+        "value": 245044800,
+        "detail": "需要搜索素因子指数分配，不能线性枚举。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/hard_20_divisors.py",
+        "pass_condition": "tau(n) == 1000 and no smaller m with tau(m)==1000",
+        "params": {
+          "target_divisors": 1000
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "hard",
+      "tags": ["divisor_function", "search", "optimization"],
+      "notes": "按非递增指数分配、候选素数有限上界搜索。"
+    }
+  ]
+}

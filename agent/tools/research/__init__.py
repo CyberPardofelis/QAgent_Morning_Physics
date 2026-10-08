@@ -50,7 +50,9 @@ from agent.infra.research_workspace import (  # noqa: E402
 from ._claim import audit_claims, normalize_claim, render_report
 from ._enumerate import GRAPH_PROPERTIES, SEQUENCE_PROPERTIES
 from ._flags import RESEARCH_EXPOSED
-from ._lean import LeanResult, check_lean, lean_available, lean_version
+from ._lean import (
+    LeanResult, check_lean, lean_available, lean_version, mathlib_available,
+)
 from ._loop import decide_next, new_state, run_loop
 from ._provenance import VERDICTS, build_evidence, claim_id_for, judge_verdict, record
 from ._retrieve import lookup as oeis_lookup
@@ -82,7 +84,8 @@ __all__ = [
     "sympy_op", "judge_verdict", "build_evidence", "record", "claim_id_for", "VERDICTS",
     "extract_code",
     "z3_solve", "Z3Error", "oeis_lookup",
-    "check_lean", "lean_available", "lean_version", "LeanResult",
+    "check_lean", "lean_available", "lean_version", "mathlib_available",
+    "LeanResult",
     "GRAPH_PROPERTIES", "SEQUENCE_PROPERTIES",
     "normalize_claim", "render_report", "audit_claims",
     "decide_next", "new_state", "run_loop",

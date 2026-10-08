@@ -122,3 +122,75 @@ class TestSymbolCheckFailsOpen:
 
     def test_wildcard_import_passes(self):
         check_code("from sympy import *\n")
+
+
+class TestModuleAttributeExistence:
+    """★ 属性访问也要查: `sympy.isqrt(...)` 这种写法静态门以前完全看不见 ★
+
+    ## 为什么要补这道门
+
+    实战(2026-10-08 V2 hard-001 Pell-61): 同一份代码里
+    `AttributeError: module 'sympy' has no attribute 'isqrt'` **连犯三次**,
+    5 轮重试烧掉 33k token 最后一轮都没跑成。
+
+    根因不是模型笨 —— 是**门的位置错了**: `_check_symbol_exists` 只管
+    `from X import Y`, 而 `sympy.isqrt(...)` 是**属性访问**, 静态门压根没看,
+    于是它一路畅通跑到运行时才崩。崩一次的代价本该是"下一轮改对",
+    但它下一轮又写了一遍同样的错 —— 因为反馈环路上没有任何东西提醒它。
+    """
+
+    def test_sympy_isqrt_is_caught_with_cross_module_hint(self):
+        """实战案例: SymPy 没有 isqrt, 正确写法是 math.isqrt。"""
+        with pytest.raises(SandboxRejected) as ei:
+            check_code("import sympy\nprint(sympy.isqrt(17))\n")
+        msg = str(ei.value)
+        assert "isqrt" in msg
+        # ★ 必须给出跨模块的正确写法 ★ 只说"不存在"的话, 它下一轮还会写错
+        assert "math.isqrt" in msg
+
+    def test_sympy_convergents_attribute_caught(self):
+        """sympy 没有 convergents(上面那对 _NAME_HINTS 已收录)。"""
+        with pytest.raises(SandboxRejected) as ei:
+            check_code("import sympy\nprint(sympy.convergents(0.5))\n")
+        assert "continued_fraction_periodic" in str(ei.value)
+
+    def test_nested_module_attribute_caught(self):
+        """`sympy.ntheory.xxx` 也要查 —— value 是 Attribute 不是 Name。"""
+        with pytest.raises(SandboxRejected):
+            check_code("import sympy\nprint(sympy.ntheory.is_not_a_thing(3))\n")
+
+    def test_aliased_module_attribute_caught(self):
+        """`import sympy as sp` 之后写 `sp.isqrt` 一样要拦。"""
+        with pytest.raises(SandboxRejected) as ei:
+            check_code("import sympy as sp\nprint(sp.isqrt(17))\n")
+        assert "math.isqrt" in str(ei.value)
+
+
+class TestModuleAttributeMustNotOverReject:
+    """★ 配套: 局部变量的同名方法一个都不能误杀 ★
+
+    这是这道门最大的误杀面 —— `result.isqrt(...)`、`data.comb(...)`、
+    `model.eval(...)` 全是普通方法调用。如果对任意 `名字.属性` 都去
+    importlib 查一遍, 这些会被当成"模块属性"全杀掉。
+    """
+
+    @pytest.mark.parametrize("code", [
+        "import sympy\nresult = 1\nprint(result.isqrt)\n",
+        "import sympy\nclass R:\n    def isqrt(self):\n        return 1\n"
+        "print(R().isqrt())\n",
+        "import math\nprint(math.isqrt(17))\n",
+        "import sympy\nprint(sympy.sqrt(2))\n",
+        "import sympy\nprint(sympy.ntheory.primetest.isprime(7))\n",
+        "import sympy\nx = sympy.Symbol('x')\nprint(x.is_real)\n",
+        # from-import 绑定的名字**不是模块**, 不能当模块查
+        "from sympy import sqrt\nprint(sqrt.isqrt)\n",
+        "import itertools\nprint(itertools.combinations)\n",
+        "import sympy\nprint(sympy.__version__)\n",
+    ])
+    def test_legal_attribute_access_passes(self, code):
+        check_code(code)
+
+    def test_math_isqrt_hint_is_not_itself_rejected(self):
+        """提示里推荐的写法自己必须能过门, 否则就是死路。"""
+        check_code("import math\nprint(math.isqrt(17))\n")
+        check_code("import sympy\nprint(sympy.isprime(7))\n")

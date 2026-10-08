@@ -40,4 +40,25 @@ RESEARCH_SANDBOX_TIMEOUT: int = int(
 )
 
 #: 单次 research_verify 最多修正几轮(把错误喂回 LLM 重试)
-RESEARCH_MAX_RETRY: int = int(os.getenv("QAGENT_RESEARCH_MAX_RETRY", "2") or 2)
+#:
+#: 为什么从 2 提到 3: 重试的**性质**变了。
+#: 以前一轮失败往往只是"代码跑挂了", 重试收益有限。
+#: 现在每一轮的反馈都是**机器给的判决理由**, 具体到病灶:
+#:   「你只查了 |p|,|q|<=200, 那不是全域证明」
+#:   「你驳的是你自己构造错的那个着色, 不是原命题」
+#:   「那个参考值是代码里的字面量, 不是算出来的见证值」
+#: 这种反馈是这整个系统里信息密度最高的输入, 每一轮都该用上。
+#:
+#: 而且**多试是安全的**: 每轮都要过机器门, 门不认的结论流不下去。
+#: V2 hard-007 就是靠第 3 轮才把 Ramsey 从假 REFUTED 修成 PROVED 的。
+#:
+#: 提到 5 的直接原因(2026-10-08 V2 hard-020「求最小的恰有 1000 个因子的 n」):
+#: 5 轮尝试**全是代码 bug**, 没有一轮是结论错 ——
+#:   0: 递归爆栈(Recursive backtrack 994 层)
+#:   1: 忘了 import sympy —— 而且 stdout 里**已经算出了正确答案 810810000**,
+#:      只是崩在 print VERDICT 之前
+#:   2: 想用 sys.setrecursionlimit 抬递归上限 → sys 不在白名单, 静态门直接拒
+#:   3: sympy.prime(0) → ValueError
+#: 每一轮的错误都极具体, 而重试预算先见底了。这类「纯实现 bug」型失败
+#: 本来就是重试最划算的场景 —— 它不需要换思路, 只需要再改一行。
+RESEARCH_MAX_RETRY: int = int(os.getenv("QAGENT_RESEARCH_MAX_RETRY", "5") or 5)

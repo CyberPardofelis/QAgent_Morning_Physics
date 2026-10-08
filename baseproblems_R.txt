@@ -1,0 +1,578 @@
+{
+  "name": "small-math-agent-benchmark-research",
+  "version": "1.0.0",
+  "description": "研究能力导向的数学 agent 基准集：多步试错、多 Agent 协作、工具编排、方法切换、交叉验证。计算量个人 PC 可承受，但很难一次性跑通。",
+  "difficulty_scale": "research",
+  "design_principles": [
+    "单次尝试大概率失败，需要多轮假设-实验-修正",
+    "需要选择正确的问题表述，而不是堆算力",
+    "不同方法互相验证，避免脚本自嗨",
+    "多 Agent 分工（规划/编码/挑错/验证）显著优于单 Agent",
+    "鼓励工具切换：SymPy/SAT/SMT/Lean/SDP/BFS 等"
+  ],
+  "items": [
+    {
+      "id": "res-001-ramsey-34-lower-bound",
+      "domain": "graph_theory",
+      "prompt": "证明 R(3,4) > 8：构造一个 8 个顶点的红蓝完全图，既无红色三角形，也无蓝色 K4，并给出机器可验证的证书。",
+      "challenge_type": ["multistep", "tool_orchestration", "certificate"],
+      "why_hard": "单纯随机搜索几乎撞不到；需要把问题编码成 SAT 或 Z3 约束，还要把解转回可验证的图着色。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "coloring": "8x8 对称矩阵，取值 red/blue",
+          "certificate": "无红 K3 且无蓝 K4 的验证输出"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_01_ramsey34.py",
+        "pass_condition": "no_red_K3(coloring) and no_blue_K4(coloring)",
+        "params": {
+          "n": 8
+        }
+      },
+      "recommended_tools": ["python", "z3", "pysat", "networkx"],
+      "difficulty": "research",
+      "tags": ["ramsey", "sat_encoding", "certificate"],
+      "notes": "好 agent 会先写小规模暴力验证器，再写 SAT 编码，再让两个结果交叉验证。"
+    },
+    {
+      "id": "res-002-golomb-ruler-15",
+      "domain": "combinatorics",
+      "prompt": "构造一个 15 阶 Golomb 尺，长度不超过 200，并给出所有两两距离互不相同的证书。",
+      "challenge_type": ["multistep", "search_strategy", "debug_loop"],
+      "why_hard": "暴力搜索空间巨大；需要 CP-SAT 或自定义剪枝，且长度界限卡得紧，可能要多次调整策略。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "marks": "长度 15 的整数序列，marks[0]=0",
+          "length": "<=200",
+          "distinct_distances": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_02_golomb.py",
+        "pass_condition": "len(marks)==15 and all pairwise differences distinct and marks[-1]<=200",
+        "params": {
+          "order": 15,
+          "max_length": 200
+        }
+      },
+      "recommended_tools": ["python", "ortools", "z3", "custom_search"],
+      "difficulty": "research",
+      "tags": ["golomb", "cp_sat", "search"],
+      "notes": "好 agent 会先试贪心失败，再换 CP-SAT，再调变量顺序。"
+    },
+    {
+      "id": "res-003-hadamard-28-paley",
+      "domain": "combinatorics",
+      "prompt": "构造一个 28 阶 Hadamard 矩阵，并验证 H H^T = 28 I。",
+      "challenge_type": ["tool_orchestration", "construction", "cross_check"],
+      "why_hard": "随机搜索几乎不可能；需要用 Paley 构造或 Williamson 构造。agent 得先识别出阶数 28 ≡ 0 mod 4 且可用 Paley I（q=27 不是素数幂，得换 q=13 的 Paley II 或 Williamson）。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "H 元素为 ±1，H H^T = 28 I。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_03_hadamard.py",
+        "pass_condition": "H.shape==(28,28) and set(unique(H))<= {-1,1} and allclose(H@H.T, 28*np.eye(28))",
+        "params": {
+          "order": 28
+        }
+      },
+      "recommended_tools": ["python", "numpy", "sympy", "sage"],
+      "difficulty": "research",
+      "tags": ["hadamard", "paley", "williamson"],
+      "notes": "纯随机失败后，agent 应能想到用 Paley II 构造 q=13 得到 28 阶。"
+    },
+    {
+      "id": "res-004-sos-inequality",
+      "domain": "inequality",
+      "prompt": "证明或证伪：对任意实数 x,y,z，有 x^4 + y^4 + z^4 + xyz >= x^2 y^2 + y^2 z^2 + z^2 x^2 + x + y + z - 3。",
+      "challenge_type": ["multistep", "method_switch", "certificate"],
+      "why_hard": "可能为假，也可能需要 SOS 分解。agent 得先用数值搜索找反例，找不到再尝试 SDP 求 SOS 证书，再让 SymPy 验证。",
+      "expected": {
+        "type": "condition",
+        "value": "给出 SOS 证书，或给出明确反例 (x,y,z)",
+        "detail": "两种结果都算通过，但必须附机器可验证证据。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_04_sos.py",
+        "pass_condition": "(certificate_sos_valid) or (counterexample_satisfies_violation)",
+        "params": {
+          "tol": 1e-9
+        }
+      },
+      "recommended_tools": ["python", "sympy", "cvxpy", "ncpol2sdpa", "sos_sdp"],
+      "difficulty": "research",
+      "tags": ["sos", "sdp", "inequality", "counterexample"],
+      "notes": "这是典型的“先证伪再证明”的研究流程题。"
+    },
+    {
+      "id": "res-005-berlekamp-massey",
+      "domain": "combinatorics",
+      "prompt": "给定整数序列前 100 项（由某个线性递推生成），求最小线性递推式，并用前 200 项验证。",
+      "challenge_type": ["multistep", "tool_orchestration", "cross_check"],
+      "why_hard": "不能靠猜；需要 Berlekamp-Massey 或高斯消元，还要处理最小性和验证。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "recurrence": "系数列表",
+          "order": "最小阶数",
+          "verified_200_terms": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_05_bm.py",
+        "pass_condition": "recurrence reproduces first 200 terms and order is minimal",
+        "params": {
+          "seq_file": "data/res_05_seq.txt",
+          "check_terms": 200
+        }
+      },
+      "recommended_tools": ["python", "sympy", "galois"],
+      "difficulty": "research",
+      "tags": ["berlekamp_massey", "recurrence", "minimal"],
+      "notes": "runner 预生成序列文件；agent 不能用 LLM 猜，必须跑算法。"
+    },
+    {
+      "id": "res-006-pslq-integer-relation",
+      "domain": "number_theory",
+      "prompt": "在高精度下寻找整数 a,b,c,d，使 a*log(2)+b*log(3)+c*log(5)+d*log(7) ≈ 0，且 (a,b,c,d) 不全为零且 |a|,|b|,|c|,|d| <= 10^6。",
+      "challenge_type": ["method_switch", "cross_check", "high_precision"],
+      "why_hard": "需要 PSLQ 或 LLL；精度不够会得到假关系；必须用两套独立实现交叉验证。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "relation": "[a,b,c,d]",
+          "residual": "< 1e-50"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_06_pslq.py",
+        "pass_condition": "abs(a*log2+b*log3+c*log5+d*log7) < 1e-50 and not all zero",
+        "params": {
+          "precision_digits": 120,
+          "bound": 1000000
+        }
+      },
+      "recommended_tools": ["python", "mpmath", "sympy", "fpylll"],
+      "difficulty": "research",
+      "tags": ["pslq", "lll", "integer_relation", "high_precision"],
+      "notes": "好 agent 会用 mpmath 高精度 + PSLQ，再用 LLL 交叉验证。"
+    },
+    {
+      "id": "res-007-oeis-identify-prove",
+      "domain": "combinatorics",
+      "prompt": "给定一个整数序列前 30 项，识别其 OEIS 条目，提取一个闭式或递推公式，并验证前 100 项一致。",
+      "challenge_type": ["multiagent", "tool_orchestration", "cross_check"],
+      "why_hard": "一个 agent 去 OEIS 查，一个 agent 独立实现公式，一个 agent 挑错。检索到的公式可能是错的或近似。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "oeis_id": "Axxxxxx",
+          "formula": "公式或递推",
+          "verified_100_terms": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_07_oeis.py",
+        "pass_condition": "formula reproduces first 100 terms and oeis_id exists",
+        "params": {
+          "seq_file": "data/res_07_seq.txt",
+          "check_terms": 100
+        }
+      },
+      "recommended_tools": ["python", "sympy", "requests", "oeis_api"],
+      "difficulty": "research",
+      "tags": ["oeis", "pattern_discovery", "verification"],
+      "notes": "runner 预置一个 OEIS 上有但公式不平凡的序列。"
+    },
+    {
+      "id": "res-008-lean-binomial",
+      "domain": "formal_math",
+      "prompt": "在 Lean 4 + Mathlib 中形式化并证明：sum_{k=0}^{n} C(n,k) = 2^n，不允许 sorry。",
+      "challenge_type": ["tool_orchestration", "debug_loop"],
+      "why_hard": "Lean 报错信息晦涩，需要多轮改写；要正确找到 Mathlib 里 Finset.sum_range_choose 等定理。",
+      "expected": {
+        "type": "boolean",
+        "value": true
+      },
+      "verifier": {
+        "type": "lean",
+        "entrypoint": "verifiers/lean/Res08Binomial.lean",
+        "pass_condition": "lean exits 0 and no sorry in proof",
+        "params": {
+          "forbid_sorry": true,
+          "timeout_sec": 300
+        }
+      },
+      "recommended_tools": ["lean4", "mathlib", "loogle", "leansearch"],
+      "difficulty": "research",
+      "tags": ["lean", "binomial", "formalization"],
+      "notes": "适合多 Agent：一个搜 Mathlib，一个写 tactic，一个看错误修。"
+    },
+    {
+      "id": "res-009-lean-quadratic",
+      "domain": "formal_math",
+      "prompt": "在 Lean 4 中形式化并证明二次公式：若 a≠0，则 a x^2 + b x + c = 0 当且仅当 x = (-b ± sqrt(b^2-4ac)) / (2a)（在适当域假设下）。",
+      "challenge_type": ["debug_loop", "method_switch"],
+      "why_hard": "要处理域假设、判别式、除法；Lean 里 sqrt 和根的关系需要小心。可能要换用 IsROOT 或 Polynomial 框架。",
+      "expected": {
+        "type": "boolean",
+        "value": true
+      },
+      "verifier": {
+        "type": "lean",
+        "entrypoint": "verifiers/lean/Res09Quadratic.lean",
+        "pass_condition": "lean exits 0 and no sorry",
+        "params": {
+          "forbid_sorry": true,
+          "timeout_sec": 600
+        }
+      },
+      "recommended_tools": ["lean4", "mathlib"],
+      "difficulty": "research",
+      "tags": ["lean", "quadratic", "formalization"],
+      "notes": "可能 Mathlib 已有 quadratic_eq_zero_iff，重点在定位和正确实例化。"
+    },
+    {
+      "id": "res-010-sprague-grundy",
+      "domain": "combinatorial_game",
+      "prompt": "对给定的一种取石子游戏（规则见 data/res_10_rules.txt），计算前 1000 个状态的 Sprague-Grundy 值，给出周期规律并用两套独立实现交叉验证。",
+      "challenge_type": ["multistep", "pattern_discovery", "cross_check"],
+      "why_hard": "暴力算 SG 容易，发现并证明周期性难；两套实现要独立，避免同一个 bug。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "sg_values": "前 1000 项",
+          "period": "疑似周期",
+          "verified_by_second_impl": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_10_sg.py",
+        "pass_condition": "sg_values match reference and period detected correctly",
+        "params": {
+          "states": 1000,
+          "rules_file": "data/res_10_rules.txt"
+        }
+      },
+      "recommended_tools": ["python", "numpy", "sympy"],
+      "difficulty": "research",
+      "tags": ["sprague_grundy", "combinatorial_game", "pattern"],
+      "notes": "鼓励 agent 写两个独立 SG 计算器互验。"
+    },
+    {
+      "id": "res-011-sudoku-diagonal-z3",
+      "domain": "logic",
+      "prompt": "用 Z3 求解一个对角数独（两条主对角线也含 1-9），并证明解唯一。",
+      "challenge_type": ["tool_orchestration", "certificate"],
+      "why_hard": "求解容易，证明唯一性要加第二个求解器调用或枚举；编码细节多，容易漏约束。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "solution": "9x9 网格",
+          "unique": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_11_sudoku.py",
+        "pass_condition": "solution valid and uniqueness proven by UNSAT of second-solution query",
+        "params": {
+          "puzzle_file": "data/res_11_sudoku.txt"
+        }
+      },
+      "recommended_tools": ["python", "z3"],
+      "difficulty": "research",
+      "tags": ["sudoku", "z3", "uniqueness"],
+      "notes": "唯一性证明是重点，单纯给解不算通过。"
+    },
+    {
+      "id": "res-012-minimal-polynomial",
+      "domain": "algebra",
+      "prompt": "求 alpha = sqrt(2) + sqrt(3) + sqrt(5) 在 Q 上的极小多项式，并验证其次数和不可约性。",
+      "challenge_type": ["multistep", "cross_check"],
+      "why_hard": "直接展开容易出错；需要 SymPy minpoly 或手工消元，还要验证不可约。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "polynomial": "整数系数多项式",
+          "degree": 8,
+          "irreducible": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_12_minpoly.py",
+        "pass_condition": "poly(alpha)==0 (numerically) and degree==8 and sympy.is_irreducible(poly)",
+        "params": {
+          "alpha": "sqrt(2)+sqrt(3)+sqrt(5)"
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "research",
+      "tags": ["minimal_polynomial", "irreducibility"],
+      "notes": "数值零 + 符号不可约双重验证。"
+    },
+    {
+      "id": "res-013-groebner-system",
+      "domain": "algebra",
+      "prompt": "在有限域 F_101 上求解多项式方程组（见 data/res_13_system.txt），给出所有解并验证。",
+      "challenge_type": ["tool_orchestration", "method_switch"],
+      "why_hard": "可能有多个解或零解；Groebner 基变量序选错会卡死；需要换序或换方法。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "solutions": "解列表",
+          "verified": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_13_groebner.py",
+        "pass_condition": "all solutions satisfy system and no solution missed",
+        "params": {
+          "field": 101,
+          "system_file": "data/res_13_system.txt"
+        }
+      },
+      "recommended_tools": ["python", "sympy", "sage"],
+      "difficulty": "research",
+      "tags": ["groebner", "finite_field", "polynomial_system"],
+      "notes": "变量序是典型的多轮试错点。"
+    },
+    {
+      "id": "res-014-rubiks-6-moves",
+      "domain": "combinatorics",
+      "prompt": "给定一个 6 步内可解的三阶魔方打乱状态，用 IDA* 或双向 BFS 找到最短解，并验证步数最少。",
+      "challenge_type": ["multistep", "debug_loop", "certificate"],
+      "why_hard": "状态编码和剪枝函数容易出错；步数最少性需要正确的可采纳启发式或枚举对侧。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "moves": "动作序列",
+          "length": "<=6",
+          "optimal": true
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_14_rubiks.py",
+        "pass_condition": "applying moves solves cube and length equals BFS-optimal",
+        "params": {
+          "state_file": "data/res_14_cube.txt",
+          "max_moves": 6
+        }
+      },
+      "recommended_tools": ["python", "kociemba", "custom_ida_star"],
+      "difficulty": "research",
+      "tags": ["rubiks", "ida_star", "optimal"],
+      "notes": "双向 BFS 到深度 6 是最稳的交叉验证方式。"
+    },
+    {
+      "id": "res-015-cyclic-inequality-counterexample",
+      "domain": "inequality",
+      "prompt": "检验猜想：对任意正实数 a,b,c，有 a/(b+c) + b/(c+a) + c/(a+b) >= 3/2。若成立给证明，若不成立给反例。",
+      "challenge_type": ["method_switch", "certificate"],
+      "why_hard": "这是经典 Nesbitt，成立；但 agent 若只用随机数搜索会误判。需要识别到 Ravi 替换或 Cauchy-Schwarz。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "verdict": "true",
+          "proof_method": "Cauchy-Schwarz / Titu 引理 或 SOS"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_15_nesbitt.py",
+        "pass_condition": "either SOS certificate valid or symbolic proof script reproduces inequality",
+        "params": {
+          "tol": 1e-9
+        }
+      },
+      "recommended_tools": ["python", "sympy", "cvxpy"],
+      "difficulty": "research",
+      "tags": ["nesbitt", "sos", "cauchy_schwarz"],
+      "notes": "重点考“别被随机搜索骗了，要换成符号方法”。"
+    },
+    {
+      "id": "res-016-tsp-heuristic-500",
+      "domain": "optimization",
+      "prompt": "对给定 500 城市 TSP 实例，找到一个长度不超过已知最优解 1.05 倍的可行巡回。",
+      "challenge_type": ["multistep", "method_switch", "debug_loop"],
+      "why_hard": "精确求解难；需要最近邻 + 2-opt/3-opt 或 LKH 启发式，参数调不好差距就大。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "tour": "城市序列",
+          "length": "<= 1.05 * optimal"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_16_tsp.py",
+        "pass_condition": "tour valid and length <= 1.05 * known_opt",
+        "params": {
+          "n_cities": 500,
+          "ratio_tol": 0.05,
+          "instance_file": "data/res_16_tsp.txt",
+          "opt_file": "data/res_16_opt.txt"
+        }
+      },
+      "recommended_tools": ["python", "numpy", "ortools", "networkx"],
+      "difficulty": "research",
+      "tags": ["tsp", "heuristic", "2opt"],
+      "notes": "考的是启发式工程 + 参数调优，不是算力。"
+    },
+    {
+      "id": "res-017-counterexample-hunt",
+      "domain": "number_theory",
+      "prompt": "对猜想：'对任意 n>=2，n^2+n+1 无平方因子'，搜索 1e6 以内反例。若找到给出反例，若没找到给出启发式理由和独立验证。",
+      "challenge_type": ["multistep", "cross_check", "hypothesis_testing"],
+      "why_hard": "猜想是假的（存在反例，如 n=18 时 343=7^3）；但 agent 若只小范围搜或实现有 bug 会漏掉。需要写两套独立搜索。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "verdict": "false",
+          "counterexample": "n 值 + 平方因子分解"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_17_squarefree.py",
+        "pass_condition": "found n<=1e6 with square factor in n^2+n+1 and factorization verified",
+        "params": {
+          "search_bound": 1000000
+        }
+      },
+      "recommended_tools": ["python", "sympy", "numpy"],
+      "difficulty": "research",
+      "tags": ["counterexample", "squarefree", "hypothesis_testing"],
+      "notes": "鼓励写第二套搜索交叉验证。"
+    },
+    {
+      "id": "res-018-formal-fermat-small",
+      "domain": "formal_math",
+      "prompt": "在 Lean 4 中形式化并证明：对素数 p=5，2^5 ≡ 2 (mod 5)，并对 p=7 同样验证。用 ZMod 表达。",
+      "challenge_type": ["debug_loop", "tool_orchestration"],
+      "why_hard": "ZMod 的 coercion 和 decide/norm_num 组合容易踩坑；需要多轮修 Lean 错误。",
+      "expected": {
+        "type": "boolean",
+        "value": true
+      },
+      "verifier": {
+        "type": "lean",
+        "entrypoint": "verifiers/lean/Res18FermatSmall.lean",
+        "pass_condition": "lean exits 0 and no sorry",
+        "params": {
+          "forbid_sorry": true,
+          "timeout_sec": 300
+        }
+      },
+      "recommended_tools": ["lean4", "mathlib"],
+      "difficulty": "research",
+      "tags": ["lean", "zmod", "fermat_small"],
+      "notes": "小型但真实的 Lean 调试任务。"
+    },
+    {
+      "id": "res-019-group-construction-60",
+      "domain": "algebra",
+      "prompt": "构造一个 60 阶非交换群，给出其乘法表和生成元，并验证群公理、非交换性、以及是否为 A5。",
+      "challenge_type": ["tool_orchestration", "cross_check"],
+      "why_hard": "容易构造出 S3×C10 之类的非 A5 群；要识别 A5 需要看单性或换位子群结构。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "group": "60 阶群",
+          "is_nonabelian": true,
+          "is_A5": true,
+          "generators": "两个生成元"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_19_group60.py",
+        "pass_condition": "group axioms hold, order==60, nonabelian, simple, and matches A5 up to isomorphism",
+        "params": {
+          "order": 60
+        }
+      },
+      "recommended_tools": ["python", "sympy", "sage", "gap"],
+      "difficulty": "research",
+      "tags": ["group_theory", "A5", "construction"],
+      "notes": "60 阶非交换群不止一个，必须验证是 A5。"
+    },
+    {
+      "id": "res-020-hypothesis-refine-loop",
+      "domain": "research_method",
+      "prompt": "给定一个可能为假的猜想（见 data/res_20_conjecture.txt）。任务：先搜反例；若有反例，修改猜想为最小修正版并给出反例边界；若在小范围无反例，给出部分证明或独立数值证据。",
+      "challenge_type": ["multiagent", "hypothesis_testing", "method_switch", "debug_loop"],
+      "why_hard": "这不是单一算法题，而是完整的研究循环：假设-实验-反例-修正-再验证。单 Agent 容易过早下结论。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "verdict": "true/false/refined",
+          "evidence": "反例或证明或数值证据",
+          "refined_conjecture": "若修正，给出修正版和边界"
+        }
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/res_20_hypothesis.py",
+        "pass_condition": "verdict consistent with evidence and refined_conjecture verified on claimed boundary",
+        "params": {
+          "conjecture_file": "data/res_20_conjecture.txt"
+        }
+      },
+      "recommended_tools": ["python", "sympy", "z3", "numpy"],
+      "difficulty": "research",
+      "tags": ["research_loop", "hypothesis", "refinement"],
+      "notes": "runner 预置一个假猜想，例如 '对所有 n>=1，2^n+1 是素数'（n=3 时 9 不是素数）。"
+    }
+  ]
+}
+
+
+这版的设计逻辑和之前几版完全不同：
+
+1. 不是堆算力，而是堆“方法选择”
+比如 res-004、res-015、res-020：随机搜索会骗你，必须切到 SOS、Cauchy-Schwarz 或反例修正。
+
+2. 不是单次运行，而是多轮试错
+比如 res-002、res-013、res-016：第一次策略几乎肯定失败，要换 CP-SAT、换变量序、调 2-opt。
+
+3. 不是单 Agent 友好，而是多 Agent 加分
+比如 res-007、res-020：一个查 OEIS、一个独立实现公式、一个挑错，比单 Agent 明显强。
+
+4. 不是“答对就行”，而是“带证书”
+比如 res-001、res-008、res-011：SAT 证书、Lean 无 sorry、唯一性 UNSAT 证明。
+
+5. 全部能在个人 PC 上跑完
+最难的大概是 res-016 的 500 城市 TSP 启发式和 res-013 的 Groebner 基，但你 64G 内存 + 12700KF 完全够，时间在分钟到小时级。
+
+如果你想真正卡住 MiniMax，重点让 runner 记录这些：
+
+总尝试次数 / 失败的中间方案
+
+是否主动切换了方法
+
+是否写了独立第二实现做交叉验证
+
+是否调用 SAT/SMT/Lean 等专用工具
+
+最终证书是否机器可验证
+
+单纯看“最终答案对不对”，这些题看起来不难；但按“研究过程质量”打分，就能把它和真正的研究型 agent 区分开。
+
+要不要我把 runner.py 和几个关键 verifier 骨架写出来？尤其 res-001、res-004、res-007、res-020 这几个最能体现研究能力。

@@ -55,3 +55,6 @@ _archive_*/
 # 9-21 加: 根 logs/ (临时 smoke 脚本 + 运行时日志, 不进 git)
 # 跟 *.log 单文件规则共存, 这里专门忽略整目录
 /logs/
+
+/output
+/scripts

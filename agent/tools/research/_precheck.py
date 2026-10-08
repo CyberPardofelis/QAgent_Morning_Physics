@@ -231,7 +231,7 @@ def _looks_clean(question: str, spec: dict[str, Any]) -> bool:
       3. 命题里有评价性/无判据词 → "优美/有趣/本质" 这类没法写成断言
       4. 命题短到不像断言        → 多半是"不存在的""最小的"这种空指代
     """
-    from ._claim import detect_quantifier, quantifier_conflict
+    from ._claim import quantifier_conflict
 
     claim = str(spec.get("claim_text") or spec.get("text") or "").strip()
     if not claim:

@@ -44,6 +44,7 @@ agent.tools.research._sandbox — S0 受限 Python 执行器 (P7 阶段 0)
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import subprocess
@@ -232,11 +233,128 @@ _NAME_HINTS: dict[tuple[str, str], tuple[str, ...]] = {
     # 实战: 线性规划题顶点枚举思路完全正确, 就栽在这个 import 上。
     ("sympy", "maximize"): ("symbols", "solve", "lambdify"),
     ("sympy", "minimize"): ("symbols", "solve", "lambdify"),
+    # SymPy **没有** convergents —— 它是 mpmath 的函数(而 mpmath 也不在白名单里)。
+    # 实战(V2 hard-001 Pell 方程): LLM 想当然地写
+    #   `from sympy import convergents`, 整份本来正确的验证器崩在 import 上。
+    # SymPy 这边的对应物是 `continued_fraction_periodic`。
+    ("sympy", "convergents"): ("continued_fraction_periodic", "nsimplify"),
+    # SymPy 没有 `comb`(那是 `math.comb`); 它的组合数叫 `binomial`。
+    # 实战(V2 hard-004 Catalan-50): 第一轮就栽在这行 import 上,
+    # 而这一轮是**唯一能纠正的机会** —— 后面两轮都花在真正的歧义上了,
+    # 结论停在 inconclusive。静态门的报错信息有没有"该用什么", 直接决定重试够不够用。
+    ("sympy", "comb"): ("binomial", "factorial"),
+    ("sympy", "factorial2"): ("factorial",),
+    # 同类"想当然"的名字: 这些在别的库里有, SymPy 没有。
+    ("sympy", "pari"): ("sympify",),
+    ("numpy", "convergents"): ("sqrt",),
     ("sympy", "optimize"): ("sympy",),
     # nroots 返回的是数值近似根, 没有 is_real 属性可用 —— 那是复数对象的
     # 可靠判据是 abs(imag) < eps
+    # SymPy 没有 `nroots` 的 is_real 之类 —— nroots 返回的是数值近似根,
+    # 没有 is_real 属性可用 —— 那是复数对象的可靠判据是 abs(imag) < eps
     ("sympy", "is_real"): ("re", "im"),
 }
+
+#: 写错的名字**在另一个模块里**的对应物。
+#: 单独一张表是因为上面 `_NAME_HINTS` 的候选是用 `hasattr(同一个模块, cand)` 验的,
+#: 而 `sympy.isqrt` 的正确写法 `math.isqrt` 在**另一个模块**里, 同一张表验不了。
+#: 收录标准同 `_NAME_HINTS`: 实战真的写过, 且错法很典型 ——
+#: 「这个数学函数, 我记得是 sympy 的」(于是顺手 `import sympy` 一把)。
+#:
+#: ★ 实战(2026-10-08 V2 hard-001 Pell-61)★
+#: 同一份代码里 `sympy.isqrt` 这个 AttributeError **连犯三次**, 烧掉 33k token
+#: 最后一轮都没跑成。原因: `_check_symbol_exists` 只管 `from X import Y`,
+#: `sympy.isqrt(...)` 这种**属性访问**静态门完全看不见 —— 于是它一路崩到运行时。
+_CROSS_MODULE_HINTS: dict[tuple[str, str], str] = {
+    ("sympy", "isqrt"): "math.isqrt",
+    ("sympy", "perm"): "math.perm",
+    ("sympy", "is_prime"): "sympy.isprime",
+    ("sympy", "next_prime"): "sympy.prime",
+}
+
+
+def _module_aliases(tree: ast.AST) -> dict[str, str]:
+    """从 AST 收集「本地名 -> 模块名」的映射, 供属性访问检查使用。
+
+    ★ 只认真正 import 进来的模块名 ★
+    如果对任意 `名字.属性` 都去 importlib 查一遍, 那么
+    `result.isqrt` / `data.comb` 这类**局部变量的方法调用**会被当成模块访问,
+    误杀面极大。所以必须先确定这些名字确实是模块。
+    """
+    out: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                # `import sympy.ntheory` 绑定的本地名是 `sympy`(顶层包),
+                # 所以按 asname 或 root 取, 不能取完整点号名
+                out[alias.asname or root] = root
+        # ★ from-import 不登记 ★: `from sympy import sqrt` 绑定的 `sqrt`
+        # 是函数不是模块, 拿它当模块名去查属性会把函数调用全误杀。
+    return out
+
+
+def _resolve_module_chain(node: ast.expr, aliases: dict[str, str]) -> str | None:
+    """把 `a.b.c` 这样的属性链解析成一个模块的完整点号名。
+
+    ★ 必须解析整条链, 不能只看最外层 ★
+    `sympy.ntheory.primetest.isprime` 在 AST 里是两层嵌套的 Attribute,
+    只看最外层它的 `.value` 还是 Attribute 就返回了 —— 于是
+    `sympy.ntheory.is_not_a_thing` 完全逃过检查。
+    返回 None 表示"这条链不是从某个已知模块名出发的"(局部变量的属性链)。
+    """
+    parts: list[str] = []
+    cur: ast.expr = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    root = aliases.get(cur.id)
+    if not root:
+        return None
+    return ".".join([root] + parts[::-1])
+
+
+def _check_module_attribute(
+    node: ast.Attribute, aliases: dict[str, str],
+) -> None:
+    """确认 `模块.属性` 里的属性在那个模块上真的存在。
+
+    查不到就放行(同 `_check_symbol_exists` 的取舍): 解析不了时宁可交给运行时,
+    也不误杀本来能跑的代码。
+    """
+    dotted = _resolve_module_chain(node, aliases)
+    if not dotted:
+        return                # 局部变量的方法调用 -> 不归这道门管
+    module, _, attr = dotted.rpartition(".")
+    if not module or not attr:
+        return
+    try:
+        mod = importlib.import_module(module)
+    except Exception:
+        return              # 解析不了 -> 交给运行时(见 _check_symbol_exists 的取舍)
+    try:
+        has = hasattr(mod, attr)
+    except Exception:
+        return
+    if has:
+        return
+    hint = ""
+    for cand in _NAME_HINTS.get((module, attr), ()):
+        if hasattr(mod, cand):
+            hint = f" 试试 `{module}.{cand}`?"
+            break
+    else:
+        cross = _CROSS_MODULE_HINTS.get((module, attr))
+        if cross:
+            hint = f" 它在 `{cross}` 里, 不在 `{module}` 里。"
+    raise SandboxRejected(
+        f"line {node.lineno}: `{module}` 里没有 `{attr}` 这个属性"
+        f"(AttributeError 的常见来源, 和写错的 import 是同一类错误)。{hint}"
+        f"不确定的话可以 print([n for n in dir({module}) if "
+        f"'{attr[:3]}' in n]) 自己查。"
+    )
 
 
 def check_code(code: str) -> None:
@@ -254,6 +372,7 @@ def check_code(code: str) -> None:
             f"语法错误 line {e.lineno}: {e.msg} — 代码根本没被解析, 修正后重试"
         ) from e
 
+    aliases = _module_aliases(tree)
     for node in ast.walk(tree):
         # import 类节点 → 走白名单校验
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -262,6 +381,14 @@ def check_code(code: str) -> None:
         # 其他被禁节点类型(留了扩展位, 当前无额外类型)
         if isinstance(node, _BANNED_NODES):
             continue
+        # 模块属性访问 → 确认属性真的存在(见 _check_module_attribute)
+        if isinstance(node, ast.Attribute):
+            if node.attr in ("eval", "exec", "__import__", "compile"):
+                raise SandboxRejected(
+                    f"line {node.lineno}: 禁止访问属性 `.{node.attr}`"
+                )
+            _check_module_attribute(node, aliases)
+            continue
         # 名字引用 → 黑名单
         if isinstance(node, ast.Name) and node.id in _BANNED_NAMES:
             raise SandboxRejected(
@@ -269,12 +396,6 @@ def check_code(code: str) -> None:
                 f"沙箱里 eval/exec/open/__import__/globals 一律不给。"
                 f"需要计算就用正常表达式, 需要 IO 就让工具层来。"
             )
-        if isinstance(node, ast.Attribute) and node.attr in _BANNED_NAMES:
-            # 拦 `.eval` / `.exec` / `.__import__` 这类属性访问
-            if node.attr in ("eval", "exec", "__import__", "compile"):
-                raise SandboxRejected(
-                    f"line {node.lineno}: 禁止访问属性 `.{node.attr}`"
-                )
 
 
 # ============================================================

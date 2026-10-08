@@ -21,6 +21,7 @@ prompt 的任务就是让 LLM 稳定地写出那行标记, 并且标记值要和
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # ============================================================
@@ -83,16 +84,18 @@ VERDICT_CONTRACT = """【VERDICT 契约 — 必须遵守, 否则结论作废】
            (这是"我的迭代不够多", 不是"根不存在"。多迭代几次就到了。)
      正确: 这种情况判 INCONCLUSIVE, 或者**加大迭代次数直到达标**再判 PROVED。
 
-   ★ 而且必须把反例打印出来 ★ 机器会独立复核: 代码里标了 REFUTED,
-   但输出里找不到具体的反例值时, **判定会被否决并降级成 INCONCLUSIVE**。
-   格式要求(照抄这个骨架):
+   ★ REFUTED 必须出示**凭证行**, 没有它判定会被否决 ★
+   机器不看你的措辞, 只看你有没有交出一个**具体的输入 + 在它上面违反命题的值**。
+   「找到了一个反例」和「我这几路验算对不上」是两件完全不同的事 ——
+   后者只说明某一路实现有 bug, 不说明命题为假。
+   格式(照抄, 改字段名和值即可):
 
-     print("反例: n =", bad_n, "此时等式不成立, 差值 =", diff)
+     print(f"COUNTEREXAMPLE: n={bad_n} | lhs={l} | rhs={r} | violated=True")
      print("VERDICT: REFUTED")
 
    光打印"发现反例"而没有具体数值不行 —— 机器只认带数字的那行。
    判据一句话: 你能打印出一个**具体的、明确违反命题的值**吗?
-     能 → 打印它, 然后 REFUTED
+     能 → 打印凭证行, 然后 REFUTED
      不能, 只是没达到精度/没跑完/超时 → INCONCLUSIVE
 
    同理: 代码报错(TypeError/ImportError)→ 那是 failed 不是 REFUTED。
@@ -107,21 +110,110 @@ NUMERICS_ARE_NOT_PROOF = """【数值检查 ≠ 证明】
   例外: 浮点数恰好为 0 **不**代表符号上恒等于 0, 必须转符号计算。
 - 报告结论时必须带上范围限定: "在 n=1..1000 范围内未发现反例" ≠ "命题成立"。
   前者是 PARTIAL, 后者需要全域论证。
-- 确需全域结论时, 用 sympy 的精确化简 / 求解, 或交给求解器判定(本阶段未接入)。
+- 确需全域结论时, 用 sympy 的精确化简 / 求解, 或**交给求解器判定(z3 已接入, 在白名单里)**。
+  `s.check() == unsat` 就是"不存在反例"的**全域**证明, 可以支撑 PROVED;
+  而 Python 暴力枚举在无界定义域上永远只能支撑 PARTIAL。这两者的区别不是风格问题。
+- ★ 判断"该用什么方法"的一条硬规则 ★
+  先看**定义域**:
+    - 定义域**有限且小**(≤ 10^5 量级) → 直接穷举, 但要确认题目是否限定了范围,
+      限定了就 PROVED, 没限定就 PARTIAL。
+    - 定义域是**结构化的**(图、着色、整数方程、SAT) → 上 z3。它是完备的。
+    - 命题**无界**且要证"不存在" → 只能靠符号恒等式或构造性下降论证(Lean/sympy),
+      枚举做不到。
+"""
+
+#: 复合命题 —— 2026-10-08 V2 hard-007 实测翻车后加
+COMPOUND_CLAIM = """【复合命题(双向题)的判定】
+- 有些命题天然是**合取**: 「验证 R(3,4)=9: 证明任意 9 顶点红蓝完全图必有红三角或蓝 K4,
+  **并**给出 8 顶点无反例的着色」。这类命题必须拆成 A、B 两部分分别验。
+- 顶层 `VERDICT` 必须是各部分的**合取**, 不能拿其中一部分的失败去驳整道题:
+    A、B 都成立            → PROVED
+    某一方向被证伪         → REFUTED (打印**反例本身**, 不是"我构造错了")
+    一部分成功一部分没验出来 → PARTIAL
+- ★ 最容易犯的错 ★ 上界方向证出来了(z3 判 unsat), 下界方向的**构造写错了**,
+  代码抓到自己的构造里有蓝 K4, 于是输出 `VERDICT: REFUTED`。
+  这是**假 REFUTED** —— 被驳的是"我构造错的那个着色", 不是原命题。R(3,4)=9 是真的。
+  抓到自己的构造有问题, 正确的处置是**回头把构造改对**(或者换个构造再试),
+  而不是宣布命题为假。
+- 自检: 打印每个部分的独立判定, 并让顶层 verdict 由它们**算出来**, 别手写。
 """
 
 #: 沙箱约束 —— 必须告诉 LLM 它在什么环境里跑, 否则它会写 import os / 读文件
-SANDBOX_RULES = """【运行环境限制】
+#:
+#: ★ 白名单部分**运行时从沙箱代码里取**, 不再手抄 ★
+#: 2026-10-08 实测事故: 这段文本是 P0 时期手写的, 后来 P7.1 往白名单里加了
+#: `z3`(P7.1 加: z3 的 Python API), **这里没跟着改**。于是:
+#:   - LLM 以为 z3 不可用, 有完备判定能力时改用 Python 硬算 → 超时/判不出
+#:   - LLM 想用 mpmath 做高精度(BBP 那道题), 白名单里也没有 → attempt 1
+#:     被沙箱静态门拒绝, 白白烧掉一轮
+#: 一份和真实配置漂移的白名单说明, 比没有说明更糟: 它让模型**基于错误前提
+#: 做选型**, 而选型失败是这个系统最大的失败模式。
+#: 硬编码在 prompt 里的白名单迟早还会漂第二次, 所以改成从源头取。
+def _sandbox_rules() -> str:
+    try:
+        # 延迟导入: prompts_research 被 research_verify 导入,
+        # 模块级再 import research 会成环。
+        from agent.tools.research._sandbox import _ALLOWED_IMPORT_ROOTS
+
+        mods = " ".join(sorted(_ALLOWED_IMPORT_ROOTS))
+    except Exception:                                   # pragma: no cover
+        mods = "(沙箱模块不可用 —— 请假设只有标准库和 sympy/numpy/scipy/networkx/z3)"
+    return SANDBOX_RULES_TEMPLATE.format(allowed_modules=mods)
+
+
+SANDBOX_RULES_TEMPLATE = """【运行环境限制】
 - 你的代码在**独立子进程的受限沙箱**里跑, 默认超时 20 秒, 超时会整棵进程树被杀。
-- **可用模块(白名单)**: math cmath itertools functools fractions decimal statistics
-  random json re string operator copy heapq bisect collections typing enum dataclasses
-  abc numbers array time datetime io csv textwrap sympy numpy scipy networkx
+- **可用模块(白名单, 以下就是全部)**:
+  {allowed_modules}
 - **禁止**: import os / sys / subprocess / socket / shutil / ctypes / importlib /
   requests / multiprocessing; 禁止 eval / exec / compile / open / input /
   globals / __builtins__
+- ★ **`.eval` 属性也被禁**(任意对象的), 例如 z3 的 `Solver().eval(...)` 一律过不了
+  静态门。要让求解器给模型取值, 用 `s.add(...)` 声明约束后 `s.check()`, 再从
+  `s.model()` 取 —— 不要调 `.eval`。
+- ★ **没有 mpmath**。需要任意精度十进制运算时用标准库 `decimal`(设好 context 精度),
+  它完全够用且在白名单里。
+- ★ **z3 在白名单里, 是完备判定器**, 但**别无脑往上套** ★
+  用对的地方: 图着色 / SAT / 组合结构 / 整数方程的「存在性」与「全域否定」。
+    - 存在性/构造: `Solver()` → `s.add(约束)` → `s.check()` → `s.model()` 取解
+    - 全域否定: `s.add(Not(命题))` 后 `check() == unsat` 就是「不存在反例」的全域证明
+  **用错的地方(实测踩过)**: 大整数/级数/数值计算题。
+    Catalan 那种题我用 z3 求解反而绕远, 直接 `math.comb` / 递推 /
+    `math.factorial` 又快又准。**先判断定义域是什么类型, 再选工具** ——
+    符号代数问 sympy, 组合搜索问 z3, 大整数问 math/decimal。
+- ⚠️ **`check()` 是三态**: `sat` / `unsat` / **`unknown`**。
+  设了 `timeout` 就会有 `unknown`。**把 unknown 当 unsat 是错的** ——
+  unknown 的意思是"我算不动", 结论必须降级成 `VERDICT: INCONCLUSIVE`。
+- ★ **绝不拿"我记得的已知答案"当反例或判据 ★
+  真实翻车(2026-10-08 V2 Catalan-50): 代码用三种方法都算出了同一个值
+  1978261657756160653623774456(三种方法互相验证, True), 然后又去和一个
+  硬编码的"已知参考值"比较, 不等, 于是输出 `VERDICT: REFUTED`。
+  **那个参考值是模型自己编的**, 而算出来的值是对的 —— 结果它证伪了一条真命题。
+  规矩:
+    - 反例必须是**代码算出来的具体输入**, 不是你记忆里的常量。
+    - 你记忆里的"已知答案"**只配当调试提示**, 绝不能进判定分支。
+      你的记忆会错, 而且错得很自信 —— 编程验证器也会崩。
+    - 多种独立方法**互相印证**的结果, 比任何"参考值"都可信。
 - 写文件、读文件、联网一律不行。数据直接在代码里构造。
+- ★ **递归爆栈了不要用 `sys`**。`sys` 不在白名单, 静态门直接拒
+  (实测踩过: 写了个递归回溯, 994 层爆栈, 然后想 `sys.setrecursionlimit(...)` 补救,
+  结果整份代码被门拒掉, 白白烧掉一轮)。
+  补救办法按优先级:
+    1. **改成迭代**(显式栈 / 生成器), 通常本来就更清晰;
+    2. 记忆化: `functools.lru_cache`(在白名单里)—— 递归深度通常是被重复子问题撑爆的;
+    3. 剪枝: 提前排除不可能的分支, 深度自然降下来。
+- ★ **`from` 导入的每个名字都要真的 import 过 ★
+  实测踩过: `sympy` 用来着但忘了 `import sympy`, 崩在最后一行,
+  而**正确答案早就算出来了**, 就差最后那个 print VERDICT。
+  结论白丢。写完先扫一遍: 每个用到的模块名都有对应的 import 吗?
+- ★ `sympy.prime` / `prime(n)` 的参数从 **1** 开始 ★
+  `prime(0)` 会抛 `ValueError: nth must be a positive integer`。
+  这行会被静态门**在执行前**拒掉 —— 实测踩过, 白白烧掉一轮。
+  Python 3.14 默认就是 postponed annotation, 你根本不需要这行。
+- ★ **z3 取值不要用 `model.eval(...)`**(`.eval` 是全局禁用的属性名)。
+  正确写法: `m = s.model()` 然后 `v = m[var]`, 配合 `z3.is_true(v)` 判断真假。
 - 异常会原样回传给你, 请根据 traceback 修正后重试 —— 不要用 try/except 吞掉错误。
-- 算不动就**缩小规模**(n 从 1000 降到 20)或改用符号方法, 不要死循环硬算。
+- 算不动就**缩小规模**(n 从 1000 降到 20)或换用符号/求解器方法, 不要死循环硬算。
 """
 
 #: 禁止编造 —— 与综述侧禁止编 paper_id 同一路数
@@ -248,7 +340,7 @@ def build_modeling_prompt(question: str) -> str:
     """构造建模 prompt"""
     return RESEARCH_MODELING_PROMPT.format(
         question=question or "(未指定问题)",
-        SANDBOX_RULES=SANDBOX_RULES,
+        SANDBOX_RULES=_sandbox_rules(),
         NO_FABRICATION=NO_FABRICATION,
     )
 
@@ -285,9 +377,19 @@ RESEARCH_CODE_PROMPT = """你是数学验证代码生成器。任务:为一条�
 2. 命题若含自由变量, 必须在代码里把它们符号化或遍历, 并把范围写进代码。
 3. 找到反例时, **把反例本身打印出来**(n 的取值、违反的具体数值), 这是最有价值的证据。
 4. 计算量要克制: 默认 20 秒超时。图枚举 n≤8, 枚举循环 n≤10000。
+5. ★ **算出来是空集时, 先怀疑自己的代码 ★
+   「没找到解」「所有解: []」这类输出, 九成是实现错了, 不是命题为空。
+   实测两次踩坑: Pell 方程 x²-61y²=1 算出「所有正整数解: []」(真解是
+   x=1766319049, y=226153980); Erdős–Straus 对 n=2 判成「无解」(2 明显有解)。
+   判 INCONCLUSIVE 之前, 至少做一次**独立 sanity check**:
+     · 拿一个你知道答案的小规模实例试你的代码, 看它能不能跑出来;
+     · 换个算法路线再算一遍;
+     · 检查边界/取模/精度这类最常见的实现错。
+   你是会犯错的 —— 编程验证器也会崩。空结果不等于命题为空。
 
 {VERDICT_CONTRACT}
 {NUMERICS_ARE_NOT_PROOF}
+{COMPOUND_CLAIM}
 {SANDBOX_RULES}
 {NO_FABRICATION}
 
@@ -322,9 +424,304 @@ def build_code_prompt(
         quantifier_hint=_quantifier_hint(quantifier),
         VERDICT_CONTRACT=VERDICT_CONTRACT,
         NUMERICS_ARE_NOT_PROOF=NUMERICS_ARE_NOT_PROOF,
-        SANDBOX_RULES=SANDBOX_RULES,
+        COMPOUND_CLAIM=COMPOUND_CLAIM,
+        SANDBOX_RULES=_sandbox_rules(),
         NO_FABRICATION=NO_FABRICATION,
     ) + ctx
+
+
+# ============================================================
+# 3b. LEAN_CODE_PROMPT — 形式化命题 → Lean 证明 (P7.3)
+# ============================================================
+# 为什么要**硬路由**而不是让 LLM 自己选:
+#   2026-10-08 V2 实测, hard-015/016 明确写着「在 Lean 4 + Mathlib 中形式化并证明」,
+#   但整条链路只会生成 Python —— LLM 于是用 sympy 硬凑, 结果
+#   hard-016 输出了一个「有界枚举 + 循环论证」的假 PROVED。
+#   根因不是模型不会 Lean, 是**它没有 Lean 这条路可选**。
+#   这跟 research_sympy / research_z3 / research_enumerate 从不被调用是同一个病:
+#   能力装上了不等于用得上。缺的是路由。
+LEAN_CODE_PROMPT = """你是 Lean 4 形式化证明生成器。任务:写一段 **Lean 4 代码**, 形式化并证明下面这条命题。
+
+【待证命题】
+{claim_text}
+
+【范围/前提】
+{scope}
+
+【环境】
+- Lean 4.9.0 + Mathlib **v4.9.0**(两者版本严格配对, 换版本会编不过)。
+- 要用 Mathlib 就写 `import Mathlib`。
+- 下面是**在这个环境里实测编译通过**的两段, 照这个风格写:
+
+```lean
+import Mathlib
+-- sqrt 2 是无理数
+example : Irrational (Real.sqrt 2) := irrational_sqrt_two
+#print axioms irrational_sqrt_two
+```
+
+```lean
+import Mathlib
+-- 费马小定理: p 为素数且 p ∤ a  =>  a^(p-1) ≡ 1 [MOD p]
+example (p : Nat) (hp : p.Prime) (a : Nat) (h : ¬ (p ∣ a)) :
+    a ^ (p - 1) ≡ 1 [MOD p] := by
+  have h' := Nat.ModEq.pow_totient (x := a) (n := p) (hp.coprime_iff_not_dvd.mpr h).symm
+  simpa [Nat.totient_prime hp] using h'
+```
+
+  第二段的要点: v4.9.0 里**没有** `Nat.Submod.pow_right`(新版才有),
+  得走费马-欧拉 `Nat.ModEq.pow_totient` 再特化 φ p = p - 1。
+  定理名不确定**不要猜**: 先写个错的名字, 编译器报的 `unknown constant`
+  会告诉你该去哪个文件找。这比凭空猜一个名字然后自说自话可靠得多。
+
+【判定规则 —— 机器会独立复核, 这不是形式】
+1. **禁止 `sorry`**。Lean 遇 `sorry` 只报 warning、**退出码仍然是 0**,
+   但那等于没证。机器会扫 `declaration uses 'sorry'` 并判不通过。
+2. **禁止 `axiom` 声明**。`axiom foo : P` + `theorem bar : P := foo` 编译通过、
+   退出码 0、零 warning, `#print axioms` 甚至说「不依赖任何公理」—— 因为它自己
+   就是公理。这等于把待证命题当前提, 机器会在**源码**里扫 axiom 声明判不通过。
+3. 末尾加 `#print axioms <你的定理名>`。机器会看输出里有没有 `sorryAx`;
+   只有 `propext` / `Classical.choice` / `Quot.sound` 是正常的。
+4. 只输出能编译的代码, 代码块外不要写任何解释。
+5. ★ 证不出来就**明说**: 写一行注释说明卡在哪。
+   **不要用 sorry 或 axiom 假装证完了** —— 机器会拦, 而且假成功比诚实失败糟得多。
+
+只输出 ```lean 代码块```。
+如果命题无法形式化, 只输出一行注释说明原因。"""
+
+#: 判一条命题是不是「必须用 Lean」。命中就走形式化后端, 不生成 Python。
+_LEAN_TRIGGER = re.compile(
+    r"(?:lean\s*4|lean4|mathlib|形式化|形式证明|formaliz)", re.IGNORECASE)
+
+
+def needs_lean(claim_text: str) -> bool:
+    """
+    这条命题是不是必须走 Lean。
+
+    触发词只取**明确无歧义**的: 判错的方向是「该走 Lean 却走了 Python」
+    (白白浪费一轮, 就是 hard-016 那个假 PROVED 的由来)。
+    「用 z3 验证」这种指向 Python 求解器的措辞不会命中。
+    """
+    return _LEAN_TRIGGER.search(claim_text or "") is not None
+
+
+def build_lean_prompt(claim_text: str, scope: str = "",
+                      extra_context: str = "") -> str:
+    """构造 Lean 证明生成 prompt。"""
+    ctx = f"\n【上一轮失败, 请避免重犯】\n{extra_context}\n" if extra_context else ""
+    return LEAN_CODE_PROMPT.format(
+        claim_text=claim_text or "(未指定命题)",
+        scope=scope or "(无额外范围限制)",
+    ) + ctx
+
+
+# ============================================================
+# 3c. 方法选型规划 —— 让「选型」变成机器算出来的东西
+# ============================================================
+# 为什么要单独做这一步:
+#
+# 这套 V2 题是**按「裸枚举必死」设计的** —— 规模 1e6 / 1e7 / K9 / 100 皇后,
+# 精度上大整数 / Pell / Catalan / 三种立方和(浮点必翻车),
+# 证明上 Lean 形式化 / R(3,4) 双向 / 最小性验证(不能只给答案)。
+#
+# 实测里 LLM 栽的跟头**几乎全是选型, 不是算力**:
+#   - 100 皇后   → 写 Python 回溯, 裸枚举在 20s 里必死 → failed
+#   - Petersen 色数 → 没意识到 2^10=1024 种 2-着色可以直接穷举 → inconclusive
+#   - Erdős–Straus → x/y/z 三重枚举, 顺序不对直接超时(正确的做法是 x、y 有界, z 解出)
+#   - sqrt2       → 以为 Python 有界枚举能证「不存在」
+#
+# 所以关键不是「提醒它别硬算」(提醒过, 会忘), 而是**把规模算出来给它看**,
+# 让它自己判断裸枚举来不来得及。而且这个判断必须由机器做 ——
+# 人对着「1e7」能直觉感到大, 对着「100 顶点图的所有 2-着色」反而容易低估。
+def _extract_scales(claim: str) -> list[str]:
+    """从命题里抽出所有规模标记, 原样回给 LLM 看。"""
+    if not claim:
+        return []
+    out: list[str] = []
+    out += re.findall(r"\d+\s*[eE]\s*\d+", claim)          # 1e6
+    out += re.findall(r"\d+\s*\^\s*\d+", claim)              # 10^1000
+    out += re.findall(r"\d+\s*\*\*\s*\d+", claim)            # 10**6
+    out += re.findall(r"\bK_?\d+", claim)                     # K9 / K_4
+    out += re.findall(r"\d[\d,]*\s*(?:个顶点|皇后|顶点|以内|以下|万元|次)",
+                      claim)
+    out += re.findall(r"\b\d{6,}\b", claim)                   # 裸的 1000000
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in out:
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq[:12]
+
+
+#: 组合/结构类问题 —— 裸枚举代价最容易被低估的一类
+_COMBINATORIAL_RE = re.compile(
+    r"(?:皇后|Ramsey|ramsey|R\(|着色|色数|图论|连通|SAT|求解器|汉诺塔|魔方"
+    r"|排列|组合|子集|匹配|独立集)",
+    re.IGNORECASE,
+)
+#: 存在性 —— 只需一个见证值, 但见证可能极难找
+_WITNESS_RE = re.compile(
+    r"(?:存在|求一个|找出一个|构造|一个解|一个见证|解\s*一个)"
+)
+#: 全域/证明要求
+_PROOF_RE = re.compile(r"(?:证明|证|最小|双向|最小性|判定)")
+
+
+#: 求某个数的第 N 位数字 —— 大数运算的高发翻车区
+_DIGIT_EXTRACT = re.compile(
+    r"(?:第\s*[\d^e+*\-]+\s*位|位数字|第\s*\d+\s*位数字|"
+    r"\d+\s*位(?:的)?(?:数字|十六进制|二进制)|"
+    r"hex\s+dig|base-?\d+\s+dig)",
+    re.IGNORECASE,
+)
+
+
+#: 丢番图方程 / 求最小解 —— 同样存在一条固定的高效路线
+_DIOPHANTINE = re.compile(
+    r"(?:Pell| pell|丢番图|Diophantine|diophantine"
+    r"|最小正整数解|最小解|x\^?\s*2\s*-\s*\d+\s*\*?\s*y\^?\s*2"
+    r"|x\s*2\s*-\s*\d+\s*y\s*2\s*=)",
+    re.IGNORECASE,
+)
+
+
+#: 命题**自带范围 + 容差** —— 判据就是它自己写出来的那两个数。
+#:
+#: 这类命题和"全域命题"是两件完全不同的事, 必须分开处理:
+#:   全域:  "证明 sqrt2 是无理数"      —— 有界验证再多次也只是 PARTIAL
+#:   自带:  "取 N=10^7, 误差小于 1e-6" —— 跑完这个 N 就是 PROVED
+#: 混起来的后果是**双向的**: 全域题被硬吹成 PROVED(假 PROVED, 更严重),
+#: 自带范围的题被无谓降级成 PARTIAL(做对了却记成没做对)。
+_TOLERANCE = r"(?:误差|精度|绝对误差|相对误差|tolerance|精度要求)"
+_SCOPED_TOLERANCE = re.compile(
+    r"(?:取\s*N\s*=|N\s*=\s*[\d^e+]+|n\s*<=\s*\d|n\s*=\s*\d+)"
+    r"[^\n]{0,40}?" + _TOLERANCE
+    + r"|" + _TOLERANCE + r"[^\n]{0,40}?(?:N\s*=\s*[\d^e+]+|1e[-+]?\d+|10\^?[-{]?\d*)",
+    re.IGNORECASE,
+)
+
+
+def plan_method(claim: str, how: str = "symbolic") -> dict[str, Any]:
+    """
+    机器做一次方法选型预判, 返回要注入 prompt 的说明与建议的 how。
+
+    Returns:
+        {"note": str, "how": str, "scales": [...], "must_use_complete_method": bool}
+    """
+    scales = _extract_scales(claim)
+    combinatorial = bool(_COMBINATORIAL_RE.search(claim or ""))
+    witness = bool(_WITNESS_RE.search(claim or ""))
+    proof = bool(_PROOF_RE.search(claim or ""))
+    must_complete = (combinatorial and (witness or proof)) or (
+        bool(scales) and combinatorial)
+
+    parts: list[str] = []
+    if scales:
+        parts.append(
+            f"【机器已从命题里读到的规模标记】{'、'.join(scales)}\n"
+            f"  → 先**自己算一遍**搜索空间有多大: 定义域里每个元素都试一遍的话,"
+            f"这个规模能在 20 秒超时内跑完吗? 算不出来就换方法, 别硬写循环。\n"
+            f"  ★ 如果最后确实只能有界枚举, 你必须在注释里**写出枚举的确切上界**,"
+            f"并说明它为什么覆盖了命题的全部定义域。没写清楚这一条, 机器会判你 PARTIAL。"
+        )
+    if combinatorial:
+        note = (
+            "【机器已判定: 这是结构化 / 组合类问题】\n"
+            "  裸枚举是最容易低估代价的写法。这类问题**默认走 z3**(完备判定, 在白名单里):\n"
+            "    - 存在性/构造题: `Solver()` → `s.add(约束)` → `s.check()` → `s.model()` 取解\n"
+            "    - 全域否定题: `s.add(Not(命题))` 后 `check() == unsat` "
+            "**就是**「不存在反例」的全域证明, 可以支撑 PROVED\n"
+            "  只有当搜索空间小到你能**说得出确切数字**(比如 10 顶点 2-着色 = 2^10 = 1024 种)"
+            "时, 才用穷举, 并在注释里写出这个数字来证明穷举是完备的。\n"
+            "  ⚠️ 禁止调用 `.eval` 属性 —— 沙箱静态门直接拒。要取值走 `s.model()`。"
+        )
+        if witness and must_complete:
+            note += (
+                "\n  本题是**存在性**的: 你需要的是一个见证值。"
+                "纯 Python 暴力搜在上面的规模下大概率超时, 求解器才是这条路。"
+            )
+        if proof:
+            note += (
+                "\n  本题还要求**证明**, 不只是给答案: 把结论写成求解器能判定的形式, "
+                "别只跑出一个解就收工。"
+            )
+        parts.append(note)
+    if _DIGIT_EXTRACT.search(claim or ""):
+        parts.append(
+            "【机器已识别: 这是「求第 N 位数字」类问题】\n"
+            "  ★ 这里有个巨大的算法分岔, 选错的代价是**几千倍** ★\n"
+            "  笨办法: 算出 16^(N+4) 这么大的整数再取十六进制位。\n"
+            "    实测 N=10^6 时这条路线估算 **11105 秒**(≈3 小时), 直接超预算。\n"
+            "  巧办法: **只要模运算, 不要大整数**。设要抽的是 frac(16^j·x) 的首位,\n"
+            "    对形如 c/d 的项, 有\n"
+            "        frac(c·16^(j-k)/d) = ((c·(16^(j-k) mod d)) mod d) / d\n"
+            "    于是整条式子只需要 `pow(16, j-k, d)` 这种**小模数**模幂,\n"
+            "    完全不碰 16^j 级别的整数。实测同题 **2.4 秒**。\n"
+            "  实现要点:\n"
+            "    · 用 `pow(16, e, d)`, **不要**写 `16 ** e % d`(那是大整数再取模)\n"
+            "    · 指数为负的尾和**逐次除以 16 累加**, 不要写 `16.0 ** (k-j)`\n"
+            "      (指数到 300 多时 float 直接 OverflowError —— 小规模测试根本碰不到)\n"
+            "    · **先在小规模上自检**: 抽前 30~60 位, 和已知的那个数的展开逐位比对。\n"
+            "      这一步能抓住索引差一位、系数写错这类错误, 而且几乎不花时间。\n"
+            "      (实测两次翻车都是自检抓到的: 一次索引差一位, 一次浮点溢出。)"
+        )
+    if _DIOPHANTINE.search(claim or ""):
+        parts.append(
+            "【机器已识别: 这是丢番图方程 / 求最小解类问题】\n"
+            "  ★ 别用「从小到大暴力试 y」—— 那要试到 y≈2.3×10^9, 超时 ★\n"
+            "  正解是**连分数收敛分数**。下面是**实测跑通**的完整代码, 直接改 D 就能用:\n"
+            "```python\n"
+            "import sympy\n"
+            "\n"
+            "def pell_min(D):\n"
+            "    # ⚠️ 签名是 (p, q, d, s) 表示 (p + s*sqrt(d))/q, **不是**直接传 sqrt(D)\n"
+            "    #    传 sqrt(61) 会报 `ValueError: sqrt(61) is not an integer`\n"
+            "    # ⚠️ 返回值是 (整数部分, 周期列表), 不是 (周期, 长度)\n"
+            "    a0, period = sympy.continued_fraction_periodic(0, 1, D, 1)\n"
+            "    # sqrt(D) = [a0; 循环节]\n"
+            "    cf = [int(a0)] + [int(x) for x in period] * 2\n"
+            "    p_m2, p_m1 = 0, 1\n"
+            "    q_m2, q_m1 = 1, 0\n"
+            "    for a in cf:\n"
+            "        p = a * p_m1 + p_m2\n"
+            "        q = a * q_m1 + q_m2\n"
+            "        p_m2, p_m1 = p_m1, p\n"
+            "        q_m2, q_m1 = q_m1, q\n"
+            "        if p * p - D * q * q == 1:\n"
+            "            return int(p), int(q)\n"
+            "    return None\n"
+            "\n"
+            "x, y = pell_min(61)      # -> (1766319049, 226153980)\n"
+            "print('验证:', x * x - 61 * y * y)   # 必须是 1\n"
+            "```\n"
+            "  ★ 上面两处 ⚠️ 是**实测踩过的坑**: 签名传错 → `is not an integer`;\n"
+            "    返回值解包错 → `'Integer' object is not iterable` ★\n"
+            "  ★ 最小性必须程序化验证: 从 y=1 遍历到你的答案, 确认没有任何更小的 y\n"
+            "    满足 p² − D·q² = 1(只验证解本身只能证明「有解」, 不能证明「最小」) ★\n"
+            "  自检: 先拿 D=2(答案 3,2)、D=3(答案 2,1) 跑一遍再动真题。"
+        )
+    if _SCOPED_TOLERANCE.search(claim or ""):
+        parts.append(
+            "【机器已判定: 本题命题**自带范围和容差**, 不是全域命题】\n"
+            "  这类命题的「判据」就是它自己写出来的那个范围 + 误差上界 ——\n"
+            "  **把那个范围完整跑完、并给出误差估计, 就算 PROVED**。\n"
+            "  ★ 不要因为「这只是数值验证, 不是符号证明」就自降 PARTIAL ★\n"
+            "  实测翻车(2026-10-08 Basel): 命题是「取 N=10^7, 误差小于 1e-6」,\n"
+            "  代码算出的误差是 1.0e-07(合规), 却因为「不是欧拉恒等式的符号证明」\n"
+            "  自己判了 PARTIAL —— 命题从来没要求符号证明。**判据要看命题, 不看你\n"
+            "  觉得命题本该长什么样。**\n"
+            "  必须做的三件事:\n"
+            "    1. 明确 print 出你用的 N / 范围, 以及它就是命题里的那个范围;\n"
+            "    2. 给出**误差上界**并算出实际误差(尾部误差不能靠「大概够小」);\n"
+            "    3. 打 `VERDICT: PROVED`。命题要求的范围全部覆盖到了, 就别降级。"
+        )
+    if not parts:
+        return {"note": "", "how": how, "scales": [],
+                "must_use_complete_method": False}
+    return {"note": "\n\n".join(parts), "how": "solver" if must_complete else how,
+            "scales": scales, "must_use_complete_method": must_complete}
 
 
 # ============================================================

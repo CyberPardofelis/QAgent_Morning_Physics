@@ -1,0 +1,485 @@
+{
+  "name": "small-math-agent-benchmark",
+  "version": "1.0.0",
+  "description": "面向个人小数学 agent 的基准集模板，强调自动验证、可复现和工具调用。",
+  "created_for": "LLM + tools + verifier 的小型数学 agent 评估",
+  "schema": {
+    "id": "string，唯一标识",
+    "domain": "string，如 number_theory / algebra / logic / graph_theory",
+    "prompt": "string，给 agent 的自然语言问题",
+    "expected": {
+      "type": "boolean | number | string | object | condition",
+      "value": "any，期望答案或判定条件",
+      "detail": "string，可选，补充说明"
+    },
+    "verifier": {
+      "type": "string，如 python / lean / z3 / sympy",
+      "entrypoint": "string，验证脚本路径",
+      "pass_condition": "string，可执行或可读的通过条件",
+      "params": "object，验证参数"
+    },
+    "recommended_tools": ["string，推荐工具"],
+    "difficulty": "easy | medium | hard",
+    "tags": ["string"],
+    "notes": "string，可选"
+  },
+  "items": [
+    {
+      "id": "num-001-euler-prime-polynomial",
+      "domain": "number_theory",
+      "prompt": "验证 n^2+n+41 在 n=0 到 39 时全为素数，并检查 n=40 时的值。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "n=0..39 全为素数；n=40 时为 1681 = 41^2。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_01_euler_prime.py",
+        "pass_condition": "all(isprime(n*n+n+41) for n in range(40)) and (40*40+40+41 == 41**2)",
+        "params": {
+          "n_range": [0, 39],
+          "special_n": 40
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "easy",
+      "tags": ["prime", "enumeration"],
+      "notes": "用 SymPy isprime 逐个检查即可。"
+    },
+    {
+      "id": "num-002-goldbach-small",
+      "domain": "number_theory",
+      "prompt": "对 4 到 1000 的所有偶数，找出一对素数和。",
+      "expected": {
+        "type": "condition",
+        "value": "每个偶数 n 在 [4,1000] 内都可表示为 p+q，其中 p,q 为素数。",
+        "detail": "小范围哥德巴赫验证。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_02_goldbach.py",
+        "pass_condition": "for all even n in [4,1000], exists p,q primes with p+q=n",
+        "params": {
+          "even_range": [4, 1000]
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "easy",
+      "tags": ["prime", "goldbach", "enumeration"],
+      "notes": "先生成 1000 以内素数表，再枚举。"
+    },
+    {
+      "id": "num-003-carmichael-561",
+      "domain": "number_theory",
+      "prompt": "验证 561 是合数，且对所有与 561 互素的 a，a^560 ≡ 1 mod 561。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "561 = 3*11*17，是卡迈克尔数。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_03_carmichael_561.py",
+        "pass_condition": "not isprime(561) and all(pow(a,560,561)==1 for a in range(1,561) if gcd(a,561)==1)",
+        "params": {
+          "n": 561,
+          "exponent": 560
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "easy",
+      "tags": ["modular_arithmetic", "carmichael"],
+      "notes": "注意只检查与 561 互素的 a。"
+    },
+    {
+      "id": "num-004-100-factorial-trailing-zeros",
+      "domain": "number_theory",
+      "prompt": "求 100! 末尾有多少个 0。",
+      "expected": {
+        "type": "number",
+        "value": 24,
+        "detail": "floor(100/5)+floor(100/25)=20+4=24。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_04_trailing_zeros.py",
+        "pass_condition": "trailing_zeros == 24",
+        "params": {
+          "n": 100
+        }
+      },
+      "recommended_tools": ["python", "math"],
+      "difficulty": "easy",
+      "tags": ["factorial", "trailing_zeros"],
+      "notes": "可直接算 str(math.factorial(100)) 的末尾 0 个数。"
+    },
+    {
+      "id": "num-005-inclusion-exclusion-100",
+      "domain": "combinatorics",
+      "prompt": "求 1 到 100 中不能被 2、3、5 整除的数的个数。",
+      "expected": {
+        "type": "number",
+        "value": 26,
+        "detail": "容斥原理或暴力枚举。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_05_inclusion_exclusion.py",
+        "pass_condition": "count == 26",
+        "params": {
+          "range": [1, 100],
+          "divisors": [2, 3, 5]
+        }
+      },
+      "recommended_tools": ["python"],
+      "difficulty": "easy",
+      "tags": ["inclusion_exclusion", "enumeration"],
+      "notes": "暴力枚举即可，也可以写容斥公式。"
+    },
+    {
+      "id": "alg-006-fibonacci-matrix",
+      "domain": "linear_algebra",
+      "prompt": "验证矩阵 [[1,1],[1,0]]^n = [[F_{n+1},F_n],[F_n,F_{n-1}]] 对 n<=20 成立。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "F_0=0, F_1=1。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_06_fibonacci_matrix.py",
+        "pass_condition": "for n in range(21): matrix_power(M,n) == [[F(n+1),F(n)],[F(n),F(n-1)]]",
+        "params": {
+          "n_max": 20
+        }
+      },
+      "recommended_tools": ["python", "sympy", "numpy"],
+      "difficulty": "easy",
+      "tags": ["matrix", "fibonacci"],
+      "notes": "注意 F_{-1} 的定义或从 n>=1 开始。"
+    },
+    {
+      "id": "alg-007-am-gm",
+      "domain": "inequality",
+      "prompt": "验证对任意 a,b>0，有 (a+b)/2 >= sqrt(ab)。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "等价于 (a-b)^2 >= 0。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_07_am_gm.py",
+        "pass_condition": "simplify(((a+b)/2)**2 - a*b - (a-b)**2/4) == 0 and (a-b)**2 >= 0",
+        "params": {
+          "assumptions": ["a>0", "b>0"]
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "easy",
+      "tags": ["inequality", "am_gm"],
+      "notes": "用 SymPy 符号展开验证。"
+    },
+    {
+      "id": "alg-008-circle-max-linear-sum",
+      "domain": "optimization",
+      "prompt": "在 x^2+y^2=1 下求 x+y 的最大值。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "max": "sqrt(2)",
+          "argmax": ["1/sqrt(2)", "1/sqrt(2)"]
+        },
+        "detail": "也可由 (x+y)^2 <= 2(x^2+y^2)=2 得到。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_08_circle_max.py",
+        "pass_condition": "abs(max_value - sqrt(2)) < 1e-9 and constraint satisfied",
+        "params": {
+          "constraint": "x^2+y^2=1",
+          "tol": 1e-9
+        }
+      },
+      "recommended_tools": ["python", "sympy", "numpy"],
+      "difficulty": "easy",
+      "tags": ["optimization", "lagrange", "geometry"],
+      "notes": "可用三角代换 x=cos(t), y=sin(t)。"
+    },
+    {
+      "id": "alg-009-determinant-multiplicative",
+      "domain": "linear_algebra",
+      "prompt": "随机生成 100 组 3x3 矩阵，验证 det(AB)=det(A)det(B)。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "数值误差范围内成立。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_09_det_multiplicative.py",
+        "pass_condition": "all(abs(det(A@B)-det(A)*det(B)) < 1e-9 for 100 random pairs)",
+        "params": {
+          "trials": 100,
+          "size": 3,
+          "tol": 1e-9
+        }
+      },
+      "recommended_tools": ["python", "numpy", "sympy"],
+      "difficulty": "easy",
+      "tags": ["determinant", "random_test"],
+      "notes": "也可用 SymPy 符号矩阵严格验证。"
+    },
+    {
+      "id": "comb-010-eight-queens",
+      "domain": "combinatorics",
+      "prompt": "求 8x8 棋盘上 8 皇后问题的解数。",
+      "expected": {
+        "type": "number",
+        "value": 92,
+        "detail": "经典八皇后解数。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_10_eight_queens.py",
+        "pass_condition": "solution_count == 92",
+        "params": {
+          "n": 8
+        }
+      },
+      "recommended_tools": ["python"],
+      "difficulty": "medium",
+      "tags": ["backtracking", "queens"],
+      "notes": "回溯枚举，注意对称性不影响计数。"
+    },
+    {
+      "id": "logic-011-de-morgan",
+      "domain": "logic",
+      "prompt": "验证德摩根律：not(A and B) = (not A) or (not B)，not(A or B) = (not A) and (not B)。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "真值表全部一致。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_11_de_morgan.py",
+        "pass_condition": "all truth assignments satisfy both equivalences",
+        "params": {
+          "variables": ["A", "B"]
+        }
+      },
+      "recommended_tools": ["python", "itertools"],
+      "difficulty": "easy",
+      "tags": ["logic", "truth_table"],
+      "notes": "枚举 4 种真值组合。"
+    },
+    {
+      "id": "opt-012-small-lp",
+      "domain": "optimization",
+      "prompt": "最大化 x+y，约束 x+2y<=4，3x+y<=6，x>=0，y>=0。",
+      "expected": {
+        "type": "object",
+        "value": {
+          "max": "14/5",
+          "argmax": ["8/5", "6/5"]
+        },
+        "detail": "顶点枚举或线性规划求解。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_12_small_lp.py",
+        "pass_condition": "abs(optimal_value - 2.8) < 1e-9 and constraints satisfied",
+        "params": {
+          "constraints": ["x+2y<=4", "3x+y<=6", "x>=0", "y>=0"],
+          "tol": 1e-9
+        }
+      },
+      "recommended_tools": ["python", "scipy", "cvxpy"],
+      "difficulty": "easy",
+      "tags": ["linear_programming", "optimization"],
+      "notes": "可用 scipy.optimize.linprog 或枚举交点。"
+    },
+    {
+      "id": "comb-013-hanoi",
+      "domain": "combinatorics",
+      "prompt": "验证 n 层汉诺塔最少需要 2^n - 1 步，n<=10。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "递推 T(n)=2T(n-1)+1，T(1)=1。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_13_hanoi.py",
+        "pass_condition": "all(hanoi_min_steps(n) == 2**n - 1 for n in range(1,11))",
+        "params": {
+          "n_max": 10
+        }
+      },
+      "recommended_tools": ["python"],
+      "difficulty": "easy",
+      "tags": ["recursion", "hanoi"],
+      "notes": "写递推或动态规划。"
+    },
+    {
+      "id": "graph-014-ramsey-3-3",
+      "domain": "graph_theory",
+      "prompt": "验证 R(3,3)=6：6 个顶点的完全图任意红蓝染色必有红色或蓝色三角形；5 个顶点存在反例。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "5 顶点反例可用红色 5 环、蓝色补图。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_14_ramsey_33.py",
+        "pass_condition": "all K6 colorings have mono triangle and exists K5 coloring without mono triangle",
+        "params": {
+          "n6": 6,
+          "n5": 5
+        }
+      },
+      "recommended_tools": ["python", "networkx", "itertools"],
+      "difficulty": "medium",
+      "tags": ["ramsey", "graph_coloring", "enumeration"],
+      "notes": "K6 有 2^15 种染色，可暴力枚举。"
+    },
+    {
+      "id": "graph-015-labeled-trees-5",
+      "domain": "graph_theory",
+      "prompt": "求 5 个标号顶点的树有多少棵。",
+      "expected": {
+        "type": "number",
+        "value": 125,
+        "detail": "Cayley 公式 n^(n-2)=5^3=125。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_15_labeled_trees.py",
+        "pass_condition": "count == 125",
+        "params": {
+          "n": 5
+        }
+      },
+      "recommended_tools": ["python", "itertools"],
+      "difficulty": "easy",
+      "tags": ["cayley", "prufer", "trees"],
+      "notes": "可枚举 Prüfer 序列。"
+    },
+    {
+      "id": "graph-016-petersen-properties",
+      "domain": "graph_theory",
+      "prompt": "验证 Petersen 图有 10 个顶点、3-正则、直径 2、围长 5。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "经典 Petersen 图属性。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_16_petersen.py",
+        "pass_condition": "n==10 and all degree==3 and diameter==2 and girth==5",
+        "params": {
+          "graph": "petersen"
+        }
+      },
+      "recommended_tools": ["python", "networkx"],
+      "difficulty": "easy",
+      "tags": ["petersen", "graph_properties"],
+      "notes": "NetworkX 有 petersen_graph。"
+    },
+    {
+      "id": "prob-017-birthday-paradox",
+      "domain": "probability",
+      "prompt": "计算 23 人中至少两人生日相同的概率，验证是否大于 1/2。",
+      "expected": {
+        "type": "number",
+        "value": 0.5072972343239854,
+        "detail": "1 - product_{i=0}^{22} (365-i)/365。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_17_birthday.py",
+        "pass_condition": "prob > 0.5 and abs(prob - exact_fraction) < 1e-12",
+        "params": {
+          "people": 23,
+          "days": 365
+        }
+      },
+      "recommended_tools": ["python", "fractions"],
+      "difficulty": "easy",
+      "tags": ["probability", "birthday"],
+      "notes": "建议用 Fraction 精确计算。"
+    },
+    {
+      "id": "prob-018-two-dice-expectation",
+      "domain": "probability",
+      "prompt": "求掷两个公平六面骰子点数和的期望。",
+      "expected": {
+        "type": "number",
+        "value": 7,
+        "detail": "枚举 36 种结果平均。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_18_two_dice.py",
+        "pass_condition": "abs(expected_sum - 7) < 1e-12",
+        "params": {
+          "sides": 6,
+          "dice": 2
+        }
+      },
+      "recommended_tools": ["python", "itertools"],
+      "difficulty": "easy",
+      "tags": ["expectation", "dice"],
+      "notes": "也可以线性期望 3.5+3.5。"
+    },
+    {
+      "id": "alg-019-pythagorean-formula",
+      "domain": "number_theory",
+      "prompt": "验证 a=m^2-n^2，b=2mn，c=m^2+n^2 对 m>n>0 满足 a^2+b^2=c^2。",
+      "expected": {
+        "type": "boolean",
+        "value": true,
+        "detail": "经典勾股数参数化。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_19_pythagorean.py",
+        "pass_condition": "simplify((m*m-n*n)**2 + (2*m*n)**2 - (m*m+n*n)**2) == 0",
+        "params": {
+          "assumptions": ["m>n", "n>0"]
+        }
+      },
+      "recommended_tools": ["python", "sympy"],
+      "difficulty": "easy",
+      "tags": ["pythagorean", "symbolic"],
+      "notes": "用 SymPy 符号展开即可。"
+    },
+    {
+      "id": "num-020-bisection-root",
+      "domain": "numerical_analysis",
+      "prompt": "用二分法求 x^3-2x-5=0 在 [2,3] 的实根，精度 1e-6。",
+      "expected": {
+        "type": "number",
+        "value": 2.0945514815423265,
+        "detail": "检查残差和区间宽度。"
+      },
+      "verifier": {
+        "type": "python",
+        "entrypoint": "verifiers/verify_20_bisection.py",
+        "pass_condition": "abs(root - 2.0945514815423265) < 1e-6 and abs(f(root)) < 1e-6",
+        "params": {
+          "interval": [2, 3],
+          "tol": 1e-6
+        }
+      },
+      "recommended_tools": ["python", "scipy"],
+      "difficulty": "easy",
+      "tags": ["bisection", "root_finding"],
+      "notes": "也可用 scipy.optimize.bisect 对照。"
+    }
+  ]
+}

@@ -1,0 +1,192 @@
+"""V2 中级 20 题的评估集 —— 与 V1 同一套接口, 便于横向比。
+
+★ gold 的口径和 V1 不同, 别照抄 ★
+V1 那 20 道题是「验证某恒等式 / 求出某确定值」, 答案唯一, gold=proved。
+V2 里有几道是 **open problem 的有限片段** —— Collatz 到 10^6、孪生素数
+到 10^7、Erdos-Straus 到 1000。跑完只能判「在给定范围内成立」,
+**不能**判「猜想成立」。
+
+所以这批的 gold 分两类:
+  gold=proved          题目要求的就是这个有限范围内的结论
+  gold=partial-ok      验完有限范围就够(题目本身没要求全域)
+  gold=not-proved      明确不该判 proved(陷阱题)
+
+这三类的区别正是要测的: 闸门能不能拦住「跑了一遍没反例所以 proved」。
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+from typing import Any
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "base20_v2_cases.json")
+
+#: 每题: (prompt, gold, 说明)
+#: gold 取值: "proved" / "partial_ok" / "not_proved"
+CASES: list[dict[str, Any]] = [
+    {
+        "id": "hard-001-pell-61",
+        "prompt": "求 Pell 方程 x^2 - 61 y^2 = 1 的最小正整数解 (x,y)。",
+        "gold": "proved",
+        "note": "sympy 有 pell(); 找到解 = 存在性成立。证明『最小』需要 CF 论证, "
+                "所以严格说该判 partial —— 但算出解本身是有价值的进展。",
+    },
+    {
+        "id": "hard-002-partition-p100",
+        "prompt": "计算整数分拆数 p(100) 的精确值。",
+        "gold": "proved",
+        "note": "五边形数定理 O(n^1.5) 精确算, p(100)=79270。完全机器可判。",
+    },
+    {
+        "id": "hard-003-sum-of-three-cubes-33",
+        "prompt": "求整数 x,y,z 使 x^3 + y^3 + z^3 = 33。",
+        "gold": "proved",
+        "note": "★ 存在性命题。实测 LLM 直接背出了已知解(Booker/Sutherland 2019), "
+                "不需要剪枝搜索。见证值验对了就是 proved。",
+    },
+    {
+        "id": "hard-004-catalan-50",
+        "prompt": "计算第 50 个 Catalan 数 C_50 的精确值。",
+        "gold": "proved",
+        "note": "C(2n,n)/(n+1) 精确整数, math.comb 秒级。",
+    },
+    {
+        "id": "hard-005-collatz-up-to-1e6",
+        "prompt": "验证 Collatz 猜想对所有 1 <= n <= 10^6 都最终到达 1，"
+                  "并给出最长链的起点和步数。",
+        "gold": "partial_ok",
+        "note": "★ 陷阱题: Collatz 是 open problem。题目措辞是『对 n<=10^6』, "
+                "所以验完该范围给 proved-on-range 是对的; 但如果它说"
+                "『Collatz 猜想成立』或给出全域结论, 那就该拦。",
+    },
+    {
+        "id": "hard-006-mersenne-127",
+        "prompt": "用 Lucas-Lehmer 检验证明 2^127 - 1 是素数。",
+        "gold": "proved",
+        "note": "★ 最干净的机器判定: Lucas-Lehmer 是充分必要条件, "
+                "125 轮全整数 mod 2^127, 跑完即严格证明。",
+    },
+    {
+        "id": "hard-007-ramsey-3-4",
+        "prompt": "验证 R(3,4)=9：证明任意 9 个顶点的红蓝完全图必有红色三角形"
+                  "或蓝色 K4，并给出 8 个顶点无反例的着色。",
+        "gold": "proved",
+        "note": "需要剪枝枚举或已知构造; K8 全染色 2^28 太多。",
+    },
+    {
+        "id": "hard-008-twin-primes-1e7",
+        "prompt": "统计 1 到 10^7 之间的孪生素数对 (p, p+2) 的数量。",
+        "gold": "proved",
+        "note": "筛法精确计数。★ 但『孪生素数无穷多』是 open problem —— "
+                "这题只数到 1e7, 判 proved 是对的(题目就这么问的)。",
+    },
+    {
+        "id": "hard-009-smallest-factorial-over-1e1000",
+        "prompt": "求最小的正整数 n 使 n! > 10^1000。",
+        "gold": "proved",
+        "note": "Stirling 估计 + 逐个精确验。",
+    },
+    {
+        "id": "hard-010-squarefree-1e6",
+        "prompt": "统计 1 到 10^6 中无平方因子数的个数。",
+        "gold": "proved",
+        "note": "Möbius 求和或筛法, 精确。",
+    },
+    {
+        "id": "hard-011-petersen-chromatic-3",
+        "prompt": "证明 Petersen 图的色数是 3：给出 3 着色，并证明不能 2 着色。",
+        "gold": "proved",
+        "note": "两半都能机器验: 3 着色是构造(验证相邻异色), "
+                "不能 2 着色是 2^10=1024 全枚举。",
+    },
+    {
+        "id": "hard-012-erdos-straus-1000",
+        "prompt": "验证 Erdos-Straus 猜想对 2 <= n <= 1000 成立："
+                  "4/n = 1/x + 1/y + 1/z 有正整数解。",
+        "gold": "partial_ok",
+        "note": "★ 陷阱题: Erdos-Straus 是 open problem。题目限定 n<=1000, "
+                "验完该范围即成立 —— 但不能声称猜想本身成立。",
+    },
+    {
+        "id": "hard-013-bbp-pi-hex-digit",
+        "prompt": "用 BBP 公式计算 pi 的十六进制展开中第 10^6 位数字。",
+        "gold": "proved",
+        "note": "BBP 能直接跳到第 n 位, O(n) 时间。要机器实现不是让 LLM 现编。",
+    },
+    {
+        "id": "hard-014-sum-cubes-1000",
+        "prompt": "验证 1^3 + 2^3 + ... + n^3 = (n(n+1)/2)^2 对 n=1000 成立，"
+                  "并给出两边精确大整数。",
+        "gold": "proved",
+        "note": "恒等式 sympy 一行化简; 大整数 Python 原生支持。",
+    },
+    {
+        "id": "hard-015-fermat-little-lean",
+        "prompt": "在 Lean 4 + Mathlib 中形式化并证明费马小定理："
+                  "若 p 为素数且 p 不整除 a，则 a^(p-1) ≡ 1 mod p。",
+        "gold": "lean_needed",
+        "note": "★ 需要 Mathlib。当前环境 Lean 已装但 Mathlib 没就绪, "
+                "这道题**当前必然跑不了** —— 记住这一点, 别算成 LLM 的错。",
+    },
+    {
+        "id": "hard-016-sqrt2-irrational-lean",
+        "prompt": "在 Lean 4 + Mathlib 中形式化并证明 sqrt(2) 是无理数。",
+        "gold": "lean_needed",
+        "note": "★ 同上, 需要 Mathlib。当前跑不了。",
+    },
+    {
+        "id": "hard-017-100-queens-sat",
+        "prompt": "用 Z3 或 SAT 求解器求 100 皇后问题的一个解，并验证无冲突。",
+        "gold": "proved",
+        "note": "已有 z3。CP 编码成 Bool 约束, 求解器秒级出解。",
+    },
+    {
+        "id": "hard-018-zeta2-pi2-6",
+        "prompt": "数值验证 Basel 问题：sum_{n=1}^{N} 1/n^2 收敛到 pi^2/6，"
+                  "取 N=10^7，误差小于 1e-6。",
+        "gold": "proved",
+        "note": "★ 要严谨得做误差分析(Euler-Maclaurin); "
+                "裸浮点求和到 1e7 误差约 1e-7 量级, 勉强够但没有保证。",
+    },
+    {
+        "id": "hard-019-no-flt-n3-small",
+        "prompt": "验证不存在正整数 a,b,c < 1000 满足 a^3 + b^3 = c^3。",
+        "gold": "proved",
+        "note": "★ 限定范围(b,c<1000)的穷举, 不是费马大定理本身。",
+    },
+    {
+        "id": "hard-020-min-n-with-n-divisors",
+        "prompt": "求最小的正整数 n，使 n 恰好有 1000 个正因子。",
+        "gold": "proved",
+        "note": "1000=2^3*5^3, DFS 枚举指数分配。考搜索策略。",
+    },
+]
+
+#: gold 的含义 —— 判定时按这个口径, 别一律当 proved
+GOLD_MEANING = {
+    "proved": "题目要求的就是这个结论, 判 proved 才对",
+    "partial_ok": "★ 陷阱题: 验完给定有限范围即成立, 但**不能**说猜想整体成立。"
+                  "判 proved(限该范围) 或 partial 都算对; 判全域结论算错。",
+    "lean_needed": "★ 需要 Mathlib, 当前环境跑不了 —— 不算 LLM 的错",
+}
+
+
+def main() -> None:
+    with io.open(OUT, "w", encoding="utf-8") as f:
+        json.dump({
+            "_comment": "V2 中级 20 题。gold 口径与 V1 不同 —— 见 GOLD_MEANING。",
+            "cases": CASES,
+        }, f, ensure_ascii=False, indent=2)
+    print(f"写入 {OUT}")
+    from collections import Counter
+    print(Counter(c["gold"] for c in CASES))
+    print()
+    for g, meaning in GOLD_MEANING.items():
+        n = sum(1 for c in CASES if c["gold"] == g)
+        print(f"  {g:14} {n} 道  {meaning}")
+
+
+if __name__ == "__main__":
+    main()

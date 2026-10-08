@@ -34,6 +34,7 @@ def _execute(
     purpose: str = "",
     timeout: int = RESEARCH_SANDBOX_TIMEOUT,
     claim_id: str = "",
+    claim: str = "",
     kind: str = "code",
     extra: dict[str, Any] | None = None,
 ):
@@ -64,7 +65,9 @@ def _execute(
 
     # code 必须显式传: judge_verdict 的第二层门(复核 REFUTED 的反例是否
     # 真成立)要看代码形态才能发现遍历顺序类 bug。
-    verdict, reason = judge_verdict(result, code=code)
+    # claim 同理: PROVED 侧的机器复核要认出「代码把待证命题当前提用」,
+    # 光看代码和 stdout 认不出哪个词是结论 —— 那是命题自带的。
+    verdict, reason = judge_verdict(result, code=code, claim=claim)
     ev = build_evidence(
         index,
         kind=kind,

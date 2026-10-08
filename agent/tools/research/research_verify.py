@@ -24,12 +24,16 @@ import re
 from typing import Any
 
 from agent.infra.research_workspace import ResearchWorkspace, hash_question
-from agent.prompts_research import build_code_prompt, format_attempts, template_for
+from agent.prompts_research import (
+    build_code_prompt, build_lean_prompt, format_attempts, needs_lean,
+    plan_method, template_for,
+)
 from agent.tools.llm import _call_llm, usage_snapshot
 from agent.tools.registry import register_tool
 
 from ._flags import RESEARCH_EXPOSED, RESEARCH_MAX_RETRY, RESEARCH_SANDBOX_TIMEOUT
-from ._provenance import VERDICTS, claim_id_for
+from ._lean import check_lean, mathlib_available
+from ._provenance import VERDICTS, build_evidence, claim_id_for, extract_verdict_marker
 from .research_run_code import _execute
 
 logger = logging.getLogger(__name__)
@@ -100,6 +104,15 @@ def _generate_code(
         quantifier: forall/exists/none (P4 加)。写进 prompt 告诉模型 verdict 该往哪个方向判。
     """
     prompt = build_code_prompt(claim, scope, how, retry_context, quantifier=quantifier)
+    # ★ 机器做的方法选型预判 ★
+    # 这套 V2 题是按「裸枚举必死」设计的(1e6/1e7/K9/100皇后),
+    # 而实测里 LLM 栽的跟头几乎全是选型。所以先把命题里的规模标记抽出来、
+    # 算出「裸枚举来不来得及」, 注入 prompt 让它自己判断 ——
+    # 而不是等它写完一坨三重循环再被超时打死。
+    plan = plan_method(claim, how)
+    if plan["note"]:
+        prompt = f"{plan['note']}\n\n{prompt}"
+        how = plan["how"]          # 选型预判可以改写建议方法
     tmpl = template_for(how)
     if tmpl:
         # 给写法示范比讲规则管用(LLM 漏 VERDICT 那行的高发点)
@@ -113,6 +126,201 @@ def _generate_code(
         timeout=timeout,
     )
     return extract_code(raw), raw
+
+
+#: 提取 Lean 围栏代码块。Lean prompt 要求 ```lean 包起来。
+_LEAN_FENCE_RE = re.compile(r"```(?:lean4?|Lean4?)?\s*\n(.*?)```",
+                            re.DOTALL)
+
+
+def extract_lean_code(text: str) -> str:
+    """从 LLM 输出里抽 Lean 代码。没围栏时, 只要看着像 Lean 就整段当代码。"""
+    if not text:
+        return ""
+    m = _LEAN_FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    s = text.strip()
+    if re.search(r"^\s*(?:import|theorem|example|lemma|axiom|#print)",
+                 s, re.MULTILINE):
+        return s
+    return ""
+
+
+def _generate_lean(
+    claim: str,
+    scope: str,
+    *,
+    retry_context: str = "",
+    timeout: int = 180,
+) -> tuple[str, str]:
+    """调 LLM 生成 Lean 证明。返回 (lean_code, raw)。"""
+    raw = _call_llm(
+        build_lean_prompt(claim, scope, retry_context),
+        temperature=0.1,       # 形式化代码更不能发挥
+        top_p=0.8,
+        max_tokens=4000,
+        timeout=timeout,
+    )
+    return extract_lean_code(raw), raw
+
+
+#: 证据强度排序 —— 「更好」= 结论更确定。
+#: refuted 排在 proved 后面而不是前面: 两者都是**定论**, 但一道题"被证伪"往往
+#: 意味着工具没能理解命题, 而"被证明"更可能是真的完成了任务。
+#: 真正的反例会带着具体见证值, 那是另一种信号, 不靠这个排序表达。
+_VERDICT_RANK = {
+    "proved": 5,
+    "refuted": 4,
+    "partial": 3,
+    "inconclusive": 2,
+    "untested": 1,
+    "failed": 0,
+}
+
+
+def _better_evidence(a: dict | None, b: dict | None) -> dict | None:
+    """两条证据里挑更好的那条(强度相同时取后一条, 保留最新的修正)。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    ra = _VERDICT_RANK.get(a.get("verdict", ""), -1)
+    rb = _VERDICT_RANK.get(b.get("verdict", ""), -1)
+    return b if rb >= ra else a
+
+
+# ============================================================
+# Lean 硬路由 —— 形式化命题根本不该走 Python
+# ============================================================
+def _verify_via_lean(
+    claim: str,
+    ws: ResearchWorkspace,
+    *,
+    scope: str = "",
+    claim_id: str = "",
+    max_try: int | None = None,
+    llm_timeout: int = 300,
+    lean_timeout: int = 900,
+) -> dict[str, Any]:
+    """
+    形式化命题走 Lean kernel, 不生成 Python。
+
+    ★ 为什么是硬路由而不是「LLM 自己选」★
+    2026-10-08 V2 实测: hard-015/016 明确要求 Lean, 但链路只会生成 Python,
+    LLM 于是用 sympy 硬凑 —— hard-016 最后输出的是一个「有界枚举 + 循环论证」
+    的**假 PROVED**。它不是不会 Lean, 是**根本没有 Lean 这条路可选**。
+    跟 research_z3/research_enumerate 从不被调用是同一个病: 能力缺路由。
+
+    ★ 判定 = Lean 的四件套, 缺一不可 ★
+        exit_code == 0  且  无 ": error:"  且  无 sorry  且  无 sorryAx/自带 axiom
+    只看退出码会把 `by sorry` 判成 proved —— 编译器对 sorry 只报 warning。
+
+    重试策略: Lean 的编译器报错是**极其精确**的(unknown constant 会告诉你在哪),
+    所以每次失败都把报错原文喂回去, 基本两三轮就能收敛。
+    """
+    attempts = ws.load_attempts()
+    _u_before = usage_snapshot()
+    used_llm = 0
+    last: dict[str, Any] | None = None
+    limit = max_try if max_try is not None else RESEARCH_MAX_RETRY + 1
+    blocked_reason = ""
+
+    for attempt in range(limit):
+        ws.set_status(phase="verify_lean", step=attempt + 1, total=limit,
+                      message=f"Lean 形式化 {claim[:50]}")
+        retry_ctx = format_attempts(attempts)
+        code, raw = _generate_lean(claim, scope, retry_context=retry_ctx,
+                                   timeout=llm_timeout)
+        used_llm += 1
+        if not code:
+            if _is_blocked(raw):
+                blocked_reason = raw[:300]
+                break
+            attempts.append({"attempt": attempt, "error_type": "NoLeanCode",
+                             "stderr": f"LLM 没输出 Lean 代码:\n{raw[:500]}"})
+            ws.append_attempt(attempts[-1])
+            continue
+
+        res = check_lean(code, timeout=lean_timeout)
+        proved = bool(res.get("proved"))
+        # 形式化后端不产出 VERDICT 标记 —— Lean kernel 本身就是判定者。
+        verdict = "proved" if proved else "inconclusive"
+        why = _lean_reason(res)
+
+        last = build_evidence(
+            ws.evidence_count() + 1,
+            kind="lean",
+            verdict=verdict,
+            reason=why,
+            code=code,
+            stdout=res.get("output", "")[-4000:],
+            stderr="\n".join(res.get("errors", [])[:10]),
+            elapsed_ms=0,
+            claim_id=claim_id,
+            extra={"attempt": attempt + 1, "how": "lean",
+                   "scope": scope, "mathlib": res.get("mathlib")},
+        )
+        ws.append_evidence(last)
+        if proved:
+            break
+        # 把编译器原文喂回去重试 —— Lean 的报错精确, 这是最高效的反馈回路
+        attempts.append({
+            "attempt": attempt,
+            "error_type": why[:120],
+            "stdout": res.get("output", "")[-1200:],
+            "stderr": "\n".join(res.get("errors", [])[:10])[:1500],
+            "claim_id": claim_id,
+        })
+        ws.append_attempt(attempts[-1])
+
+    _u_after = usage_snapshot()
+    if blocked_reason:
+        return {"ok": False, "verdict": "blocked", "blocked": True,
+                "blocked_reason": blocked_reason, "evidence": [],
+                "all_evidence_ids": [], "backend": "lean",
+                "summary": f"请求被上游阻断, 没有真的跑过: {blocked_reason}",
+                "attempt_count": len(attempts), "workspace": str(ws.path),
+                "env": {},
+                "cost": {"tokens": _u_after["total_tokens"] - _u_before["total_tokens"],
+                         "llm_calls": used_llm, "elapsed_ms": 0}}
+    if last is None:
+        return {"ok": False, "verdict": "untested", "evidence": [],
+                "all_evidence_ids": [], "backend": "lean",
+                "summary": "Lean 后端没有产出任何证据",
+                "attempt_count": len(attempts), "workspace": str(ws.path),
+                "env": {}, "cost": {"tokens": 0, "llm_calls": used_llm,
+                                    "elapsed_ms": 0}}
+    return {
+        "ok": last["verdict"] == "proved",
+        "verdict": last["verdict"],
+        "evidence": [last],
+        "all_evidence_ids": [last.get("id")],
+        "backend": "lean",
+        "summary": last["reason"],
+        "attempt_count": len(attempts),
+        "workspace": str(ws.path),
+        "env": last.get("env", {}),
+        "cost": {"tokens": _u_after["total_tokens"] - _u_before["total_tokens"],
+                 "llm_calls": used_llm, "elapsed_ms": 0},
+    }
+
+
+def _lean_reason(res: dict[str, Any]) -> str:
+    """把 Lean 检查结果翻成一句给 LLM 看的话。"""
+    if not res.get("available"):
+        return "Lean 不可用 —— 不能用它做机器判定"
+    if res.get("proved"):
+        return ("Lean kernel 编译通过: 退出码 0, 无 error, 无 sorry, "
+                "公理审计无 sorryAx —— 证明成立")
+    bits = []
+    if res.get("timed_out") or res.get("exit_code") == -2:
+        bits.append("编译超时")
+    if res.get("errors"):
+        bits.append(f"{len(res['errors'])} 处编译错误")
+    if res.get("sorry_used"):
+        bits.append("用了 sorry 或 axiom(等于没证)")
+    return "Lean 未证成: " + "、".join(bits or ["未知原因"])
 
 
 # ============================================================
@@ -148,8 +356,20 @@ def research_verify(
     cid = claim_id_for(claim, scope)
     ws.append_spec({"claim_text": claim, "scope": scope, "how": how, "claim_id": cid})
 
+    # ★ Lean 硬路由 ★
+    # 命题点名 Lean/Mathlib 时, 走形式化后端, **不生成 Python**。
+    # 没装 Mathlib 时如实说明并回落 Python —— 但要在返回里说清楚走的是哪条路,
+    # 不能让调用方以为"已经形式化验证过了"。
+    if needs_lean(claim):
+        if mathlib_available():
+            return _verify_via_lean(claim, ws, scope=scope, claim_id=cid)
+        logger.warning(
+            "[research_verify] 命题要求形式化, 但 Mathlib 不可用, 回落 Python。"
+            "注意: 这**不构成形式化证明**。")
+
     attempts = ws.load_attempts()
     last_ev: dict[str, Any] | None = None
+    best_ev: dict[str, Any] | None = None
     used_llm = 0
     blocked_reason = ""     # 上游阻断(cost_guard/限流)时的原因; 非空 = 压根没跑
     # 成本要真数字。之前 cost.tokens 硬编码 0 —— 成本统计骗人会让人以为
@@ -213,19 +433,75 @@ def research_verify(
             purpose=f"verify: {claim[:80]}",
             timeout=timeout,
             claim_id=cid,
+            claim=claim,
             extra={"attempt": attempt + 1, "how": how, "scope": scope},
         )
         last_ev = ev
 
+        # ★ 保留**历史最好**的一条, 不是最后一条 ★
+        #
+        # 为什么: 2026-10-08 V2 实跑发现 BBP 与 100 皇后是**时好时坏**的 ——
+        # 同一道题, 有时第 3 轮就 PROVED, 有时烧完 6 轮还是 failed。
+        # 只看最后一次, 意味着「第 3 轮明明做对了, 却因为第 6 轮崩了而被记成失败」。
+        # 这不是保守, 是**丢掉已经拿到手的证据**。
+        #
+        # 取"最好"是安全的, 因为每一条都过了机器门 —— 门不认的结论根本没进来。
+        # 排序即证据强度: proved > refuted > partial > inconclusive > failed/untested。
+        best_ev = _better_evidence(best_ev, ev)
+
         verdict = ev["verdict"]
-        # 只有 failed 才值得让 LLM 改 —— untested 是"代码没写标记",
+        # ★ 只有 failed 才值得让 LLM 改 —— untested 是"代码没写标记",
         # 重试同样代码没用(那是 prompt 问题, P2 的 research_audit 再查)
-        if verdict != "failed":
+        #
+        # ★★ 机器门推翻了 LLM 的声明时, 必须重试 ★★
+        # 2026-10-08 加。机器门(R1 有限枚举冒充全域 / R2 循环论证 /
+        # REFUTED 三层见证值检查)会给出一段**很具体的**理由("你只查了
+        # |p|,|q|<=200"、"你把 sqrt(2) 是无理数当前提用了"、"那个参考值
+        # 是源码里的字面量")。这段理由是机器给的, 比"再试一次"有用得多。
+        #
+        # ⚠️ 三种触发条件, 区别很关键, 不能一刀切 ★
+        #
+        #  (a) failed            —— 代码没跑成, 重试无争议
+        #  (b) machine_overrode  —— 机器推翻了 LLM 的声明, 有客观缺陷
+        #  (c) inconclusive      —— LLM 自己说"定不了"
+        #
+        # **(partial 不重试)**。sqrt2 那道事故就是这么来的:
+        # attempt 1 老老实实判 PARTIAL, 重试时被推着升级成假的 PROVED。
+        # partial 是一个**诚实的、有边界的**结论, 重试它等于逼模型多要一点,
+        # 而多要的那一点往往不是多算了, 是多说了一句。禁掉。
+        #
+        # ★ 但「自己判的 partial」和「机器降下来的 partial」必须分开 ★
+        # 条件写的是 `declared != verdict`, 所以:
+        #   自己判 partial  -> declared == verdict     -> machine_overrode=False -> break
+        #   机器把 REFUTED 降成 partial(R3 靶子错了)
+        #                   -> declared != verdict     -> machine_overrode=True  -> **重试**
+        # 后者恰恰**需要**重试, 因为它身上带着一个客观缺陷:
+        # 实测(2026-10-08 V2 hard-011 Petersen 色数) z3 已经证成了「不能 2 着色」,
+        # 整体却判了 REFUTED, R3 降成 partial —— 此时缺的是把 3 着色构造修好,
+        # 而机器给的判词("输出自相矛盾")会原样喂回去。停在 partial 就再也修不了。
+        #
+        # 但 (c) 必须重试。V2 hard-001 Pell: 它的代码算出「所有正整数解: []」
+        # 然后判 INCONCLUSIVE —— 这是**实现错了却没能自我怀疑**(真解是
+        # x=1766319049, y=226153980)。inconclusive 没有任何虚假声明需要保护,
+        # 而且它自己的 stdout 就在上下文里, 重试时 LLM 能看到那个空结果并改对。
+        # 唯一的风险是烧 token, 而每次尝试都过机器门, 门不认的结论流不下去。
+        declared, _raw_marker = extract_verdict_marker(ev.get("stdout", ""))
+        machine_overrode = declared is not None and declared != verdict
+        gave_up = verdict == "inconclusive"
+
+        # 重试 = (跑挂了) 或 (机器推翻了它) 或 (它自己说定不了)。
+        # 除此之外一律 break —— 尤其是它自己给了 partial。
+        if not (verdict == "failed" or machine_overrode or gave_up):
             break
 
         attempts.append({
             "attempt": attempt,
-            "error_type": ev.get("reason", "")[:60],
+            # machine_overrode 时, reason 就是**机器的判决理由**, 直接当反馈喂回去
+            "error_type": ("MachineGate: " + ev.get("reason", ""))[:120]
+            if machine_overrode else ev.get("reason", "")[:60],
+            "declared_by_llm": declared,
+            "judged_by_machine": verdict,
+            "gave_up_by_llm": gave_up,
             "stdout": ev.get("stdout", "")[-800:],
             "stderr": ev.get("stderr", "")[-1500:],
             "claim_id": cid,
@@ -237,7 +513,12 @@ def research_verify(
     # ---- 3. 汇总 ----
     all_ev = ws.load_evidence()
     _u_after = usage_snapshot()
-    verdict = last_ev["verdict"] if last_ev else "inconclusive"
+    # ★ 汇总用**最好的一条**, 不是最后一条 ★
+    # 见 _better_evidence: BBP / 100 皇后实测时好时坏, 只看最后一次会
+    # 把「第 3 轮已经 PROVED」的结果记成「第 6 轮崩了」。证据都在 _evidence.jsonl 里,
+    # 一条都没丢, 只是报告该引用哪一条的问题。
+    final_ev = best_ev or last_ev
+    verdict = final_ev["verdict"] if final_ev else "inconclusive"
     if verdict not in VERDICTS:      # 防御: judge_verdict 已保证合法, 这里兜底
         verdict = "untested"
 
@@ -268,17 +549,17 @@ def research_verify(
     return {
         "ok": verdict in ("proved", "refuted"),
         "verdict": verdict,
-        "evidence": [last_ev] if last_ev else [],
+        "evidence": [final_ev] if final_ev else [],
         "all_evidence_ids": [e.get("id") for e in all_ev],
-        "summary": last_ev["reason"] if last_ev else "没有产出任何证据",
+        "summary": final_ev["reason"] if final_ev else "没有产出任何证据",
         "attempt_count": len(attempts),
         "workspace": str(ws.path),
-        "env": last_ev.get("env", {}) if last_ev else {},
+        "env": final_ev.get("env", {}) if final_ev else {},
         "cost": {
             "tokens": _u_after["total_tokens"] - _u_before["total_tokens"],
             "prompt_tokens": _u_after["prompt_tokens"] - _u_before["prompt_tokens"],
             "completion_tokens": _u_after["completion_tokens"] - _u_before["completion_tokens"],
             "llm_calls": used_llm,
-            "elapsed_ms": last_ev.get("elapsed_ms", 0) if last_ev else 0,
+            "elapsed_ms": final_ev.get("elapsed_ms", 0) if final_ev else 0,
         },
     }
