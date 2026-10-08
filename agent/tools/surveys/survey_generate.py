@@ -47,7 +47,11 @@ logger = logging.getLogger(__name__)
 # **改了任何 prompt 常量 / 阶段顺序 / 合并逻辑, 就把这个日期往后挪一天。**
 # 代价是所有现存 checkpoint 作废(从头重跑一次); 不挪的代价是静默产出
 # 上一个版本的结论。后者贵得多。
-PROMPT_VERSION = "2026-10-07b"
+# 10-08: fact 抽取 prompt 加了"本篇独有性"铁律(见 prompts_survey
+# SURVEY_FACT_PROMPT 第 6 条)—— 抽 fact 时避开转述他人和纯定义型内容。
+# 不动 JSON schema, 所以老 fact 仍可读; 但**抽 fact 这步**的产物语义变了,
+# 版本号必须跟着走, 否则复跑/续跑会拿同一个版本号跑出不同的 fact。
+PROMPT_VERSION = "2026-10-08"
 
 
 @register_tool(name="survey_generate", is_streaming=True, cost_tier="L2")
@@ -493,7 +497,8 @@ def _phase_macros(ws, theme_map: dict[str, Any]):
 # ============================================================
 
 def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
-                  from_stage: str, sig: str):
+                  from_stage: str, sig: str,
+                  paper_titles: dict[str, str] | None = None):
     """主题 -> (技术路线) -> 命题。产出 (claims, from_stage)。
 
     缺这一层, 综述就没有"综": fact 逐条成句、逐条挂引用, 同一篇论文在一段话里
@@ -536,7 +541,9 @@ def _phase_claims(ws, usable: list[dict[str, Any]], theme_map: dict[str, Any],
         yield "\n🔗 归纳技术路线并合并成命题...\n"
         from ._organize import condense_facts_by_paradigm, condense_facts_by_theme
         try:
-            claims, paradigms = condense_facts_by_paradigm(usable, theme_map)
+            claims, paradigms = condense_facts_by_paradigm(
+                usable, theme_map, paper_titles=paper_titles,
+            )
         except Exception as e:
             logger.warning("[organize] 范式层异常, 退回主题合并: %s", e)
             claims, paradigms = [], {}
@@ -896,8 +903,12 @@ def _run_organize_phase(topic: str, ws, topic_hash: str, max_pool: int = 50,
             yield f"   ⚠ {w}\n"
 
     # ---- Phase B2: 命题合并 (9-30 加, 10-03 改成范式层) ----
+    # 10-08: 把论文标题传下去 —— 支撑判定("这篇是在提出还是在使用那个技术")
+    # 靠标题判断最准, "A Bayesian analysis of classical shadows" 本身就说清了。
     claims, from_stage = yield from _phase_claims(
-        ws, usable, theme_map, from_stage, _sig)
+        ws, usable, theme_map, from_stage, _sig,
+        paper_titles={p["paper_id"]: (p.get("title") or "") for p in pool},
+    )
 
     # ---- Phase C: 逐主题写叙述 ----
     yield "\n✍️ 按主题写叙述...\n"
