@@ -327,6 +327,35 @@ def _agreement(results: list[dict], tol: float = 1e-6) -> tuple[int, int, str]:
             f"{n_good} 条 lane 交出的数值结论**互不相符** —— 答案存疑")
 
 
+#: 答案短于这个长度且全是占位内容 -> 不算"真交出了东西"
+PLACEHOLDER_MAX = 40
+_PLACEHOLDER_PAT = re.compile(
+    r"^\s*(?:\.{2,}|…+|-+)?\s*(?:你的?答案|答案|your\s+answer|answer|"
+    r"结果|result|待定|todo|n/?a|null|none)\s*(?:\.{2,}|…+)?\s*$",
+    re.IGNORECASE)
+
+
+def _is_placeholder(result: dict) -> bool:
+    """这条 lane 交出来的是不是"占位符"而不是内容?
+
+    ★ 要害 ★ `has_artifact=True` 只说明 worker 自己认为做完了。
+      实测 2026-10-11 oeis-03: 三条 lane 都 has_artifact, 但其中一条的
+      制品是字面的 `"..."` —— 我按序号取第一条, **恰好选中了它**。
+
+    ⇒ 这里只判"有没有内容", 不判内容对不对(那是 `_agreement` 的事)。
+    """
+    art = result.get("artifact") or {}
+    if not isinstance(art, dict):
+        return True
+    txt = str(art.get("answer") or "").strip()
+    if not txt:
+        return True
+    if len(txt) <= PLACEHOLDER_MAX and _PLACEHOLDER_PAT.match(txt):
+        return True
+    return bool(len(txt) <= PLACEHOLDER_MAX
+                and re.fullmatch(r"[.。…\s\-]+", txt))
+
+
 def lane_trace_fields() -> tuple[str, ...]:
     """lane 的 worker trace 条目必须带的字段。
 
@@ -537,16 +566,37 @@ def solve_d(problem: str, *, hints: str | None = None,
                     "lesson_given": True})
                 continue
 
+            # ★★ 先**剔除占位符答案**, 再选 ★★
+            #   实测 2026-10-11 oeis-03-candidates: 三条 lane 都"交出了制品",
+            #   但 trace 里 lane0 的 制品预览 就是字面的 "..."(它调了 4 次
+            #   oeis_lookup 撞了两次 stall, 收尾只写了半句话), 而 lane1/lane2
+            #   各 1~2 次就交出了完整答案。
+            #   ★ 我原来写 `best = good[0]` —— 按 lane 序号取第一条,
+            #     **恰好选中了最差的那条**, 于是整题被判错。
+            #
+            #   `has_artifact` 只说明 worker 自己认为做完了, 不代表交出了
+            #   **内容**。三选的失败形态实测有两种: "..." / "你的答案" / 空。
+            #   ⇒ 选之前先按内容分类, 占位符的一律不选。
+            real = [r for r in good if not _is_placeholder(r)]
+            if real:
+                good = real
+                dropped = len([r for r in results
+                               if r.get("has_artifact") and r.get("artifact")
+                               and _is_placeholder(r)])
+                if dropped:
+                    trace.append({
+                        "turn": turn, "role": "note", "action": None,
+                        "outcome": f"{dropped} 条 lane 交出的是占位符"
+                                   f"('...' / '你的答案' / 空), 已剔除",
+                        "lesson": None, "lesson_given": False})
+
             # ★ 多条 lane 都交出: 用**交叉验证**决定这条答案有多可信 ★
-            #   `has_artifact` 只说明 worker 自己认为做完了, **不代表对**。
-            #   没有可用 Verifier 时, lane 之间互不可见这一点恰好白送了
-            #   一个交叉验证的机会 —— 几条 lane 独立算出**同一个数**,
-            #   这条证据比"某条 lane 说的"强得多。
+            #   lane 之间互不可见这一点白送了交叉验证的机会 ——
+            #   几条 lane 独立算出**同一个数**, 这证据比"某条 lane 说的"强。
             agree_n, n_good, agree_why = _agreement(results)
             disputed = bool(n_good >= 2 and agree_n < 2)
 
-            #   多条都交出时取 lane 序号最小的那条 —— 可复现。
-            #   (不是"最快那条": 结果没带完成时间戳, 按序取才可复现。)
+            #   剔除占位符后取 lane 序号最小的那条 —— 可复现。
             best = good[0]
             art = best.get("artifact")
             if not verify:
