@@ -275,8 +275,33 @@ def _digest_one(tool: str, args: dict, obs) -> dict:
     if not isinstance(obs, dict):
         return {"tool": tool, "ok": None, "value": str(obs)[:120]}
     d = {"tool": tool, "ok": obs.get("ok")}
+    # ★ Lean 类工具用 `proved` 表达成败, **不填 `ok`** ——
+    #   于是 findings 里 ok=None, brief() 数成"0 次成功", 看着像全失败。
+    #   ⇒ `ok` 缺失时用 `proved` 兜底。
+    if d["ok"] is None and "proved" in obs:
+        d["ok"] = bool(obs.get("proved"))
     if obs.get("error_type"):
         d["error"] = f"{obs.get('error_type')}: {str(obs.get('error'))[:90]}"
+    # ★★ 编译/求解类工具**失败时必须带回"为什么" ★★
+    #   实测 2026-10-11 part1 的 lean-02: D 调了 11 次 `lean_check` 全失败,
+    #   而 `LeanResult` 明明有 `errors` / `output` 字段(docstring 原话:
+    #   "完整输出, 供回传给 LLM 修") —— 但这个函数只把 `proved=False`
+    #   那一行留下, **错误信息全被截掉了**。
+    #   于是 worker 只看到"没过", 不知道"为什么没过", 只能盲改盲试,
+    #   408 秒烧光。同一道题 B 59 秒一次就过(它的证明本来就对)。
+    #
+    #   ⇒ 失败优先把 `errors` / `error` 原文带回来。**成功时才只留布尔值**
+    #     —— 成功不需要解释, 失败才需要。
+    if obs.get("ok") is False or obs.get("proved") is False:
+        errs = obs.get("errors")
+        if isinstance(errs, list) and errs:
+            d["error"] = "编译报错: " + " | ".join(
+                str(e).strip().splitlines()[0][:90] for e in errs[:3])
+        elif obs.get("output"):
+            lines = [x for x in str(obs["output"]).strip().splitlines()
+                     if x.strip()][:3]
+            if lines:
+                d["error"] = "输出: " + " | ".join(x[:90] for x in lines)
     for k in ("status", "proved", "found", "n_candidates", "n_classes",
               "elapsed_ms"):
         if k in obs and obs[k] is not None:
@@ -588,7 +613,13 @@ def brief(r: WorkerResult, limit: int = 900) -> str:
     bits = []
     calls = r.get("tool_calls") or []
     if calls:
-        ok = sum(1 for c in calls if c.get("ok"))
+        # ★ 成功要认 `ok` **和** `proved` ★
+        #   Lean 工具成功时不填 `ok`(它用 `proved` 表达), 于是这里永远数出
+        #   "0 次成功" —— 实测 lean-02 重跑时 findings 明明 proved=True,
+        #   摘要却写「调了 1 次工具(0 次成功)」。看着像失败, 排查时会被带偏。
+        def _succeeded(c) -> bool:
+            return bool(c.get("ok")) or c.get("proved") is True
+        ok = sum(1 for c in calls if _succeeded(c))
         bits.append(f"调了 {len(calls)} 次工具({ok} 次成功): "
                     + ", ".join(c.get("tool", "?") for c in calls[-6:]))
     else:
