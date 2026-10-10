@@ -37,8 +37,9 @@ worker 去干同一件事。
 from __future__ import annotations
 
 import os
+import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable
 
 _HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -220,27 +221,110 @@ def run_lanes(runners: list[Callable[..., dict]],
     # ★ max_workers 默认 = lane 数, 不能更小 ★
     #   设成 1 就退化成串行, 而那正是我们想防的失败模式。
     mw = max_workers or len(wrapped)
-    with ThreadPoolExecutor(max_workers=mw) as pool:
-        futs = [pool.submit(f) for f in wrapped]
-        out: list[dict] = []
-        for i, fu in enumerate(futs):
-            try:
-                r = fu.result()
-            except Exception as e:  # noqa: BLE001
-                # ★ 一条 lane 崩了**不能带崩整轮** ★
-                #   并行的意义就是"三条路总有一条通" ——
-                #   若第一条异常就把整轮扔掉, 并行反而比串行更脆。
-                r = {"has_artifact": False,
-                     "error": f"{type(e).__name__}: {e}"}
-            # ★ lane 编号**必须显式写** ★
-            #   WorkerResult 是 dict 子类, 它自己**没有** lane 键,
-            #   而我 `futs` 是按提交顺序建的, `i` 就是 lane 号。
-            #   (第一版漏了这行, 于是 note 里出现 `laneNone` ——
-            #    不影响判决, 但 trace 与日志都丢了"是哪一路"的信息。)
-            r["lane"] = i
-            r["_concurrent"] = state["max"]
-            out.append(r)
+    pool = ThreadPoolExecutor(max_workers=mw)
+    futs = {pool.submit(f): i for i, f in enumerate(wrapped)}
+    out: list[dict] = []
+    try:
+        # ★★ 早到的直接赢, 不等全部 ★★
+        #   第一版是 `for fu in futs: fu.result()` —— 那等价于"全部到齐再看",
+        #   于是 `with ThreadPoolExecutor` 退出时 shutdown(wait=True)
+        #   **把三条 lane 全等完**。后果实测很明显: D 平均 233s/题,
+        #   比 B 的串行还慢 —— 因为 lane0 早就交出答案, 却在陪 lane1/lane2
+        #   烧完各自的 8 步预算。
+        #
+        #   ⇒ 并行的全部价值就是"先到先赢"。这里改成: 任何一条 lane
+        #     **交出制品**就立即返回, 剩下的设成守护线程、不 join。
+        while futs:
+            done, _ = wait(futs, return_when=FIRST_COMPLETED)
+            for fu in done:
+                i = futs.pop(fu)
+                try:
+                    r = fu.result()
+                except Exception as e:  # noqa: BLE001
+                    # ★ 一条 lane 崩了**不能带崩整轮** ★
+                    #   并行的意义就是"三条路总有一条通" ——
+                    #   若第一条异常就把整轮扔掉, 并行反而比串行更脆。
+                    r = {"has_artifact": False,
+                         "error": f"{type(e).__name__}: {e}"}
+                # ★ lane 编号**必须显式写** ★
+                #   WorkerResult 是 dict 子类, 它自己**没有** lane 键,
+                #   而 `i` 就是 lane 号。
+                #   (第一版漏了这行, 于是 note 里出现 `laneNone` ——
+                #    不影响判决, 但 trace 与日志都丢了"是哪一路"的信息。)
+                r["lane"] = i
+                r["_concurrent"] = state["max"]
+                out.append(r)
+            # ★★ 不早退 ★★
+            #   我一度改成"任何 lane 交出制品就立刻返回"想省墙钟时间 —— 那是错的:
+            #   `has_artifact` 只说明 worker **自己认为**做完了, 不代表答案对。
+            #   实测 res-08 就是 C 路线交出了答案但判 WRONG。
+            #   早退等于"lane0 交出一个错答案, lane1 正在算对的, 我不等它",
+            #   拿正确率去赌速度。
+            #   ⇒ 等全部跑完, 再用 `_agreement` 交叉检查。
+            #     并行的真正红利不是"同时跑", 是**天然产生冗余证据**。
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    for r in out:
+        r.setdefault("_concurrent", state["max"])
     return out
+
+
+def _nums_in(text: str) -> set[float]:
+    out: set[float] = set()
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", text or ""):
+        try:
+            out.add(float(m.group(0)))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _agreement(results: list[dict], tol: float = 1e-6) -> tuple[int, int, str]:
+    """几条 lane 的结论**数值上是否一致** —— 并行白送的交叉检查。
+
+    ★ 为什么需要它 ★
+      `has_artifact=True` 只说明 worker **自己认为**做完了, **不代表对**。
+      实测 res-08 就是交出了答案但判 WRONG。
+      没有 Verifier 时(它的检查程序 0/2 验过, 不可用), 我们没有任何
+      信号说"这条答案是不是真的"。
+
+    ★ 并行的红利就在这里 ★
+      三条 lane **独立**解同一道题, 却**互相看不见** ——
+      所以它们一致时的一致, 是真的交叉验证, 不是抄的。
+      这是零成本的冗余证据, 不加白不加。
+
+    ⇒ 一致且 >=2 条交出 -> 高置信; 不一致 -> 标 disputed,
+      让分数**可解释**(不是"某条 lane 说的", 而是"几条 lane 都这么说")。
+
+    返回 (一致的 lane 数, 交出制品的 lane 数, 文字描述)。
+    """
+    good = [r for r in results
+            if r.get("has_artifact") and isinstance(r.get("artifact"), dict)]
+    n_good = len(good)
+    if n_good < 2:
+        return (0, n_good, f"只有 {n_good} 条 lane 交出制品, 无从交叉验证")
+    sets = [_nums_in(str(r["artifact"].get("answer") or ""))
+            for r in good]
+    # 以**数字最多**的那条为基准(信息量最大), 看别的 lane 有多少比例命中
+    base_i = max(range(len(sets)), key=lambda i: len(sets[i]))
+    base = sets[base_i]
+    if not base:
+        return (0, n_good, "交出的答案里没有可比对的数值")
+    agree = 1
+    for i, s in enumerate(sets):
+        if i == base_i:
+            continue
+        if not s:
+            continue
+        hit = sum(1 for v in s if any(abs(v - b) <= tol * max(1.0, abs(b))
+                                      for b in base))
+        if hit / len(s) >= 0.8:
+            agree += 1
+    if agree >= 2:
+        return (agree, n_good,
+                f"{agree}/{n_good} 条 lane 的数值结论一致 —— 交叉验证通过")
+    return (1, n_good,
+            f"{n_good} 条 lane 交出的数值结论**互不相符** —— 答案存疑")
 
 
 def lane_trace_fields() -> tuple[str, ...]:
@@ -274,6 +358,10 @@ def _lanes_from_plan(pl: dict) -> list[Lane]:
     intents = spec.get("intents")
     if not isinstance(intents, list):
         intents = []
+    # ★ explorer 决定开几条, 但**上限 3**, 且**有 hints 时强制 1** ★
+    #   有 hints = 题面点名了工具 = 没有选择空间, 多开 lane 纯浪费,
+    #   还让交叉验证失效(都做同一件事,"一致"什么也证明不了)。
+    n = max(1, min(n, DEFAULT_LANES))
     return make_lanes(n, intents)
 
 
@@ -337,6 +425,18 @@ def solve_d(problem: str, *, hints: str | None = None,
                     "lesson": None, "lesson_given": False})
                 continue
 
+            # ★★ lane 数**只由 explorer 决定**, 我不做任何强制 ★★
+            #   上限 max_lanes(默认 3), 读不到就 1 条。
+            #
+            #   ★ 曾经的错: 我把 hints 变成"强制 1 lane" ★
+            #     那等于**剥夺 explorer 的第二次机会** —— lane 0 出问题时,
+            #     explorer 连"再加一条路"都做不到。而 explorer 本来就是
+            #     "看上一轮结果决定换不换路"这个角色, 强制恰好删掉了它。
+            #     简单题一条 lane 够用, **复杂题不够** —— 而我按简单题的
+            #     结论去限制复杂题, 是拿测试集的形状去卡设计。
+            #
+            #   ⇒ hints 里只**提一句**"这题大概一条 lane 就够", 让 explorer
+            #     自己判断; 它若看到 lane 0 走不通, 下一轮自己会开到 2/3 条。
             lanes = _lanes_from_plan(pl)[:max(1, int(max_lanes or 1))]
             action = pl.action
             trace.append({
@@ -345,6 +445,7 @@ def solve_d(problem: str, *, hints: str | None = None,
                 "rationale": pl.get("rationale"),
                 "lanes": [{"lane": x.idx, "intent": x.intent} for x in lanes],
                 "n_lanes": len(lanes),
+                "done": pl.get("done"),
                 "outcome": f"计划: {action}, 工具={pl.tools}, "
                            f"分派 {len(lanes)} 条 lane"})
             lanes_seen += len(lanes)
@@ -414,6 +515,19 @@ def solve_d(problem: str, *, hints: str | None = None,
             # ---- 4. 收制品: 任一 lane 交出就算这轮成功 ----
             good = [r for r in results
                     if r.get("has_artifact") and r.get("artifact")]
+
+            # ★ explorer 说 done 且这轮真交出了 -> 立刻收工, 别再开下一轮 ★
+            #   (2026-10-11 修正: 我把 `done` 字段**只记进 trace 却从不读它**,
+            #    于是 max_turns=3 总是被跑满 —— 第一轮就够的题也在空转后面两轮,
+            #    每轮又要开 lane 等它们跑完。这就是 D 慢的另一半原因。)
+            #   语义: explorer 在**上一轮之后**才说 done, 那时收工才有意义;
+            #   若它第一轮就 done, 说明它认为"这轮就能出答案", 出不出由结果决定。
+            if bool(pl.get("done")) and good:
+                trace.append({
+                    "turn": turn, "role": "note", "action": None,
+                    "outcome": "Explorer 判定 done 且本轮已交出制品 -> 收工, "
+                               "不再消耗剩余轮次",
+                    "lesson": None, "lesson_given": False})
             if not good:
                 trace.append({
                     "turn": turn, "role": "note", "action": None,
@@ -423,14 +537,21 @@ def solve_d(problem: str, *, hints: str | None = None,
                     "lesson_given": True})
                 continue
 
-            # ★ 多条 lane 都交出时, 取**最先跑完**的那条 ★
-            #   results 按 lane 序而非完成序返回, 所以这里按序取第一条 ——
-            #   可复现。若要"最快那条",得让 lane 带完成时间戳, 那是第二版的事。
+            # ★ 多条 lane 都交出: 用**交叉验证**决定这条答案有多可信 ★
+            #   `has_artifact` 只说明 worker 自己认为做完了, **不代表对**。
+            #   没有可用 Verifier 时, lane 之间互不可见这一点恰好白送了
+            #   一个交叉验证的机会 —— 几条 lane 独立算出**同一个数**,
+            #   这条证据比"某条 lane 说的"强得多。
+            agree_n, n_good, agree_why = _agreement(results)
+            disputed = bool(n_good >= 2 and agree_n < 2)
+
+            #   多条都交出时取 lane 序号最小的那条 —— 可复现。
+            #   (不是"最快那条": 结果没带完成时间戳, 按序取才可复现。)
             best = good[0]
             art = best.get("artifact")
             if not verify:
                 return {
-                    "verdict": "WORKER_ONLY",
+                    "verdict": "DISPUTED" if disputed else "WORKER_ONLY",
                     "artifact": art,
                     "evidence": None,
                     "trace": list(trace), "turns": budget.turns,
@@ -438,9 +559,14 @@ def solve_d(problem: str, *, hints: str | None = None,
                     "budget_exhausted": False,
                     "n_lanes": len(lanes), "lanes_seen": lanes_seen,
                     "concurrent": peak_conc,
+                    # ★ 交叉验证结果要随答案一起交出去 ★
+                    #   调用方据此就知道"这条答案有几条独立 lane 背书"。
+                    "agree": agree_n, "n_good": n_good,
+                    "agreement_note": agree_why,
                     "note": f"lane{best.get('lane')} 交出制品"
                             + (f"(共 {len(lanes)} 条 lane 并发)"
-                               if len(lanes) > 1 else ""),
+                               if len(lanes) > 1 else "")
+                            + f"。{agree_why}",
                 }
 
         return {

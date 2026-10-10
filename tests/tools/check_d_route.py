@@ -281,6 +281,71 @@ def test_b_prompt_unchanged() -> None:
     ck("不含 D 的分派指令", "lane" not in p.lower())
 
 
+def test_lane_count_decided_by_explorer() -> None:
+    """★ lane 数**由 explorer 决定**, hints 只能建议, 不能强制 ★
+
+    ★ 为什么这条必须钉死 ★
+      2026-10-11 我曾把 hints 做成"强制 1 lane", 理由是"题面点名了工具
+      就没有选择空间"。方向反了: 强制单 lane 等于**剥夺 explorer 的第二次
+      机会** —— lane 0 出问题时它连"再加一条路"都做不到。
+      简单题一条 lane 够用, **复杂题不够**; 拿测试集的形状去卡设计是错的。
+      Explorer 这个角色的存在意义就是"看上一轮结果决定换不换路"。
+
+    ⇒ 判据: explorer 写 n=1 就开 1 条, 写 n=3 就开 3 条 —— 不受 hints 影响。
+    """
+    print()
+    print("=" * 78)
+    print("防 6: lane 数由 explorer 决定 (hints 只建议, 不强制)")
+    print("=" * 78)
+
+    from agent.tools.research.roles import _util as U, worker as WK
+    import agent.tools.research.routes.d as Dmod
+
+    def run_with(n: int) -> int:
+        plan = ('{"read_first":"x","method":"m","tools":["numeric_code"],'
+                '"rationale":"r","next_action":"execute","probe_spec":null,'
+                '"done":true,"lanes":{"n":%d,"intents":["A","B","C"]}}' % n)
+        orig_ask, orig_exec, orig_probe = U.ask, WK.run_execute, WK.run_probe
+        seen = {"n_lanes": 0}
+
+        def fake_exec(problem, plan_, scratch_dir, **_kw):
+            return _FakeWorkerResult({
+                "ran": True, "tool_calls": [], "lang": "tool",
+                "scratch": scratch_dir, "error_type": None, "stderr": "",
+                "has_artifact": True,
+                "artifact": {"answer": "x", "reason": "y"},
+                "shape_problems": [], "switches": [], "findings": {},
+                "final_answer": "x", "stripped_self_claims": []})
+
+        try:
+            U.ask = lambda p, **_k: plan
+            WK.run_execute = fake_exec
+            WK.run_probe = fake_exec
+            res = Dmod.solve_d("题面", hints="用 numeric_code",
+                               budget=U.Budget(max_turns=1), verbose=False,
+                               verify=False, provider="minimax",
+                               model="MiniMax-M3.1-Flash-Preview")
+            # ★ 数 explorer trace 里的 n_lanes, **不要**数 prompt ★
+            #   每条 lane 是**独立并发调用**一次 run_execute, 每次只带
+            #   **自己那一条**的 prompt —— 所以"每次调用里出现 1 个 lane 标记"
+            #   恰恰是正确的。★ 我第一版就是这么数的, 于是误判成"被压制成 1" ★
+            for t in (res.get("trace") or []):
+                if t.get("role") == "explorer":
+                    seen["n_lanes"] = int(t.get("n_lanes") or 0)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [!! ] solve_d 抛异常 {type(e).__name__}: {e}")
+            FAILS.append("solve_d 抛异常")
+        finally:
+            U.ask = orig_ask
+            WK.run_execute, WK.run_probe = orig_exec, orig_probe
+        return seen["n_lanes"]
+
+    n1, n3 = run_with(1), run_with(3)
+    ck("explorer 要 1 条 -> 开 1 条", n1 == 1, f"实际 {n1}")
+    ck("explorer 要 3 条 -> 开 3 条(即使有 hints)", n3 == 3,
+       f"实际 {n3} —— 有 hints 也不该压制 explorer 加 lane")
+
+
 def main() -> int:
     print("=" * 78)
     print("D 路线契约检查 (并行 worker + hints)")
@@ -291,6 +356,7 @@ def main() -> int:
     test_trace_and_b_untouched()
     test_b_prompt_unchanged()
     test_orchestration_end_to_end()
+    test_lane_count_decided_by_explorer()
 
     print()
     print("=" * 78)
