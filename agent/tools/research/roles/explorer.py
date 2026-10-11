@@ -94,8 +94,17 @@ class Plan(dict):
 
 
 def plan_prompt(problem: str, history: list[dict] | None = None,
-                tools: list[dict] | None = None) -> str:
-    cat = render_catalog(tools)
+                tools: list[dict] | None = None,
+                catalog: str | None = None) -> str:
+    # ★ `catalog` 形参是**给 D1 用的旁路**, 默认 None 走原路径 ★
+    #   实测 2026-10-11: Explorer 的 prompt 中位 **21518 字符**, 其中
+    #   catalog(全量) 占 **93.6%** —— 而 Explorer **只选路、不调工具**,
+    #   参数 schema 是给 Worker 用的, 对它是纯噪声。
+    #
+    #   但这里**不能**默认改成简述: B/C/D 三条路线都走这个函数,
+    #   改了它们的选路质量就跟着变, 而它们是对照组。
+    #   ⇒ 做成可选旁路, 只有 D1 显式传值时才生效。
+    cat = catalog if catalog is not None else render_catalog(tools)
     hist = ""
     if history:
         rows = []

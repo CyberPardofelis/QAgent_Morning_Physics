@@ -1,0 +1,49 @@
+修 B 路线的 probe 陷阱: 连续 probe 会把预算烧光
+
+## 现象 (实测 2026-10-10, part2 零提示 20 题, B 路线)
+
+B 路线的 6 道"没交出答案"里, **有 2 道全程只 probe、0 次工具调用**:
+res-09-tsp-200、res-19-bifurcation-rossler。
+
+trace 统计:
+    Explorer 动作 = execute 20 次 / probe 8 次 / None 4 次
+    Worker 错误   = UnparsedOutput 12 次(压倒性第一) / GaveUp 1 / RanOutOfSteps 2
+
+## 根因: probe 是个陷阱, 不是收敛机制弱
+
+probe(小规模试验)模式下 Worker **不强制交 final** —— 那是设计意图,
+小规模试验本来就不该交答案。于是形成死循环:
+
+    probe -> 没交出制品 -> orchestrator continue
+         -> Explorer 又说"我还不确定, 先 probe"
+         -> 预算在 probe<->probe 之间烧光, 一件制品都没有
+
+预算只有 `max_turns=3`, **两轮 probe 就烧掉 2/3**。
+
+res-09 的 6 轮里 5 轮是 probe, `tool_calls` 全空, **stall 检测一次都没触发**
+—— 因为它压根没进 execute 循环。
+
+## 修法: 连续 probe 不超过 1 次, 第二次强制 execute
+
+纯 harness 计数, **不靠 prompt 劝** —— 实测模型能**连着 6 次**无视 Worker 那条
+"你已经连续 N 次调同一个工具, 不要再原样调它"的提示。软提醒不管用, 机制必须硬。
+
+probe 可以有一次(它是有价值的信息来源), 但不能连着来。
+
+## 实证: res-09-tsp-200
+
+    修复前: INCONCLUSIVE  954s  16 次调用全是 numeric_code
+    修复后: CORRECT       679s  8 次调用 3 种工具
+
+## 顺带修了同一文件里的 None 切片 bug
+
+`_tried_methods` —— `t.get('method','')[:40]`, 而 `dict.get` 的 default
+**只在 key 不存在时**生效; Explorer 交上来的 JSON 是 `{"method": null}`
+(key 在、值是 None), 于是 `None[:40]` 直接 TypeError。
+
+★ 它崩在**只有"没交出答案"才走到的收尾分支**上 ⇒ 本该记
+  INCONCLUSIVE(没交出答案) 的题被记成 CRASH(程序炸了),
+  res-05 与 res-17 两道各烧 366s / 1038s、0 次工具调用。
+  **"模型不行"被伪装成"程序坏了"。**
+
+见 check_finalize_robust.py(11 项,锁住这条)。

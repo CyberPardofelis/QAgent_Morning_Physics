@@ -62,3 +62,26 @@ RESEARCH_SANDBOX_TIMEOUT: int = int(
 #: 每一轮的错误都极具体, 而重试预算先见底了。这类「纯实现 bug」型失败
 #: 本来就是重试最划算的场景 —— 它不需要换思路, 只需要再改一行。
 RESEARCH_MAX_RETRY: int = int(os.getenv("QAGENT_RESEARCH_MAX_RETRY", "5") or 5)
+
+
+# ============================================================
+# 架构版本标签
+# ============================================================
+#: 每条证据都会被打上这个版本号, 汇总报告也会显示它。
+#:
+#: ★ 为什么必须打 ★
+#: 2026-10-09 架构要重搭(单发 codegen -> Explorer/Worker/Verifier),
+#: 新旧两套并行存在。而**分数在架构、题库、判据、verifier 里任意一样
+#: 改动后都不可比** —— 看到"分数从 9/20 变成 15/20"时, 如果不知道
+#: 那是哪一版架构 + 哪一版题库跑出来的, 这个对比就是无效的。
+#:
+#: 历史上已经踩过:`all60_process.md` / `progress_and_failures.md` 里的
+#: 数字都对应当时那套代码, 几个月后没人说得清。
+#:
+#: 用法: 换架构时改这个默认值, 或运行时覆盖
+#:     $env:QAGENT_RESEARCH_ARCH = "v2-explorer-worker"
+#: 已有的旧证据没有这个字段 —— 报告里会显示为 "unstamped", 不会假装它
+#: 属于哪一版。
+RESEARCH_ARCH_VERSION: str = (
+    os.getenv("QAGENT_RESEARCH_ARCH", "").strip() or "v1-single-shot"
+)

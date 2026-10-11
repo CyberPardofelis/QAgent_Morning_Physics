@@ -208,10 +208,35 @@ def render_catalog(tools: list[dict] | None = None) -> str:
         rows.append(f"### {t['name']}")
         rows.append(t["description"])
         schema = t.get("inputSchema") or {}
-        props = sorted((schema.get("properties") or {}))
+        sprops = schema.get("properties") or {}
+        props = sorted(sprops)
         req = set(schema.get("required") or [])
-        rows.append("参数: " + (", ".join(f"{p}*" if p in req else p
-                                         for p in props) or "无"))
+        # ★ 必须打印**类型** ★ (2026-10-11 实测 40 题)
+        #   原来只打参数名: `参数: code*, data_files, timeout` —— 模型于是
+        #   只能猜 `data_files` 是数组还是对象, 实测 **42 次**传成 list 被
+        #   registry 拦下(`参数类型不对: data_files 应该是 object, 收到 list`),
+        #   其中 **32 次题面里根本没有数据文件**, 是模型凭空发明这个参数。
+        #   每一次都要赔一整个 LLM 回合(实测均值 18.7s)才算得出这个类型。
+        #   ⇒ 类型就在 inputSchema 里, 最后一步渲染扔掉它没有任何好处。
+        def _fmt(p: str) -> str:
+            ty = (sprops.get(p) or {}).get("type") or "?"
+            return f"{p}*: {ty}" if p in req else f"{p}: {ty}"
+
+        rows.append("参数: " + (", ".join(_fmt(p) for p in props) or "无"))
+        # ★ 属性 description 必须渲染出来 ★ (2026-10-11 实测 40 题)
+        #   那句最关键的信息就**只**写在属性上, 工具级 description 里没有:
+        #     「沙箱里读不到文件系统, 所以题目提到文件时**必须**用 data_files
+        #       把内容交进来。代码里用**别名本身**取全文(不是路径)」
+        #   模型看不到它, 于是去 `import os` / `open()` / `pathlib` 找文件 ——
+        #   实测 15 次 `SandboxRejected`, 全部集中在 networkx-04 / ortools-04
+        #   这两道题面**真的带数据文件**的题上。
+        #
+        #   代价很小: 5 个代码类工具的属性描述**是同一段文字**(共 1605 字符),
+        #   只占工具描述总量(10222 字符)的 16%, 换来的是沙箱数据访问契约可见。
+        for p in props:
+            d = str((sprops.get(p) or {}).get("description") or "").strip()
+            if d:
+                rows.append(f"  · {p}: {d}")
         rows.append("")
     lines.append("【可用工具】(名字必须**逐字**用这里的, 不要发明)\n"
                  + "\n".join(rows).rstrip())

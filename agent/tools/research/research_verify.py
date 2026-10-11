@@ -20,13 +20,14 @@ agent.tools.research.research_verify — ★ 科研验证主入口 (P7 阶段 0,
 from __future__ import annotations
 
 import logging
+import json
 import re
 from typing import Any
 
 from agent.infra.research_workspace import ResearchWorkspace, hash_question
 from agent.prompts_research import (
     build_code_prompt, build_lean_prompt, format_attempts, needs_lean,
-    plan_method, template_for,
+    method_catalog_block, plan_method, template_for,
 )
 from agent.tools.llm import _call_llm, usage_snapshot
 from agent.tools.registry import register_tool
@@ -34,6 +35,8 @@ from agent.tools.registry import register_tool
 from ._flags import RESEARCH_EXPOSED, RESEARCH_MAX_RETRY, RESEARCH_SANDBOX_TIMEOUT
 from ._lean import check_lean, mathlib_available
 from ._provenance import VERDICTS, build_evidence, claim_id_for, extract_verdict_marker
+from . import _verdict
+from ._strategy import declared_strategy, method_class_failure, strategy_switch_penalty
 from .research_run_code import _execute
 
 logger = logging.getLogger(__name__)
@@ -86,6 +89,109 @@ def _is_blocked(raw: str) -> bool:
 # ============================================================
 # 内部: 生成验证代码
 # ============================================================
+#: ★ 对答案的**评价**字段 —— 门不要求 agent 填, verifier 自己算 ★
+#:
+#: 2026-10-09 实测事故: 题库 expected.value 里混着两类字段 ——
+#:   答案本身:   recurrence / moves / solutions / tuple / marks
+#:   对答案的评价: verified_200_terms / optimal / unique / irreducible
+#: 调用方按原始字段传进 answer_fields, 而 prompt 同时在说"不要报告这些",
+#: 于是模型被夹在中间: 照 prompt 做被门拒, 照门做就必须编造。
+#: 实测它真的会编(verified_200_terms=true 而递推式根本生成不出那条序列)。
+#:
+#: 这些量本来就该由**独立验证器自己算**: 拿 recurrence 生成 200 项自己比对 /
+#: 用 BFS 判最优性 / 自己代回验证唯一性与不可约性。让 agent 自报 = 自己给自己打分。
+SELF_EVAL_FIELDS = frozenset({
+    "verified", "verified_200_terms", "verified_100_terms",
+    "verified_by_second_impl", "verified_terms", "checked",
+    "optimal", "is_optimal", "unique", "claims_unique",
+    "irreducible", "distinct_distances", "all_distinct",
+    "holds", "holds_5", "holds_7", "is_prime", "solved", "closed",
+})
+
+
+#: 制品行的标记(与 verifiers_r/common.py 同一套约定)
+_ARTIFACT_TAG = re.compile(
+    r"^\s*(CONSTRUCT|ANSWER|COUNTEREXAMPLE)\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def _artifact_fields(stdout: str) -> set[str]:
+    """抓出制品行 JSON 里的字段名(多行/单行都认)。"""
+    names: set[str] = set()
+    for m in _ARTIFACT_TAG.finditer(stdout or ""):
+        i = m.end()
+        while i < len(stdout) and stdout[i] in " \t\r\n":
+            i += 1
+        if i >= len(stdout) or stdout[i] != "{":
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(stdout)):
+            ch = stdout[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        v = json.loads(stdout[i:j + 1])
+                        if isinstance(v, dict):
+                            names |= {str(k) for k in v}
+                    except Exception:
+                        pass
+                    break
+    return names
+
+
+def _missing_artifact_reason(stdout: str, required: list[str]) -> str | None:
+    """宣称 PROVED 却没把该交的对象交出来 -> 给出理由; 交了就返回 None。
+
+    ★ 只在**题目要求交对象**时才要求 ★
+    required 由题库的 expected.value 字段名给出(已脱敏)。真假判定类题目
+    (expected.type 是 boolean) 不传 required, 所以不受影响。
+    """
+    if not required:
+        return None
+    got = _artifact_fields(stdout)
+    if not got:
+        return (
+            "你判了 PROVED, 但**没有交出本题要求的对象** —— "
+            "机器无法独立复核一个没交出来的东西。\n"
+            "  必须打一行制品(字段名照抄):\n"
+            '      print("ANSWER: " + json.dumps({'
+            + ", ".join(f'"{f}": ...' for f in required) + '}))\n'
+            "  ★ 判据不是\"你能不能证明\", 是\"你交没交\" —— "
+            "交不出来就只能判 PARTIAL/INCONCLUSIVE。"
+        )
+    missing = [f for f in required if f not in got]
+    if missing:
+        return (
+            f"你判了 PROVED, 但制品里缺这些字段: {', '.join(missing)}\n"
+            f"  已交: {', '.join(sorted(got)) or '(空)'}\n"
+            "  ★ 独立复核器只会按约定的字段去核对你交的东西, "
+            "少一个字段它就无法判定 —— 那等于没交。"
+        )
+    return None
+
+
+#: ★ 每轮的「声明 vs 推导」对照 ★
+#:
+#: 这是 2026-10-09 新引入的诊断量 —— 此前完全没有。
+#: 它直接回答"模型对自己的结论有多不靠谱", 而这个数字在只看 VERDICT 行时
+#: 是永远看不到的(因为声明和判定是同一个东西)。
+_DERIVED: list[dict] = []
+
+
 def _generate_code(
     claim: str,
     scope: str,
@@ -94,6 +200,7 @@ def _generate_code(
     retry_context: str = "",
     timeout: int = 180,
     quantifier: str = "",
+    answer_spec: str = "",
 ) -> tuple[str, str]:
     """
     调 LLM 生成验证代码。返回 (code, raw_llm_output)。
@@ -103,7 +210,9 @@ def _generate_code(
     Args:
         quantifier: forall/exists/none (P4 加)。写进 prompt 告诉模型 verdict 该往哪个方向判。
     """
-    prompt = build_code_prompt(claim, scope, how, retry_context, quantifier=quantifier)
+    prompt = build_code_prompt(claim, scope, how, retry_context,
+                                quantifier=quantifier,
+                                answer_spec=answer_spec)
     # ★ 机器做的方法选型预判 ★
     # 这套 V2 题是按「裸枚举必死」设计的(1e6/1e7/K9/100皇后),
     # 而实测里 LLM 栽的跟头几乎全是选型。所以先把命题里的规模标记抽出来、
@@ -113,6 +222,12 @@ def _generate_code(
     if plan["note"]:
         prompt = f"{plan['note']}\n\n{prompt}"
         how = plan["how"]          # 选型预判可以改写建议方法
+    # ★ 方法目录: 可查的通用方法学, 不是按题型塞的技法提示 ★
+    # 见 prompts_research.method_catalog_block 的说明(为什么旧做法会泄题)。
+    cat = method_catalog_block(claim)
+    if cat:
+        prompt += cat
+
     tmpl = template_for(how)
     if tmpl:
         # 给写法示范比讲规则管用(LLM 漏 VERDICT 那行的高发点)
@@ -193,6 +308,31 @@ def _better_evidence(a: dict | None, b: dict | None) -> dict | None:
 # ============================================================
 # Lean 硬路由 —— 形式化命题根本不该走 Python
 # ============================================================
+def _lean_artifact(code: str) -> str:
+    """Lean 后端也要打出与其他后端**同一种**制品行。
+
+    ★ 为什么 ★
+    独立验证器只认一条通道: stdout 里的 `CONSTRUCT: {...}`。而 Lean 后端原来
+    把源码放在证据的 code 字段、stdout 只有 Lean 的编译输出 —— 于是
+    「形式化证明题」在验证器眼里永远是「没交制品」, 判 correct=False。
+
+    实测事故(2026-10-09 res-018): agent 的证明**完全正确**
+    (native_decide, 公理只有 propext/Quot.sound/Lean.ofReduceBool, 无 sorry),
+    只因为渠道不对被判错。
+
+    ★ 这是一次性把接口对齐, 不是给某个 verifier 打补丁 ★
+    与其让每个 Lean verifier 分别去 code 字段里找, 不如让 Lean 后端也产出
+    同样的制品通道 —— 一处改, 三道 Lean 题(res-008/009/018)一起通。
+    """
+    import json as _json
+    try:
+        payload = _json.dumps({"lean": code, "backend": "lean4+mathlib"},
+                              ensure_ascii=False)
+    except Exception:
+        return ""
+    return "\nCONSTRUCT: " + payload
+
+
 def _verify_via_lean(
     claim: str,
     ws: ResearchWorkspace,
@@ -254,7 +394,7 @@ def _verify_via_lean(
             verdict=verdict,
             reason=why,
             code=code,
-            stdout=res.get("output", "")[-4000:],
+            stdout=res.get("output", "")[-4000:] + _lean_artifact(code),
             stderr="\n".join(res.get("errors", [])[:10]),
             elapsed_ms=0,
             claim_id=claim_id,
@@ -335,6 +475,8 @@ def research_verify(
     task_hash: str = "",
     code: str = "",
     dry_run: bool = False,
+    answer_fields: list[str] | None = None,
+    answer_spec: str = "",
 ) -> dict[str, Any]:
     """
     验证一条命题, 返回带证据的结论。
@@ -381,6 +523,12 @@ def research_verify(
     # 2026-10-08 实测踩坑: 无条件 `code = ""` 导致手写代码失败后偷偷去调 LLM 重新生成。
     code_provided = bool(code.strip())
     max_try = 1 if code_provided else RESEARCH_MAX_RETRY + 1
+    # ★ 强制换方法: 记住上一轮被判方法错时它声明的策略 ★
+    # 只在**方法类失败**(超时/用错模块)后置位, 编码错不置位 ——
+    # 逼它换方法解决不了「import 写错了」, 只会让它越改越乱。
+    last_strategy: str | None = None
+    method_hint: str | None = None
+    strategy_rejects = 0
 
     for attempt in range(max_try):
         ws.set_status(phase="verify", step=attempt + 1,
@@ -392,7 +540,9 @@ def research_verify(
             retry_ctx = ""
         else:
             retry_ctx = format_attempts(attempts)
-            cur_code, raw = _generate_code(claim, scope, how, retry_context=retry_ctx)
+            cur_code, raw = _generate_code(
+                claim, scope, how, retry_context=retry_ctx,
+                answer_spec=answer_spec)
             used_llm += 1
             if not cur_code:
                 # ★ 阻断要当场停, 不能当"代码没生成出来"空转 ★
@@ -428,6 +578,24 @@ def research_verify(
             }
 
         # ---- 2. 跑 + 判 + 记 ----
+        # ---- 2a. 强制换方法(上一轮是方法错, 这轮不许原样重来) ----
+        if method_hint:
+            why = strategy_switch_penalty(last_strategy, cur_code, method_hint)
+            if why:
+                # ★ 挡回重试循环, 但**不占证据槽**, 因为这不是一次执行 ★
+                # 占槽的话 5 次重试会被这种空转吃光, 反而没机会换成功。
+                strategy_rejects += 1
+                if strategy_rejects > 2:
+                    method_hint = None      # 连续两次不改, 放它走, 免得死循环
+                attempts.append({
+                    "attempt": attempt, "error_type": "StrategyUnchanged",
+                    "stderr": why[:1500],
+                    "declared_strategy": declared_strategy(cur_code),
+                })
+                ws.append_attempt(attempts[-1])
+                used_llm += 0
+                continue
+
         _, ev = _execute(
             cur_code, ws,
             purpose=f"verify: {claim[:80]}",
@@ -437,6 +605,71 @@ def research_verify(
             extra={"attempt": attempt + 1, "how": how, "scope": scope},
         )
         last_ev = ev
+
+        # ---- 制品要求(与 prompt 保持一致) ----
+        #
+        # ★ wanted_fields 必须在这里一次算清 ★
+        # 它有两处用途:
+        #   1. 制品门只要求"答案本身"的字段(不含自评字段)
+        #   2. 判定推导要知道**本题是否需要制品** —— 真假判定题
+        #      (answer_fields 为空)**不需要**制品, sin^2+cos^2=1 那个
+        #      计算本身就是证明。
+        # ★ 第一版漏了第 2 点, 全量回归实测 9 道确定性题全被杀 ★
+        wanted_fields = [f for f in (answer_fields or [])
+                         if f not in SELF_EVAL_FIELDS]
+
+        # ★ DS 判断 1: 宣称 PROVED 却没交出该交的对象 → 不可复核, 降级 ★
+        #
+        # 只在 prompt 里写"记得交制品"没用 —— 那是软要求, 不在行动空间里。
+        # 所以在判定这一层直接否决, 并把缺什么原样喂回去。
+        if ev.get("verdict") == "proved" and wanted_fields:
+            miss = _missing_artifact_reason(ev.get("stdout") or "",
+                                            wanted_fields)
+            if miss:
+                ev = dict(ev)
+                ev["verdict"] = "inconclusive"
+                ev["reason"] = miss
+                ws.append_evidence(ev)
+
+        # ★★ 判定从**制品推导**, 而不是采信模型的声明 ★★
+        #
+        # ★★ 这一段曾经被我自己的重写脚本整段删掉 ★★
+        # 2026-10-09: 我用 _rewrite_block.py 把"制品门"到"保留最好"之间的区域
+        # 整体替换, 而 derive 的接线正好在那中间 —— 于是它成了只有测试在调的
+        # 死代码, `_DERIVED.append` 在源码里出现 0 次。
+        # **教训: 批量重写代码块时, 必须先确认边界内没有别的逻辑。**
+        #
+        # DS 诊断(2026-10-09): Executor 的 schema 里不该有 verdict。
+        # res-006/013/014 的死法都是同一个 ——「宣布结论」成本为零,
+        # 交出制品要费力气, 所以模型总选前者。
+        _dv = _verdict.derive(ev, ev.get("verdict", "untested"),
+                              ev.get("reason", ""),
+                              require_artifact=bool(wanted_fields))
+        if _dv["verdict"] != ev.get("verdict"):
+            ev = dict(ev)
+            ev["verdict"] = _dv["verdict"]
+            ev["reason"] = _dv["reason"]
+            ws.append_evidence(ev)
+        last_ev = ev
+        _DERIVED.append({
+            "claim_id": cid, "attempt": attempt,
+            "declared": _dv["declared"], "verdict": _dv["verdict"],
+            "mismatch": _dv["mismatch"], "basis": _dv["basis"],
+            "has_artifact": _dv["has_artifact"],
+        })
+        if _dv["mismatch"]:
+            # 不一致是**可用的信号**: 喂回下一轮, 让它看见自己宣称的东西
+            # 和制品对不上。
+            attempts.append({
+                "attempt": attempt,
+                "error_type": ("DeclaredVsDerived: 你宣称 "
+                               f"{_dv['declared']}, 但制品支持的是 "
+                               f"{_dv['verdict']}"),
+                "stdout": (ev.get("stdout") or "")[-800:],
+                "stderr": "",
+                "claim_id": cid,
+            })
+            ws.append_attempt(attempts[-1])
 
         # ★ 保留**历史最好**的一条, 不是最后一条 ★
         #
@@ -493,6 +726,22 @@ def research_verify(
         # 除此之外一律 break —— 尤其是它自己给了 partial。
         if not (verdict == "failed" or machine_overrode or gave_up):
             break
+
+        # ---- 2b. 记录本轮策略; 只有**方法类失败**才要求下一轮换 ----
+        # 窄判据, 因为误判代价高: 把"import 写错了"当成方法错去逼它换方法,
+        # 只会让它越改越乱。所以只有超时 / 用错模块这两种硬信号才算。
+        m_hint = method_class_failure(ev.get("verdict", ""),
+                                      ev.get("reason", ""))
+        if m_hint:
+            last_strategy = declared_strategy(cur_code)
+            if last_strategy is None:
+                # 连标签都没声明, 那更该说的是"你没说自己打算怎么算",
+                # 而不是逼它换 —— 此时换不换无从判断。
+                method_hint = ("上一轮是方法类失败(" + m_hint + "), 但你没声明"
+                               " `# STRATEGY:` 标签, 机器无法判断你有没有换路。"
+                               "请先想清楚这次用的是什么计算形态再动手。")
+            else:
+                method_hint = m_hint
 
         attempts.append({
             "attempt": attempt,
@@ -552,6 +801,9 @@ def research_verify(
         "evidence": [final_ev] if final_ev else [],
         "all_evidence_ids": [e.get("id") for e in all_ev],
         "summary": final_ev["reason"] if final_ev else "没有产出任何证据",
+        "strategy": (declared_strategy(final_ev.get("code") or "")
+                    if final_ev else None),
+        "strategy_switch_rejected": strategy_rejects,
         "attempt_count": len(attempts),
         "workspace": str(ws.path),
         "env": final_ev.get("env", {}) if final_ev else {},
@@ -561,5 +813,14 @@ def research_verify(
             "completion_tokens": _u_after["completion_tokens"] - _u_before["completion_tokens"],
             "llm_calls": used_llm,
             "elapsed_ms": final_ev.get("elapsed_ms", 0) if final_ev else 0,
+        },
+        # ★ 声明 vs 推导 ★
+        # 这个量此前根本不存在: 因为 VERDICT 既是模型的声明、又是判定本身,
+        # 所以"它宣称的对不对"这个问题在结构上无法被问。
+        # 判定改为从制品推导之后, 这个问题第一次可以被回答。
+        "declared_vs_derived": {
+            "rows": len(_DERIVED),
+            "mismatch": sum(1 for r in _DERIVED if r["mismatch"]),
+            "detail": _verdict.summarize(_DERIVED) if _DERIVED else "无",
         },
     }

@@ -15,8 +15,12 @@ V2 这套题是按「裸枚举必死」设计的, 所以人工基准尤其重要
 每道 hard 题的正确解法都依赖**方法选型**而非计算量。
 
 用法:
-    $env:PYTHONIOENCODING="utf-8"
     python tests/tools/run_v2_verifiers.py
+
+★ 不再需要手动设 `$env:PYTHONIOENCODING` ★
+子进程 UTF-8 现在由 `run_capture` 强制注入。旧写法是把这个坑绕过去:
+跑批时人肉记得设环境变量, 于是**换个终端/换个人跑就静默变乱码** ——
+`_marker()` 是子串匹配, 乱码不报错, 只让它读到 None。见 _proc.py。
 """
 from __future__ import annotations
 
@@ -29,6 +33,9 @@ import time
 
 ROOT = r"D:\pythonProject\QAgent"
 VDIR = os.path.join(ROOT, "tests", "tools", "verifiers_v2")
+
+sys.path.insert(0, ROOT)
+from agent.tools.research._proc import run_capture  # noqa: E402
 
 #: (题号, 文件名, gold)
 PY_CASES = [
@@ -68,9 +75,7 @@ def run_python_cases() -> list[dict]:
             print(f"  {cid:34s} MISSING ({fn})", flush=True)
             continue
         t0 = time.time()
-        p = subprocess.run([sys.executable, path], cwd=ROOT,
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=900)
+        p = run_capture([sys.executable, path], cwd=ROOT, timeout=900)
         dt = time.time() - t0
         out = (p.stdout or "") + (p.stderr or "")
         got = _marker(out)

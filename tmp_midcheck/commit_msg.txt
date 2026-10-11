@@ -1,0 +1,50 @@
+P8: roles 架构 + ReAct 闭环 + D 路线(并行 lane) + 收尾路径 None 切片修复
+
+## roles 架构首次进版本控制
+Explorer / Worker / Verifier 三个互不可见的角色 + orchestrator 编排。
+worker 换成原生工具调用(不写代码进沙箱), 消掉了 NameError / SandboxRejected /
+NotCode / NoArtifact 这一整类与数学无关的失败。
+
+## ReAct 闭环: Worker 的调查真的交回 Explorer
+问题: part2 零提示 20 题里 13 道"没交出答案"的题, **13 道都在重复调同一个
+工具**(numeric_code 最多 x16)。根因不是收敛机制弱, 是**信息没交回去** ——
+Worker 每轮从零开始, 上一轮的中间结果全烂在上一轮上下文里。
+修法: 逐步攒 findings(每次调用拿到什么 ok/value/error) -> 交回 Explorer ->
+下一轮 Worker 能看到 prior。
+实测: C 路线 5 道从"没交出"变"交出", 反向 0。
+
+## 对话压缩(MAX_FEEDBACK / KEEP_TURNS)
+cvxpy-04 的 prompt 曾涨到 24k 字符, 每轮都变慢且挤掉 max_tokens。
+保留最近 2 轮完整工具返回, 更早的压成一行摘要。
+
+## D 路线: 并行 lane + 调用方 hints (routes/d.py)
+B = Explorer -> 单 Worker(串行)。D = Explorer -> N 条 lane -> N Worker(并发)。
+  · hints 是第一等公民: 独立区块, 不是拼进题面 —— Explorer 要能分清
+    "这是别人给的方法建议" 与 "这是题目"。
+  · 共享**只读板**: lane 看得见别人**在干什么**, 看不见别人的**结果**。
+    worker 间直接对话会引入顺序依赖(要等), 且毁掉可复现性。
+  · run_lanes 把"同时最多几条在跑"记进结果 —— 写了线程池但实际串行,
+    数据上完全看不出来, 只有并发计数能证明。
+  · 一条 lane 崩了不带走整轮(并行的意义就是三条路总有一条通)。
+
+★ D 一行都没改 roles/ —— 这样 B 的 40 题实测数据仍然可比。
+
+## 修: 收尾分支的 .get(k,'') 不是空值兜底
+orchestrator.py 预算耗尽分支写 t.get('method','')[:40], 但
+dict.get 的 default **只在 key 不存在时**生效, 而 Explorer 交上来的 JSON 是
+{"method": null} —— key 在、值是 None, 于是 None[:40] 直接 TypeError。
+它崩在**只有"没交出答案"才走到的分支**上, 于是 res-05 / res-17 两道被记成
+CRASH(程序炸了) 而不是 INCONCLUSIVE(没交出答案) ——
+"模型不行"被伪装成"程序坏了", 两道各烧 366s / 1038s、0 次工具调用。
+新增 check_finalize_robust.py 锁住。
+
+## 修: 桥的死锁 + LLM 硬超时
+  · _registry 用 RLock 而非 Lock: env_report() 持锁后调 _load(), 而 _load()
+    也抢同一把锁 —— 第一版 C 路线冒烟卡了十分钟。
+  · LLM 调用加与传输层无关的硬墙(独立线程 + result(timeout+5)):
+    httpx 的 read timeout 量的是"数据块间隔", 服务端发心跳就永不超时。
+
+## 测试
+check_react_loop / check_convergence / check_no_hardcoded_routing /
+check_d_route / check_finalize_robust / check_registry_no_deadlock /
+check_llm_hard_timeout 等 10 个检查器全绿。

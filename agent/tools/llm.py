@@ -184,6 +184,55 @@ def reset_usage() -> None:
             _LAST_USAGE[k] = 0
 
 
+def _call_with_hard_timeout(client, kwargs: dict, timeout: int):
+    """发一次 chat.completions, 带一道**硬墙**。
+
+    ## 为什么 `kwargs["timeout"]` 不够 (2026-10-10 实测)
+
+    那次跑 part1 的 cvxpy-04, 一次调用**挂住 4 分钟没有任何返回**:
+    TCP 保持 `Established`、进程 CPU 零增长、stdout 零输出。而
+    `timeout=180` 是**确实传进去了**的(见上面 `kwargs["timeout"] = timeout`)。
+
+    原因在 httpx/OpenAI 的 timeout 语义: 它是**分阶段**的
+    (connect / write / read / pool), 而 **read timeout 量的是"两个数据块之间的间隔"**。
+    服务端只要还在发心跳/中间字节, 就永远不超时 —— 连接活着, 但请求永远不结束。
+    于是"超时"这个保证在最需要它的场合(连接活着但结果不来)是**失效的**。
+
+    ⇒ 所以再加一道**与传输层无关**的墙: 放到独立线程里跑, 到点就放弃。
+      线程是 daemon, 主流程返回后它不会挡住退出。
+
+    ## 为什么不用信号量 / 直接改 client 的 timeout
+    改 client 级 timeout 会影响**所有**调用方(含主界面对话流式请求, 那些
+    本来就该跑很久); 而这里的问题只出在"工具内部的一次性非流式调用"上。
+    """
+    import concurrent.futures as _cf
+    box: dict = {}
+
+    def _run():
+        try:
+            box["resp"] = client.chat.completions.create(**kwargs)
+        except BaseException as e:          # noqa: BLE001 - 转交给主线程抛出
+            box["err"] = e
+
+    # 多给 5 秒: 让传输层自己的超时(如果生效)先报, 拿到更准的错误信息
+    wall = max(5.0, float(timeout) + 5.0)
+    ex = _cf.ThreadPoolExecutor(max_workers=1,
+                                thread_name_prefix="llm-hardwall")
+    fut = ex.submit(_run)
+    try:
+        fut.result(timeout=wall)
+    except _cf.TimeoutError:
+        _log(f"[llm] ★ 硬墙超时 {wall:.0f}s —— 放弃这次调用(传输层超时没兜住)")
+        raise TimeoutError(
+            f"LLM 调用超过 {wall:.0f}s 仍未返回(连接可能活着但结果不来)。"
+            f"这通常不是参数问题, 是上游卡住了。") from None
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if "err" in box:
+        raise box["err"]
+    return box["resp"]
+
+
 def _call_llm(
         prompt: str,
         model: str = None,   # 2026-09-04 改:None 表示跟主界面 chat mode
@@ -325,7 +374,7 @@ def _call_llm(
         if _guard_msg:
             _log(f"[llm] cost_guard: {_guard_msg.strip()}")
 
-        resp = client.chat.completions.create(**kwargs)
+        resp = _call_with_hard_timeout(client, kwargs, timeout)
         msg = resp.choices[0].message
         out = msg.content
         # 2026-09-05 P6.0 fix: deepseek 推理模型在 enable_thinking=False 时把"实际答案"放 reasoning_content,

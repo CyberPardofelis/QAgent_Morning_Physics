@@ -23,8 +23,23 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 文件路径
 # ============================================================
-DATA_DIR = Path("data")
-KEYS_FILE = DATA_DIR / ".api_keys.json"
+# ★ DATA_DIR 必须锚在**项目根**, 不能跟着 cwd 走 ★
+#   原来写的是 Path("data") —— 相对当前工作目录。
+#   后果实测 2026-10-09: 从 QAgent 目录跑 get_api_key("minimax") 拿得到 125 字符的 key,
+#   换个 cwd(比如从 MAGI-Tools 目录)跑就返回空, 而错误信息是
+#   「未设置 MiniMax API Key，请在设置中配置」——
+#   ★ 把**路径问题**说成了**配置问题** ★ 于是人会去设置里翻、
+#   去 .env 里找, 半天找不到, 因为 key 一直好好地躺在项目 data 目录里。
+#
+#   修法: 锚到本文件上溯三层(agent/infra/api_keys.py -> 项目根)。
+#   仍保留"cwd 下有 data/.api_keys.json 就用它"的行为, 以免打乱既有布局。
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROJECT_KEYS_FILE = _PROJECT_ROOT / "data" / ".api_keys.json"
+_CWD_KEYS_FILE = Path("data") / ".api_keys.json"
+#: 写永远落在项目根那份 —— 免得在别的 cwd 跑一次就多出一份残缺的 key 文件
+KEYS_FILE = _PROJECT_KEYS_FILE
+DATA_DIR = KEYS_FILE.parent
+_CWD_DATA = KEYS_FILE.parent
 
 # 迁移来源（QSettings 里的旧 key）
 LEGACY_SETTINGS_KEYS = {
@@ -45,22 +60,40 @@ def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_from_disk() -> dict[str, str]:
-    """从 .api_keys.json 读所有 key（文件不存在返回空 dict）"""
-    _ensure_data_dir()
-    if not KEYS_FILE.exists():
+def _read_one(path: Path) -> dict[str, str]:
+    if not path.exists():
         return {}
     try:
-        with open(KEYS_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            logger.warning("%s 内容不是 dict，重置为空", KEYS_FILE)
+            logger.warning("%s 内容不是 dict，忽略", path)
             return {}
-        # 过滤非字符串值
         return {k: v for k, v in data.items() if isinstance(v, str)}
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning("读取 %s 失败: %s（视为空）", KEYS_FILE, e)
+        logger.warning("读取 %s 失败: %s（忽略）", path, e)
         return {}
+
+
+def _load_from_disk() -> dict[str, str]:
+    """读所有 key。
+
+    ★ 项目根那份**优先**, cwd 下那份只当补充 ★
+    实测 2026-10-10: 磁盘上存在**两份** `.api_keys.json` ——
+      QAgent/data/.api_keys.json       有 deepseek + minimax   (权威那份)
+      MAGI-Tools/data/.api_keys.json   只有 deepseek
+    而 MAGI-Tools 目录里跑的对拍脚本原本只读到后者, 于是 minimax 报
+    「未设置 API Key」—— key 一直好好地躺在 QAgent/data 里。
+    ⇒ 合并两份, **项目根优先**; 两个都读, 谁有算谁的, 不丢。
+    """
+    _ensure_data_dir()
+    merged: dict[str, str] = {}
+    for p in (KEYS_FILE, _CWD_KEYS_FILE, _PROJECT_KEYS_FILE):
+        if p is None:
+            continue
+        for k, v in _read_one(p).items():
+            merged.setdefault(k, v)
+    return merged
 
 
 def _save_to_disk(keys: dict[str, str]) -> None:

@@ -1,0 +1,40 @@
+修 Lean 题: 编译错误信息被摘要截断, worker 只能盲改
+
+## 现象 (实测 2026-10-11, part1 lean-02-induction)
+
+    修复前: lean_check x11, 408s, WRONG
+    修复后: lean_check x5,  233s, CORRECT
+
+模型自己在 note 里写"此前对完整 Lean 4 声明的 lean_check 验收结果为
+proved: true" —— 它**以为通过了**, 但判据判没过。
+
+## 根因: _digest_one 把"为什么失败"扔了
+
+`LeanResult` 专门收集了错误信息, docstring 原话:
+    output: str  —— 完整输出, **供回传给 LLM 修**
+
+但 `_digest_one()` 只把 `proved=False` 这个布尔值留下, errors/output 全丢。
+
+⇒ worker 只看到"没过", **不知道"为什么没过"**, 只能盲改盲试,
+   11 次 lean_check 全在撞墙。同一道题 B 59 秒一次就过(它证明本来就对)。
+
+## 修法
+
+失败时优先带回 errors 首行 / output 前几行; **成功时才只留布尔值**
+—— 成功不需要解释, 失败才需要。
+
+## 顺带两个诊断信息错误 (trace 落盘后才看见)
+
+1. `brief()` 把 Lean 题算成「0 次成功」—— 它数成功靠 `ok` 字段,
+   而 Lean 工具成功时 `ok` 是 `None`(它用 `proved` 表达)。
+   于是 findings 明明写着 `proved=True`, 摘要却显示「0 次成功」。
+   **看着像失败, 排查时会被带偏。**
+2. `_digest_one` 的 `ok` 同样是 `None`。
+
+⇒ 两处都改成 `ok` 缺失时用 `proved` 兜底。
+
+## 回归
+check_react_loop / check_worker_tool_paths / check_convergence /
+check_d_route / check_finalize_robust / check_probe_not_trap /
+check_no_hardcoded_routing / check_extract_code / check_strip_self_claims /
+check_placeholder_answer —— 10 个检查器全部通过。

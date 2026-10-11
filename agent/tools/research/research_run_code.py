@@ -68,6 +68,28 @@ def _execute(
     # claim 同理: PROVED 侧的机器复核要认出「代码把待证命题当前提用」,
     # 光看代码和 stdout 认不出哪个词是结论 —— 那是命题自带的。
     verdict, reason = judge_verdict(result, code=code, claim=claim)
+
+    # ★ stdout 抽取与 exit code 解耦 ★
+    # judge_verdict 的第一优先级是「没跑成 -> failed」, 于是**先看退出码、
+    # 后看 stdout**。但 stdout 里可能已经有一个自证有效的制品(见文件头事故)。
+    # 这里: 崩了但 stdout 非空时, 用 ok=True 再判一次 —— 让标记解析与制品门
+    # 照常跑。若它给出确定结论(而且带上了可复核的制品), 就采信, 并标注崩溃。
+    # 若仍然判 failed, 说明 stdout 里确实没有可用证据, 维持原判。
+    crashed_with_output = False
+    if not getattr(result, "ok", True) and (result.stdout or "").strip():
+        import copy as _copy
+        lenient = _copy.copy(result)
+        lenient.ok = True
+        lenient.timed_out = False
+        lenient.rejected = False
+        v2, r2 = judge_verdict(lenient, code=code, claim=claim)
+        if v2 in ("proved", "refuted", "partial"):
+            verdict = v2
+            reason = ("⚠ 程序在打印上述结果后崩溃(exit!=0), "
+                      "但 stdout 里留下了可复核的制品, 据此采信; "
+                      "崩前未能完成的部分不作数。\n  " + r2)
+            crashed_with_output = True
+
     ev = build_evidence(
         index,
         kind=kind,
@@ -78,7 +100,8 @@ def _execute(
         stderr=result.stderr or result.reject_reason,
         elapsed_ms=result.elapsed_ms,
         claim_id=claim_id,
-        extra=extra,
+        extra={**(extra or {}),
+               "crashed_with_output": crashed_with_output},
     )
     ws.append_evidence(ev)
     return result, ev

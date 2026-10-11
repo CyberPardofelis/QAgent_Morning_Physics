@@ -124,7 +124,8 @@ def board_intents(lanes: list[Lane], *, for_lane: int | None = None) -> str:
 def explorer_prompt(problem: str, *, hints: str | None = None,
                     history: list[dict] | None = None,
                     tools: list[dict] | None = None,
-                    turn: int = 0) -> str:
+                    turn: int = 0,
+                    catalog: str | None = None) -> str:
     """Explorer 的 prompt = B 的 prompt + 两个 D 特有的区块。
 
     ★ 复用 `EX.plan_prompt` 而不是重写 ★
@@ -135,8 +136,13 @@ def explorer_prompt(problem: str, *, hints: str | None = None,
     ★ hints 是**独立区块**, 不拼进题面 ★
       拼进题面的话 Explorer 分不清哪句是题、哪句是建议;
       独立区块让"这是别人给的方法建议"成为一个**有身份的信息**。
+
+    ★ `catalog` 是给 D1 用的**可选旁路** ★
+      默认 None -> 走 `render_catalog(tools)` 的全量渲染, 与历史四轮
+      **逐字一致**。只有 D1 显式传值才会换成"名字 + 一行简述"。
+      B/C/D 三条对照路线一个字节都不受影响。
     """
-    base = EX.plan_prompt(problem, history, tools)
+    base = EX.plan_prompt(problem, history, tools, catalog=catalog)
     blocks: list[str] = []
 
     if hints:

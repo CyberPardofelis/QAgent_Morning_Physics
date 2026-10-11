@@ -77,14 +77,111 @@ STALL_N = 3
 FORCE_SWITCH_AT = 3
 
 
-def _loop_note(tool: str, times: int, tried: list) -> str:
+def _err_class(err: str) -> str:
+    """把一条工具错误归成**类别** token(不是具体名字)。
+
+    ★ 为什么要按"类别"而不是按"名字"判循环 ★
+      2026-10-11 实测 lean-04-multistep: 17 次工具调用, **0 次成功**,
+      其中 11 次是"猜一个不存在的 Mathlib 定理名" ——
+      `Nat.sum_choose_eq` → `binomial_theorem` → `sum_range_choose` → …
+      每次名字都不同, 但**根因完全一样**: 记不住 Mathlib 的 API。
+
+      而 stall 检测原来只数"连续调了同一个工具几次"
+      (`for x in reversed(tried): if x != name: break`)。
+      这 17 次全是 `lean_check`, 于是 stall **触发了 6 次**, 每次都告诉模型
+      "你已经连续 N 次调同一个工具了, **换一个工具**"。
+
+      ★ 而 `lean_check` 是这道题**唯一**能用的工具 ★
+      换工具的建议在这道题上是有害的 —— 它把唯一的路也堵上了。
+      模型确实换了(去 `#check` 枚举), 但换的是**用法**, 不是工具, 于是照旧。
+
+    ⇒ 于是把"卡住"的定义从「同一个工具连着调 N 次」放宽成
+      「**同一种错误**连着出现 N 次」。后者才对应真正的循环。
+    """
+    s = str(err or "")
+    # 顺序有意义: 先匹配更具体的
+    #
+    # ★ `unknown constant` 与 `unknown identifier` 必须归成**同一类** ★
+    #   实测 lean-04 那 7 次里, 前 4 次是前者、后 2 次是后者, 根因完全
+    #   一样("这个名字不存在")。我第一版把它们分成两类, 于是从后往前数
+    #   连续同类只够得着 2 次, 永远触发不了 STALL_N=3 —— 改动等于没做。
+    #   归类必须按**根因**, 不按错误信息的措辞。
+    for pat, tag in (
+        (r"unknown constant|unknown identifier|no declaration|"
+         r"not a valid|unresolved name|failed to synthesize|"
+         r"omega could not prove|unsolved goals|application type mismatch|"
+         r"type mismatch", "name-or-shape"),
+        (r"field notation|unexpected token|expected token|parse|syntax",
+         "syntax"),
+        (r"参数类型不对|缺参数|SandboxRejected", "contract"),
+        (r"Timeout|timed out|超时", "timeout"),
+        (r"AssertionError", "assertion"),
+        (r"AttributeError", "attribute"),
+        (r"TypeError", "typeerror"),
+        (r"NameError", "nameerror"),
+        (r"ValueError", "valueerror"),
+        (r"KeyError", "keyerror"),
+        (r"ZeroDivision", "divzero"),
+        (r"IndexError", "index"),
+    ):
+        if re.search(pat, s, re.I):
+            return tag
+    return "other" if s else "none"
+
+
+def _failed_ids(findings: list[dict]) -> list[str]:
+    """从已失败的调用里抠出"它试过的标识符/名字"。
+
+    ★ 为什么要这个 ★
+      模型记不住 Mathlib 的名字, 于是换一个名字再试 —— 而 harness
+      **已经知道**它试过哪些了(`unknown constant 'X'` 里就有 X),
+      却从来没把这些名字告诉它。加进提醒里, 就是零成本的"记忆外挂"。
+    """
+    out: list[str] = []
+    for d in (findings or []):
+        if not isinstance(d, dict):
+            continue
+        for m in re.finditer(
+                r"(?:unknown constant|unknown identifier|invalid "
+                r"field notation with '@'|no declaration|not found)\s*"
+                r"['\"]?([A-Za-z_][A-Za-z0-9_'.]*)", str(d.get("error") or "")):
+            # ★ 必须 rstrip 掉尾引号 ★
+            #   Lean 的名字带点(`Nat.sum_choose_eq`), 所以字符类里必须留 `'`,
+            #   但那样**结尾的引号也会被一起吞掉** ->
+            #   `Nat.sum_choose_eq'`。这个字符串是要**回灌给模型**的,
+            #   它照抄一个带尾巴的名字, 下一次照样 unknown constant。
+            nm = m.group(1).rstrip("'")
+            if nm and nm not in out:
+                out.append(nm)
+    return out[:12]
+
+
+def _loop_note(tool: str, times: int, tried: list,
+               findings: list | None = None,
+               only_tool: bool = False) -> str:
     """告诉模型它在一个循环里, 并点名已经试过的工具。"""
     others = list(dict.fromkeys(t for t in tried if t != tool))
-    alt = ("\n你已经试过(也都卡住了): " + ", ".join(others)
-           if others else "\n你还没试过别的工具。")
+    if others:
+        alt = "\n你已经试过(也都卡住了): " + ", ".join(others)
+    elif only_tool:
+        # ★★★ 这里原来输出的是"你还没试过别的工具" ★★★
+        #   对"只有一个工具可用"的题, 那是一句**有害**的话:
+        #   模型于是以为"该换个工具", 而能换的都换不动。
+        #   实测 lean-04: 17 次全是 lean_check, 提醒里点名"你还没试过
+        #   别的工具", 模型就去 `#check` 枚举常量 —— 换了用法, 没换根因。
+        alt = ("\n★ 这道题**只有这一个工具**能用, 换工具不是出路 ★\n"
+               "要换的是**思路**: 换建模方式 / 换一个更小的规模先试 / "
+               "把你已经确认的中间结论直接组织成答案。")
+    else:
+        alt = "\n你还没试过别的工具。"
+    names = _failed_ids(findings or [])
+    black = ""
+    if names:
+        black = ("\n★ 你已经试过下面这些名字, **它们都不存在**, "
+                 "不要再原样试了 ★\n  " + ", ".join(names))
     return (
         f"\n★ 你已经**连续 {times} 次**调同一个工具 `{tool}` 了 ★\n"
-        f"{alt}\n"
+        f"{alt}{black}\n"
         f"**不要再原样调它**。要么换一个工具, 要么换一个思路"
         f"(换建模方式 / 换数值方法 / 降规模先看小例子 / "
         f"把已经算出来的中间结果直接组织成答案)。\n"
@@ -263,6 +360,55 @@ def _tool_task_prompt(problem: str, plan: dict, catalog: str, *,
         + "\n\n【可用工具】\n" + catalog)
 
 
+def _call_ok(obs) -> bool | None:
+    """这次工具调用**成功**了吗? —— 全文件**唯一**的判据。
+
+    ★ 为什么不能写 `bool(obs.get("ok"))` ★
+      `magi_tools.registry.call_tool` 的契约是「**失败时**一定返回
+      `{"ok": False, "error": ...}`; **成功时原样返回工具自己的输出**」
+      (`registry.py` 里就是一句 `return t["_fn"](**kw)`)。所以**成功路径
+      根本没有 `ok` 键** —— `obs.get("ok")` 给 None, `bool(None)` 是 False。
+
+      实测 2026-10-11 的 17 个工具, 成败信号分三族:
+
+        · 有 `ok`            sympy_* / graph_* / numeric_code / oeis_lookup
+        · `proved` 而无 `ok`  lean_check / gap_*      (证成 / 证伪)
+        · `status` 无 `ok`   z3_smt2                  (sat / unsat / unknown)
+
+      ★ 这个坑已经栽了两次 ★
+        1. `_digest_one` 原来只认 `ok`, 于是 Lean 题的 findings 里
+           `ok=None`, `brief()` 数成「0 次成功」—— 明明 proved=True。
+        2. `tool_calls` 那条更彻底: 它只写了 `obs.get("ok")`, **连
+           `proved` 都没带上**, 于是 `brief()` 的 `_succeeded()` 永远
+           读不到任何 Lean 证据。实测 2026-10-11 D1 跑 lean-04:
+           「调了 12 次工具(**0 次成功**): lean_check ...」,
+           同一行 trace 里就写着 `lean_check: proved=True` ——
+           **诊断信息自相矛盾, 看着像全失败**。
+
+    ⇒ 判据: `ok` 在就用它; 不在就看 `proved`; 都不在就**没有 error 即成功**。
+
+    ★★ 为什么 Lean 族和 z3 族**故意不对称** ★★
+      这看着像不一致, 其实是两个不同的问题, 强行统一才会真出错:
+
+      · Lean 家族有**明确的裁决字段** `proved`(True 证成 / False 证伪)。
+        `findings` 会回到模型的下一轮, 若把"证伪"报成 ok=True, 模型会
+        以为这条路走通了、继续在错的假设上打转。所以尊重 `proved`。
+      · z3 家族的 `status: unsat` 只是"无解"。对"证明这就是全部解集"
+        这种用法, unsat 恰恰是**想要的**结果 —— 它没有"我期望什么"这层
+        语义, 所以那里只问"跑没跑通", 没有 error 就算成功。
+
+      ⚠ 别把它们"顺手统一"成同一个语义。那会把 Lean 的证伪报成成功,
+        直接影响模型下一步的行为。
+    """
+    if not isinstance(obs, dict):
+        return None
+    if "ok" in obs:
+        return bool(obs.get("ok"))
+    if "proved" in obs:
+        return bool(obs.get("proved"))
+    return "error" not in obs
+
+
 def _digest_one(tool: str, args: dict, obs) -> dict:
     """一次工具调用 -> 一行**可决策**的摘要。
 
@@ -274,34 +420,41 @@ def _digest_one(tool: str, args: dict, obs) -> dict:
     """
     if not isinstance(obs, dict):
         return {"tool": tool, "ok": None, "value": str(obs)[:120]}
-    d = {"tool": tool, "ok": obs.get("ok")}
-    # ★ Lean 类工具用 `proved` 表达成败, **不填 `ok`** ——
-    #   于是 findings 里 ok=None, brief() 数成"0 次成功", 看着像全失败。
-    #   ⇒ `ok` 缺失时用 `proved` 兜底。
-    if d["ok"] is None and "proved" in obs:
-        d["ok"] = bool(obs.get("proved"))
+    d = {"tool": tool, "ok": _call_ok(obs)}
     if obs.get("error_type"):
         d["error"] = f"{obs.get('error_type')}: {str(obs.get('error'))[:90]}"
     # ★★ 编译/求解类工具**失败时必须带回"为什么" ★★
-    #   实测 2026-10-11 part1 的 lean-02: D 调了 11 次 `lean_check` 全失败,
-    #   而 `LeanResult` 明明有 `errors` / `output` 字段(docstring 原话:
-    #   "完整输出, 供回传给 LLM 修") —— 但这个函数只把 `proved=False`
-    #   那一行留下, **错误信息全被截掉了**。
-    #   于是 worker 只看到"没过", 不知道"为什么没过", 只能盲改盲试,
-    #   408 秒烧光。同一道题 B 59 秒一次就过(它的证明本来就对)。
+    #   交接文档记这条已修("11次→5次, 408s→233s"), 但实测 **一次都没触发过**:
+    #   它找的是 `obs["errors"]` / `obs["output"]`, 而 `lean_check` 实际返回的键是
+    #       proved / reason / **detail** / **output_tail** / exit_code / error_count
+    #   —— `errors` 和 `output` **根本不存在**, 于是四个 if 全落空,
+    #   `d["error"]` 恒为空。2026-10-11 重跑 40 题, lean-04 于是又盲改 21 次
+    #   烧了 451 秒, 和"修好之前"一模一样。
     #
-    #   ⇒ 失败优先把 `errors` / `error` 原文带回来。**成功时才只留布尔值**
-    #     —— 成功不需要解释, 失败才需要。
+    #   ⇒ 这里**按优先级多试几个键**, 而不是押注某一个字段名 ——
+    #     工具层改字段名时, 这个分支不该再静默退化成"只留 proved=False"。
     if obs.get("ok") is False or obs.get("proved") is False:
-        errs = obs.get("errors")
-        if isinstance(errs, list) and errs:
-            d["error"] = "编译报错: " + " | ".join(
-                str(e).strip().splitlines()[0][:90] for e in errs[:3])
-        elif obs.get("output"):
-            lines = [x for x in str(obs["output"]).strip().splitlines()
-                     if x.strip()][:3]
-            if lines:
-                d["error"] = "输出: " + " | ".join(x[:90] for x in lines)
+        # ① 结构化的报错列表(有的工具给 list, 给什么算什么)
+        for key in ("errors", "error_list", "messages"):
+            errs = obs.get(key)
+            if isinstance(errs, list) and errs:
+                d["error"] = "编译报错: " + " | ".join(
+                    str(e).strip().splitlines()[0][:90] for e in errs[:3])
+                break
+        # ② 编译器给的**第一手诊断**(lean_check 走的是这条)
+        if "error" not in d:
+            det = str(obs.get("detail") or "").strip()
+            if det:
+                d["error"] = "诊断: " + " | ".join(
+                    x[:90] for x in det.splitlines() if x.strip())[:180]
+        # ③ 完整输出的尾巴(短版本)
+        if "error" not in d:
+            for key in ("output_tail", "output", "stdout"):
+                txt = str(obs.get(key) or "").strip()
+                lines = [x for x in txt.splitlines() if x.strip()][:3]
+                if lines:
+                    d["error"] = f"{key}: " + " | ".join(x[:90] for x in lines)
+                    break
     for k in ("status", "proved", "found", "n_candidates", "n_classes",
               "elapsed_ms"):
         if k in obs and obs[k] is not None:
@@ -430,8 +583,13 @@ def _run_loop(problem: str, plan: dict, catalog: str, *, probe: bool,
         findings.append(_digest_one(name, args, obs))
         res["tool_calls"].append({"tool": name, "args": args,
                                   "ms": int((time.time() - t0) * 1000),
-                                  "ok": obs.get("ok") if isinstance(obs, dict)
-                                  else None})
+                                  # ★ 必须用 `_call_ok`, 不能 `obs.get("ok")` ★
+                                  #   这条记录是 `brief()` 里「N 次成功」的唯一
+                                  #   数据源; 原来只写 obs.get("ok"), 于是
+                                  #   lean_check(proved) / z3_smt2(status) 调了
+                                  #   多少次都被数成 0 次成功 —— 见 `_call_ok`
+                                  #   的 docstring。
+                                  "ok": _call_ok(obs)})
         if name == "lean_check" and isinstance(obs, dict):
             ctx["lean_proved"] = obs.get("proved")
             ctx["lean_sorry"] = bool(obs.get("sorry_used"))
@@ -482,12 +640,44 @@ def _run_loop(problem: str, plan: dict, catalog: str, *, probe: bool,
             if x != name:
                 break
             n_same += 1
+        # ★ 还要看**错误类别**有没有在原地打转 ★
+        #   只数工具名会漏掉最贵的那种卡住: 同一个工具、每次试**不同的**
+        #   错东西。实测 lean-04 的 17 次全是 lean_check 但根因是同一个
+        #   ("记不住 Mathlib 的定理名"), 工具计数完全看不出它在打转。
+        n_cls = 0
+        cur_cls = ""
+        # ★★★ 循环变量**必须叫别的名字** ★★★
+        #   我第一版写成 `for k in reversed(findings)` ——
+        #   而外层 `for k in range(1, max_steps+1)` 的 `k` 就是**第几步**。
+        #   于是内层循环结束后 `k` 变成了 findings 的一个元素(字符串),
+        #   紧接着 `left = max_steps - k` 直接
+        #     TypeError: unsupported operand type(s) for -: 'int' and 'str'
+        #   而 `check_convergence.py` / `check_react_loop.py` 当场崩掉。
+        #
+        #   教训: 我给 `_err_class` / `_failed_ids` / `_loop_note` 都写了单测,
+        #   全绿 —— **但那些是纯函数, 不经过这个循环**。
+        #   "测过了"和"这条路径被执行过"是两件事。
+        for _d in reversed(findings):
+            if not isinstance(_d, dict):
+                break
+            _c = _err_class(_d.get("error") or "")
+            if _c in ("none", "other"):
+                break
+            if not cur_cls:
+                cur_cls = _c
+            elif _c != cur_cls:
+                break
+            n_cls += 1
         left = max_steps - k
-        if n_same >= STALL_N:
+        if n_same >= STALL_N or n_cls >= STALL_N:
             res.setdefault("switches", []).append(
                 {"step": k, "tool": name, "times": n_same,
+                 "err_class": cur_cls, "n_same_err": n_cls,
                  "trigger": "stall"})
-            convo.append(_loop_note(name, n_same, tried))
+            # ★ 这道题能用几个工具? 只有 1 个时不能说"换工具" ★
+            convo.append(_loop_note(
+                name, max(n_same, n_cls), tried, findings,
+                only_tool=len(set(t for t in tried if t)) <= 1))
         # ★ 和上面的 elif 改成独立 if ★
         #   用 elif 时, 只要 stall 触发了 budget_low 永远不会触发 ——
         #   而"要交卷了"和"你卡住了"是**两件都要说**的事。

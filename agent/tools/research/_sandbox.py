@@ -49,6 +49,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +63,10 @@ _SENTINEL = "__QAGENT_SANDBOX_RESULT__ "
 
 #: stdout / stderr 各自的截断上限 —— 超了标记 truncated, 不让 LLM 被日志淹掉
 MAX_OUTPUT_CHARS = 8000
+
+#: 制品行的独立额度 —— 制品就是答案, 不能从中间劈开
+#: (res-019 的群乘法表 46454 字符, 劈开后 json 直接解析失败)
+MAX_ARTIFACT_CHARS = 200_000
 
 #: 默认硬超时 (秒)。SymPy 积分可能慢, 但 20s 是"卡住了"的合理判据
 DEFAULT_TIMEOUT = 20
@@ -78,7 +83,10 @@ _ALLOWED_IMPORT_ROOTS = frozenset({
     "random", "json", "re", "string", "operator", "copy", "heapq", "bisect",
     "collections", "typing", "enum", "dataclasses", "abc", "numbers", "array",
     # 标准库: 时间/IO (受限用途, 靠超时兜住)
-    "time", "datetime", "io", "csv", "textwrap",
+    # ★ io 已移除 ★ 2026-10-09 实测: `import io; io.open(绝对路径)` 能读走
+    # data/*_reference.json 里的**参考答案**。csv/textio 在这个项目里没有
+    # 真实用途(没有输入文件要读), 而留着 io 等于把"沙箱禁读文件"这句话变成谎言。
+    "time", "datetime", "csv", "textwrap",
     # 科学计算 (已在 requirements.txt 锁定版本)
     "sympy", "numpy", "scipy", "networkx",
     # P7.1 加: z3 的 Python API —— 让"用代码调 Z3"这条路和 research_z3 工具
@@ -95,6 +103,44 @@ _BANNED_NAMES = frozenset({
     "memoryview",  # 可拿 buffer 原始内存
     "__builtins__",  # 拿到就能翻出上面那些
 })
+
+#: ★ 读/写文件的属性名 ★
+#:
+#: 2026-10-09 实测事故: 门只拦 `open(...)` 这个 Name, 于是
+#: `io.open(path).read()` 完整绕过, 把 data/*_reference.json 的参考答案读走 ——
+#: 于是 prompt 里那句「写文件、读文件、联网一律不行」是**假的**。
+#:
+#: 一个靠这句话建立的基准, 如果那句话不成立, 整套分数都不作数。
+_BANNED_FILE_ATTRS = frozenset({
+    "open", "read", "read_text", "readlines", "write", "write_text",
+    "writelines", "read_bytes", "write_bytes", "readinto",
+    # ★ numpy 的文件读取器 ★
+    # 2026-10-09 实测事故: 上一轮我加了上面那一串属性, 测试只覆盖了
+    # io / open / pathlib / os, 就宣布"沙箱读文件已封堵"。实际:
+    #     np.loadtxt(r"data/res_16_reference.json")    -> 读到了(报的是解析错)
+    #     np.genfromtxt(r"...", dtype=str)           -> 读到了(报的是列数不符)
+    # 报的是**内容解析错误**, 不是被拦 —— 文件真的被打开了。
+    # 同一个 bug 两头吃: 既没守住"读不到参考答案"的红线,
+    # 又挡住了模型读自己的输入(现在改成输入内联进题面, 这条不再冲突)。
+    "loadtxt", "fromfile", "genfromtxt", "load", "frombuffer",
+    "fromregex", "fromstring", "memmap", "DataFrame",
+})
+
+
+#: 这些 numpy API 只在**参数不是字符串字面量**时才放行(那是读内存)。
+_NUMPY_MEM_OK = frozenset({"load", "frombuffer", "fromstring", "DataFrame",
+                           "memmap", "fromregex"})
+
+
+def _numpy_file_api(attr: str) -> bool:
+    """numpy 的一批 API 既能读文件也能从字符串读, 只能按调用形态区分。
+
+    `np.load("a.npy")` 读文件, `np.load(some_bytes)` 读内存 —— AST 上看
+    第一个参数是常量还是变量。所以: **参数是字符串字面量 -> 拦**,
+    参数是变量 -> 放行(它读的是内存)。
+    """
+    return attr in {"load", "frombuffer", "fromstring", "DataFrame",
+                    "memmap", "fromregex"}
 
 #: 禁止的 ast 节点类型 —— 与 names 互补(有些危险用法不需要可疑名字)
 _BANNED_NODES: tuple[type[ast.AST], ...] = (
@@ -373,6 +419,18 @@ def check_code(code: str) -> None:
         ) from e
 
     aliases = _module_aliases(tree)
+    # ★ 先算出"哪些 Call 的第���个参数是路径字面量" ★
+    # AST 上 np.load("a.npy") 里, 字符串是 **Call 的 args[0]**,
+    # 而 node.value 是 Name("np") —— 我第一版在这里判断, 结果 load/memmap
+    # 全放行了。判据必须落在 Call 节点上。
+    path_arg_calls: set[int] = set()
+    for n2 in ast.walk(tree):
+        if (isinstance(n2, ast.Call) and n2.args
+                and isinstance(n2.args[0], ast.Constant)
+                and isinstance(n2.args[0].value, str)
+                and n2.args[0].value):
+            path_arg_calls.add(id(n2.func))
+
     for node in ast.walk(tree):
         # import 类节点 → 走白名单校验
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -383,10 +441,40 @@ def check_code(code: str) -> None:
             continue
         # 模块属性访问 → 确认属性真的存在(见 _check_module_attribute)
         if isinstance(node, ast.Attribute):
-            if node.attr in ("eval", "exec", "__import__", "compile"):
+            # ★ 2026-10-10 订正: 属性名 `eval` 从禁表里去掉 ★
+            #   原来这里把 ("eval","exec","__import__","compile") 一视同仁,
+            #   结果 **`z3` 的核心 API 被误杀** ——
+            #   `model.eval(expr)` 是 z3 报告模型取值的**标准写法**,
+            #   实测 z3-01(线性整数) 和 z3-04(八皇后) 两道都死在这行。
+            #
+            #   为什么去掉不损失安全性:
+            #     · Python 内置 `eval(...)` 是 **ast.Name**, 已被 _BANNED_NAMES 单独禁;
+            #     · 真正的防线是 _ALLOWED_IMPORT_ROOTS 白名单 ——
+            #       `code.InteractiveInterpreter.eval` 那类真能动态执行的入口
+            #       所在的 `code` 模块**根本不在白名单里**, import 不到。
+            #     · 而 sympy 的 `Expr.eval` 是符号替换, z3 的 `ModelRef.eval`
+            #       是模型求值, 都不执行任意字符串。
+            #   ⇒ 属性这条禁令对内置函数是**冗余**的, 对库调用是**有害**的。
+            if node.attr in ("exec", "__import__", "compile"):
                 raise SandboxRejected(
                     f"line {node.lineno}: 禁止访问属性 `.{node.attr}`"
                 )
+            # ★ 读/写文件的属性也要拦 ★
+            # 只拦 ast.Name 叫 open 是不够的: `io.open(...)` 是 Attribute 调用,
+            # 实测能直接读走 data/*_reference.json 里的参考答案。
+            if node.attr in _BANNED_FILE_ATTRS:
+                # numpy 有一批 API 既能读文件也能读内存(np.load(path) vs
+                # np.load(buf)), 只能靠**第一个参数是不是路径字面量**区分。
+                # 判据落在 Call 节点上(path_arg_calls), 不是这个 Attribute 上 ——
+                # 这里 node.value 永远是 Name("np")。
+                mem_ok = (node.attr in _NUMPY_MEM_OK
+                          and id(node) not in path_arg_calls)
+                if not mem_ok:
+                    raise SandboxRejected(
+                        f"line {node.lineno}: 禁止访问属性 `.{node.attr}` —— "
+                        f"沙箱里读不了文件, 所以你**读不到任何参考答案**。"
+                        f"需要 IO 就让工具层做。"
+                    )
             _check_module_attribute(node, aliases)
             continue
         # 名字引用 → 黑名单
@@ -582,8 +670,16 @@ def run_code(
         result.error_type = "SandboxBootstrapError"
         return result
 
-    stdout = _truncate(payload.get("print_out", ""))
-    result.truncated = len(payload.get("print_out", "")) > MAX_OUTPUT_CHARS
+    raw_stdout = payload.get("print_out", "")
+    # ★ 先抽制品, 再截断 ★
+    # 实测事故(2026-10-09 res-019, 另一个 Mavis 的复核发现, 我已复核):
+    # 那道题要交 60x60 的群乘法表, JSON 有 46454 字符。MAX_OUTPUT_CHARS=8000
+    # 保留头尾, **把 JSON 从中间劈开** -> parse_artifact 返回 None ->
+    # 制品门判"你没交出本题要求的对象"。
+    # 模型**每一轮都交了**, 被同一个截断吃掉 11 次。
+    # 我一度把它当成"模型不听话", 那个诊断是错的。
+    stdout = _truncate_keeping_artifacts(raw_stdout)
+    result.truncated = len(raw_stdout) > MAX_OUTPUT_CHARS
 
     result.ok = bool(payload.get("ok"))
     result.stdout = stdout
@@ -625,6 +721,50 @@ def _parse_sentinel(data: bytes) -> tuple[dict | None, bytes]:
             except json.JSONDecodeError:
                 return None, data
     return None, data
+
+
+
+#: 制品行前缀 —— 这些行的内容**不能被截断**, 否则复核无从下手。
+_ARTIFACT_LINE = re.compile(r"^\s*(?:CONSTRUCT|ANSWER|COUNTEREXAMPLE)\s*:",
+                           re.IGNORECASE | re.MULTILINE)
+
+
+def _truncate_keeping_artifacts(text: str) -> str:
+    """截断 stdout, 但**先把完整的制品行摘出来**接到末尾。
+
+    ★ 为什么 ★
+    制品(构造的矩阵/群表/巡回)可能几万字符, 而人类可读的日志只需要几千。
+    原来一刀切 8000 字符、保留头尾 —— 制品这种"一整行 JSON"正好横跨
+    头尾接缝, 于是被劈成两半, json.loads 失败, 复核拿不到任何东西。
+    实测 2026-10-09 res-019: 原始 46454 字符, 被劈后 parse_artifact 返回 None,
+    而模型 11 轮里 11 轮都规规矩矩交了制品。
+
+    ★ 为什么不直接把上限抬到 200k ★
+    那样人类可读日志会把重试 prompt 灌满噪声, 而噪声正是重试时最不该看的东西。
+    制品要**完整**, 日志可以**短** —— 两者分开。
+
+    接缝处的半截 JSON 依然会被留着(那是 `_truncate` 的头尾), 但完整的那一份
+    会在末尾, `parse_artifact` 用大括号配平扫描会先命中它。
+    """
+    if not text or len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    lines = text.splitlines()
+    arts = [ln for ln in lines if _ARTIFACT_LINE.match(ln)]
+    if not arts:
+        return _truncate(text)
+    kept = "\n".join(arts)
+    body = _truncate(text)
+    # ★ 制品只做**整体**兜底, 不从中间劈 ★
+    # 从中间劈等于什么都没做 —— json.loads 照样失败, 复核照样拿不到东西。
+    # 实测 res-019 的群乘法表 46454 字符, 劈开后 parse_artifact 返回 None。
+    # 制品本身是"答案", 它该完整; 人类可读日志已经单独截到 8000 了。
+    cap = MAX_ARTIFACT_CHARS
+    if len(kept) > cap:
+        kept = (kept[:cap // 2]
+                + f"\n... [制品过长被截断, 原文 {len(kept)} 字符] ...\n"
+                + kept[-(cap // 2):])
+    return (body + "\n\n[以下是完整的制品行, 不受上面的长度截断影响]\n"
+            + kept)
 
 
 def _decode(data: bytes) -> str:

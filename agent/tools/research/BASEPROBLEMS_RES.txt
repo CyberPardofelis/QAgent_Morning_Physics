@@ -1,0 +1,468 @@
+{
+  "part": 2,
+  "name": "research_capability",
+  "description": "无方法提示。考察 Explorer-Worker-Verifier 循环中的方法选择、探索、交叉验证、自我修正。",
+  "scoring": {
+    "weights": {
+      "correctness": 0.20,
+      "method_diversity": 0.15,
+      "self_correction": 0.15,
+      "cross_validation": 0.15,
+      "certification": 0.10,
+      "tool_quality": 0.05,
+      "exploration": 0.15,
+      "calibration": 0.05
+    }
+  },
+  "items": [
+    {
+      "id": "res-01-ramsey-lower",
+      "part": 2,
+      "category": "construction",
+      "prompt": "证明 R(3,4) > 8：构造一个 8 顶点红蓝完全图，既无红色三角形，也无蓝色 K4。",
+      "tool_hints": null,
+      "ground_truth": {
+        "exists": true,
+        "verifier_checks": ["no_red_K3", "no_blue_K4"]
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_01.py",
+        "pass_condition": "coloring valid and both properties verified independently"
+      },
+      "expected_behaviors": [
+        "判断为构造型",
+        "在 SAT / 穷举 / 有限域构造之间选择",
+        "验证时用两套独立方法（例如 python 暴力 + z3）"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-02-hadamard-28",
+      "part": 2,
+      "category": "construction",
+      "prompt": "构造一个 28 阶 Hadamard 矩阵，元素为 ±1，满足 H H^T = 28 I。",
+      "tool_hints": null,
+      "ground_truth": {
+        "exists": true,
+        "method_known": "Paley II with q=13, 或 Williamson"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_02.py",
+        "pass_condition": "H valid, entries in {-1,1}, HH^T == 28 I"
+      },
+      "expected_behaviors": [
+        "意识到随机搜索不可行",
+        "识别 28 = 2*(13+1)，想到 Paley II",
+        "用 numpy 验证 HH^T 和元素范围"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-03-sylvester-matrix",
+      "part": 2,
+      "category": "existence",
+      "prompt": "给定 A=[[1,2],[0,3]]，B=[[4,0],[1,5]]，C=I_2。判定 Sylvester 方程 AX+XB=C 是否存在唯一解；若存在求 X，若不存在给出证明。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "存在唯一解",
+        "X": [[0.20512820512820512, -0.017094017094017096], [-0.017094017094017096, 0.09401709401709402]]
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_03.py",
+        "pass_condition": "spectral condition checked and residual < 1e-10"
+      },
+      "expected_behaviors": [
+        "想到用谱条件判别（eig(A) ∩ eig(-B) = ∅）",
+        "用 vec 化或线性系统求解 X",
+        "验证残差"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-04-cptp-existence",
+      "part": 2,
+      "category": "existence",
+      "prompt": "给定 ρ_in = [[0.5,0.5],[0.5,0.5]]，ρ_out = [[0.7,0],[0,0.3]]。判定是否存在 CPTP 映射 Φ 使 Φ(ρ_in)=ρ_out。若存在给 Kraus 表示，若不存在给证明。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "存在",
+        "example": "Φ(ρ) = diag(0.7, 0.3) * tr(ρ)"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_04.py",
+        "pass_condition": "Kraus representation valid and Choi PSD and trace preserving"
+      },
+      "expected_behaviors": [
+        "想到常数信道",
+        "验证 Choi 矩阵 PSD 和保迹",
+        "用 qutip 或 numpy 交叉验证"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-05-refute-erdos-straus-small",
+      "part": 2,
+      "category": "refutation",
+      "prompt": "命题：对任意 n >= 2，4/n 可以写成 1/x + 1/y + 1/z（x,y,z 正整数）。先在小范围搜索反例。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "小范围内无反例（Erdős-Straus 猜想对 n <= 10^6 成立）",
+        "search_bound": "建议搜索 n <= 1000 至少"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_05.py",
+        "pass_condition": "all n<=1000 decomposed and no counterexample found"
+      },
+      "expected_behaviors": [
+        "用 Fraction 精确计算，不用浮点",
+        "逐 n 搜索解",
+        "报告搜索范围和未搜索范围，标 INCONCLUSIVE 或 PARTIAL"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-06-refute-fermat-poly",
+      "part": 2,
+      "category": "refutation",
+      "prompt": "命题：对所有 n >= 0，n^2 + n + 41 都是素数。请判定真假。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "false",
+        "smallest_counterexample": 40,
+        "value_at_40": 1681,
+        "factorization": "41^2"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_06.py",
+        "pass_condition": "counterexample n == 40 and factorization verified"
+      },
+      "expected_behaviors": [
+        "枚举 n",
+        "用 sympy.isprime 或试除",
+        "发现 n=40 时失败，给出完整分解"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-07-proof-identity",
+      "part": 2,
+      "category": "proof",
+      "prompt": "证明或证伪：对任意实数 a,b,c > 0，a/(b+c) + b/(c+a) + c/(a+b) >= 3/2。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "true",
+        "method": "Cauchy-Schwarz 或 SOS"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_07.py",
+        "pass_condition": "SOS certificate valid or symbolic proof reproduces inequality"
+      },
+      "expected_behaviors": [
+        "先用随机数值扫描，发现总成立",
+        "识别为 Nesbitt 不等式",
+        "尝试 SOS 或 Cauchy-Schwarz 证明",
+        "不在数值证据上就宣称证明"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-08-proof-formal-small",
+      "part": 2,
+      "category": "proof",
+      "prompt": "证明或证伪：对任意正整数 n，2^n + 1 是素数当且仅当 n 是 2 的幂。",
+      "tool_hints": null,
+      "ground_truth": {
+        "verdict": "false",
+        "note": "n=2^5=32 时 F_5 是合数（641 整除）",
+        "partial_truth": "n 是 2 的幂时，2^n+1 是费马数 F_k"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_08.py",
+        "pass_condition": "counterexample identified correctly"
+      },
+      "expected_behaviors": [
+        "先枚举小 n 判断方向",
+        "发现 n=32 时不是素数",
+        "用 sympy 或 gmpy2 分解 2^32+1"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-09-tsp-200",
+      "part": 2,
+      "category": "optimization",
+      "prompt": "对 data/tsp_200.txt 中的 200 城市 TSP 实例，找到一个长度不超过已知最优解 1.10 倍的可行巡回。",
+      "tool_hints": null,
+      "ground_truth": {
+        "ratio_tolerance": 0.10,
+        "instance": "data/tsp_200.txt",
+        "reference": "data/tsp_200_opt.txt"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_09.py",
+        "pass_condition": "tour valid and length <= 1.10 * reference"
+      },
+      "expected_behaviors": [
+        "判断为优化问题，非精确求解",
+        "选择 2-opt / 3-opt / LKH / OR-Tools",
+        "用最近邻初始化 + 局部搜索",
+        "报告 gap 而不是只报长度"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-10-optimize-golomb-15",
+      "part": 2,
+      "category": "optimization",
+      "prompt": "构造 15 阶 Golomb 尺，长度不超过 200。",
+      "tool_hints": null,
+      "ground_truth": {
+        "exists": true,
+        "optimal_length": 151,
+        "tolerance": 200
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_10.py",
+        "pass_condition": "marks valid (all pairwise differences distinct) and length <= 200"
+      },
+      "expected_behaviors": [
+        "识别为约束优化问题",
+        "选 CP-SAT 或 SAT 或 ILP",
+        "设置合理的上界和下界",
+        "不选纯 Python 回溯"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-11-classify-group-60",
+      "part": 2,
+      "category": "classification",
+      "prompt": "判定 60 阶非交换群有哪些同构类，并给出每个同构类的识别特征。",
+      "tool_hints": null,
+      "ground_truth": {
+        "classes": ["A5", "C3 ⋊ (C2×C2) 等", "其他"],
+        "primary_one": "A5",
+        "reference": "GAP 的 SmallGroup(60, k) 分类"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_11.py",
+        "pass_condition": "at least 3 isomorphism classes identified with distinguishing invariant"
+      },
+      "expected_behaviors": [
+        "识别为群论分类问题",
+        "用不变量（换位子群、单性、Sylow 结构）",
+        "报告分类的依据，不是穷举"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-12-classify-finite-topologies",
+      "part": 2,
+      "category": "classification",
+      "prompt": "对 4 元集合 {1,2,3,4}，枚举所有不同的拓扑，给出总数和分类依据。",
+      "tool_hints": null,
+      "ground_truth": {
+        "count": 355,
+        "known_sequence": "A001930",
+        "source": "已知文献值"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_12.py",
+        "pass_condition": "count == 355 and topology axioms verified for sample"
+      },
+      "expected_behaviors": [
+        "识别为枚举+去重问题",
+        "枚举子集族，验证拓扑三公理",
+        "处理同构去重（或者接受不同构枚举）",
+        "查 OEIS 交叉验证计数"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-13-chaos-logistic-scan",
+      "part": 2,
+      "category": "dynamics",
+      "prompt": "对 logistic 映射 x_{n+1} = r x_n (1-x_n)，扫描 r ∈ [3.4, 4.0]，步长 0.001，判定哪些 r 对应混沌轨道。给出判定依据和临界 r 的估计。",
+      "tool_hints": null,
+      "ground_truth": {
+        "method": "最大 Lyapunov 指数 > 0 判混沌",
+        "critical_region": "r > 3.5699 (Feigenbaum 点) 进入混沌带",
+        "method_fingerprint": "λ_max(r) 曲线、分岔图、周期窗口"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_13.py",
+        "pass_condition": "Lyapunov curve computed for all r and critical r estimated in [3.55, 3.60]"
+      },
+      "expected_behaviors": [
+        "选择 Lyapunov 指数作为判据",
+        "识别需要丢弃瞬态",
+        "发现周期窗口（如 r=3.83 附近）",
+        "报告 Feigenbaum 点附近的行为"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-14-chaos-lorenz-map",
+      "part": 2,
+      "category": "dynamics",
+      "prompt": "对 Lorenz 系统（σ=10, ρ=28, β=8/3），用 Poincaré 截面和 return map 分析其结构。给出 return map 形状和 Lyapunov 谱。",
+      "tool_hints": null,
+      "ground_truth": {
+        "lyapunov_spectrum": [0.9056, 0.0, -14.5723],
+        "return_map_shape": "类似 tent map，有单峰结构",
+        "ky_dimension": 2.062
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_14.py",
+        "pass_condition": "Lyapunov spectrum correct and return map structure identified"
+      },
+      "expected_behaviors": [
+        "选择 Poincaré 截面 z=27 或类似",
+        "计算 return map 并识别单峰结构",
+        "计算 Lyapunov 谱（QR 分解）",
+        "报告 KY 维数"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-15-entanglement-werner-scan",
+      "part": 2,
+      "category": "quantum",
+      "prompt": "对 Werner 态 ρ_W(p) = p|Φ-><Φ-| + (1-p)I/4，扫描 p ∈ [0, 1]，用 PPT 判据识别纠缠区间，并在 p=0.4 处给出纠缠度量。",
+      "tool_hints": null,
+      "ground_truth": {
+        "threshold": "p > 1/3",
+        "entangled_range": "(1/3, 1]",
+        "negativity_at_0.4": 0.1,
+        "min_eig_PT_at_0.4": -0.05
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_15.py",
+        "pass_condition": "threshold estimate in [0.32, 0.35] and negativity at p=0.4 correct"
+      },
+      "expected_behaviors": [
+        "识别 PPT 判据",
+        "扫描 p 并记录最小本征值",
+        "计算 Negativity",
+        "给出阈值 p=1/3"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-16-entanglement-ghz-w",
+      "part": 2,
+      "category": "quantum",
+      "prompt": "给定两个三量子比特纯态 |GHZ> 和 |W>。判定它们的纠缠类型，并给出不能 SLOCC 互相转换的数学证据。",
+      "tool_hints": null,
+      "ground_truth": {
+        "GHZ_type": "GHZ 类，3-tangle = 1",
+        "W_type": "W 类，3-tangle = 0",
+        "invariant": "3-tangle 或纠缠秩",
+        "verdict": "SLOCC 不等价"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_16.py",
+        "pass_condition": "both types identified and at least one SLOCC invariant computed correctly"
+      },
+      "expected_behaviors": [
+        "识别需要用 SLOCC 不变量",
+        "计算 3-tangle",
+        "或计算纠缠秩",
+        "对比 GHZ 和 W 的不变量值"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-17-scaling-prime-gaps",
+      "part": 2,
+      "category": "scaling",
+      "prompt": "统计 1 到 10^6 之间素数间隔的分布，拟合其统计规律，并指出偏离该规律的显著区间。",
+      "tool_hints": null,
+      "ground_truth": {
+        "expected_distribution": "近似几何/指数分布",
+        "n_primes": 78498,
+        "major_deviation": "gap=2 处孪生素数过量，约 8169 次",
+        "secondary_deviation": "gap 为奇数的素数对为 0（除 2,3）"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_17.py",
+        "pass_condition": "distribution fitted and gap=2 excess quantified"
+      },
+      "expected_behaviors": [
+        "用筛法生成素数表",
+        "统计相邻间隔分布",
+        "拟合指数分布",
+        "发现 gap=2 的过量并解释"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-18-scaling-percolation",
+      "part": 2,
+      "category": "scaling",
+      "prompt": "对二维方格键渗流，用 Monte Carlo 估计临界概率 p_c，并通过有限尺寸分析消除边界效应。给出 p_c 估计与误差棒。",
+      "tool_hints": null,
+      "ground_truth": {
+        "p_c_infinite": 0.592746,
+        "tolerance": 0.015,
+        "finite_size_sizes": "[32, 64, 128]"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_18.py",
+        "pass_condition": "p_c estimate in [0.58, 0.61] and finite size study done"
+      },
+      "expected_behaviors": [
+        "选择 Monte Carlo 方法",
+        "对多个格点尺寸测量 p_c(L)",
+        "外推 L→∞",
+        "报告误差棒"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-19-bifurcation-rossler",
+      "part": 2,
+      "category": "dynamics",
+      "prompt": "对 Rössler 系统，扫描参数 c ∈ [3, 8]（固定 a=0.2, b=0.2），画出分岔图并识别主要周期窗口。",
+      "tool_hints": null,
+      "ground_truth": {
+        "main_transition": "c≈4.2 附近进入混沌",
+        "period_windows": "c≈4.6, 5.0 附近有周期窗口",
+        "structure": "period-doubling route"
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_19.py",
+        "pass_condition": "bifurcation diagram generated and transition identified"
+      },
+      "expected_behaviors": [
+        "选择 Poincaré 截面投影到 c 轴",
+        "追踪 x_n 极值或截面交点",
+        "识别周期-倍周期路径",
+        "报告主要周期窗口"
+      ],
+      "difficulty": "research"
+    },
+    {
+      "id": "res-20-cross-method-matrix",
+      "part": 2,
+      "category": "cross_method",
+      "prompt": "给定矩阵 M = [[2,1,0],[1,3,1],[0,1,4]]，用至少三种独立方法计算其特征值，并交叉验证结果一致。",
+      "tool_hints": null,
+      "ground_truth": {
+        "eigenvalues": "约 4.4605, 2.5198, 2.0197",
+        "checks": ["特征多项式", "数值对角化", "幂迭代或 QR"]
+      },
+      "verifier": {
+        "entrypoint": "verifiers/part2/res_20.py",
+        "pass_condition": "at least 3 independent methods used and results consistent within tolerance"
+      },
+      "expected_behaviors": [
+        "方法一：sympy 符号特征多项式",
+        "方法二：numpy.linalg.eigvals",
+        "方法三：手工 QR 或幂迭代",
+        "报告三组结果一致"
+      ],
+      "difficulty": "research"
+    }
+  ]
+}

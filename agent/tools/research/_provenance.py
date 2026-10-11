@@ -26,10 +26,13 @@ agent.tools.research._provenance — 证据链: 编号 / 环境指纹 / verdict 
 from __future__ import annotations
 
 import hashlib
+import json
 import platform
 import re
 import sys
 from typing import Any
+
+from ._flags import RESEARCH_ARCH_VERSION
 
 # ============================================================
 # verdict 硬枚举
@@ -550,7 +553,7 @@ _CONTRADICTIONS = (
 #: 交不出来就是交不出来 —— 不管它是「没找到」「几路对不上」还是「数错了」。
 #: 这样一条规则覆盖六种形态, 而且能拦住我没见过的。
 _COUNTEREXAMPLE = re.compile(
-    r"^\s*COUNTEREXAMPLE\s*:\s*(?P<fields>.+?)\s*$",
+    r"^\s*COUNTEREXAMPLE\s*:\s*(?P<body>.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _FIELD = re.compile(r"(\w+)\s*=\s*([^|]+?)\s*(?=\||$)")
@@ -558,10 +561,18 @@ _FIELD = re.compile(r"(\w+)\s*=\s*([^|]+?)\s*(?=\||$)")
 
 def _counterexample_credential(stdout: str) -> dict[str, str] | None:
     """
-    判断 REFUTED 有没有交出**具体反例**。两种合格形态:
+    判断 REFUTED 有没有交出**具体反例**。三种合格形态:
 
-      1. 标准凭证行 `COUNTEREXAMPLE: n=15 | lhs=60 | ... | violated=True`
-      2. 自然写法 `反例: n = 15, 差值 = 0.25` —— 标记词 + 同行有具体数值
+      1. `COUNTEREXAMPLE: {"n": 18, "value": 343}` —— **标准 JSON 制品行**(优先)
+      2. `COUNTEREXAMPLE: n=18 | lhs=9 | rhs=0 | violated=True` —— 旧管道格式
+      3. 自然写法 `反例: n = 18, 差值 = ...` —— 标记词 + 同行有具体数值
+
+    ★ 三种都要认 ★
+    误杀真反例的代价 = 一个真结论被降级成 inconclusive, 比放过假反例更糟。
+    模型未必会照抄格式, 但只要它**确实指出了一个具体输入和值**, 那份证据
+    就该被采信 —— 机器要做的是**核对凭证**, 不是**考格式**。
+    要 JSON 是为了让独立复核器能自动核对(见 tests/tools/VERIFIER_CONTRACT.md),
+    不是为了让判定更严。
 
     ★ 「凭证」的边界是量出来的, 不是拍出来的 ★
     两个极端都试过, 都错:
@@ -583,8 +594,30 @@ def _counterexample_credential(stdout: str) -> dict[str, str] | None:
     """
     if not stdout:
         return None
+    # ★ 见过 COUNTEREXAMPLE 行 = agent 明确在交制品 ★
+    # 此时若一行都解析不出来, 必须**明确判未提交**, 不能掉进下面的自然写法兜底 ——
+    # 否则截断的 JSON (COUNTEREXAMPLE: {"n": 18,) 会因为同行含数字而被放行,
+    # 变成"格式坏了但毕竟给出了具体数值"。那是蒙混, 不是证据。
+    seen_marker = False
     for m in _COUNTEREXAMPLE.finditer(stdout):
-        fields = dict(_FIELD.findall(m.group("fields")))
+        seen_marker = True
+        body = m.group("body")
+        # (1) JSON 制品 —— 标准格式, 优先
+        if body.lstrip().startswith("{"):
+            try:
+                v = json.loads(body)
+            except Exception:
+                continue
+            if not isinstance(v, dict):
+                continue
+            if str(v.get("violated", "True")).strip().lower() in (
+                    "false", "no", "0"):
+                return None
+            if not any(re.search(r"-?\d", str(x)) for x in v.values()):
+                continue          # 全是 none/bad 这种等于没交
+            return {str(k): str(val) for k, val in v.items()}
+        # (2) 旧管道格式 —— 保留兼容
+        fields = dict(_FIELD.findall(body))
         if not fields:
             continue
         if fields.get("violated", "").strip().lower() in ("false", "no", "0"):
@@ -593,7 +626,9 @@ def _counterexample_credential(stdout: str) -> dict[str, str] | None:
         if not any(re.search(r"\d", x) for x in fields.values()):
             continue
         return fields
-    # 自然写法: 指名了违反的对象, 且同行给出了值
+    if seen_marker:
+        return None            # 有制品行却一行都解析不出来 -> 未提交
+    # (3) 自然写法: 指名了违反的对象, 且同行给出了值
     for line in stdout.splitlines():
         if (_WITNESS_STRONG.search(line) or _WITNESS_WEAK.search(line)) \
                 and re.search(r"\d", line):
@@ -1146,6 +1181,9 @@ def build_evidence(
         "stdout": stdout,
         "stderr": stderr,
         "elapsed_ms": elapsed_ms,
+        # ★ 架构版本: 这条证据是哪一版回路产出的 ★
+        # 不打戳的话, 架构重构后新旧分数会被放在一起比, 而那个对比无效。
+        "arch_version": RESEARCH_ARCH_VERSION,
         "env": env_fingerprint(),
     }
     if extra:

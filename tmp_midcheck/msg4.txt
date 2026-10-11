@@ -1,0 +1,51 @@
+收制品时剔除占位符答案, 别按 lane 序号瞎取第一条
+
+## 现象 (实测 2026-10-11, oeis-03-candidates)
+
+三条 lane 都 `has_artifact=True`, 但 trace 里:
+    lane1: 1 次 oeis_lookup -> 制品预览 "A000079 - Powers of 2..."   完整
+    lane2: 2 次 oeis_lookup -> 制品预览 "至少有以下条目..."        完整
+    lane0: 4 次 oeis_lookup -> 制品预览 "..."                      半截!
+            收敛: stall 触发 2 次
+
+我原来写 `best = good[0]` —— **按 lane 序号取第一条, 恰好选中了最差的那条**,
+于是整题被判 WRONG。而 lane0 之所以交半截, 是因为它调了 4 次撞了 stall。
+
+## 根因
+
+`has_artifact=True` 只说明 **worker 自己认为**做完了, 不代表交出了**内容**。
+三选的失败形态实测有三种: `"..."` / `"你的答案"` / 空字符串。
+
+★ `check_placeholder_answer.py` 我早就写好了, 却**没接到选制品的逻辑里** ——
+  判据写了却不用, 等于没写。
+
+## 修法
+
+新增 `_is_placeholder()`, 选制品前先过滤:
+
+    real = [r for r in good if not _is_placeholder(r)]
+    if real: good = real   # 并在 trace 里记下剔除了几条
+
+只判"有没有内容", 不判内容对不对 —— 对不对是 `_agreement` 的职责。
+
+## part1 最终 (同分母 39 题)
+
+    C 32/39   B 37/39   D 35/39
+
+D 剩下的 4 道判错(mpmath-02 / oeis-02 / oeis-04 / sympy-02)**答案形态全是 OK,
+没有一道是真错** —— 都是"判据挑表现形式"(要小数点、要 OEIS 编号、要无空格减号)。
+
+而 D **反超** B 2 道(qutip-01 / qutip-04 是 D 对 B 错)。
+
+## 今晚第四个真 bug 的教训
+
+trace 没落盘时, "这题为什么交出半截文字"这个问题**在数据里无解**,
+我只能靠猜, 而猜测就表现为打哈哈。trace 落盘后一眼就看出是"lane0 交了 ..."。
+
+★ 归因的前提是**数据里有证据**。没有 trace 时, 任何根因分析都是编的 ★
+
+## 回归
+check_d_route / check_placeholder_answer / check_react_loop /
+check_worker_tool_paths / check_convergence / check_finalize_robust /
+check_probe_not_trap / check_no_hardcoded_routing / check_extract_code /
+check_strip_self_claims —— 10 个检查器全部通过。

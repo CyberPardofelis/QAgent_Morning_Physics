@@ -1,0 +1,49 @@
+P8.1: D 路线三处返工 + 占位符答案分类
+
+## D 路线(并行 lane) 的三处设计返工
+
+1. **不再"交出就早退"**
+   `has_artifact=True` 只说明 worker **自己认为**做完了, 不代表答案对
+   (实测 res-08 交出了但判 WRONG)。早退等于"lane0 交出一个错答案,
+   lane1 正在算对的, 我不等它", 拿正确率赌速度。
+   ⇒ 等全部 lane, 再用 `_agreement` 交叉检查, 不符则 verdict=DISPUTED。
+
+2. **撤销"有 hints 就强制 1 lane"**
+   ★ 这是我犯的错 ★ 强制单 lane 等于**剥夺 explorer 的第二次机会** ——
+   lane 0 出问题时它连"再加一条路"都做不到。而 explorer 这个角色的存在
+   意义就是"看上一轮结果决定换不换路", 强制恰好删掉了它。
+   简单题一条 lane 够用, **复杂题不够** —— 拿测试集的形状去卡设计是错的。
+
+3. **`done` 字段终于被读了**
+   之前它只被记进 trace、**从没参与控制流**, 于是 max_turns=3 总是跑满 ——
+   第一轮就够的题也在空转后面两轮, 每轮又要开 lane 等它们跑完。
+   ⇒ done=true 且本轮真交出 -> 立刻收工。
+
+## 现在的行为
+   · lane 数**只由 explorer 决定**(上限 3); hints 只能**建议**"这类任务通常一条就够"
+   · hints 分两层: 「用什么工具」是**硬约束**(题面点名了, 换工具就是答非所问),
+     「开几条 lane」是**方法选择**, 归 explorer
+   · 实测 part1 平均耗时 142s -> 104s; cvxpy-04 出现 lane=2
+     (explorer 第一条走不通, 自己加了第二条) —— 正是要的行为
+
+## 新增 check_placeholder_answer.py
+答案被占位符掏空是一类**与数学能力无关**的失败, 且必须单独查:
+实测 part2 有三道 —— res-14(答案空)、res-17("你的答案")、res-18("...")。
+判据说它们 WRONG 是对的, 但**原因不是"算错"**:
+  · 可能已经把结论算出来了, 只是组织 final 时塌成占位符 -> 加重试就能救;
+  · 也可能压根没算出来 -> 要改收敛。
+**这两种在分数上一样(都记 WRONG), 但修法完全相反。**
+
+`classify_answer()` 认 EMPTY / PLACEHOLDER / OK;
+`_has_real_work()` 从 findings 区分"算出来了写不出" vs "没算出来"。
+
+## part1 实测(10 题小批验证)
+   D 判对 8/8 与 B 打平, 平均耗时 51s vs B 的 103s;
+   其中 sympy-02 那道**最初判 WRONG, 复核发现是判据 bug**(减号后有空格),
+   判据修在 MAGI-Tools 侧。
+
+## 回归
+check_d_route(19 项) / check_placeholder_answer(13 项) / check_finalize_robust /
+check_react_loop / check_convergence / check_no_hardcoded_routing /
+check_probe_not_trap / check_worker_tool_paths / check_strip_self_claims /
+check_extract_code —— 全部通过。
