@@ -47,6 +47,13 @@ class Trace(list):
     """整道题的完整轨迹。打分器读它, 出错时人读它。"""
 
 
+#: ★ 允许的**连续** probe 次数 ★
+#:   probe(小规模试验)是有价值的信息来源, 所以不禁用它 —— 但不能连着来。
+#:   实测 2026-10-10: B 路线有 2 道题全程只 probe, 预算在 probe<->probe 里
+#:   烧光, 一件制品都没产出。详见 solve() 里 2b 的说明。
+MAX_CONSECUTIVE_PROBE = 1
+
+
 def solve(problem: str, *, budget: Budget | None = None,
           tools: list[dict] | None = None, scratch_dir: str | None = None,
           verbose: bool = True, verify: bool = True, **llm_kw) -> dict:
@@ -71,6 +78,8 @@ def solve(problem: str, *, budget: Budget | None = None,
     own_dir = scratch_dir is None
     scratch = scratch_dir or tempfile.mkdtemp(prefix="lab_")
     used_methods: dict[str, int] = {}
+    #: 连续 probe 计数。★ 见下面 2b 的说明: probe 可以有, 但不能连着来 ★
+    probe_used = 0
     started = time.time()
 
     def log(msg: str) -> None:
@@ -179,6 +188,38 @@ def solve(problem: str, *, budget: Budget | None = None,
                 log(f"[{turn}] 同一方法已试 2 次, 挡回")
                 continue
             used_methods[fp] = used_methods.get(fp, 0) + 1
+
+            # ---- 2b. ★ 连续 probe 不许超过一次 ★
+            #   实测 2026-10-10 (part2 零提示 20 题, B 路线):
+            #     Explorer 动作分布 = execute 20 / probe 8 / None 4,
+            #     Worker 错误里 **UnparsedOutput 占 12 次**(压倒性第一),
+            #     而 res-09 / res-19 两道**全程只 probe、一次 execute 都没有**。
+            #
+            #   ★ 这不是收敛机制弱, 是 probe 本身是个**陷阱** ★
+            #     probe 模式下 Worker **不强制 final**(那是设计意图: 小规模试验
+            #     本来就不该交答案), 于是:
+            #       probe -> 没交出制品 -> orchestrator continue
+            #            -> Explorer 又说"我还是不确定, 先 probe"
+            #            -> 预算在 probe<->probe 之间烧光, 一件制品都没有。
+            #     预算只有 max_turns=3, 两轮 probe 就烧掉 2/3。
+            #
+            #   ⇒ probe 可以有一次(它是有价值的信息来源), 但**第二次必须 execute**。
+            #     这是 harness 计数, 不是靠 prompt 劝 —— 实测模型能连着 6 次无视
+            #     Worker 那条"不要再原样调它"的提示, 所以软提醒不可靠。
+            n_probe = probe_used + 1 if action == "probe" else 0
+            if action == "probe" and probe_used >= MAX_CONSECUTIVE_PROBE:
+                trace[-1].update({
+                    "action": "execute",
+                    "outcome": f"已经连续 probe {probe_used} 次, 这一次强制 execute",
+                    "lesson": "你已经探了够多次了。这一轮**必须产出可复核的制品**: "
+                              '输出 {"final": "你的答案", "reason": "怎么得到的"}。'
+                              "哪怕答案不完整, 也远好过再探一次什么都不交。",
+                    "lesson_given": True,
+                })
+                action = "execute"
+                n_probe = 0
+                log(f"[{turn}] 连续 probe {probe_used} 次, 强制切 execute")
+            probe_used = n_probe
 
             # ---- 3. Worker 去调工具 ----
             # ★ Worker 自己渲染目录 ★ 不再由编排器往里塞一个"工具列表"对象 ——
