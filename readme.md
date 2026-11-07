@@ -5,6 +5,7 @@
 
 ### 预编译版本
 从[GitHub Releases](https://github.com/CyberPardofelis/QAgent_Morning_Physics/releases/latest) 页面下载最新的文件压缩包，解压后运行`light.exe`
+（版本已过期）
 
 发送 早上好 + 名称以获取新文章（或近期文章）总结，如 早上好 arxiv，早上好 prl 等\
 可以继续展开其中某一个领域总结所有文章（目前只针对arxiv）\
